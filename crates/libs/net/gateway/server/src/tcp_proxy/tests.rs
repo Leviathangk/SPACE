@@ -908,41 +908,49 @@ async fn record_emits_one_connection_metric_and_reports_every_failure_outcome() 
                         assert_eq!(metrics[0].value, 1);
                     }
                     assert!(events.events().is_empty());
-                    cloned_proxy
-                        .connect_failure_warnings
-                        .lock()
-                        .unwrap()
-                        .last_logged_at = Some(Instant::now() - REFUSAL_WARNING_INTERVAL);
-                    let capture = pplx_space_metrics::test_capture::capture_counters_guard();
-                    assert!(!cloned_proxy.record(
-                        destination,
-                        Some(&unknown_host),
-                        FlowOutcome::RelayFailed(RelayFailure::Connect(io::Error::other(
-                            PRIVATE_ERROR_TEXT
-                        ))),
-                    ));
-                    let metrics = capture.finish();
-                    assert_eq!(metrics.len(), 1);
-                    assert_eq!(metrics[0].value, 1);
+                    for error in [
+                        io::Error::other(PRIVATE_ERROR_TEXT),
+                        io::Error::from_raw_os_error(i32::MAX),
+                    ] {
+                        cloned_proxy
+                            .connect_failure_warnings
+                            .lock()
+                            .unwrap()
+                            .last_logged_at = Some(Instant::now() - REFUSAL_WARNING_INTERVAL);
+                        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+                        assert!(!cloned_proxy.record(
+                            destination,
+                            Some(&unknown_host),
+                            FlowOutcome::RelayFailed(RelayFailure::Connect(error)),
+                        ));
+                        let metrics = capture.finish();
+                        assert_eq!(metrics.len(), 1);
+                        assert_eq!(metrics[0].value, 1);
+                    }
                 });
                 let diagnostics = events.events();
-                assert_eq!(diagnostics.len(), 1);
-                let mut fields = diagnostics[0].clone();
-                fields.sort();
-                let mut expected = vec![
-                    (
-                        "message".to_owned(),
-                        "TCP upstream connect failed".to_owned(),
-                    ),
-                    ("sandbox_id".to_owned(), "test".to_owned()),
-                    ("destination_port".to_owned(), "8443".to_owned()),
-                    ("destination_family".to_owned(), "ipv6".to_owned()),
-                    ("destination_scope".to_owned(), "private".to_owned()),
-                    ("io_kind".to_owned(), "Other".to_owned()),
-                    ("suppressed".to_owned(), "2".to_owned()),
-                ];
-                expected.sort();
-                assert_eq!(fields, expected);
+                assert_eq!(diagnostics.len(), 2);
+                for (event, (io_kind, suppressed)) in diagnostics
+                    .iter()
+                    .zip([("Other", "2"), ("Uncategorized", "0")])
+                {
+                    let mut fields = event.clone();
+                    fields.sort();
+                    let mut expected = vec![
+                        (
+                            "message".to_owned(),
+                            "TCP upstream connect failed".to_owned(),
+                        ),
+                        ("sandbox_id".to_owned(), "test".to_owned()),
+                        ("destination_port".to_owned(), "8443".to_owned()),
+                        ("destination_family".to_owned(), "ipv6".to_owned()),
+                        ("destination_scope".to_owned(), "private".to_owned()),
+                        ("io_kind".to_owned(), io_kind.to_owned()),
+                        ("suppressed".to_owned(), suppressed.to_owned()),
+                    ];
+                    expected.sort();
+                    assert_eq!(fields, expected);
+                }
             }
         }
         assert_eq!(emitted_tag_sets.len(), outcome_count);
