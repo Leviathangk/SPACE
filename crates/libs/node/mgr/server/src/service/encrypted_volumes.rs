@@ -29,6 +29,7 @@
 use pplx_space_common_core::types::OrgId;
 
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use pplx_space_common_core::host::linux::paths;
 use pplx_space_common_core::types::SandboxId;
@@ -50,6 +51,9 @@ const ROOTFS_ORIGIN_FILE: &str = "rootfs.ext4";
 
 /// Per-sandbox encrypted rootfs COW backing file inside `instance/`.
 pub(super) const ROOTFS_COW_FILE: &str = "cow.luks";
+
+const DEK_PLACEMENT_RETRY_DELAY: Duration = Duration::from_millis(100);
+const DEK_PLACEMENT_MAX_ATTEMPTS: usize = 10;
 
 /// Upper bound on `volume_name`. The name lands in a dm mapper name
 /// (`sbxvol-<uuid>-<name>`, kernel limit 127 chars) and in derived paths, so
@@ -541,9 +545,11 @@ fn stage_ciphertext(root: &Path, src: &Path, dst: &Path, reader_gid: u32) -> Res
 
 /// Resolve the sandbox's single volume DEK from credmgr. The plaintext lives
 /// in [`Zeroizing`] so it scrubs on drop; keep the binding short-lived.
-/// Connect failures surface as `Unavailable` (retryable by the orchestrator);
-/// credmgr's own status code passes through otherwise, preserving its
-/// permanent-vs-transient taxonomy.
+/// Connect failures surface as `Unavailable` (retryable by the orchestrator).
+/// A `NotFound` is retried for at most 900 ms because kubelet may start the
+/// shim after scheduling but before the control plane persists that scheduler
+/// binding into the active execution row. Every other credmgr status passes
+/// through immediately, and the final `NotFound` remains fail-closed.
 ///
 /// `expected_org` makes credmgr verify the sandbox's resolved owner before
 /// issuing or unwrapping anything — callers that assert ownership (the
@@ -567,19 +573,33 @@ async fn fetch_sandbox_volume_dek(
             byok::dek_fetch_failed(byok::DEK_UNREACHABLE);
             Status::unavailable(format!("credmgr connect: {e}"))
         })?;
-    let mut resp = client
-        .get_or_issue_sandbox_volume_dek(
-            pplx_space_credmgr_client::proto::GetOrIssueSandboxVolumeDekRequest {
-                sandbox_id: sandbox_id.to_string(),
-                expected_org_id: expected_org.map(|org| org.to_string()).unwrap_or_default(),
-            },
-        )
-        .await
-        .map_err(|status| {
-            byok::dek_fetch_failed(dek_failure_reason(status.code()));
-            credmgr_status_with_context(status)
-        })?
-        .into_inner();
+    let sandbox_id = sandbox_id.to_string();
+    let expected_org_id = expected_org.map(|org| org.to_string()).unwrap_or_default();
+    let mut attempt = 1;
+    let mut resp = loop {
+        match client
+            .get_or_issue_sandbox_volume_dek(
+                pplx_space_credmgr_client::proto::GetOrIssueSandboxVolumeDekRequest {
+                    sandbox_id: sandbox_id.clone(),
+                    expected_org_id: expected_org_id.clone(),
+                },
+            )
+            .await
+        {
+            Ok(response) => break response.into_inner(),
+            Err(status)
+                if status.code() == tonic::Code::NotFound
+                    && attempt < DEK_PLACEMENT_MAX_ATTEMPTS =>
+            {
+                attempt += 1;
+                tokio::time::sleep(DEK_PLACEMENT_RETRY_DELAY).await;
+            }
+            Err(status) => {
+                byok::dek_fetch_failed(dek_failure_reason(status.code()));
+                return Err(credmgr_status_with_context(status));
+            }
+        }
+    };
     byok::dek_fetch_duration(started);
     Ok(Zeroizing::new(std::mem::take(&mut resp.plaintext_dek)))
 }
