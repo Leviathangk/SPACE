@@ -89,6 +89,22 @@ where
 
             // Origin setup and sender readiness can outlive a policy update. This
             // is the final fence before request headers can leave the gateway.
+            if !self.lease.is_usable() {
+                forwarding.finish(Outcome::Cancelled, "lease_invalidated");
+                return self.refuse("lease_invalidated", StatusCode::FORBIDDEN);
+            }
+            match tokio::time::timeout_at(deadline, self.binding.authorize(&request)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(reason)) => {
+                    forwarding.finish(Outcome::Cancelled, reason.as_str());
+                    return self.refuse(reason.as_str(), reason.refusal_status());
+                }
+                Err(_) => {
+                    forwarding.finish(Outcome::Error, "origin_timeout");
+                    return self
+                        .refuse(TlsTransportError::Timeout.as_str(), StatusCode::BAD_GATEWAY);
+                }
+            }
             let headers = match credential_headers(&self.lease, &request) {
                 Ok(headers) => headers,
                 Err(error) => {
@@ -142,7 +158,7 @@ where
                 }
                 Err(error) => {
                     forwarding.finish(Outcome::Error, "upstream_http");
-                    self.draining.cancel();
+                    generation.retired.cancel();
                     TlsTransportError::Http(error).record("upstream_request");
                     self.refuse("upstream_http_error", StatusCode::BAD_GATEWAY)
                 }

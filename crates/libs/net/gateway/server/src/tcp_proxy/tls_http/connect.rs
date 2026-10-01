@@ -143,6 +143,7 @@ where
             Ok(response) => response,
             Err(error) => {
                 forwarding.finish(Outcome::Error, "upstream_http");
+                generation.retired.cancel();
                 TlsTransportError::Http(error).record("connect_proxy_request");
                 return self.refuse("upstream_http_error", StatusCode::BAD_GATEWAY);
             }

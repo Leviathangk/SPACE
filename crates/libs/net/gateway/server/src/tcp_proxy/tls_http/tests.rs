@@ -1189,6 +1189,75 @@ async fn lawful_http1_retirement_forwards_queued_requests_once_on_the_original_g
     completed.unwrap();
 }
 
+#[tokio::test]
+async fn dns_binding_withdrawn_during_origin_setup_never_forwards_the_request() {
+    use pplx_space_net_common::{
+        EgressDefaultAction, EgressDestinationV1, EgressPolicyV1, NetworkPolicyV1, TlsInterception,
+    };
+    use tokio::io::AsyncReadExt;
+    let mut policy = NetworkPolicyV1::deny_all();
+    policy.tls_interception = TlsInterception::On;
+    policy.egress = EgressPolicyV1::new(
+        EgressDefaultAction::Deny,
+        vec![EgressDestinationV1::Domain("allowed.test".parse().unwrap())],
+        Vec::new(),
+    )
+    .unwrap();
+    let state = crate::state::GatewayNetworkState::pending_policy();
+    let (_, _, provider) = crate::certificates::local_provider_with_policy(
+        state.clone(),
+        policy.clone(),
+        Default::default(),
+    )
+    .await;
+    let lease = provider
+        .get("allowed.test".parse().unwrap(), 443)
+        .await
+        .unwrap();
+    let cache = crate::dns::DnsAllowCache::default();
+    cache.observe_response(
+        &crate::dns::test_fixtures::a_response("allowed.test", [93, 184, 216, 34], 60),
+        &policy,
+    );
+    let binding = HostBinding::new(
+        "test",
+        "93.184.216.34:443".parse().unwrap(),
+        state,
+        cache.clone(),
+    );
+    let (origin, mut origin_peer) = tokio::io::duplex(4096);
+    let mut origin = Some(origin);
+    let (guest, peer) = tokio::io::duplex(4096);
+    let gateway = tokio::spawn(serve(
+        guest,
+        HttpProtocol::Http1,
+        binding,
+        lease,
+        move || {
+            cache.retain_relevant_to_policy(&NetworkPolicyV1::deny_all());
+            let origin = origin.take().unwrap();
+            std::future::ready(Ok((origin, HttpProtocol::Http1)))
+        },
+    ));
+    let (mut sender, connection) = http1::handshake(TokioIo::new(peer)).await.unwrap();
+    let client = tokio::spawn(connection);
+    let response = sender
+        .send_request(
+            Request::get("https://allowed.test/")
+                .header(header::HOST, "allowed.test")
+                .body(Empty::<Bytes>::new())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        matches!(origin_peer.read_u8().await, Err(error) if error.kind() == io::ErrorKind::UnexpectedEof)
+    );
+    client.await.unwrap().unwrap();
+    gateway.await.unwrap().unwrap();
+}
+
 async fn session_with_connector<F>(connect: F) -> Session<F> {
     let (binding, lease, _) = fixture().await;
     Session {
@@ -1465,4 +1534,114 @@ async fn pending_origin_setup_has_one_bounded_preparation_budget() {
     gateway.abort();
     let _ = client.await;
     let _ = gateway.await;
+}
+
+#[tokio::test]
+async fn active_http2_abort_does_not_replay_writes_and_original_guest_can_recover() {
+    use http_body_util::{BodyExt, Full};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const COUNT: usize = 32;
+    let (binding, lease, _) = fixture().await;
+    let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dials = Arc::new(AtomicUsize::new(0));
+    let origin_received = received.clone();
+    let origin_dials = dials.clone();
+    let origins = TaskTracker::new();
+    let origin_tasks = origins.clone();
+    let (guest, peer) = tokio::io::duplex(64 * 1024);
+    let gateway = tokio::spawn(serve(
+        guest,
+        HttpProtocol::Http2,
+        binding,
+        lease,
+        move || {
+            let first = origin_dials.fetch_add(1, Ordering::SeqCst) == 0;
+            let received = origin_received.clone();
+            let (origin, peer) = tokio::io::duplex(64 * 1024);
+            origin_tasks.spawn(async move {
+                let mut connection = h2::server::handshake(peer).await.unwrap();
+                let mut responses = Vec::new();
+                while let Some(Ok((request, mut response))) = connection.accept().await {
+                    received
+                        .lock()
+                        .unwrap()
+                        .push(request.headers()["x-write-id"].clone());
+                    if first {
+                        responses.push(response);
+                        if responses.len() == COUNT {
+                            connection.abrupt_shutdown(h2::Reason::INTERNAL_ERROR);
+                            while connection.accept().await.is_some() {}
+                            return;
+                        }
+                    } else {
+                        let mut body = response.send_response(Response::new(()), false).unwrap();
+                        body.send_data(Bytes::from_static(b"recovered-without-replay"), true)
+                            .unwrap();
+                    }
+                }
+            });
+            std::future::ready(Ok((origin, HttpProtocol::Http2)))
+        },
+    ));
+    let (sender, connection) = http2::handshake(TokioExecutor::new(), TokioIo::new(peer))
+        .await
+        .unwrap();
+    let client = tokio::spawn(connection);
+    let completed = tokio::time::timeout(Duration::from_secs(5), async {
+        let responses = futures_util::future::join_all((0..COUNT).map(|index| {
+            let mut sender = sender.clone();
+            async move {
+                sender
+                    .send_request(
+                        Request::post("https://allowed.test/write")
+                            .header("x-write-id", index.to_string())
+                            .body(Full::new(Bytes::from(format!("write-{index}"))))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        }))
+        .await;
+        assert!(
+            responses
+                .iter()
+                .all(|status| *status == StatusCode::BAD_GATEWAY)
+        );
+        assert_eq!(dials.load(Ordering::SeqCst), 1);
+        let mut sender = sender.clone();
+        let response = sender
+            .send_request(
+                Request::post("https://allowed.test/write")
+                    .header("x-write-id", "probe")
+                    .body(Full::new(Bytes::from_static(b"new-write")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "recovered-without-replay"
+        );
+        assert_eq!(dials.load(Ordering::SeqCst), 2);
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), COUNT + 1);
+        assert_eq!(
+            received
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            COUNT + 1
+        );
+    })
+    .await;
+    client.abort();
+    gateway.abort();
+    let _ = client.await;
+    let _ = gateway.await;
+    origins.close();
+    origins.wait().await;
+    completed.unwrap();
 }

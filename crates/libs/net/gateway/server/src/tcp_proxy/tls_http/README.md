@@ -8,8 +8,9 @@ old driver or active HTTP/2 response streams. Successful upgrades retain their
 relay ownership and drain the guest when the relay ends.
 
 Ordinary requests remain untouched until sender readiness and the final current
-credential/lease fence succeed. A failed readiness check can replace the upstream
-before the request's first handoff. Concurrent initialization is singleflight.
+hostname/DNS binding and credential/lease fences succeed. A failed readiness check
+can replace the upstream before the request's first handoff. Concurrent
+initialization is singleflight.
 Each request can cross at most 32 failed-readiness retirements (the guest HTTP/2
 concurrency limit), within one ten-second setup/readiness budget. Failed or
 cancelled initialization drains the guest instead of allowing queued requests to
