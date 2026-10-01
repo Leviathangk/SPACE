@@ -420,6 +420,7 @@ impl CredentialStore for TestCredentialStore {
     async fn sandbox_owner(
         &self,
         _sandbox_id: SandboxId,
+        _scope: crate::credential_store::SandboxOwnerScope,
     ) -> Result<
         Option<crate::credential_store::SandboxOwner>,
         crate::credential_store::CredentialStoreError,
