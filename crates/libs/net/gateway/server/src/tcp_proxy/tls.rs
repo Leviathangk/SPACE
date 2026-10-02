@@ -385,7 +385,17 @@ impl TcpProxy {
             }
             let accounting = WireAccounting::new(self.stats.clone());
             let operation = async {
-                let (downstream, protocol) = accept(client, &lease, &self.tls_interception).await?;
+                let (downstream, negotiated) =
+                    accept(client, &lease, &self.tls_interception).await?;
+                let (downstream, protocol) = guest_protocol(downstream, negotiated).await;
+                // A CONNECT spoken over an h2 ALPN is an HTTP/1.1 proxy hop:
+                // offer the origin only http/1.1 so the forwarded CONNECT gets
+                // the HTTP/1 sender it requires.
+                let client_alpn = if protocol == negotiated {
+                    client_alpn
+                } else {
+                    ClientAlpnOffer::Http1
+                };
                 tracing::Span::current().record("protocol", protocol.as_str());
                 let binding = HostBinding::new(
                     self.sandbox_id,
@@ -819,6 +829,129 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for TlsIo<T> {
             self.record_error("write_vectored", error);
         }
         result
+    }
+}
+
+/// The only HTTP/1 request line served on an h2-negotiated guest connection.
+const HTTP1_CONNECT: &[u8] = b"CONNECT ";
+/// Upper bound on waiting for the guest's first bytes. On expiry the session
+/// proceeds as the negotiated protocol, exactly as before the sniff existed.
+const GUEST_PROTOCOL_BUDGET: Duration = Duration::from_secs(10);
+
+/// Pick the HTTP protocol the guest actually speaks after ALPN.
+///
+/// Go's `net/http` dials an `https://` proxy with the transport's ordinary
+/// TLS configuration, so it offers `h2, http/1.1` and, when `h2` is selected,
+/// still writes an HTTP/1.1 `CONNECT` request line. That is a client bug, but
+/// answering with HTTP/2 frames breaks every Go tool (`gh`, `go`, `terraform`)
+/// behind an HTTPS proxy. An h2 client must open with the connection preface
+/// (RFC 9113 section 3.4), so a session negotiated as h2 whose first bytes are
+/// instead `CONNECT ` is served as HTTP/1.1. Every other byte sequence keeps
+/// the negotiated protocol, and the request is still authorized like any other
+/// inspected HTTP/1 CONNECT.
+pub(super) async fn guest_protocol<S>(
+    mut guest: S,
+    negotiated: HttpProtocol,
+) -> (Rewind<S>, HttpProtocol)
+where
+    S: AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+
+    let mut prefix = Vec::new();
+    let mut error = None;
+    if negotiated == HttpProtocol::Http2 {
+        let _ = tokio::time::timeout(GUEST_PROTOCOL_BUDGET, async {
+            while prefix.len() < HTTP1_CONNECT.len() && HTTP1_CONNECT.starts_with(&prefix) {
+                prefix.reserve(1024);
+                match guest.read_buf(&mut prefix).await {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(read_error) => {
+                        error = Some(read_error);
+                        break;
+                    }
+                }
+            }
+        })
+        .await;
+    }
+    // The h2 preface starts with `PRI`, so it can never match here.
+    let protocol = if negotiated == HttpProtocol::Http2 && prefix.starts_with(HTTP1_CONNECT) {
+        tracing::debug!(
+            telemetry_type = "tls_guest_protocol",
+            negotiated = negotiated.as_str(),
+            served = HttpProtocol::Http1.as_str(),
+            "guest sent an HTTP/1.1 CONNECT over an h2 ALPN"
+        );
+        HttpProtocol::Http1
+    } else {
+        negotiated
+    };
+    (
+        Rewind {
+            inner: guest,
+            prefix: prefix.into(),
+            error,
+        },
+        protocol,
+    )
+}
+
+/// Replays the bytes read by [`guest_protocol`], then any read error it hit,
+/// before reading the guest stream again.
+pub(super) struct Rewind<T> {
+    inner: T,
+    prefix: bytes::Bytes,
+    error: Option<io::Error>,
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for Rewind<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+        if !this.prefix.is_empty() {
+            let count = this.prefix.len().min(buf.remaining());
+            buf.put_slice(&this.prefix.split_to(count));
+            return Poll::Ready(Ok(()));
+        }
+        if let Some(error) = this.error.take() {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for Rewind<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
     }
 }
 

@@ -229,3 +229,130 @@ mod http_failure {
         assert_eq!(HttpFailure::classify(&error).reason, "parse");
     }
 }
+
+mod guest_protocol {
+    use std::collections::VecDeque;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
+
+    use super::super::{HttpProtocol, guest_protocol};
+
+    /// Delivers each scripted read as one TLS record would, then EOF.
+    struct Script(VecDeque<io::Result<Vec<u8>>>);
+
+    impl AsyncRead for Script {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            match self.0.pop_front() {
+                None => Poll::Ready(Ok(())),
+                Some(Err(error)) => Poll::Ready(Err(error)),
+                Some(Ok(mut chunk)) => {
+                    let rest = chunk.split_off(chunk.len().min(buf.remaining()));
+                    buf.put_slice(&chunk);
+                    if !rest.is_empty() {
+                        self.0.push_front(Ok(rest));
+                    }
+                    Poll::Ready(Ok(()))
+                }
+            }
+        }
+    }
+
+    const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+    async fn sniff(chunks: &[&[u8]], negotiated: HttpProtocol) -> (HttpProtocol, Vec<u8>) {
+        let script = Script(chunks.iter().map(|chunk| Ok(chunk.to_vec())).collect());
+        let (mut rewound, protocol) = guest_protocol(script, negotiated).await;
+        let mut replayed = Vec::new();
+        rewound.read_to_end(&mut replayed).await.unwrap();
+        (protocol, replayed)
+    }
+
+    #[tokio::test]
+    async fn only_an_http1_connect_downgrades_an_h2_session_and_bytes_replay_exactly() {
+        let connect: &[u8] = b"CONNECT inner.test:443 HTTP/1.1\r\nHost: inner.test:443\r\n\r\n";
+        for (name, chunks, negotiated, expected) in [
+            (
+                "h2 preface",
+                vec![PREFACE],
+                HttpProtocol::Http2,
+                HttpProtocol::Http2,
+            ),
+            (
+                "Go CONNECT",
+                vec![connect],
+                HttpProtocol::Http2,
+                HttpProtocol::Http1,
+            ),
+            (
+                "CONNECT split across records",
+                vec![&connect[..3], &connect[3..7], &connect[7..]],
+                HttpProtocol::Http2,
+                HttpProtocol::Http1,
+            ),
+            (
+                "other HTTP/1 method stays h2",
+                vec![&b"GET / HTTP/1.1\r\n\r\n"[..]],
+                HttpProtocol::Http2,
+                HttpProtocol::Http2,
+            ),
+            (
+                "CONNECT prefix then EOF stays h2",
+                vec![&b"CONN"[..]],
+                HttpProtocol::Http2,
+                HttpProtocol::Http2,
+            ),
+            ("empty", vec![], HttpProtocol::Http2, HttpProtocol::Http2),
+            (
+                "http1 is never inspected",
+                vec![connect],
+                HttpProtocol::Http1,
+                HttpProtocol::Http1,
+            ),
+        ] {
+            let (protocol, replayed) = sniff(&chunks, negotiated).await;
+            assert_eq!(protocol, expected, "{name}");
+            assert_eq!(
+                replayed,
+                chunks.concat(),
+                "{name}: bytes must replay unchanged"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn read_errors_are_replayed_after_the_buffered_prefix() {
+        let guest = Script(VecDeque::from([
+            Ok(b"CON".to_vec()),
+            Err(io::Error::new(io::ErrorKind::ConnectionReset, "reset")),
+        ]));
+        let (mut rewound, protocol) = guest_protocol(guest, HttpProtocol::Http2).await;
+        assert_eq!(protocol, HttpProtocol::Http2);
+        let mut buffered = [0; 3];
+        rewound.read_exact(&mut buffered).await.unwrap();
+        assert_eq!(&buffered, b"CON");
+        let error = rewound.read_u8().await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_guest_keeps_the_negotiated_protocol_and_writes_pass_through() {
+        let (guest, mut peer) = tokio::io::duplex(64);
+        let (mut rewound, protocol) = guest_protocol(guest, HttpProtocol::Http2).await;
+        assert_eq!(protocol, HttpProtocol::Http2);
+        rewound.write_all(b"settings").await.unwrap();
+        let mut written = [0; 8];
+        tokio::time::timeout(Duration::from_secs(1), peer.read_exact(&mut written))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&written, b"settings");
+    }
+}
