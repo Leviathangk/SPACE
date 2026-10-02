@@ -377,7 +377,7 @@ class Certification:
     def cluster(self):
         if "space-local" in self.command("kind", "get", "clusters").splitlines():
             raise RuntimeError(
-                "space-local already exists: use teardown for this harness's owned cluster, or a separate devbox"
+                "space-local already exists: use teardown for this harness's owned cluster, or a separate host"
             )
         scripts = self.source / "infra/space/kind/scripts"
         self.command("bash", scripts / "install-fc-vendor.sh", timeout=900)

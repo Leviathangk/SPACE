@@ -1,4 +1,4 @@
-# OTLP observability certification: devbox handoff
+# OTLP observability certification
 
 This opt-in certification installs the OSS receivers from this checkout, builds
 SPACE from a separate, pinned source checkout, and drives the real Kind /
@@ -14,22 +14,19 @@ python3 scripts/tests/observability/certification/run.py run \
   --artifacts "$HOME/space-certification-results/$(date -u +%Y%m%dT%H%M%SZ)"
 ```
 
-The matching [copy-paste agent prompt](observability-certification-agent-prompt.md)
-is intended for the agent on the devbox that has Docker and KVM access.
+is intended for whoever runs it on a host with Docker and KVM access.
 
 ## Revisions and scope
 
 The chart baseline is the head of
-[#110](https://github.com/perplexityai/SPACE/pull/110),
-`8a0c600abd1c44ea214a08e1ce0bfea74c478b3c`, branch
-`codex/kind-oss-helper-lib`. It contains the
+[#110](https://github.com/perplexityai/SPACE/pull/110), which contains the
 [#85](https://github.com/perplexityai/SPACE/pull/85) →
 [#86](https://github.com/perplexityai/SPACE/pull/86) →
 [#87](https://github.com/perplexityai/SPACE/pull/87) →
 [#88](https://github.com/perplexityai/SPACE/pull/88) →
 [#101](https://github.com/perplexityai/SPACE/pull/101) →
 [#110](https://github.com/perplexityai/SPACE/pull/110) chart/helper work.
-There was no reason to fall back to the library branch.
+Once that stack merges, the baseline is `main`.
 
 The application default is **`a85c35f98cc9d6628184c1c561ba908fdbc6f0e6`**, the
 merged naming revision. Application and chart revisions are independent so the
@@ -57,9 +54,9 @@ the boundary in [observability.md](observability.md#collector-requirements) to
 make these rows green. A host-only fixture is not evidence of guest ingestion.
 The builder is tested as an excluded log source, not as a required log producer.
 
-## Devbox prerequisites
+## Host prerequisites
 
-Use a disposable **Linux x86_64 devbox** with nested virtualization enabled, or
+Use a disposable **Linux x86_64 host** with nested virtualization enabled, or
 bare metal. Docker Desktop on macOS and a container without `/dev/kvm` cannot
 supply this proof. Suggested capacity (planning estimates, not measured minima):
 16 CPU cores, 32 GiB RAM, and at least 150 GiB free disk on the filesystem holding
@@ -87,7 +84,7 @@ KVM, btrfs, loop devices, namespaces, and the existing Kind harness's mounts.
 The Docker daemon must see the same host paths as the client. See the
 [Kind runbook](../infra/space/kind/README.md) for host setup.
 
-On a provisioned devbox, verify rather than reinstall:
+On an already provisioned host, verify rather than reinstall:
 
 ```bash
 docker info
@@ -111,7 +108,7 @@ KIND_VERSION=v0.30.0 KUBECTL_VERSION=v1.34.0 HELM_VERSION=v3.19.2 \
 
 The fixed chart helpers target **`kind-space-local`**. The runner refuses an
 existing cluster, including an ordinary developer Tilt cluster. Use a dedicated
-devbox/Docker daemon. Do not delete someone else's `space-local` or run Tilt
+host's Docker daemon. Do not delete someone else's `space-local` or run Tilt
 concurrently: local image tags belong to the existing build tooling.
 
 ## Exact commands
@@ -275,10 +272,10 @@ requiring fix 361. The harness never edits or cherry-picks other PRs for you.
 
 ## Troubleshooting and evidence handling
 
-- **No `/dev/kvm`:** move to a Linux/KVM devbox. A render or mocked run is not
+- **No `/dev/kvm`:** move to a Linux host with KVM. A render or mocked run is not
   Firecracker evidence. Missing-device preflight writes a failure report without
   creating a cluster.
-- **Existing `space-local`:** do not adopt it. Use another devbox or tear down only
+- **Existing `space-local`:** do not adopt it. Use another host or tear down only
   a cluster recorded in this harness's state file. Lost/mismatched ownership
   records are a refusal, not permission to delete.
 - **Build or image-load failure:** inspect the `command-NNN.log` named by the
@@ -315,5 +312,5 @@ Validation available when this harness was authored: assertion unit tests,
 existing helper/telemetry tests, shell syntax/ShellCheck, Python compilation,
 and all four chart lint/renders. The implementation environment had Docker but
 no `/dev/kvm`; full runtime, signal queries, and the traffic negative control
-require the devbox run. Estimates and source-derived expectations above are not
+require the full run. Estimates and source-derived expectations above are not
 live-cluster results.
