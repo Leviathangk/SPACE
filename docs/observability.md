@@ -600,5 +600,5 @@ reconnect-attempt counters do not necessarily count one event per connect.
 The [OTLP certification handoff](observability-certification.md) provides an
 opt-in, credential-free Kind run with per-producer Prometheus, Loki and Tempo
 assertions, revision/image evidence, a Datadog-default negative control, and
-explicit guest/filesystem-worker gaps. It includes an agent prompt and teardown
-commands; see its report limitations before interpreting an exit status.
+explicit guest/filesystem-worker gaps. It includes teardown commands; see its
+report limitations before interpreting an exit status.
