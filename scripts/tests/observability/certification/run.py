@@ -261,11 +261,10 @@ class Certification:
         records = {}
         for chart in charts:
             path = CHARTS / chart
-            # The chart directory is the short signal name; the release and the
-            # namespace still carry the oss- owner prefix, matching
-            # infra/space/kind/lib/release.sh. Render under the names the real
-            # install uses so this manifest corresponds to the deployed one.
-            release = f"space-oss-{chart}"
+            # Render under the names the real install uses, so this manifest
+            # corresponds to the deployed one: release_init derives the release
+            # and the namespace from the same short signal name.
+            release = f"space-{chart}"
             self.command("helm", "dependency", "build", path)
             self.command("helm", "lint", path, "-f", path / "profiles/kind.yaml")
             manifest = self.command(
@@ -561,7 +560,7 @@ class Certification:
             "loki": ("logs", "loki", 3100),
             "tempo": ("traces", "tempo", 3200),
         }[backend]
-        raw = f"/api/v1/namespaces/space-oss-{ns}/services/http:{service}:{port}/proxy{path}"
+        raw = f"/api/v1/namespaces/space-{ns}/services/http:{service}:{port}/proxy{path}"
         if params:
             raw += "?" + urllib.parse.urlencode(params)
         response = json.loads(self.command(*KUBE, "get", "--raw", raw))
@@ -854,7 +853,7 @@ class Certification:
     def receiver_counts(self):
         result = {}
         for backend in ("metrics", "traces"):
-            path = f"/api/v1/namespaces/space-oss-{backend}/services/http:collector:8888/proxy/metrics"
+            path = f"/api/v1/namespaces/space-{backend}/services/http:collector:8888/proxy/metrics"
             raw = self.command(*KUBE, "get", "--raw", path)
             for line in raw.splitlines():
                 if re.match(
@@ -909,7 +908,7 @@ class Certification:
                     c["restarts"],
                 )
                 for p in inventory
-                if p["namespace"] in ("space-oss-metrics", "space-oss-traces")
+                if p["namespace"] in ("space-metrics", "space-traces")
                 for c in p["containers"]
             )
 
