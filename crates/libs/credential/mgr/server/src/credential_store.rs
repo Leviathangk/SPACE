@@ -27,7 +27,7 @@ pub enum CredentialStoreError {
 /// constrained to sandboxes whose active execution belongs to the exact node
 /// incarnation authenticated by TokenReview. The unrestricted arm is only for
 /// the authority's root-owned local operator socket.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxOwnerScope {
     AuthorityOperator,
     KubernetesNode { name: K8sNodeName, uid: K8sNodeUid },
@@ -83,12 +83,10 @@ impl CredentialStore for PgCredentialStore {
                    AND EXISTS (
                        SELECT 1
                        FROM sandbox_k8s_executions execution
-                       JOIN node_k8s node
-                         ON node.k8s_node_name = execution.k8s_node_name
                        WHERE execution.sandbox_id = s.id
                          AND execution.active
                          AND execution.k8s_node_name = $2
-                         AND node.k8s_node_uid = $3
+                         AND execution.k8s_node_uid = $3
                    )"
                 ))
                 .bind(sandbox_id)
@@ -105,3 +103,6 @@ impl CredentialStore for PgCredentialStore {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests;

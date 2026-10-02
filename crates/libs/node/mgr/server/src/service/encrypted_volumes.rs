@@ -54,6 +54,7 @@ pub(super) const ROOTFS_COW_FILE: &str = "cow.luks";
 
 const DEK_PLACEMENT_RETRY_DELAY: Duration = Duration::from_millis(100);
 const DEK_PLACEMENT_MAX_ATTEMPTS: usize = 10;
+const DEK_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Upper bound on `volume_name`. The name lands in a dm mapper name
 /// (`sbxvol-<uuid>-<name>`, kernel limit 127 chars) and in derived paths, so
@@ -546,7 +547,8 @@ fn stage_ciphertext(root: &Path, src: &Path, dst: &Path, reader_gid: u32) -> Res
 /// Resolve the sandbox's single volume DEK from credmgr. The plaintext lives
 /// in [`Zeroizing`] so it scrubs on drop; keep the binding short-lived.
 /// Connect failures surface as `Unavailable` (retryable by the orchestrator).
-/// A `NotFound` is retried for at most 900 ms because kubelet may start the
+/// The complete connect-and-fetch operation is bounded to two seconds. Within
+/// it, a `NotFound` is retried for at most 900 ms because kubelet may start the
 /// shim after scheduling but before the control plane persists that scheduler
 /// binding into the active execution row. Every other credmgr status passes
 /// through immediately, and the final `NotFound` remains fail-closed.
@@ -564,29 +566,55 @@ async fn fetch_sandbox_volume_dek(
 
     byok::dek_fetch_attempted();
     let started = std::time::Instant::now();
-    let mut client = pplx_space_credmgr_client::connect_from_env()
-        .await
-        .map_err(|e| {
-            // Never reached credmgr at all: the node-local socket is missing or
-            // its peer is down. Distinct from a refusal, and distinct from an
-            // authority-side error, because the remedy is on this node.
-            byok::dek_fetch_failed(byok::DEK_UNREACHABLE);
-            Status::unavailable(format!("credmgr connect: {e}"))
-        })?;
     let sandbox_id = sandbox_id.to_string();
     let expected_org_id = expected_org.map(|org| org.to_string()).unwrap_or_default();
-    let mut attempt = 1;
-    let mut resp = loop {
-        match client
-            .get_or_issue_sandbox_volume_dek(
-                pplx_space_credmgr_client::proto::GetOrIssueSandboxVolumeDekRequest {
-                    sandbox_id: sandbox_id.clone(),
-                    expected_org_id: expected_org_id.clone(),
-                },
-            )
+    let fetch = async {
+        let client = pplx_space_credmgr_client::connect_from_env()
             .await
-        {
-            Ok(response) => break response.into_inner(),
+            .map_err(|e| {
+                // Never reached credmgr at all: the node-local socket is missing or
+                // its peer is down. Distinct from a refusal, and distinct from an
+                // authority-side error, because the remedy is on this node.
+                byok::dek_fetch_failed(byok::DEK_UNREACHABLE);
+                Status::unavailable(format!("credmgr connect: {e}"))
+            })?;
+        retry_dek_fetch_on_placement_race(|| {
+            let mut client = client.clone();
+            let request = pplx_space_credmgr_client::proto::GetOrIssueSandboxVolumeDekRequest {
+                sandbox_id: sandbox_id.clone(),
+                expected_org_id: expected_org_id.clone(),
+            };
+            async move {
+                client
+                    .get_or_issue_sandbox_volume_dek(request)
+                    .await
+                    .map(Response::into_inner)
+            }
+        })
+        .await
+        .map_err(|status| {
+            byok::dek_fetch_failed(dek_failure_reason(status.code()));
+            credmgr_status_with_context(status)
+        })
+    };
+    let mut resp = tokio::time::timeout(DEK_FETCH_TIMEOUT, fetch)
+        .await
+        .map_err(|_| {
+            byok::dek_fetch_failed(byok::DEK_UNREACHABLE);
+            Status::unavailable("credmgr volume DEK fetch timed out")
+        })??;
+    byok::dek_fetch_duration(started);
+    Ok(Zeroizing::new(std::mem::take(&mut resp.plaintext_dek)))
+}
+
+async fn retry_dek_fetch_on_placement_race<T, F, Fut>(mut fetch: F) -> Result<T, Status>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, Status>>,
+{
+    let mut attempt = 1;
+    loop {
+        match fetch().await {
             Err(status)
                 if status.code() == tonic::Code::NotFound
                     && attempt < DEK_PLACEMENT_MAX_ATTEMPTS =>
@@ -594,14 +622,9 @@ async fn fetch_sandbox_volume_dek(
                 attempt += 1;
                 tokio::time::sleep(DEK_PLACEMENT_RETRY_DELAY).await;
             }
-            Err(status) => {
-                byok::dek_fetch_failed(dek_failure_reason(status.code()));
-                return Err(credmgr_status_with_context(status));
-            }
+            result => return result,
         }
-    };
-    byok::dek_fetch_duration(started);
-    Ok(Zeroizing::new(std::mem::take(&mut resp.plaintext_dek)))
+    }
 }
 
 fn credmgr_status_with_context(status: Status) -> Status {
