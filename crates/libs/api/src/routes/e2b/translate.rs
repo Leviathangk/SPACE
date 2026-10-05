@@ -6,7 +6,7 @@ use pplx_space_metrics::sandbox::api::{
 };
 use pplx_space_net_common::{
     DomainName, EgressDefaultAction, EgressDestinationV1, EgressPolicyV1, IpCidr, NetworkPolicyV1,
-    NetworkPolicyVersion, TlsInterception, WildcardDomainName,
+    TlsInterception, WildcardDomainName,
 };
 use std::net::IpAddr;
 
@@ -355,13 +355,7 @@ fn resolve_e2b_network_policy(
     let egress = EgressPolicyV1::new(default_action, allow_destinations, deny_destinations)
         .map_err(|err| E2bApiError::bad_request(format!("invalid network policy: {err}")))?;
 
-    Ok(Some(NetworkPolicyV1 {
-        version: NetworkPolicyVersion::V1,
-        egress,
-        tls_interception: Default::default(),
-        tls_interception_exemptions: Vec::new(),
-        network_credential_rules: Vec::new(),
-    }))
+    Ok(Some(NetworkPolicyV1::new(egress)))
 }
 
 fn is_e2b_deny_all_marker(destination: &EgressDestinationV1) -> bool {

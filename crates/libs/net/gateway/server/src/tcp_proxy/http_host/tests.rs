@@ -20,27 +20,19 @@ const DESTINATION: &str = "93.184.216.34:80";
 const PIPE: usize = 64 * 1024;
 
 fn policy() -> NetworkPolicyV1 {
-    NetworkPolicyV1 {
-        version: Default::default(),
-        tls_interception: Default::default(),
-        tls_interception_exemptions: Vec::new(),
-        network_credential_rules: vec![],
-        egress: EgressPolicyV1::new(
+    NetworkPolicyV1::new(
+        EgressPolicyV1::new(
             EgressDefaultAction::Deny,
             vec![EgressDestinationV1::Domain(ALLOWED_HOST.parse().unwrap())],
             Vec::new(),
         )
         .unwrap(),
-    }
+    )
 }
 
 fn policy_denying(host: &str) -> NetworkPolicyV1 {
-    NetworkPolicyV1 {
-        version: Default::default(),
-        tls_interception: Default::default(),
-        tls_interception_exemptions: Vec::new(),
-        network_credential_rules: vec![],
-        egress: EgressPolicyV1::new(
+    NetworkPolicyV1::new(
+        EgressPolicyV1::new(
             EgressDefaultAction::Deny,
             vec![
                 EgressDestinationV1::Domain(ALLOWED_HOST.parse().unwrap()),
@@ -49,7 +41,7 @@ fn policy_denying(host: &str) -> NetworkPolicyV1 {
             vec![EgressDestinationV1::Domain(host.parse().unwrap())],
         )
         .unwrap(),
-    }
+    )
 }
 
 fn policy_loader(policy: NetworkPolicyV1) -> PolicyLoader {
@@ -223,12 +215,8 @@ async fn plaintext_upgrades_are_refused_before_connect() {
 #[tokio::test]
 async fn independent_ip_allow_applies_to_an_existing_host_bound_flow() {
     let destination: SocketAddr = DESTINATION.parse().unwrap();
-    let direct_policy = NetworkPolicyV1 {
-        version: Default::default(),
-        tls_interception: Default::default(),
-        tls_interception_exemptions: Vec::new(),
-        network_credential_rules: vec![],
-        egress: EgressPolicyV1::new(
+    let direct_policy = NetworkPolicyV1::new(
+        EgressPolicyV1::new(
             EgressDefaultAction::Deny,
             vec![
                 EgressDestinationV1::Ip(destination.ip()),
@@ -237,7 +225,7 @@ async fn independent_ip_allow_applies_to_an_existing_host_bound_flow() {
             vec![EgressDestinationV1::Domain(ALLOWED_HOST.parse().unwrap())],
         )
         .unwrap(),
-    };
+    );
     let binding = HostBinding::new(
         "test",
         destination,

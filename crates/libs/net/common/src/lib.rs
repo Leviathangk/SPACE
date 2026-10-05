@@ -320,6 +320,7 @@ pub enum NetworkPolicyVersion {
 /// in a strict nested type such as [`EgressPolicyV1`].
 #[cfg_attr(feature = "serde", derive(Serialize))]
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct NetworkPolicyV1 {
     #[cfg_attr(feature = "serde", serde(default))]
     pub version: NetworkPolicyVersion,
@@ -393,24 +394,28 @@ pub fn network_policy_hash(policy: &NetworkPolicy) -> String {
 }
 
 impl NetworkPolicyV1 {
-    pub fn allow_all() -> Self {
+    /// A policy with the given egress rules and every other field at its default.
+    pub fn new(egress: EgressPolicyV1) -> Self {
         Self {
             version: NetworkPolicyVersion::V1,
-            egress: EgressPolicyV1::allow_all(),
+            egress,
             tls_interception: TlsInterception::Off,
             tls_interception_exemptions: Vec::new(),
             network_credential_rules: Vec::new(),
         }
     }
 
+    pub fn with_tls_interception(mut self, tls_interception: TlsInterception) -> Self {
+        self.tls_interception = tls_interception;
+        self
+    }
+
+    pub fn allow_all() -> Self {
+        Self::new(EgressPolicyV1::allow_all())
+    }
+
     pub fn deny_all() -> Self {
-        Self {
-            version: NetworkPolicyVersion::V1,
-            egress: EgressPolicyV1::deny_all(),
-            tls_interception: TlsInterception::Off,
-            tls_interception_exemptions: Vec::new(),
-            network_credential_rules: Vec::new(),
-        }
+        Self::new(EgressPolicyV1::deny_all())
     }
 
     /// Select transport only; an exemption grants no egress permission.

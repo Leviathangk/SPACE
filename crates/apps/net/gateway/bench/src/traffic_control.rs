@@ -204,25 +204,21 @@ async fn policy_response(path: &Path) -> anyhow::Result<host_control::GetNetwork
                 value,
             });
     }
-    let policy = NetworkPolicyV1 {
-        version: Default::default(),
-        tls_interception: document.tls_interception,
-        tls_interception_exemptions: Vec::new(),
-        network_credential_rules,
-        egress: EgressPolicyV1::new(
-            document.default_action,
-            document
-                .allow
-                .into_iter()
-                .map(parse)
-                .collect::<anyhow::Result<_>>()?,
-            document
-                .deny
-                .into_iter()
-                .map(parse)
-                .collect::<anyhow::Result<_>>()?,
-        )?,
-    };
+    let mut policy = NetworkPolicyV1::new(EgressPolicyV1::new(
+        document.default_action,
+        document
+            .allow
+            .into_iter()
+            .map(parse)
+            .collect::<anyhow::Result<_>>()?,
+        document
+            .deny
+            .into_iter()
+            .map(parse)
+            .collect::<anyhow::Result<_>>()?,
+    )?)
+    .with_tls_interception(document.tls_interception);
+    policy.network_credential_rules = network_credential_rules;
     response.effective_policy = Some((&policy).into());
     response.effective_policy_ref = policy_reference(&bytes)?.to_string();
     Ok(response)

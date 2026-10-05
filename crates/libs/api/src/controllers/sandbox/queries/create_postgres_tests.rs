@@ -988,10 +988,8 @@ async fn postgres_insert_pooled_sandbox_writes_api_row() -> TestResult {
     env.insert("HELLO".to_string(), "world".to_string());
     let mut metadata = SandboxMetadata::default();
     metadata.insert("warm".to_string(), SandboxMetadataValue::Bool(true));
-    let network_policy_override = NetworkPolicyV1 {
-        tls_interception: pplx_space_net_common::TlsInterception::On,
-        ..Default::default()
-    };
+    let network_policy_override = NetworkPolicyV1::default()
+        .with_tls_interception(pplx_space_net_common::TlsInterception::On);
     let mut req = pooled_create_request("pooled-sandbox", Some(network_policy_override));
     req.env = env;
     req.metadata = metadata;

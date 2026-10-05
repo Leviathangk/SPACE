@@ -74,12 +74,8 @@ fn platform_guardrail_denies_even_under_v1_allow_all() {
 #[test]
 fn v1_explicit_deny_precedes_an_overlapping_allow() {
     let destination = dst();
-    let policy = NetworkPolicyV1 {
-        version: Default::default(),
-        tls_interception: Default::default(),
-        tls_interception_exemptions: Vec::new(),
-        network_credential_rules: vec![],
-        egress: pplx_space_net_common::EgressPolicyV1::new(
+    let policy = NetworkPolicyV1::new(
+        pplx_space_net_common::EgressPolicyV1::new(
             pplx_space_net_common::EgressDefaultAction::Deny,
             vec![pplx_space_net_common::EgressDestinationV1::Ip(
                 destination.ip(),
@@ -89,7 +85,7 @@ fn v1_explicit_deny_precedes_an_overlapping_allow() {
             )],
         )
         .unwrap(),
-    };
+    );
 
     assert_eq!(
         evaluate_v1(destination, false, &policy),

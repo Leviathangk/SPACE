@@ -1,9 +1,7 @@
 use std::sync::Arc;
 
 use hickory_resolver::proto::rr::rdata::A;
-use pplx_space_net_common::{
-    EgressDefaultAction, EgressDestinationV1, EgressPolicyV1, NetworkPolicyVersion,
-};
+use pplx_space_net_common::{EgressDefaultAction, EgressDestinationV1, EgressPolicyV1};
 use tokio::sync::Notify;
 
 use super::*;
@@ -550,13 +548,9 @@ fn policy(
     allow: &[EgressDestinationV1],
     deny: &[EgressDestinationV1],
 ) -> NetworkPolicyV1 {
-    NetworkPolicyV1 {
-        version: NetworkPolicyVersion::V1,
-        tls_interception: Default::default(),
-        tls_interception_exemptions: Vec::new(),
-        network_credential_rules: vec![],
-        egress: EgressPolicyV1::new(default_action, allow.to_vec(), deny.to_vec()).unwrap(),
-    }
+    NetworkPolicyV1::new(
+        EgressPolicyV1::new(default_action, allow.to_vec(), deny.to_vec()).unwrap(),
+    )
 }
 
 struct BlockingResolver {

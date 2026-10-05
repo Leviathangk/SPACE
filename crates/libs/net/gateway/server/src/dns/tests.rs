@@ -1,6 +1,6 @@
 use super::*;
 use pplx_space_net_common::{
-    EgressDefaultAction, EgressDestinationV1, EgressPolicyV1, NetworkPolicyV1, NetworkPolicyVersion,
+    EgressDefaultAction, EgressDestinationV1, EgressPolicyV1, NetworkPolicyV1,
 };
 
 fn domain_allow_policy(deny: Vec<EgressDestinationV1>) -> NetworkPolicyV1 {
@@ -11,13 +11,7 @@ fn domain_allow_policy(deny: Vec<EgressDestinationV1>) -> NetworkPolicyV1 {
 }
 
 fn policy(allow: Vec<EgressDestinationV1>, deny: Vec<EgressDestinationV1>) -> NetworkPolicyV1 {
-    NetworkPolicyV1 {
-        version: NetworkPolicyVersion::V1,
-        tls_interception: Default::default(),
-        tls_interception_exemptions: Vec::new(),
-        network_credential_rules: vec![],
-        egress: EgressPolicyV1::new(EgressDefaultAction::Deny, allow, deny).unwrap(),
-    }
+    NetworkPolicyV1::new(EgressPolicyV1::new(EgressDefaultAction::Deny, allow, deny).unwrap())
 }
 
 fn example_ip() -> IpAddr {

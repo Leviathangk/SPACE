@@ -21,12 +21,8 @@ fn composition_preserves_policy_and_deny_precedence(
     .unwrap();
 
     for default_action in [EgressDefaultAction::Deny, EgressDefaultAction::Allow] {
-        let base = NetworkPolicyV1 {
-            version: Default::default(),
-            tls_interception: pplx_space_net_common::TlsInterception::On,
-            tls_interception_exemptions: Vec::new(),
-            network_credential_rules: Vec::new(),
-            egress: pplx_space_net_common::EgressPolicyV1::new(
+        let base = NetworkPolicyV1::new(
+            pplx_space_net_common::EgressPolicyV1::new(
                 default_action,
                 vec![EgressDestinationV1::Domain("user.example".parse().unwrap())],
                 vec![
@@ -35,7 +31,8 @@ fn composition_preserves_policy_and_deny_precedence(
                 ],
             )
             .unwrap(),
-        };
+        )
+        .with_tls_interception(pplx_space_net_common::TlsInterception::On);
 
         let composed = egress.compose(&base);
         assert_eq!(

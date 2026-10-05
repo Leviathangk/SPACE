@@ -248,13 +248,9 @@ async fn ready_invalidation_cancels_open_reserved_tcp_connections() {
 }
 
 fn policy(allow: &[EgressDestinationV1]) -> NetworkPolicyV1 {
-    NetworkPolicyV1 {
-        version: Default::default(),
-        tls_interception: Default::default(),
-        tls_interception_exemptions: Vec::new(),
-        network_credential_rules: vec![],
-        egress: EgressPolicyV1::new(EgressDefaultAction::Deny, allow.to_vec(), Vec::new()).unwrap(),
-    }
+    NetworkPolicyV1::new(
+        EgressPolicyV1::new(EgressDefaultAction::Deny, allow.to_vec(), Vec::new()).unwrap(),
+    )
 }
 
 async fn ready_state(policy: NetworkPolicyV1) -> GatewayNetworkState {

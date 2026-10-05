@@ -375,13 +375,7 @@ fn v1_domain_allow_loader(policy_ref: EffectiveNetworkPolicyRef) -> PolicyLoader
             )
             .unwrap();
             Ok(PulledNetworkPolicy {
-                policy: pplx_space_net_common::NetworkPolicyV1 {
-                    version: pplx_space_net_common::NetworkPolicyVersion::V1,
-                    tls_interception: Default::default(),
-                    tls_interception_exemptions: Vec::new(),
-                    network_credential_rules: vec![],
-                    egress,
-                },
+                policy: pplx_space_net_common::NetworkPolicyV1::new(egress),
                 policy_ref,
                 network_credentials: Default::default(),
             })

@@ -26,18 +26,14 @@ fn destination_rule(value: &str) -> EgressDestinationV1 {
 }
 
 fn v1_policy(allow: &[&str], deny: &[&str]) -> NetworkPolicyV1 {
-    NetworkPolicyV1 {
-        version: Default::default(),
-        tls_interception: Default::default(),
-        tls_interception_exemptions: Vec::new(),
-        network_credential_rules: vec![],
-        egress: EgressPolicyV1::new(
+    NetworkPolicyV1::new(
+        EgressPolicyV1::new(
             EgressDefaultAction::Deny,
             allow.iter().map(|value| destination_rule(value)).collect(),
             deny.iter().map(|value| destination_rule(value)).collect(),
         )
         .unwrap(),
-    }
+    )
 }
 
 fn dns_a_response(name: &str, ip: [u8; 4]) -> Vec<u8> {

@@ -15,12 +15,8 @@ fn domain_policy(allowed_domains: &[&str], denied_domains: &[&str]) -> NetworkPo
         EgressDefaultAction, EgressDestinationV1, EgressPolicyV1, TlsInterception,
     };
 
-    NetworkPolicyV1 {
-        version: Default::default(),
-        tls_interception: TlsInterception::On,
-        tls_interception_exemptions: Vec::new(),
-        network_credential_rules: vec![],
-        egress: EgressPolicyV1::new(
+    NetworkPolicyV1::new(
+        EgressPolicyV1::new(
             EgressDefaultAction::Deny,
             allowed_domains
                 .iter()
@@ -32,7 +28,8 @@ fn domain_policy(allowed_domains: &[&str], denied_domains: &[&str]) -> NetworkPo
                 .collect(),
         )
         .unwrap(),
-    }
+    )
+    .with_tls_interception(TlsInterception::On)
 }
 
 #[test]
@@ -47,11 +44,8 @@ fn policy_resweep_closes_opaque_tls_when_interception_turns_on() {
         // Tightening to domain-only permission keeps a flow bound to its SNI,
         // unless a relay admitted with interception off meets a policy that
         // turns it on.
-        let old_policy = NetworkPolicyV1 {
-            tls_interception: admitted,
-            tls_interception_exemptions: Vec::new(),
-            network_credential_rules: Vec::new(),
-            egress: EgressPolicyV1::new(
+        let old_policy = NetworkPolicyV1::new(
+            EgressPolicyV1::new(
                 EgressDefaultAction::Deny,
                 vec![
                     EgressDestinationV1::Ip(destination.ip()),
@@ -60,8 +54,8 @@ fn policy_resweep_closes_opaque_tls_when_interception_turns_on() {
                 Vec::new(),
             )
             .unwrap(),
-            version: Default::default(),
-        };
+        )
+        .with_tls_interception(admitted);
         let cache = DnsAllowCache::default();
         cache.observe_response(&dns_a_response(host, [93, 184, 216, 34], 60), &old_policy);
         let tracker = DnsAttributedTcpTracker::default();
@@ -240,18 +234,14 @@ fn policy_resweep_keeps_plaintext_when_the_new_policy_allows_the_ip_directly() {
     let host = "pypi.org";
     let destination: SocketAddr = "93.184.216.34:80".parse().unwrap();
     let old_policy = domain_policy(&[host], &[]);
-    let new_policy = NetworkPolicyV1 {
-        version: Default::default(),
-        tls_interception: Default::default(),
-        tls_interception_exemptions: Vec::new(),
-        network_credential_rules: vec![],
-        egress: EgressPolicyV1::new(
+    let new_policy = NetworkPolicyV1::new(
+        EgressPolicyV1::new(
             EgressDefaultAction::Deny,
             vec![EgressDestinationV1::Ip(destination.ip())],
             Vec::new(),
         )
         .unwrap(),
-    };
+    );
     let cache = DnsAllowCache::default();
     cache.observe_response(&dns_a_response(host, [93, 184, 216, 34], 60), &old_policy);
     cache.retain_relevant_to_policy(&new_policy);
@@ -279,17 +269,16 @@ fn policy_resweep_closes_unclassified_off_relays_when_interception_turns_on() {
     use pplx_space_net_common::{EgressDefaultAction, EgressDestinationV1, EgressPolicyV1};
 
     let destination: SocketAddr = "93.184.216.34:443".parse().unwrap();
-    let address_policy = |tls_interception| NetworkPolicyV1 {
-        tls_interception,
-        tls_interception_exemptions: Vec::new(),
-        network_credential_rules: Vec::new(),
-        egress: EgressPolicyV1::new(
-            EgressDefaultAction::Deny,
-            vec![EgressDestinationV1::Ip(destination.ip())],
-            Vec::new(),
+    let address_policy = |tls_interception| {
+        NetworkPolicyV1::new(
+            EgressPolicyV1::new(
+                EgressDefaultAction::Deny,
+                vec![EgressDestinationV1::Ip(destination.ip())],
+                Vec::new(),
+            )
+            .unwrap(),
         )
-        .unwrap(),
-        version: Default::default(),
+        .with_tls_interception(tls_interception)
     };
     // Off relays a late, absent or malformed ClientHello opaquely to an
     // address-permitted destination, so the guest can complete TLS inside the

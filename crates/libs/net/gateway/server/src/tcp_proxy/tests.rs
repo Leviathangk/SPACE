@@ -81,18 +81,14 @@ async fn failed_plaintext_connect() -> FailedPlaintextConnect {
     const ALLOWED_HOST: &str = "pypi.org";
     const DESTINATION_IP: &str = "93.184.216.34";
     let destination: SocketAddr = format!("{DESTINATION_IP}:80").parse().unwrap();
-    let policy = NetworkPolicyV1 {
-        version: Default::default(),
-        tls_interception: Default::default(),
-        tls_interception_exemptions: Vec::new(),
-        network_credential_rules: vec![],
-        egress: EgressPolicyV1::new(
+    let policy = NetworkPolicyV1::new(
+        EgressPolicyV1::new(
             EgressDefaultAction::Deny,
             vec![EgressDestinationV1::Domain(ALLOWED_HOST.parse().unwrap())],
             Vec::new(),
         )
         .unwrap(),
-    };
+    );
     let (network_state, policy) = ready_policy(policy).await;
     let dns_allow_cache = DnsAllowCache::default();
     dns_allow_cache.observe_response(
@@ -170,18 +166,14 @@ async fn failed_plaintext_connect() -> FailedPlaintextConnect {
 /// A proxy whose policy allows only `pypi.org` by domain, with the guest having
 /// resolved it to `93.184.216.34`.
 async fn dns_attributed_pypi_proxy() -> (TcpProxy, Arc<NetworkPolicyV1>) {
-    let policy = NetworkPolicyV1 {
-        version: Default::default(),
-        tls_interception: Default::default(),
-        tls_interception_exemptions: Vec::new(),
-        network_credential_rules: vec![],
-        egress: EgressPolicyV1::new(
+    let policy = NetworkPolicyV1::new(
+        EgressPolicyV1::new(
             EgressDefaultAction::Deny,
             vec![EgressDestinationV1::Domain("pypi.org".parse().unwrap())],
             Vec::new(),
         )
         .unwrap(),
-    };
+    );
     let (network_state, policy) = ready_policy(policy).await;
     let dns_allow_cache = DnsAllowCache::default();
     dns_allow_cache.observe_response(
@@ -238,18 +230,14 @@ async fn an_address_refused_before_its_client_hello_is_read_does_not_wait_for_on
     // (link-local metadata) and an explicit deny refuse them outright.
     let denied: SocketAddr = "93.184.216.34:443".parse().unwrap();
     let guardrailed: SocketAddr = "169.254.169.254:443".parse().unwrap();
-    let policy = NetworkPolicyV1 {
-        version: Default::default(),
-        tls_interception: Default::default(),
-        tls_interception_exemptions: Vec::new(),
-        network_credential_rules: vec![],
-        egress: EgressPolicyV1::new(
+    let policy = NetworkPolicyV1::new(
+        EgressPolicyV1::new(
             EgressDefaultAction::Deny,
             vec![EgressDestinationV1::Domain("pypi.org".parse().unwrap())],
             vec![EgressDestinationV1::Ip(denied.ip())],
         )
         .unwrap(),
-    };
+    );
     let (network_state, policy) = ready_policy(policy).await;
     let (mut proxy, _) = dns_attributed_pypi_proxy().await;
     proxy.network_state = network_state;
@@ -298,18 +286,15 @@ async fn tls_interception_waits_for_a_late_client_hello_on_an_allowed_destinatio
         "without interception the flow proceeds without SNI, so waiting only delays it"
     );
 
-    let mut explicit_deny = NetworkPolicyV1 {
-        version: Default::default(),
-        tls_interception: pplx_space_net_common::TlsInterception::On,
-        tls_interception_exemptions: Vec::new(),
-        network_credential_rules: vec![],
-        egress: EgressPolicyV1::new(
+    let mut explicit_deny = NetworkPolicyV1::new(
+        EgressPolicyV1::new(
             EgressDefaultAction::Allow,
             Vec::new(),
             vec![EgressDestinationV1::Ip(destination.ip())],
         )
         .unwrap(),
-    };
+    )
+    .with_tls_interception(pplx_space_net_common::TlsInterception::On);
     assert_eq!(
         proxy.missing_client_hello(
             destination,
@@ -469,27 +454,19 @@ async fn tcp_admission_returns_the_authorized_route_or_deny() {
     const ALLOWED_HOST: &str = "pypi.org";
     const OTHER_ALLOWED_HOST: &str = "files.pythonhosted.org";
     let destination: SocketAddr = "93.184.216.34:80".parse().unwrap();
-    let mut domain_policy = NetworkPolicyV1 {
-        version: Default::default(),
-        tls_interception: Default::default(),
-        tls_interception_exemptions: Vec::new(),
-        network_credential_rules: vec![],
-        egress: EgressPolicyV1::new(
+    let mut domain_policy = NetworkPolicyV1::new(
+        EgressPolicyV1::new(
             EgressDefaultAction::Deny,
             vec![EgressDestinationV1::Domain(ALLOWED_HOST.parse().unwrap())],
             Vec::new(),
         )
         .unwrap(),
-    };
+    );
     domain_policy.tls_interception = pplx_space_net_common::TlsInterception::On;
     let mut domain_policy_off = domain_policy.clone();
     domain_policy_off.tls_interception = pplx_space_net_common::TlsInterception::Off;
-    let domain_deny_policy = NetworkPolicyV1 {
-        version: Default::default(),
-        tls_interception: Default::default(),
-        tls_interception_exemptions: Vec::new(),
-        network_credential_rules: vec![],
-        egress: EgressPolicyV1::new(
+    let domain_deny_policy = NetworkPolicyV1::new(
+        EgressPolicyV1::new(
             EgressDefaultAction::Deny,
             vec![
                 EgressDestinationV1::Domain(ALLOWED_HOST.parse().unwrap()),
@@ -498,31 +475,23 @@ async fn tcp_admission_returns_the_authorized_route_or_deny() {
             vec![EgressDestinationV1::Domain(ALLOWED_HOST.parse().unwrap())],
         )
         .unwrap(),
-    };
-    let ip_allow_policy = NetworkPolicyV1 {
-        version: Default::default(),
-        tls_interception: Default::default(),
-        tls_interception_exemptions: Vec::new(),
-        network_credential_rules: vec![],
-        egress: EgressPolicyV1::new(
+    );
+    let ip_allow_policy = NetworkPolicyV1::new(
+        EgressPolicyV1::new(
             EgressDefaultAction::Deny,
             vec![EgressDestinationV1::Ip(destination.ip())],
             Vec::new(),
         )
         .unwrap(),
-    };
-    let ip_deny_policy = NetworkPolicyV1 {
-        version: Default::default(),
-        tls_interception: Default::default(),
-        tls_interception_exemptions: Vec::new(),
-        network_credential_rules: vec![],
-        egress: EgressPolicyV1::new(
+    );
+    let ip_deny_policy = NetworkPolicyV1::new(
+        EgressPolicyV1::new(
             EgressDefaultAction::Allow,
             vec![EgressDestinationV1::Ip(destination.ip())],
             vec![EgressDestinationV1::Ip(destination.ip())],
         )
         .unwrap(),
-    };
+    );
     let default_deny_policy = NetworkPolicyV1::deny_all();
     let cache = DnsAllowCache::default();
     cache.observe_response(
