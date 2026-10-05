@@ -105,7 +105,9 @@ except (TimeoutError, ConnectionError, OSError):
             out, err = process.communicate(timeout=5)
             assert process.returncode == 0, err
             assert received == (PAYLOAD if allowed else "blocked"), received
-            assert out.strip() == ("delivered" if allowed else "blocked"), out
+            # UDP sendto can succeed even when the firewall drops the reply.
+            if allowed or protocol == "tcp":
+                assert out.strip() == ("delivered" if allowed else "blocked"), out
         finally:
             if process.poll() is None:
                 process.kill()
@@ -328,7 +330,9 @@ def main():
         timeout=10,
         check=False,
     )
-    assert audit_result.returncode == 1 and "stale" in audit_result.stdout, audit_result
+    assert audit_result.returncode == 1, audit_result
+    for comment in ("ct-inbound-replies", "skip-tproxy-inbound-replies"):
+        assert comment in audit_result.stdout, audit_result
     run(installer, "reapply")
     print(run(sys.executable, audit, GATEWAY).strip())
     after = ruleset()
