@@ -113,13 +113,8 @@ pub struct EvictionConfig {
     pub enabled: bool,
     pub engage_fraction: f64,
     pub target_fraction: f64,
+    /// Shared floor for eviction eligibility and early-eviction warnings.
     pub min_idle: Duration,
-    /// Evictions younger than this count as early (retention pressure):
-    /// they increment `sandbox.evict.retention_pressure` and trigger the
-    /// per-tick "shortened local retention" warning. Independent of
-    /// `min_idle`, which gates eligibility; this only classifies evictions
-    /// that already passed it.
-    pub retention_warning: Duration,
     pub interval: Duration,
     pub max_per_tick: usize,
     pub reupload_max_per_tick: usize,
@@ -130,7 +125,6 @@ impl EvictionConfig {
     const ENV_ENGAGE_FRACTION: &'static str = "SPACE_SBX_EVICT_ENGAGE_FRACTION";
     const ENV_TARGET_FRACTION: &'static str = "SPACE_SBX_EVICT_TARGET_FRACTION";
     const ENV_MIN_IDLE_SECS: &'static str = "SPACE_SBX_EVICT_MIN_IDLE_SECS";
-    const ENV_RETENTION_WARNING_SECS: &'static str = "SPACE_SBX_EVICT_RETENTION_WARNING_SECS";
     const ENV_INTERVAL_SECS: &'static str = "SPACE_SBX_EVICT_INTERVAL_SECS";
     const ENV_REUPLOAD_MAX_PER_TICK: &'static str = "SPACE_SBX_EVICT_REUPLOAD_MAX_PER_TICK";
 
@@ -149,11 +143,6 @@ impl EvictionConfig {
     /// value, including 0.
     const RECOMMENDED_MIN_IDLE_SECS: u64 = 25 * 60 * 60;
     const DEFAULT_MIN_IDLE_SECS: u64 = Self::RECOMMENDED_MIN_IDLE_SECS;
-    /// Default age below which an eviction counts as early. Deployments
-    /// that deliberately run a shorter `min_idle` set
-    /// `SPACE_SBX_EVICT_RETENTION_WARNING_SECS` to match their retention
-    /// policy so by-design evictions are not reported as pressure.
-    const DEFAULT_RETENTION_WARNING_SECS: u64 = 48 * 60 * 60;
     const DEFAULT_INTERVAL_SECS: u64 = 600;
     /// Per-tick candidate cap bounds cluster-api call volume and therefore
     /// also upper-bounds node-mgr cleanup load. The cursor prevents skipped
@@ -200,10 +189,6 @@ impl EvictionConfig {
                  honoring the configured value — recently-idle sandboxes may be evicted",
             );
         }
-        let retention_warning_secs = std::env::var(Self::ENV_RETENTION_WARNING_SECS)
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(Self::DEFAULT_RETENTION_WARNING_SECS);
         let interval_secs = std::env::var(Self::ENV_INTERVAL_SECS)
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -225,7 +210,6 @@ impl EvictionConfig {
             engage_fraction,
             target_fraction,
             min_idle: Duration::from_secs(min_idle_secs),
-            retention_warning: Duration::from_secs(retention_warning_secs),
             interval: Duration::from_secs(interval_secs),
             max_per_tick,
             reupload_max_per_tick,
@@ -1516,7 +1500,7 @@ async fn evict_tick(
                     );
                 }
                 pplx_space_metrics::sandbox_eviction::logical_bytes_freed(reason.as_str(), bytes);
-                if age_secs < cfg.retention_warning.as_secs() {
+                if age_secs < cfg.min_idle.as_secs() {
                     pplx_space_metrics::sandbox_eviction::retention_pressure(1);
                     report.young_evictions += 1;
                     report.youngest_eviction_age_secs = Some(
@@ -1615,7 +1599,6 @@ pub async fn run_loop(
         engage_fraction = cfg.engage_fraction,
         target_fraction = cfg.target_fraction,
         min_idle_secs = cfg.min_idle.as_secs(),
-        retention_warning_secs = cfg.retention_warning.as_secs(),
         interval_secs = cfg.interval.as_secs(),
         max_per_tick = cfg.max_per_tick,
         reupload_max_per_tick = cfg.reupload_max_per_tick,
@@ -1645,9 +1628,9 @@ pub async fn run_loop(
                     warn!(
                         young_evictions = report.young_evictions,
                         youngest_eviction_age_secs = report.youngest_eviction_age_secs,
-                        warning_age_secs = cfg.retention_warning.as_secs(),
+                        warning_age_secs = cfg.min_idle.as_secs(),
                         target_fraction = cfg.target_fraction,
-                        "sandbox eviction: disk pressure shortened local retention below warning age",
+                        "sandbox eviction: local presence evicted below configured minimum idle age",
                     );
                 }
                 info!(

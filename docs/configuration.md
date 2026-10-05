@@ -98,7 +98,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_NODE_API_UDS_PER_SANDBOX` | 64 | Per-sandbox control-socket permits, `1..=node permits`. |
 | `SPACE_INTERNAL_API_VISIBILITY_CACHE_TTL_SECS`, `SPACE_INTERNAL_API_VISIBILITY_CACHE_STALE_CEILING_SECS` | built-in | Template visibility cache freshness and stale ceiling. |
 | `SPACE_SBXMGR_ACTIVATION_ADMISSION_MAX_CONCURRENT` | 5 | |
-| `SPACE_SBX_EVICT_ENABLED`, `SPACE_SBX_EVICT_ENGAGE_FRACTION`, `SPACE_SBX_EVICT_TARGET_FRACTION`, `SPACE_SBX_EVICT_MIN_IDLE_SECS` | off, 0.75, 0.70, 25 h | |
+| `SPACE_SBX_EVICT_ENABLED`, `SPACE_SBX_EVICT_ENGAGE_FRACTION`, `SPACE_SBX_EVICT_TARGET_FRACTION`, `SPACE_SBX_EVICT_MIN_IDLE_SECS` | off, 0.75, 0.70, 25 h | Minimum idle age controls both eligibility and early-eviction warnings. Eligible evictions do not increment `sandbox.evict.retention_pressure`; use `sandbox.evict.evicted_age_secs` to observe retention under disk pressure. |
 | `SPACE_SBX_EVICT_INTERVAL_SECS`, `SPACE_SBX_EVICT_MAX_PER_TICK`, `SPACE_SBX_EVICT_REUPLOAD_MAX_PER_TICK` | 600, 100, 5 | |
 | `SPACE_SBXMGR_NETWORK_CREDENTIALS_ENABLED` | off | |
 | `SPACE_SNAPSHOT_KEY_PREFIX` | empty | Object key prefix for suspend snapshots; keeps clusters apart in a shared bucket. |

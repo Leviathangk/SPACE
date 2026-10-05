@@ -60,9 +60,9 @@ pub fn evicted_age_secs(age_secs: u64) {
     distribution("sandbox.evict.evicted_age_secs", age_secs as f64, &[]);
 }
 
-/// An eviction crossed the retention warning threshold. This is an
-/// alertable early signal that disk pressure is forcing the node to
-/// trade away recently used wake-cache.
+/// An eviction fell below the configured minimum idle age. Normal candidates
+/// already meet that floor; use `evicted_age_secs` to observe cache retention
+/// under disk pressure.
 pub fn retention_pressure(evictions: u64) {
     counter("sandbox.evict.retention_pressure", evictions, &[]);
 }
