@@ -664,9 +664,14 @@ impl WakeNetworkContext {
                         | Ok(crate::proto::SandboxSubstrateKind::Direct)
                 )
         });
+        // An identity-free activation is a direct one: Kubernetes launches
+        // always carry their pod's route identity. It keeps the manager-owned
+        // namespace, and route-identity resolution, not a missing namespace,
+        // decides whether it may proceed.
+        let identity_free = start.route_identity.is_none();
         match start.netns_path.as_deref().filter(|path| !path.is_empty()) {
             Some(path) => Self::RuntimePath(path.to_string()),
-            None if direct_route_identity => Self::Unspecified,
+            None if direct_route_identity || identity_free => Self::Unspecified,
             None => Self::MissingRuntimePath,
         }
     }
@@ -825,9 +830,7 @@ pub(super) async fn wait_ready_via_spaced_host(
             .await
             .map_err(|error| Status::unavailable(error.to_string()))?;
         let ready = client.wait_ready(timeout).await?;
-        // A sidecar can outlive a manager upgrade. Older spaced-host versions
-        // report readiness without enforcing the manager's supported range.
-        validate_ready_guest_status(&client.get_status().await?)?;
+        validate_ready_guest_identity(ready.guest_version.as_ref(), client.get_status()).await?;
         Ok(ready)
     })
     .await
@@ -844,15 +847,29 @@ pub(super) async fn wait_ready_via_spaced_host(
     result
 }
 
-fn validate_ready_guest_status(
-    status: &pplx_space_spaced_host_client::proto::GetStatusResponse,
+async fn validate_ready_guest_identity(
+    guest: Option<&pplx_space_spaced_host_client::proto::VersionInfo>,
+    legacy_status: impl std::future::Future<
+        Output = Result<pplx_space_spaced_host_client::proto::GetStatusResponse, Status>,
+    >,
 ) -> Result<(), Status> {
-    if !status.ready {
-        return Err(Status::unavailable(
-            "guest readiness changed while checking compatibility",
-        ));
-    }
-    let guest = status.guest_version.as_ref();
+    // Validate the successful readiness observation. A second, shorter status
+    // probe can reject a responsive guest merely because its response is slower.
+    // Sidecars can outlive manager upgrades; retain the identity check when an
+    // older sidecar omits it from WaitReady.
+    let status;
+    let guest = match guest {
+        Some(guest) => Some(guest),
+        None => {
+            status = legacy_status.await?;
+            if !status.ready {
+                return Err(Status::unavailable(
+                    "guest readiness changed while checking compatibility",
+                ));
+            }
+            status.guest_version.as_ref()
+        }
+    };
     pplx_space_spaced_common::validate_spaced_guest_compatibility(
         guest.map(|guest| guest.version.as_str()),
         guest.map(|guest| guest.compatibility_family.as_str()),
