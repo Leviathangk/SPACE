@@ -68,6 +68,10 @@ impl Meta for SpacedHostService {
             guest_uptime: response.guest_uptime,
             mem_total_bytes: response.mem_total_bytes,
             vcpu_count: response.vcpu_count,
+            guest_version: Some(proto::VersionInfo {
+                version: response.version,
+                compatibility_family: response.compatibility_family,
+            }),
         }))
     }
 

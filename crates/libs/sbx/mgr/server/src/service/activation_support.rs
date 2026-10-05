@@ -830,9 +830,7 @@ pub(super) async fn wait_ready_via_spaced_host(
             .await
             .map_err(|error| Status::unavailable(error.to_string()))?;
         let ready = client.wait_ready(timeout).await?;
-        // A sidecar can outlive a manager upgrade. Older spaced-host versions
-        // report readiness without enforcing the manager's supported range.
-        validate_ready_guest_status(&client.get_status().await?)?;
+        validate_ready_guest_identity(ready.guest_version.as_ref(), || client.get_status()).await?;
         Ok(ready)
     })
     .await
@@ -849,15 +847,34 @@ pub(super) async fn wait_ready_via_spaced_host(
     result
 }
 
-fn validate_ready_guest_status(
-    status: &pplx_space_spaced_host_client::proto::GetStatusResponse,
-) -> Result<(), Status> {
-    if !status.ready {
-        return Err(Status::unavailable(
-            "guest readiness changed while checking compatibility",
-        ));
-    }
-    let guest = status.guest_version.as_ref();
+async fn validate_ready_guest_identity<F>(
+    guest: Option<&pplx_space_spaced_host_client::proto::VersionInfo>,
+    legacy_status: impl FnOnce() -> F,
+) -> Result<(), Status>
+where
+    F: std::future::Future<
+            Output = Result<pplx_space_spaced_host_client::proto::GetStatusResponse, Status>,
+        >,
+{
+    // Validate the successful readiness observation. A second, shorter status
+    // probe can reject a responsive guest merely because its response is slower.
+    // Sidecars can outlive manager upgrades; retain the identity check when an
+    // older sidecar omits it from WaitReady.
+    let status;
+    let guest = match guest {
+        Some(guest) => Some(guest),
+        None => {
+            // Keep the legacy RPC's large future out of the nested activation
+            // future. Current sidecars neither construct nor allocate it.
+            status = Box::pin(legacy_status()).await?;
+            if !status.ready {
+                return Err(Status::unavailable(
+                    "guest readiness changed while checking compatibility",
+                ));
+            }
+            status.guest_version.as_ref()
+        }
+    };
     pplx_space_spaced_common::validate_spaced_guest_compatibility(
         guest.map(|guest| guest.version.as_str()),
         guest.map(|guest| guest.compatibility_family.as_str()),

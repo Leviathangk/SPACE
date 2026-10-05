@@ -493,6 +493,9 @@ async fn readiness_requires_a_supported_guest_and_preserves_legacy_support() {
             assert_eq!(ready.guest_uptime, Some(duration_from_millis(42)));
             assert_eq!(ready.mem_total_bytes, Some(8_589_934_592));
             assert_eq!(ready.vcpu_count, Some(4));
+            let identity = ready.guest_version.expect("ready guest identity");
+            assert_eq!(identity.version, version);
+            assert_eq!(identity.compatibility_family, family);
         } else {
             assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
         }
@@ -504,6 +507,38 @@ async fn readiness_requires_a_supported_guest_and_preserves_legacy_support() {
         fixture.stop().await;
         bridge_task.abort();
     }
+}
+
+#[tokio::test]
+async fn slow_ready_guest_returns_identity_without_a_second_probe() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("guest.sock");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let guest = ReadyWaitGuest {
+        // Longer than GetStatus's readiness response budget. Real transport
+        // timing exercises the mismatch without a VM or external services.
+        response_delay: Duration::from_millis(200),
+        ..ReadyWaitGuest::new(calls.clone())
+    };
+    let server = guest.start(path.clone()).await;
+    let fixture = HostFixture::start(Some(path)).await;
+    let client = fixture.client().await;
+    let ready = client
+        .wait_ready(Duration::from_secs(2))
+        .await
+        .expect("guest is ready");
+    fixture.stop().await;
+    server.abort();
+
+    let identity = ready
+        .guest_version
+        .expect("readiness must include guest identity");
+    pplx_space_spaced_common::validate_spaced_guest_compatibility(
+        Some(&identity.version),
+        Some(&identity.compatibility_family),
+    )
+    .expect("supported guest identity");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
