@@ -288,6 +288,94 @@ is a local experiment. It was reverted before experiment 1, which runs on
 
 ## Experiment 1 — natural guest death after restore
 
+### Workload (`asi_workload.py`, one process per sandbox; `run-exp1.sh`)
+
+The repository has no ASI template or recipe. The closest recipe,
+`templates/firecracker/recipes/code-runtime.toml`, needs a networked builder
+pool. The workload therefore emulates an ASI worker on `seed:latest` (python3
+and curl, no git).
+
+**Sandbox:** 2 vCPU, `memory_mib` 2048 (the guest sees `MemTotal` 1991 MiB;
+Firecracker reports `memory_mib` 2176), `disk_mib` 4096. Auto-lifecycle is
+access-idle → suspend at 8 h, so it never fires during the run.
+
+**At every connect** (after create and after every restore):
+- 9 CLI wrapper scripts, the memory grower, and a launcher are backfilled with
+  `files:write`;
+- three long-lived processes are ensured: `python3 -m http.server`, a log
+  writer, and `memhog.py`.
+- `memhog.py` keeps `/tmp/memtarget` MB resident in 16 MB chunks with every
+  page touched, and re-touches part of the set every 10 s. The driver raises
+  the target every 5 min from 200 MB toward 1500 MB over 4 h (about 75% of
+  the limit).
+- The long-lived processes survive suspend/restore (same PIDs after restore).
+
+**Busy loop:**
+- a short command every 5–20 s, picked at random from:
+  - shell `ls`/`df`;
+  - python (sha256 of 1 MiB; JSON of 20k objects);
+  - a VCS-like tree hash (`find | sha1sum`, standing in for git);
+  - one of the wrappers;
+  - `curl` to the local server;
+  - 2 MB workspace writes with rotation;
+  - `ps`.
+- telemetry every 60 s (`free`, loadavg, memhog MB, live process count, and
+  `dmesg | tail` every 5th time);
+- a 1–6 MB `files:write` upload plus a verified `files:read` download every
+  2–3 min.
+
+All calls go through the native API (`POST /commands` is the native
+Process.Start), and every call is recorded with its latency.
+
+**Cycles:**
+- create, then 10 min warm-up;
+- then 3 cycles, each: explicit `:suspend` → wait until the snapshot is
+  portable (the smoke suite's `RESTORE_PORTABLE_SQL`) → `:wake` with the
+  *other* sandbox worker cordoned → 60 min busy.
+- Odd labels restore cross, same, cross; even labels same, cross, same.
+- Restores are serialized cluster-wide.
+- Cross-node restores pull `rootfs.btrfs-send` and the memory image from
+  object storage (`runtime_activated`: `boot_type=snapshot`,
+  `restore_provenance=remote_matches_local`, `remote_snapshot_staged=true`).
+  Same-node restores are `local_only`.
+
+**Detection:**
+- Three consecutive failed operations open an incident. `capture.sh` then
+  records:
+  - raw `CONNECT 5002`;
+  - Firecracker thread states and wchan;
+  - `fc.log` and the Firecracker API state;
+  - `space-sbxmgr health/doctor`;
+  - `space-nodemgr inspect`;
+  - 30 min of node-stack log lines for the sandbox;
+  - a guest dmesg attempt;
+  - a 30 min follow-up of vsock and health.
+- The workload keeps probing every 15 s.
+
+**Per minute, host side (`monitor.sh`):** raw `CONNECT 5002` and latency,
+Firecracker RSS and CPU for every VM, `space-sbxmgr list` (composed health),
+disk headroom, and a copy of `/space/logs`. The DogStatsD sink records
+`space.sandbox.guest.health`.
+
+### Attempt 1 (aborted, harness artifact)
+
+- Attempt 1 started at 15:33Z.
+- At 15:46:58Z the Kind nodes' shared `/var` filesystem filled up. That
+  filesystem is the devbox's 50 GB Docker data disk, about 35 GB of which is
+  shared Docker images and build cache, which this task does not prune.
+- The sparse cache images could no longer allocate
+  (`critical space allocation error, dev loopN`; btrfs `Transaction aborted
+  (error -5)`, `forced readonly`).
+- Within 30 s, 8 of 12 sandboxes failed `files:write` with `Read-only file
+  system (os error 30)` and commands with 500. Postgres, on the same disk,
+  stopped accepting writes.
+- This was not a guest death. The worker cache images and the SeaweedFS data
+  were moved to the 400 GB home disk with bind mounts inside the Kind node
+  containers (same code paths), and the run was restarted with a disk guard.
+- Evidence is kept outside the repository.
+
+### Attempt 2 (started 15:57:08Z)
+
 *(running; results to follow)*
 
 ## Side findings

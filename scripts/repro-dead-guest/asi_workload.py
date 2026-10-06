@@ -412,14 +412,17 @@ def run(args):
     r = Run(args)
     if args.attach:
         r.started = now() - args.elapsed
+        r.cycle = args.cycle
+        phase = args.attach_phase or "warm"
     else:
         r.create()
-    r.phase = "warm"
+        phase = "warm"
+    r.phase = phase
     r.connect()
-    if not r.busy(args.warm, "warm"):
+    if not r.busy(args.warm, phase):
         return
     for index, kind in enumerate([k for k in args.plan.split(",") if k]):
-        r.cycle = index + 1
+        r.cycle = r.cycle + 1
         if not r.suspend_restore(kind):
             r.lifecycle("cycle_aborted")
             return
@@ -438,6 +441,8 @@ def main():
     p.add_argument("--out", required=True)
     p.add_argument("--attach", action="store_true")
     p.add_argument("--elapsed", type=float, default=0, help="with --attach: seconds already ramped")
+    p.add_argument("--attach-phase", help="with --attach: name of the first busy phase (e.g. post-restore-4)")
+    p.add_argument("--cycle", type=int, default=0, help="with --attach: cycle number of that phase")
     p.add_argument("--plan", default="same,cross,same")
     p.add_argument("--warm", type=float, default=600)
     p.add_argument("--busy", type=float, default=3600)
