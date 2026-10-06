@@ -9,8 +9,10 @@ scope:
   table tests, not in the TCP, UDP or interception paths.
 - React to policy changes by subscribing to the policy generation, not by
   adding hook closures in `run.rs`.
-- Do not add readers of resolved credential values or of the interception
-  `traffic_gate` outside the interception code.
+- Do not add readers of resolved credential values outside the interception
+  code, or new closures over the certificate authority like `traffic_gate`.
+  The sandbox-wide refusal while interception is required and not ready is
+  intended; keep it in policy admission.
 - Do not read sandbox identity through `ServicePortIngressState`.
 - Prefer deleting dead code over moving it.
 

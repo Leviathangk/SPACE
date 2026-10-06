@@ -21,11 +21,14 @@ Observed coupling in the current tree:
   them with an install hook and a policy-invalidation hook. Which components
   react to a policy change is visible only by reading `run()`.
   `TcpProxyConfig` takes 12 handles.
-- **Global interception gate.** `GatewayNetworkState::with_traffic_gate` is
-  wired to `GatewayAuthority::is_ready`. With `tls_interception = On` and the
-  authority not ready, every new TCP flow and UDP datagram is refused,
-  including flows that would be exempt or relayed. The gate also forces a
-  cycle workaround in `interception_readiness_observer`.
+- **Interception readiness wired by closure.** With `tls_interception = On`
+  and the authority not ready, every new TCP flow and UDP datagram is
+  refused, including flows that would be exempt or relayed. This sandbox-wide
+  fail-closed behavior is intended and is preserved by this design. The
+  problem is the wiring: `GatewayNetworkState::with_traffic_gate` takes a
+  closure over `GatewayAuthority::is_ready`, so the policy state depends on
+  the certificate authority and needs a cycle workaround in
+  `interception_readiness_observer`.
 - **Identity owned by ingress.** `GatewayAuthority` holds a
   `ServicePortIngressState` to read route and execution generations, so
   certificate code depends on the ingress module.
@@ -84,6 +87,8 @@ pub enum Lifecycle { PendingPolicy, Ready, NoIdentity, PolicyError, Draining, St
 
 pub struct Policy { /* lifecycle + watch of Arc<PolicyGeneration> */ }
 impl Policy {
+    // Refuses with NotReady::InterceptionNotReady while the generation
+    // requires interception and the interceptor's readiness is not Ready.
     pub fn admission(&self) -> Result<Arc<PolicyGeneration>, NotReady>;
     pub async fn wait_admission(&self, deadline: Instant) -> Result<Arc<PolicyGeneration>, NotReady>;
     pub fn subscribe(&self) -> watch::Receiver<Arc<PolicyGeneration>>;
@@ -92,8 +97,11 @@ impl Policy {
 }
 ```
 
-`NotReady` maps one-to-one from `Lifecycle`; one function replaces the
-per-state arms. Moves from: `state.rs`, hydration in `run.rs`.
+`NotReady` maps one-to-one from `Lifecycle`, plus `InterceptionNotReady`;
+one function replaces the per-state arms. `Policy` reads interception
+readiness from a `watch::Receiver<InterceptionReadiness>` supplied at
+construction, not from a closure over the authority. Moves from: `state.rs`,
+hydration in `run.rs`.
 
 ### `dns_evidence`: which addresses a domain resolved to
 
@@ -160,13 +168,15 @@ accounting, admission}`, `udp_proxy.rs`, `sniff.rs`, `tls_sni.rs`.
 
 ### `interception`: TLS and HTTP for flows that require it
 
-The only module that holds TLS key material or credential values. Its
-readiness affects only flows whose decision is `Intercept`. Depends on
-`identity`, `policy`.
+The only module that holds TLS key material or credential values. It
+publishes its readiness on a watch channel. While the current generation
+requires interception and readiness is not `Ready`, `policy` admission
+refuses all new TCP and UDP flows; this sandbox-wide fail-closed rule is
+intended. Depends on `identity`, `policy` types.
 
 ```rust
 pub trait Interceptor: Send + Sync + 'static {
-    fn readiness(&self) -> InterceptionReadiness;
+    fn readiness(&self) -> watch::Receiver<InterceptionReadiness>;
     async fn serve(&self, conn: AdmittedConn, rules: &[RuleId],
                    gen: Arc<PolicyGeneration>) -> FlowOutcome;
 }
@@ -241,8 +251,9 @@ run.rs                      # composition root
 3. Only `interception` holds TLS keys or credential values.
 4. Policy changes propagate as generations. Components subscribe and
    reconcile their own state; no install or invalidation callbacks.
-5. Interception readiness is scoped to `Intercept` decisions, never a
-   sandbox-wide traffic gate.
+5. Interception readiness reaches `policy` as data on a watch channel, not
+   as a closure. The sandbox-wide fail-closed rule while interception is
+   required and not ready stays in `policy` admission.
 6. Only `control` speaks gRPC. Only `run.rs` wires modules together. Modules
    take narrow dependencies, not handle bundles.
 
@@ -262,20 +273,21 @@ change's scope.
   first time one is needed), with table tests.
 - New consumers of policy changes subscribe to the generation watch; do not
   add another hook closure in `run.rs`.
-- Do not add new readers of credential values or of `traffic_gate`.
+- Do not add new readers of credential values, or new closures over the
+  authority like `traffic_gate`.
 - Do not add identity reads through `ServicePortIngressState`.
 - Prefer passing a narrow trait or struct over adding a field to
   `TcpProxyConfig` or `UdpProxyConfig`.
 
-**Dedicated steps**, each independently mergeable. Steps 1 to 3 and 5 change
-no behavior; step 4 changes behavior.
+**Dedicated steps**, each independently mergeable. No step changes the
+enforcement contract.
 
 | # | Step | Behavior change | Status |
 |---|---|---|---|
 | 1 | Extract `Decision` and `decide()`; route TCP and UDP through it; table tests | No | Not started |
 | 2 | Add `PolicyGeneration` with explicit id and subscribers; delete install and invalidation hooks; split `Lifecycle` from policy content | No | Not started |
 | 3 | Extract `identity`; ingress and certificates depend on it | No | Not started |
-| 4 | Put interception behind `Interceptor` with `NoInterception`; scope readiness to `Intercept`; remove `traffic_gate`. Keep any intended UDP fail-closed rule explicit in `decide` | Yes, behind a flag defaulting to current behavior | Not started |
+| 4 | Put interception behind `Interceptor` with `NoInterception`; replace the `traffic_gate` closure with a readiness watch consumed by `policy` admission; keep the sandbox-wide fail-closed rule | No | Not started |
 | 5 | Move credential values into `interception`; core never holds secrets | No | Not started |
 | 6 | Move files into the target layout | No | Not started |
 
@@ -286,6 +298,7 @@ into a separate process is out of scope.
 
 Steps without a behavior change keep existing gateway tests and benches
 passing unchanged. Step 1 adds table tests covering every `DenyReason` and
-each of `Relay`, `Exempt` and `Intercept`. Step 4 adds tests showing that an
-unready authority refuses only `Intercept` flows when the flag is enabled and
-preserves current refusals when it is disabled.
+each of `Relay`, `Exempt` and `Intercept`. Step 4 keeps tests showing that,
+with interception required and the authority not ready, new TCP flows and UDP
+datagrams are refused regardless of decision, and that admission resumes when
+readiness becomes `Ready`.
