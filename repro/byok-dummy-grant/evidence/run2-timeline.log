@@ -1,0 +1,9 @@
+2026-10-06T15:14:49Z org B: plaintext materializing create
+2026-10-06T15:14:54Z org B: C control real-grant encrypted create -> 201 2.350275
+2026-10-06T15:15:03Z warm-up 1: 01a111c8-47b3-7368-b180-b6a925c87f33 on 172.18.0.6
+2026-10-06T15:15:05Z warm-up 2: 01a111c8-518e-7279-bb6b-f9b5eab52485 on 172.18.0.4
+2026-10-06T15:15:05Z warm nodes: 172.18.0.6 172.18.0.4; creating with grant=dummy exp=1791303300
+2026-10-06T15:15:07Z B-D dummy create exp=16:15:00Z (t0+3600, as the upstream client does) -> 201 2.323801 id=01a111c8-5a45-73ff-835c-65a5b2e0cec5
+2026-10-06T15:15:14Z B-D native :stop -> {"operation_id":"op_01a111c8-7fa5-709e-8de9-3e5fd3b03841","sandbox_id":"sbx_01a111c8-5a45-73ff-835c-65a5b2e0cec5"}
+2026-10-06T15:15:18Z B-D state=stopped
+2026-10-06T15:17:06Z B-D native :start (org B cache cold; last org-B unwrap 15:15:01Z) -> {"operation_id":"op_01a111ca-31ca-76c8-a904-1dc648896e01","sandbox_id":"sbx_01a111c8-5a45-73ff-835c-65a5b2e0cec5"}

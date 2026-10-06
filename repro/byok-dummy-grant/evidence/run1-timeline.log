@@ -1,0 +1,30 @@
+2026-10-06T14:58:00Z P0 plaintext materializing create (real grant)
+2026-10-06T14:58:13Z C1 control: encrypted create with REAL grant exp=1791302293
+2026-10-06T14:58:16Z C1 create returned
+2026-10-06T14:58:44Z D1: encrypted create with DUMMY grant exp=1791299324 (t0+600s)
+2026-10-06T15:00:44Z D1 create returned: 503 120.431196
+2026-10-06T15:01:09Z R2 warm-up: encrypted create REAL grant
+2026-10-06T15:01:12Z R3 warm-up: encrypted create REAL grant
+2026-10-06T15:01:19Z D2: encrypted create DUMMY grant with warm caches, exp=1791299779 (t0+900s)
+2026-10-06T15:01:21Z D2 create returned: 201 2.480848
+2026-10-06T15:03:35Z D2 fault: delete pod space-sbx-01a111bbbfe57095bf1060a8c1e2aaf8-g1 (worker2 intermediate-key cache cold: last unwrap 15:01:12, cap 120s)
+2026-10-06T15:04:24Z D2 connect (no grant headers; stored grant is the placeholder)
+2026-10-06T15:04:24Z D2 connect returned: 404 0.007696
+2026-10-06T15:06:16Z D2 native :start (no grant headers; stored grant = placeholder, expires 15:16:19Z)
+2026-10-06T15:06:16Z D2 :start returned: 202 0.007557
+2026-10-06T15:06:37Z deleted D2 (rootfs gone after pod deletion), R2, R3
+2026-10-06T15:06:45Z R4 warm-up: encrypted create REAL grant -> 201 2.141230
+2026-10-06T15:06:47Z R5 warm-up: encrypted create REAL grant -> 201 2.245736
+2026-10-06T15:06:54Z D3: encrypted create DUMMY grant, exp=1791300414 (t0+1200s = 15:26:54Z)
+2026-10-06T15:08:54Z D3 create returned: 503 120.432199
+2026-10-06T15:09:37Z warm-up 1: 01a111c3-502e-7142-b95c-2fe936ee901c on 172.18.0.6
+2026-10-06T15:09:40Z warm-up 2: 01a111c3-5a6d-7711-97bd-69944842ef6c on 172.18.0.4
+2026-10-06T15:09:40Z warm nodes: 172.18.0.6 172.18.0.4; creating with grant=dummy exp=1791300874
+2026-10-06T15:09:42Z D4 dummy create (exp 15:34:34Z) -> 201 2.323701 id=
+2026-10-06T15:09:54Z D4 native :stop
+2026-10-06T15:11:44Z D4 native :start (cold cache on all workers; stored grant=placeholder until 15:34:34Z; org has live real grants)
+2026-10-06T15:13:16Z N1 control: federated encrypted create with NO grant headers
+2026-10-06T15:13:16Z N1 -> 401 0.003449
+2026-10-06T15:13:16Z N2 control: grant header without expires-at
+2026-10-06T15:13:57Z S1 store-order probe: native GET D4 with REAL grant exp=15:29:34Z (< placeholder expiry), no issued-at
+01a111c3-6475-7646-a3e4-b843e37762a2|5|t|2026-10-06 15:34:34+00|t|stopped|

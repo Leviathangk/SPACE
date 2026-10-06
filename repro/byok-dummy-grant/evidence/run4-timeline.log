@@ -1,0 +1,13 @@
+2026-10-06T16:20:04Z [repro-upstream-org-d] materialize: 201 2.300388
+{"id":"01a11203-d12c-71d3-9b72-be9b5cbda70f","byok_enabled":true}
+2026-10-06T16:20:08Z [repro-upstream-org-d] control real-grant encrypted create: 201 2.486672
+2026-10-06T16:20:11Z warm-up 1: 01a11203-eabc-70ab-933c-beb346bcab12 on 172.18.0.6
+2026-10-06T16:20:14Z warm-up 2: 01a11203-f45b-731a-bfeb-6bbe06b628e3 on 172.18.0.4
+2026-10-06T16:20:14Z warm nodes: 172.18.0.6 172.18.0.4; creating with grant=dummy exp=1791307208
+2026-10-06T16:20:16Z [repro-upstream-org-d] placeholder create id=01a11203-fe47-76a8-9a42-b1b6584f6a36 expires=17:20:08Z -> 201 2.304513
+01a11203-fe47-76a8-9a42-b1b6584f6a36|5|t|2026-10-06 17:20:08+00|t|started|2d4303a9-4fcd-5bac-854b-23847b0df036
+01a11203-eabc-70ab-933c-beb346bcab12|91|f|2026-10-06 17:20:09+00|t|started|d281308d-a7c8-57b6-9d67-c705634e83ea
+01a11203-f45b-731a-bfeb-6bbe06b628e3|91|f|2026-10-06 17:20:11+00|t|started|2d4303a9-4fcd-5bac-854b-23847b0df036
+01a11203-e03d-7591-b5a1-357cfcb36e4d|91|f|2026-10-06 19:20:06+00|t|started|2d4303a9-4fcd-5bac-854b-23847b0df036
+2026-10-06T16:20:16Z [repro-upstream-org-d] :stop -> {"operation_id":"op_01a11204-07f9-7055-9685-47b508ec6f8e","sandbox_id":"sbx_01a11203-fe47-76a8-9a42-b1b6584f6a36"}
+2026-10-06T16:22:15Z [repro-upstream-org-d] :start (org cache cold) -> {"operation_id":"op_01a11205-d96d-71d6-aada-edbd272c9e88","sandbox_id":"sbx_01a11203-fe47-76a8-9a42-b1b6584f6a36"}

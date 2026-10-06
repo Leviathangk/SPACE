@@ -46,8 +46,10 @@ fed_request() { # method path upstream-org subject grant-mode expires-at-unix [b
   printf 'header = "x-api-key: %s"\n' "$(<"$CALLER_KEY_FILE")" | curl --config - "${args[@]}"
 }
 
+# SANDBOX_TIMEOUT (default 3600) is the ECW sandbox lifetime; keep it longer
+# than any stall being observed, or the timeout deletes the sandbox and its grant.
 fed_create() { # upstream-org subject grant-mode expires-at-unix
-  fed_request POST /sandboxes "$1" "$2" "$3" "$4" '{"templateID":"seed","timeout":3600}'
+  fed_request POST /sandboxes "$1" "$2" "$3" "$4" "{\"templateID\":\"seed\",\"timeout\":${SANDBOX_TIMEOUT:-3600}}"
 }
 
 admin() { # method resource [body]

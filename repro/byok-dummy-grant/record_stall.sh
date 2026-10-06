@@ -21,5 +21,15 @@ while true; do
     echo "$(now) RECOVERED public_state=started" >> "$OUT/samples.log"
     break
   fi
+  # A pod left behind by a failed start can boot the VM while the control
+  # plane still records the sandbox as stopped; record that and stop.
+  if [[ "$pods" == *Running* ]]; then
+    echo "$(now) POD_RUNNING public_state=$state lifecycle=$life" >> "$OUT/samples.log"
+    break
+  fi
+  if [[ -z "$life" ]]; then
+    echo "$(now) SANDBOX_ROW_GONE" >> "$OUT/samples.log"
+    break
+  fi
   sleep 30
 done

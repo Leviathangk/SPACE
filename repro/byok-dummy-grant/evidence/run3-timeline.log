@@ -1,0 +1,12 @@
+2026-10-06T15:17:42Z warm-up 1: 01a111ca-b7f9-7318-9fc2-39a549c12027 on 172.18.0.4
+2026-10-06T15:17:44Z warm-up 2: 01a111ca-bf74-7220-a32e-bc9468e9d0b2 on 172.18.0.6
+2026-10-06T15:17:44Z warm nodes: 172.18.0.6 172.18.0.4; creating with grant=dummy exp=1791303460
+2026-10-06T15:17:47Z C-D dummy create exp=16:17:40Z -> 201 2.331557 id=01a111ca-c966-73e1-b40b-d97ca4c2e3af
+2026-10-06T15:17:47Z C-D :stop -> {"operation_id":"op_01a111ca-d28f-70b4-8702-dabfd2e8ba8f","sandbox_id":"sbx_01a111ca-c966-73e1-b40b-d97ca4c2e3af"}
+2026-10-06T15:19:49Z C-D :start (org C cache cold) -> {"operation_id":"op_01a111cc-afbf-7441-9747-042452effe1c","sandbox_id":"sbx_01a111ca-c966-73e1-b40b-d97ca4c2e3af"}
+2026-10-06T15:22:28Z C sibling 1 real-grant create 01a111cf-1566-73fa-8aa5-79270c7b7cf9 -> 201 1.875356 on ?
+2026-10-06T15:22:30Z C sibling 2 real-grant create 01a111cf-1d51-74fa-84dd-cf2b6489dcd9 -> 201 1.853474 on ?
+2026-10-06T15:22:33Z C sibling 3 real-grant create 01a111cf-2567-7722-b025-e176c2f627b9 -> 201 2.272321 on ?
+2026-10-06T15:22:35Z C sibling 4 real-grant create 01a111cf-2edb-72e4-8e07-a25ee53d0629 -> 201 1.861267 on ?
+2026-10-06T15:22:37Z C sibling 5 real-grant create 01a111cf-36e1-70bc-b62b-801ef6ae56c0 -> 201 2.313682 on ?
+2026-10-06T15:22:40Z C sibling 6 real-grant create 01a111cf-40b4-7553-a641-9906d864d3c6 -> 201 2.298671 on ?
