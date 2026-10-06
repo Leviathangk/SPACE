@@ -185,6 +185,11 @@ to the path reaches a socket inode with no listener. That is the ~35 µs
   `/var/lib/space-cache.img` and mounts it.
 - The jailer's mount namespaces were cloned from the old container and keep the
   old mount alive.
+- So do the per-sandbox `space-spaced-host-svc` and `space-netgtw-svc`
+  processes, which runtime-supervisor launches in per-sandbox cgroups. They
+  outlive the node-stack container: after a pod deletion they were found
+  reparented to init, still holding the old pod's mount namespace, and the
+  deleted image's loop device stayed attached until they were killed.
 
 Observed with `mountcheck.sh` and `dmesg` at T1b:
 
