@@ -12,7 +12,7 @@ This guide covers the Kubernetes-based local setup, not a Kubernetes-free deploy
 
 Use an apt-based **Linux x86_64 host with KVM**. The host needs `/dev/kvm`, `/dev/net/tun`, loop devices, btrfs support, and a local Docker daemon that permits privileged containers. A VM must expose the required devices and support nested virtualization; these instructions do not run directly on macOS.
 
-Start with Bash, Git, curl, tar, OpenSSL, Python 3.8 or newer, and `ssh-keygen`. The prerequisite installer needs root or non-interactive sudo to install system packages.
+Start with Bash, Git, curl 7.76.0 or newer, tar, OpenSSL, Python 3.8 or newer, and `ssh-keygen`. Check `curl --version` before continuing: the installers use `--retry-all-errors`, and the examples use `--fail-with-body`. The prerequisite installer needs root or non-interactive sudo to install system packages.
 
 Setup uses the existing [prerequisite installer](../infra/space/kind/scripts/install-prereqs.sh), [Firecracker installer](../infra/space/kind/scripts/install-fc-vendor.sh), and [bootstrap script](../infra/space/kind/scripts/bootstrap.sh). The steps below configure and run them in order.
 
@@ -107,7 +107,7 @@ Run this block from the checkout root. It checks the platform, required devices,
 
 These checks do not verify privileged Docker operations, loop devices, or btrfs support.
 
-This deployment uses development passwords and signing keys. Keep it private and do not use production credentials.
+Use a dedicated development host whose users you trust, without production credentials. Loopback port forwards prevent remote connections but remain accessible to other users and processes on that host. The default administrator password, internal bearer tokens, and route-signing keys are public development fixtures. The Kind charts also enable plaintext internal RPC through `SPACE_INTERNAL_RPC_INSECURE_DEV=true`; see [Internal RPC TLS](internal-rpc-tls.md). Changing the administrator password alone does not make this deployment suitable for shared or production use.
 
 ## Install and verify tools
 
@@ -190,7 +190,9 @@ The first build compiles the Rust workspace and builds the seed template.
 
 Continue in the same shell, checkout, and Docker environment.
 
-Do not configure cloud or telemetry credentials for this setup. Clear any inherited values below: bootstrap otherwise copies AWS and Datadog credentials from the shell into cluster secrets.
+Do not configure cloud or telemetry credentials for this setup. Clear the inherited values below: bootstrap copies AWS credentials into the `space/space-aws-creds` Secret when both the access key and secret key are set. Datadog defaults to `off`; SaaS export requires explicit configuration and a pre-existing credential Secret, and bootstrap does not copy `DD_API_KEY` from the shell. See the [Kind telemetry backend configuration](../infra/space/kind/README.md) before enabling export.
+
+These steps assume a fresh local cluster. Unsetting shell variables does not remove an existing AWS Secret or credentials already loaded by running services. Datadog `off` skips installation and leaves existing Agents unchanged. Before reusing a cluster, review its credential and telemetry configuration; remove unwanted credentials through the owning configuration and restart affected services, or use a fresh task-owned cluster. Revoke any cloud credential that was exposed; deleting its local copy does not revoke it.
 
 A fresh setup has three users in the Local organization: `root@local` and `deploy@local` have the `organization_admin` role, and `dev@local` has the `member` role. `root@local` can sign in to both the API and Admin Console. `deploy@local` and `dev@local` cannot sign in by default; an admin must [set their passwords](#activate-the-other-local-users-optional) to enable login.
 
@@ -207,6 +209,8 @@ Bootstrap does not print or retain the password in a Kubernetes Secret. It sets 
 ```bash
 unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
 unset DD_API_KEY EPPO_SDK_KEY
+unset SPACE_KIND_OBSERVABILITY_CONFIG
+export SPACE_KIND_DATADOG_MODE=off
 
 export SPACE_VENDOR_ROOT="$HOME/.local/share/space/vendor"
 export SPACE_KIND_CLUSTER=space-local
@@ -228,6 +232,15 @@ Each timed command prints its elapsed duration as `real`. Bootstrap builds and p
 | UI | `3000` |
 | Object storage | `8333` |
 
+For an SSH installation, these ports listen on the remote Linux host. To use the UI in your laptop's browser, run this command in a separate **local** terminal, replacing `user@host` with your SSH destination, and leave it running:
+
+```bash
+ssh -N -o ExitOnForwardFailure=yes \
+  -L 127.0.0.1:3000:127.0.0.1:3000 user@host
+```
+
+Then open <http://127.0.0.1:3000> locally. Continue running the API examples on the remote host in the setup session; they use its API and data-plane port forwards. Keep the forwards bound to loopback.
+
 If either API or data-plane port refuses connections, confirm bootstrap reached its final summary. The [local installation troubleshooting steps](troubleshooting.md#local-installation) show how to restart a missing port forward without redeploying the cluster.
 
 Tilt is optional for this API walkthrough, but some smoke tests start it automatically in the background. Starting Tilt can replace pods and briefly interrupt their local port forwards; see [Troubleshoot setup](#troubleshoot-setup) before interpreting an empty reply as an authentication problem.
@@ -236,13 +249,15 @@ Tilt is optional for this API walkthrough, but some smoke tests start it automat
 
 ## Configure your environment
 
-Keep installation settings consistent across steps. The guide explicitly sets the first three values below; the others retain an existing environment value or use their script default.
+Keep installation settings consistent across steps. The table distinguishes values set by this guide from settings that retain an existing environment value or use their script default.
 
 | Setting | Value | Purpose |
 |---|---|---|
 | `INSTALL_DIR` | Explicitly set to `$HOME/.local/bin` | Destination for prerequisite tools. |
 | `SPACE_VENDOR_ROOT` | Explicitly set to `$HOME/.local/share/space/vendor` | Firecracker and guest kernel artifacts. |
 | `SPACE_KIND_CLUSTER` | Explicitly set to `space-local` | Kind cluster name; context is `kind-space-local`. |
+| `SPACE_KIND_DATADOG_MODE` | Explicitly set to `off` | Skip Datadog installation; existing Agents remain unchanged. |
+| `SPACE_KIND_OBSERVABILITY_CONFIG` | Explicitly unset | Prevent a previous telemetry experiment file from selecting a backend for this setup. |
 | `SPACE_CONSOLE_PASSWORD` | Defaults to `password` when unset | Initial `root@local` login password for a locked account. |
 | `SPACE_KIND_DATA_ROOT` | Defaults to `$HOME/.kind-data` when not already set | Host-side backing storage for node containerd data. This guide does not override it. |
 | `SPACE_BOOTSTRAP_TIMEOUT` | Defaults to `600` seconds when not already set | Bootstrap's per-release wait, not a sandbox or command timeout. |
