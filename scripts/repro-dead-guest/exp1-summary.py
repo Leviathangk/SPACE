@@ -98,3 +98,49 @@ if monitor:
     for label, sbx in sorted(sbx_of.items()):
         u = sbx.removeprefix("sbx_")
         print(f"  {label} {u[-8:]} rss_peak={rss[u] // 1024} vsock={vs[u][True]}:{vs[u][False]}")
+
+if monitor:
+    # Composed health per minute from `space-sbxmgr list` (HP column) and raw
+    # vsock failures, excluding each sandbox's own suspend/restore windows
+    # (the VM is paused or being replaced there).
+    windows = defaultdict(list)
+    for path in sorted(run.glob("*.cycles.jsonl")):
+        for line in open(path):
+            c = json.loads(line)
+            if c["step"] in {"suspend", "restore"}:
+                t = ts(c["ts"])
+                windows[c["sbx"].removeprefix("sbx_")].append((t - (c.get("secs") or 0) - 70, t + 70))
+    for path in sorted(run.glob("stress-*.jsonl")):
+        for line in open(path):
+            c = json.loads(line)
+            if c.get("step") in {"suspend", "restore"} and c.get("label") in sbx_of:
+                t = ts(c["ts"])
+                windows[sbx_of[c["label"]].removeprefix("sbx_")].append((t - 900, t + 120))
+
+    def in_window(u, t):
+        return any(lo <= t <= hi for lo, hi in windows.get(u, []))
+
+    hp = defaultdict(Counter)
+    stamp = None
+    for line in open(monitor / "sbxmgr-list.txt"):
+        if line.startswith("## "):
+            stamp = ts(line.split()[1])
+            continue
+        if not line.startswith("│") or "ID (short)" in line:
+            continue
+        cols = [c.strip() for c in line.strip("│ \n").split("┆")]
+        if len(cols) > 3:
+            short, state, health = cols[0], cols[2], cols[3]
+            hp[short][(state, health, in_window(next((u for u in map(lambda s: s.removeprefix("sbx_"), sbx_of.values()) if u.endswith(short)), ""), stamp))] += 1
+    print("composed health samples per sandbox (state, HP, in own suspend/restore window): count")
+    for label, sbx in sorted(sbx_of.items()):
+        short = sbx[-8:]
+        print(f"  {label} {short} {dict(hp.get(short, {}))}")
+    bad = []
+    for line in open(monitor / "vm-samples.jsonl"):
+        v = json.loads(line)
+        if not v["vsock_ok"] and not in_window(v["sbx"], ts(v["ts"])):
+            bad.append(v)
+    print(f"raw vsock failures outside suspend/restore windows: {len(bad)}")
+    for v in bad[:10]:
+        print("  ", json.dumps(v)[:200])
