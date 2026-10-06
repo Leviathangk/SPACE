@@ -658,8 +658,9 @@ pub fn mark_error(
 /// the sandbox self-heals when the cause clears (e.g. a completed
 /// node-manager rollout) without needing tenant activity, while the fast
 /// loop stays dead.
-pub const MAX_AUTO_SUSPEND_ERROR_STREAK: u32 = 10;
-const AUTO_SUSPEND_RETRY_BASE_SECS: u64 = 10;
+// REPRO ONLY: pre-budget behaviour (never park; retry on the next reconcile tick).
+pub const MAX_AUTO_SUSPEND_ERROR_STREAK: u32 = u32::MAX;
+const AUTO_SUSPEND_RETRY_BASE_SECS: u64 = 0;
 const AUTO_SUSPEND_RETRY_CAP_SECS: u64 = 600;
 const AUTO_SUSPEND_STREAK_STALE_SECS: u64 = 6 * 3600;
 
