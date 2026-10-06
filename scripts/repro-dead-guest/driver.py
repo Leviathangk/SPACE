@@ -223,6 +223,30 @@ def probe(args):
         print(json.dumps(result), flush=True)
 
 
+def action(args):
+    """Run lifecycle actions in order (e.g. stop start); one JSON result line each."""
+    cfg = config()
+    for name in args.actions:
+        started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        try:
+            result = fs.api(cfg, "POST", f"/v1/sandboxes/{args.sandbox}:{name}", body={},
+                            key=f"repro-{name}-{uuid.uuid4().hex}")
+            deadline = time.monotonic() + args.wait
+            while True:
+                op = fs.api(cfg, "GET", f"/v1/operations/{result['operation_id']}")
+                if op["state"] in {"succeeded", "failed", "cancelled"} or time.monotonic() > deadline:
+                    break
+                time.sleep(2)
+            line = {"op_state": op["state"], "terminal_error_code": op.get("terminal_error_code"),
+                    "terminal_error": json.dumps(op.get("terminal_error"))[:600]}
+        except Exception as error:  # noqa: BLE001 - reported, next action still runs
+            line = {"error": (str(error) + " " + getattr(error, "read", lambda: b"")().decode(errors="replace"))[:400]}
+        line.update(sbx=args.sandbox, action=name, start=started,
+                    end=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    sandbox_state=fs.api(cfg, "GET", f"/v1/sandboxes/{args.sandbox}")["state"])
+        print(json.dumps(line), flush=True)
+
+
 def get(args):
     result = fs.api(config(), "GET", f"/v1/sandboxes/{args.sandbox}")
     print(json.dumps(result if args.full else {k: result.get(k) for k in ("id", "state", "updated_at")}))
@@ -263,6 +287,11 @@ def main():
     p = sub.add_parser("probe")
     p.add_argument("sandboxes", nargs="+")
     p.set_defaults(fn=probe)
+    p = sub.add_parser("action")
+    p.add_argument("sandbox")
+    p.add_argument("actions", nargs="+")
+    p.add_argument("--wait", type=int, default=400)
+    p.set_defaults(fn=action)
     p = sub.add_parser("get")
     p.add_argument("sandbox")
     p.add_argument("--full", action="store_true")
