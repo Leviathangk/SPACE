@@ -10443,67 +10443,311 @@ mod kubernetes_tests {
         );
     }
 
-    /// Regression for the orphan-reconciler jam: `delete_execution` must not
-    /// short-circuit when the tracked pod is `Pending+Unschedulable`. That pod
-    /// shape makes `resolve_pod_ip` return `SubstrateError::Unavailable`; the
-    /// delete path has to treat it as "no live runtime", skip the in-VM
-    /// stop/delete gRPC calls, and proceed to delete the pod object.
-    ///
-    /// A full `delete_execution` test would need a Postgres-backed `K8sStore`
-    /// and a kube client fixture, neither of which exists in these unit tests,
-    /// so we assert the decision predicate against the exact error
-    /// `resolve_pod_ip` builds for an unschedulable pod.
-    #[test]
-    fn delete_skips_runtime_cleanup_for_unschedulable_pod() {
-        let status = PodStatus {
-            phase: Some("Pending".to_string()),
-            conditions: Some(vec![k8s_openapi::api::core::v1::PodCondition {
+    /// A Pending sandbox pod as the reflector holds it: no IP yet, and bound to
+    /// `node_name` when the scheduler has placed it.
+    fn pending_sandbox_pod(
+        pod_name: &str,
+        pod_uid: &str,
+        node_name: Option<&str>,
+        conditions: Option<Vec<PodCondition>>,
+    ) -> Pod {
+        Pod {
+            metadata: kube::api::ObjectMeta {
+                name: Some(pod_name.to_string()),
+                namespace: Some("space".to_string()),
+                uid: Some(pod_uid.to_string()),
+                ..Default::default()
+            },
+            spec: Some(K8sPodSpec {
+                node_name: node_name.map(str::to_string),
+                ..Default::default()
+            }),
+            status: Some(K8sPodStatus {
+                phase: Some("Pending".to_string()),
+                conditions,
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn captured_delete_names(
+        captured_deletes: &Mutex<Vec<(String, serde_json::Value)>>,
+    ) -> Vec<String> {
+        let mut names: Vec<String> = captured_deletes
+            .lock()
+            .expect("capture mutex poisoned")
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A sandbox whose current pod cannot be resolved to a runtime address:
+    /// generation 1 is an older, inactive pod and generation 2 the active one,
+    /// Pending and bound to a node that is in neither the node cache nor the
+    /// apiserver (the capturing client answers the node GET with a 400).
+    /// `resolve_pod_ip` therefore fails while recording the pod's placement —
+    /// an error that is not `Unavailable`, which is the shape that used to
+    /// return before any pod was deleted.
+    async fn unresolvable_runtime_subject(
+        pool: &PgPool,
+        sandbox_id: SandboxId,
+        lifecycle: &str,
+        captured_deletes: &Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    ) -> Result<(KubernetesSubstrate, Vec<String>), BoxError> {
+        let older = format!("space-sbx-{}-g1", sandbox_id.as_uuid().simple());
+        let current = format!("space-sbx-{}-g2", sandbox_id.as_uuid().simple());
+        insert_test_sandbox_row(pool, sandbox_id, lifecycle).await?;
+        insert_k8s_execution(pool, sandbox_id, 1, &older, "uid-g1", None, false).await?;
+        insert_k8s_execution(pool, sandbox_id, 2, &current, "uid-g2", None, true).await?;
+        let pod = pending_sandbox_pod(&current, "uid-g2", Some("unregistered-worker"), None);
+        let substrate = substrate_with_store_client_proxy_port_and_pod(
+            pool.clone(),
+            delete_capturing_kubernetes_client(Arc::clone(captured_deletes), Some(pod.clone())),
+            DEFAULT_SANDBOX_PROXY_PORT,
+            Some(pod),
+        );
+        let mut tracked = vec![older, current];
+        tracked.sort();
+        Ok((substrate, tracked))
+    }
+
+    async fn execution_rows(pool: &PgPool, sandbox_id: SandboxId) -> Result<i64, BoxError> {
+        Ok(sqlx::query_scalar(sql!(
+            "SELECT COUNT(*)::BIGINT FROM sandbox_k8s_executions WHERE sandbox_id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(pool)
+        .await?)
+    }
+
+    /// The tracked pod of a `Pending+Unschedulable` restore has no runtime to
+    /// talk to, so `resolve_pod_ip` reports `Unavailable`. The delete must
+    /// treat that as "no live runtime": skip the in-VM cleanup, delete the pod
+    /// object, and complete.
+    #[tokio::test(flavor = "current_thread")]
+    async fn delete_removes_an_unschedulable_pod_without_runtime_cleanup() -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        let pod_name = format!("space-sbx-{}-g1", sandbox_id.as_uuid().simple());
+        insert_test_sandbox_row(&pool, sandbox_id, "deleting").await?;
+        insert_k8s_execution(&pool, sandbox_id, 1, &pod_name, "uid-g1", None, true).await?;
+        let pod = pending_sandbox_pod(
+            &pod_name,
+            "uid-g1",
+            None,
+            Some(vec![PodCondition {
                 type_: "PodScheduled".to_string(),
                 status: "False".to_string(),
                 reason: Some("Unschedulable".to_string()),
                 message: Some(
-                    "0/109 nodes are available: 109 node(s) didn't match Pod's node affinity/selector. [NodeAffinity]"
+                    "0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector."
                         .to_string(),
                 ),
                 ..Default::default()
             }]),
-            ..Default::default()
-        };
-        let message =
-            pod_unschedulable_message(Some(&status)).expect("pod should be unschedulable");
-        let err = SubstrateError::Unavailable {
-            message: format!("sandbox pod is unschedulable: {message}"),
-        };
+        );
+        let captured_deletes = Arc::new(Mutex::new(Vec::new()));
+        let substrate = substrate_with_store_client_proxy_port_and_pod(
+            pool.clone(),
+            delete_capturing_kubernetes_client(Arc::clone(&captured_deletes), Some(pod.clone())),
+            DEFAULT_SANDBOX_PROXY_PORT,
+            Some(pod),
+        );
 
-        assert!(delete_can_skip_runtime_cleanup(&err));
+        substrate.delete_execution(sandbox_id).await?;
+
+        assert_eq!(captured_delete_names(&captured_deletes), vec![pod_name]);
+        let active: bool = sqlx::query_scalar(sql!(
+            "SELECT EXISTS (
+                 SELECT 1 FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND active
+             )"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(&pool)
+        .await?;
+        assert!(!active, "a completed delete releases pod tracking");
+        Ok(())
     }
 
-    /// Genuine infra faults surfaced by `resolve_pod_ip` (DB error, kube-API
-    /// query failure, malformed pod IP) must still propagate out of the delete
-    /// path — the pod-delete loop would hit the same fault.
-    #[test]
-    fn delete_propagates_genuine_infra_errors() {
-        let propagating = [
-            SubstrateError::Failed {
-                message: "failed to query K8s pod: connection refused".to_string(),
-            },
-            SubstrateError::NotFound {
-                message: "pod not found".to_string(),
-            },
-            SubstrateError::Timeout {
-                message: "kube-API timeout".to_string(),
-                phase: None,
-            },
-            SubstrateError::Conflict {
-                message: "conflict".to_string(),
-            },
-        ];
-        for err in &propagating {
-            assert!(
-                !delete_can_skip_runtime_cleanup(err),
-                "{err:?} must propagate"
-            );
-        }
+    /// Deleting a pod needs no address. When the runtime cannot be resolved,
+    /// the in-VM cleanup is skipped and the error surfaces, but every tracked
+    /// generation's pod must still be DELETEd: the alternative is a pod nobody
+    /// asked kubelet to stop, which keeps retrying its create once the row
+    /// that names it is gone. Tracking stays in place because the teardown did
+    /// not complete, so a retry can still find what it has to confirm.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delete_that_cannot_resolve_the_runtime_still_deletes_every_tracked_pod()
+    -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        let captured_deletes = Arc::new(Mutex::new(Vec::new()));
+        let (substrate, tracked) =
+            unresolvable_runtime_subject(&pool, sandbox_id, "deleting", &captured_deletes).await?;
+
+        let result = substrate.delete_execution(sandbox_id).await;
+
+        assert!(
+            matches!(result, Err(SubstrateError::Failed { .. })),
+            "the unresolved runtime must still surface: {result:?}"
+        );
+        assert_eq!(captured_delete_names(&captured_deletes), tracked);
+        let active_generation: Option<i64> = sqlx::query_scalar(sql!(
+            "SELECT generation FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND active"
+        ))
+        .bind(sandbox_id)
+        .fetch_optional(&pool)
+        .await?;
+        assert_eq!(
+            active_generation,
+            Some(2),
+            "an incomplete teardown keeps the execution tracked for its retry"
+        );
+        Ok(())
+    }
+
+    /// A delete that lands while a suspend may still publish from its pod
+    /// defers (`SuspendInFlight`), and that deferral only holds if the pod is
+    /// still there for the publisher: the address-free pod delete must not run
+    /// for it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delete_deferred_by_a_pending_suspend_publication_deletes_no_pod()
+    -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        let pod_name = format!("space-sbx-{}-g1", sandbox_id.as_uuid().simple());
+        insert_test_sandbox_row(&pool, sandbox_id, "suspending").await?;
+        insert_k8s_execution(
+            &pool,
+            sandbox_id,
+            1,
+            &pod_name,
+            "uid-g1",
+            Some("10.4.0.7"),
+            true,
+        )
+        .await?;
+        let finished_at = jiff::Timestamp::now().round(jiff::Unit::Second)?;
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": pod_name, "namespace": "space", "uid": "uid-g1"},
+            "status": {
+                "phase": "Succeeded",
+                "containerStatuses": [{
+                    "name": "sandbox",
+                    "image": "",
+                    "imageID": "",
+                    "ready": false,
+                    "restartCount": 0,
+                    "state": {"terminated": {"exitCode": 0, "finishedAt": finished_at.to_string()}}
+                }]
+            }
+        }))?;
+        let captured_deletes = Arc::new(Mutex::new(Vec::new()));
+        let substrate = substrate_with_store_client_proxy_port_and_pod(
+            pool.clone(),
+            delete_capturing_kubernetes_client(Arc::clone(&captured_deletes), Some(pod.clone())),
+            DEFAULT_SANDBOX_PROXY_PORT,
+            Some(pod),
+        );
+
+        let result = substrate.delete_execution(sandbox_id).await;
+
+        assert!(
+            matches!(result, Err(SubstrateError::SuspendInFlight { .. })),
+            "{result:?}"
+        );
+        assert!(captured_delete_names(&captured_deletes).is_empty());
+        Ok(())
+    }
+
+    /// The control-plane half of the same failure. Finalizing the row would
+    /// cascade the execution rows away, and with them the only record of the
+    /// pods this delete could not confirm — the restore-pod GC skips
+    /// non-restore pods, and nothing else looks for a pod without a row. So
+    /// the delete must fail, and the row must stay claimed for deletion with
+    /// its executions, for the delete retry or the orphaned-sandbox
+    /// reconciler to finish. Restoring the pre-delete `stopped` would be no
+    /// better: that reconciler leaves dormant rows alone.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unconfirmed_teardown_keeps_the_deleting_row_and_its_executions()
+    -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        let captured_deletes = Arc::new(Mutex::new(Vec::new()));
+        let (substrate, tracked) =
+            unresolvable_runtime_subject(&pool, sandbox_id, "stopped", &captured_deletes).await?;
+        let sandbox = fetch_sandbox(&pool, sandbox_id)
+            .await?
+            .expect("sandbox row exists");
+        let controller = SandboxController::new(Substrate::Kubernetes(Box::new(substrate)));
+
+        let result = controller
+            .delete_control_plane(&pool, sandbox_id, Some(&sandbox))
+            .await;
+
+        assert!(
+            result.is_err(),
+            "an unconfirmed teardown must not report success"
+        );
+        assert_eq!(captured_delete_names(&captured_deletes), tracked);
+        let lifecycle: Option<String> =
+            sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
+                .bind(sandbox_id)
+                .fetch_optional(&pool)
+                .await?;
+        assert_eq!(lifecycle.as_deref(), Some("deleting"));
+        assert_eq!(
+            execution_rows(&pool, sandbox_id).await?,
+            2,
+            "the rows naming both pods survive for the retry"
+        );
+        Ok(())
+    }
+
+    /// The path the failure cases branch from: a `stopped` sandbox whose start
+    /// left an active Pending pod. With nothing failing, the delete removes the
+    /// pod and reaches authoritative finality.
+    #[tokio::test(flavor = "current_thread")]
+    async fn deleting_a_stopped_sandbox_deletes_its_pending_pod_and_the_row() -> Result<(), BoxError>
+    {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        let pod_name = format!("space-sbx-{}-g1", sandbox_id.as_uuid().simple());
+        insert_test_sandbox_row(&pool, sandbox_id, "stopped").await?;
+        insert_k8s_execution(&pool, sandbox_id, 1, &pod_name, "uid-g1", None, true).await?;
+        let pod = pending_sandbox_pod(&pod_name, "uid-g1", None, None);
+        let captured_deletes = Arc::new(Mutex::new(Vec::new()));
+        let substrate = substrate_with_store_client_proxy_port_and_pod(
+            pool.clone(),
+            delete_capturing_kubernetes_client(Arc::clone(&captured_deletes), Some(pod.clone())),
+            DEFAULT_SANDBOX_PROXY_PORT,
+            Some(pod),
+        );
+        let sandbox = fetch_sandbox(&pool, sandbox_id)
+            .await?
+            .expect("sandbox row exists");
+        let controller = SandboxController::new(Substrate::Kubernetes(Box::new(substrate)));
+
+        controller
+            .delete_control_plane(&pool, sandbox_id, Some(&sandbox))
+            .await?;
+
+        assert_eq!(captured_delete_names(&captured_deletes), vec![pod_name]);
+        let remaining: bool = sqlx::query_scalar(sql!(
+            "SELECT EXISTS (SELECT 1 FROM sandboxes WHERE id = $1)"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(&pool)
+        .await?;
+        assert!(!remaining, "a confirmed teardown finalizes the row");
+        assert_eq!(execution_rows(&pool, sandbox_id).await?, 0);
+        Ok(())
     }
 
     /// `retire_execution` exists so failure reconcilers can release pods
@@ -10511,9 +10755,7 @@ mod kubernetes_tests {
     /// mid-suspend may hold the only up-to-date copy of the sandbox on the
     /// node. The teardown-mode predicate is the single switch that decides
     /// whether the in-VM cleanup sends the sbx-mgr `Delete`; `Retire` must
-    /// never do so. (A full `retire_execution` test has the same missing
-    /// fixture problem as `delete_execution`, documented above, so we pin
-    /// the decision predicates.)
+    /// never do so.
     #[test]
     fn retire_teardown_never_sends_sandbox_delete() {
         assert!(!ExecutionTeardown::Retire.sends_sandbox_delete());
