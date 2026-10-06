@@ -1,0 +1,52 @@
+[Tue Oct  6 15:46:58 2026] critical space allocation error, dev loop3, sector 12542608 op 0x1:(WRITE) flags 0x4800 phys_seg 22 prio class 2
+[Tue Oct  6 15:46:58 2026] critical space allocation error, dev loop3, sector 12545168 op 0x1:(WRITE) flags 0x4800 phys_seg 21 prio class 2
+[Tue Oct  6 15:46:58 2026] critical space allocation error, dev loop3, sector 12547728 op 0x1:(WRITE) flags 0x4800 phys_seg 21 prio class 2
+[Tue Oct  6 15:46:58 2026] critical space allocation error, dev loop3, sector 12550288 op 0x1:(WRITE) flags 0x4800 phys_seg 21 prio class 2
+[Tue Oct  6 15:46:58 2026] critical space allocation error, dev loop3, sector 12552848 op 0x1:(WRITE) flags 0x4800 phys_seg 22 prio class 2
+[Tue Oct  6 15:46:58 2026] critical space allocation error, dev loop3, sector 12555408 op 0x1:(WRITE) flags 0x4800 phys_seg 22 prio class 2
+[Tue Oct  6 15:46:58 2026] critical space allocation error, dev loop3, sector 12557968 op 0x1:(WRITE) flags 0x4800 phys_seg 23 prio class 2
+[Tue Oct  6 15:46:58 2026] critical space allocation error, dev loop3, sector 12560528 op 0x1:(WRITE) flags 0x4800 phys_seg 25 prio class 2
+[Tue Oct  6 15:46:58 2026] critical space allocation error, dev loop3, sector 12563088 op 0x1:(WRITE) flags 0x4800 phys_seg 21 prio class 2
+[Tue Oct  6 15:46:58 2026] critical space allocation error, dev loop3, sector 12565648 op 0x1:(WRITE) flags 0x4800 phys_seg 20 prio class 2
+[Tue Oct  6 15:47:00 2026] BTRFS error (device loop3 state A): Transaction aborted (error -5)
+[Tue Oct  6 15:47:00 2026] BTRFS: error (device loop3 state A) in btrfs_orphan_add:3593: errno=-5 IO failure
+[Tue Oct  6 15:47:00 2026] BTRFS info (device loop3 state EA): forced readonly
+[Tue Oct  6 15:47:06 2026] BTRFS error (device loop0 state A): Transaction aborted (error -5)
+[Tue Oct  6 15:47:06 2026] BTRFS: error (device loop0 state A) in do_free_extent_accounting:2980: errno=-5 IO failure
+[Tue Oct  6 15:47:06 2026] BTRFS info (device loop0 state EA): forced readonly
+[Tue Oct  6 15:47:06 2026] BTRFS error (device loop0 state EA): failed to run delayed ref for logical 1382477824 num_bytes 4096 type 178 action 2 ref_mod 1: -5
+[Tue Oct  6 15:47:06 2026] BTRFS: error (device loop0 state EA) in btrfs_run_delayed_refs:2214: errno=-5 IO failure
+[Tue Oct  6 15:47:06 2026] BTRFS error (device loop0 state EA): run_delalloc_nocow failed, root=259 inode=257 start=544768 len=4096: -5
+[Tue Oct  6 15:47:06 2026] BTRFS error (device loop0 state EA): failed to run delalloc range, root=259 ino=257 folio=544768 submit_bitmap=0 start=544768 len=4096: -5
+[Tue Oct  6 15:47:06 2026] BTRFS error (device loop0 state EA): run_delalloc_nocow failed, root=259 inode=257 start=565248 len=4096: -5
+[Tue Oct  6 15:47:06 2026] BTRFS error (device loop0 state EA): failed to run delalloc range, root=259 ino=257 folio=565248 submit_bitmap=0 start=565248 len=4096: -5
+[Tue Oct  6 15:47:06 2026] critical space allocation error, dev loop0, sector 3365016 op 0x1:(WRITE) flags 0x100000 phys_seg 1 prio class 2
+[Tue Oct  6 15:47:06 2026] BTRFS error (device loop0 state EA): run_delalloc_nocow failed, root=258 inode=257 start=372654080 len=24576: -5
+[Tue Oct  6 15:47:06 2026] BTRFS error (device loop0 state EA): failed to run delalloc range, root=258 ino=257 folio=372654080 submit_bitmap=0 start=372654080 len=24576: -5
+[Tue Oct  6 15:47:06 2026] BTRFS error (device loop0 state EA): run_delalloc_nocow failed, root=260 inode=257 start=371822592 len=24576: -5
+[Tue Oct  6 15:47:06 2026] BTRFS error (device loop0 state EA): failed to run delalloc range, root=260 ino=257 folio=371822592 submit_bitmap=0 start=371822592 len=24576: -5
+[Tue Oct  6 15:47:07 2026] BTRFS error (device loop0 state EA): run_delalloc_nocow failed, root=262 inode=257 start=371527680 len=24576: -5
+[Tue Oct  6 15:47:07 2026] BTRFS error (device loop0 state EA): failed to run delalloc range, root=262 ino=257 folio=371527680 submit_bitmap=0 start=371527680 len=24576: -5
+[Tue Oct  6 15:47:07 2026] BTRFS error (device loop0 state EA): run_delalloc_nocow failed, root=261 inode=257 start=371650560 len=24576: -5
+[Tue Oct  6 15:47:07 2026] BTRFS error (device loop0 state EA): failed to run delalloc range, root=261 ino=257 folio=371650560 submit_bitmap=0 start=371650560 len=24576: -5
+[Tue Oct  6 15:47:07 2026] BTRFS error (device loop0 state EA): run_delalloc_nocow failed, root=261 inode=257 start=538030080 len=8192: -5
+[Tue Oct  6 15:47:07 2026] BTRFS error (device loop0 state EA): failed to run delalloc range, root=261 ino=257 folio=538030080 submit_bitmap=0 start=538030080 len=8192: -5
+[Tue Oct  6 15:47:07 2026] critical space allocation error, dev loop0, sector 3365016 op 0x1:(WRITE) flags 0x100000 phys_seg 1 prio class 2
+[Tue Oct  6 15:47:07 2026] critical space allocation error, dev loop0, sector 3365016 op 0x1:(WRITE) flags 0x100000 phys_seg 3 prio class 2
+[Tue Oct  6 15:47:11 2026] BTRFS error (device loop0 state EA): run_delalloc_nocow failed, root=259 inode=257 start=4431872 len=4096: -5
+[Tue Oct  6 15:47:11 2026] BTRFS error (device loop0 state EA): failed to run delalloc range, root=259 ino=257 folio=4431872 submit_bitmap=0 start=4431872 len=4096: -5
+[Tue Oct  6 15:47:11 2026] BTRFS error (device loop0 state EA): run_delalloc_nocow failed, root=260 inode=257 start=391290880 len=8192: -5
+[Tue Oct  6 15:47:11 2026] BTRFS error (device loop0 state EA): failed to run delalloc range, root=260 ino=257 folio=391290880 submit_bitmap=0 start=391290880 len=8192: -5
+[Tue Oct  6 15:47:12 2026] BTRFS error (device loop0 state EA): run_delalloc_nocow failed, root=262 inode=257 start=390676480 len=12288: -5
+[Tue Oct  6 15:47:12 2026] BTRFS error (device loop0 state EA): failed to run delalloc range, root=262 ino=257 folio=390676480 submit_bitmap=0 start=390676480 len=12288: -5
+[Tue Oct  6 15:47:12 2026] critical space allocation error, dev loop0, sector 3365016 op 0x1:(WRITE) flags 0x100000 phys_seg 1 prio class 2
+[Tue Oct  6 15:47:16 2026] BTRFS error (device loop0 state EA): run_delalloc_nocow failed, root=259 inode=257 start=4440064 len=4096: -5
+[Tue Oct  6 15:47:16 2026] BTRFS error (device loop0 state EA): failed to run delalloc range, root=259 ino=257 folio=4440064 submit_bitmap=0 start=4440064 len=4096: -5
+[Tue Oct  6 15:47:21 2026] BTRFS error (device loop0 state EA): run_delalloc_nocow failed, root=259 inode=257 start=17448960 len=4096: -5
+[Tue Oct  6 15:47:21 2026] BTRFS error (device loop0 state EA): failed to run delalloc range, root=259 ino=257 folio=17448960 submit_bitmap=0 start=17448960 len=4096: -5
+[Tue Oct  6 15:47:26 2026] BTRFS error (device loop0 state EA): run_delalloc_nocow failed, root=259 inode=257 start=372465664 len=24576: -5
+[Tue Oct  6 15:47:26 2026] BTRFS error (device loop0 state EA): failed to run delalloc range, root=259 ino=257 folio=372465664 submit_bitmap=0 start=372465664 len=24576: -5
+[Tue Oct  6 15:47:31 2026] BTRFS error (device loop0 state EA): run_delalloc_nocow failed, root=259 inode=257 start=389705728 len=4096: -5
+[Tue Oct  6 15:47:31 2026] BTRFS error (device loop0 state EA): failed to run delalloc range, root=259 ino=257 folio=389705728 submit_bitmap=0 start=389705728 len=4096: -5
+[Tue Oct  6 15:47:31 2026] BTRFS error (device loop0 state EA): run_delalloc_nocow failed, root=259 inode=257 start=392609792 len=12288: -5
+[Tue Oct  6 15:47:31 2026] BTRFS error (device loop0 state EA): failed to run delalloc range, root=259 ino=257 folio=392609792 submit_bitmap=0 start=392609792 len=12288: -5

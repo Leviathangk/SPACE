@@ -1,0 +1,59 @@
+## 2026-10-06T14:47:15Z pod=space-node-stack-55frw node=space-local-worker2
+0:999 / /space/cache rw,relatime shared:2966 - btrfs /dev/loop6
+pod-view 01a1103a-49ba-765f-aec0-c553ffd0fc6b 3145961:340
+pod-view 01a1103a-49c1-7755-a3c3-cde1840a7060 3145961:432
+pod-view 01a1103a-49e6-700c-8516-b8ecc4aba0db 3145961:372
+pod-view 01a1109d-c43f-753f-9fc3-ab9c68124cf3 3145961:672
+pod-view 01a11196-b1e7-73da-8d68-ff7737686d05 3145961:692
+pod-view 01a11197-7969-70af-b56f-312c78521535 3145961:779
+pod-view 01a11197-7975-7148-a65e-fd96836ebb5a 3145961:733
+pod-view 01a111a8-afe4-75d4-a588-4732788a6371 3145961:820
+pod-view 01a111a8-afe4-75d4-a588-4734fab1d368 3145961:806
+pod-view 01a111ac-b0f3-771c-ac15-0bbcafe2f8c9 3145961:891
+pod-view 01a111ac-b0f4-7250-9f20-2e31402ab80f 3145961:877
+pod-view 01a111ac-b0f5-7731-9063-81f32e27d298 3145961:862
+pod-view 01a111ac-b0f6-75a7-80ed-0474ecb3a74d 3145961:952
+fc-root  01a11196-b1e7-73da-8d68-ff7737686d05 2097240:692 pid=93096
+fc-root  01a11197-7975-7148-a65e-fd96836ebb5a 2097240:733 pid=100458
+fc-root  01a11197-7969-70af-b56f-312c78521535 2097240:779 pid=104083
+fc-root  01a111a8-afe4-75d4-a588-4734fab1d368 2097240:806 pid=262624
+fc-root  01a111a8-afe4-75d4-a588-4732788a6371 2097240:820 pid=262648
+fc-root  01a111ac-b0f5-7731-9063-81f32e27d298 3145961:862 pid=318503
+fc-root  01a111ac-b0f4-7250-9f20-2e31402ab80f 3145961:877 pid=318508
+fc-root  01a111ac-b0f3-771c-ac15-0bbcafe2f8c9 3145961:891 pid=318519
+fc-root  01a111ac-b0f6-75a7-80ed-0474ecb3a74d 3145961:952 pid=321202
+/dev/loop1: [66311]:1099398 (/var/lib/space-cache.img)
+/dev/loop6: [66311]:1099357 (/var/lib/space-cache.img)
+/dev/loop4: [66311]:1099310 (/var/lib/space-cache.img)
+/dev/loop2: [66311]:1099435 (/var/lib/space-cache.img)
+/dev/loop0: [66311]:1099357 (/var/lib/space-cache.img)
+/dev/loop5: [66311]:1099310 (/var/lib/space-cache.img)
+/dev/loop3: [66311]:1099310 (/var/lib/space-cache.img)
+## 2026-10-06T14:47:15Z pod=space-node-stack-flsf6 node=space-local-worker
+0:998 / /space/cache rw,relatime shared:2941 - btrfs /dev/loop5
+pod-view 01a1103a-49bd-7596-a7f5-9228ccb9a552 3145973:417
+pod-view 01a1103a-49d4-757a-bc9f-36b7354e6bb5 3145973:355
+pod-view 01a1103a-4a04-75c2-9c82-f463c2062fff 3145973:384
+pod-view 01a11197-796f-777d-be33-8bfa84e1e807 3145973:461
+pod-view 01a11197-7970-7124-83b5-0719ea58695d 3145973:568
+pod-view 01a11197-7970-7124-83b5-071a77fc3ab3 3145973:632
+pod-view 01a11197-7977-7798-b47e-e4c884da64e6 3145973:501
+pod-view 01a111a8-afe4-75d4-a588-4731dc7f73c6 3145973:719
+pod-view 01a111a8-afe4-75d4-a588-4733a6cf2e12 3145973:674
+pod-view 01a111ac-b0f4-7250-9f20-2e32a42a0ca7 3145973:760
+pod-view 01a111ac-b0f4-7250-9f20-2e3322d86789 3145973:804
+fc-root  01a11197-796f-777d-be33-8bfa84e1e807 2097241:461 pid=100577
+fc-root  01a11197-7977-7798-b47e-e4c884da64e6 2097241:501 pid=100629
+fc-root  01a11197-7970-7124-83b5-0719ea58695d 2097241:568 pid=104448
+fc-root  01a11197-7970-7124-83b5-071a77fc3ab3 3145938:632 pid=223269
+fc-root  01a111a8-afe4-75d4-a588-4733a6cf2e12 3145938:674 pid=284716
+fc-root  01a111a8-afe4-75d4-a588-4731dc7f73c6 3145938:719 pid=287412
+fc-root  01a111ac-b0f4-7250-9f20-2e32a42a0ca7 3145973:760 pid=332826
+fc-root  01a111ac-b0f4-7250-9f20-2e3322d86789 3145973:804 pid=335835
+/dev/loop1: [66311]:1099398 (/var/lib/space-cache.img)
+/dev/loop6: [66311]:1099357 (/var/lib/space-cache.img)
+/dev/loop4: [66311]:1099310 (/var/lib/space-cache.img)
+/dev/loop2: [66311]:1099435 (/var/lib/space-cache.img)
+/dev/loop0: [66311]:1099357 (/var/lib/space-cache.img)
+/dev/loop5: [66311]:1099310 (/var/lib/space-cache.img)
+/dev/loop3: [66311]:1099310 (/var/lib/space-cache.img)

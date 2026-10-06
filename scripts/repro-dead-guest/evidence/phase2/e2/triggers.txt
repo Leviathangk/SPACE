@@ -1,0 +1,17 @@
+T4 spaced-host kill 2026-10-06T14:24:22Z e2a-1 e2a-4
+T2 sbxmgr-only restart on space-local-worker 2026-10-06T14:26:02Z
+restarted sbxmgr: old=82304 stopped=2026-10-06T14:26:07.340Z new=139822
+T3 nodemgr-only restart on space-local-worker 2026-10-06T14:27:30Z
+restarted nodemgr: old=75261 stopped=2026-10-06T14:27:34.104Z new=152679
+T1b container restart (credmgr killed) on space-local-worker 2026-10-06T14:28:27Z
+2026-10-06T14:29:16Z
+C1 clear-attempt: in-place sbxmgr restart on space-local-worker (stranded cohort) 2026-10-06T14:31:21Z
+restarted sbxmgr: old=179696 stopped=2026-10-06T14:31:24.625Z new=204757
+C2 spaced-host kill e2a-2 2026-10-06T14:32:57Z; C3 explicit suspend e2a-4 2026-10-06T14:32:57Z; C4 stop+start e2a-6 2026-10-06T14:32:57Z
+C2' spaced-host kill e2a-2 2026-10-06T14:33:14Z; C3 explicit suspend e2a-4 2026-10-06T14:33:14Z; C4 stop+start e2a-6 2026-10-06T14:33:14Z (redo)
+T1 pod replacement (delete pod space-node-stack-sl6sh) on space-local-worker2 2026-10-06T14:41:48Z
+2026-10-06T14:42:34Z
+P0 apply hostPath+Bidirectional cache patch to worker DS (rolls both pods = T1 on both) 2026-10-06T14:43:58Z
+2026-10-06T14:44:44Z
+P-T1b container restart (credmgr killed) on space-local-worker [patched] + P-T1 pod delete space-node-stack-xb4r6 on space-local-worker2 [patched] 2026-10-06T14:46:26Z
+2026-10-06T14:47:15Z

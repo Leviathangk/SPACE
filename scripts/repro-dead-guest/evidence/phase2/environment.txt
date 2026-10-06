@@ -1,0 +1,15 @@
+main: 84a1d9ea2ff806e31694bd0ba5c88eedad75681c (branch tree sync 1e143284; crates/docker/infra identical to main)
+node-stack image: sha256:95fa398c0ff72b44b953df1fe6091f4c1b1ef7d1e7aa74741b599c1740befec1
+space-sbxmgr-svc sha256: 690945c7abc19e29a95a8d4c0b0add57ef1c19fd4f53ef88cca0879e5b130c0d (both pods)
+space-nodemgr-svc sha256: fbeffec23d4b18ea8987c129ea872e911876d83af0c6cb42a0b0d2e467498518 (both pods)
+rollout at: 2026-10-06T14:19:35Z
+kind: kind v0.30.0 go1.24.6 linux/amd64
+Server Version: v1.34.0
+space-api image: space-api:local sha256:34c9608972c2b6a00b4168cea83508c94b1e042fcabe7c15f3fc73ff3bef6a3a
+space-data-plane image: space-data-plane:local sha256:d46b6ccde85252fc69afdd3eb351e359c7ec763d443739b8355881d581ded069
+space-internal-api image: space-node-stack:local sha256:823aab6da2cd7b5dbdc66a17d64d58a1472d2c1ab9ea2cf52ad2e587ced2ff00
+space-cluster-controller image: space-cluster-controller:local sha256:59d25a7443e5c44b9208780b257319dd6aac109284983459e7f564573997f882
+32
+               total        used        free      shared  buff/cache   available
+Mem:             123           7          72           0          45         116
+space-internal-api image after restart: sha256:95fa398c0ff72b44b953df1fe6091f4c1b1ef7d1e7aa74741b599c1740befec1

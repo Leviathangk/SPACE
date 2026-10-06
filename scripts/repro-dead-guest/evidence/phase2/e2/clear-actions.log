@@ -1,0 +1,8 @@
+{"start": "14:32:58", "sbx": "sbx_01a11197-7970-7124-83b5-0719ea58695d", "action": "suspend", "error": "signal only works in main thread of the main interpreter"}
+{"start": "14:32:58", "sbx": "sbx_01a11197-7970-7124-83b5-071a77fc3ab3", "action": "stop", "error": "signal only works in main thread of the main interpreter"}
+{"start": "14:32:58", "sbx": "sbx_01a11197-7970-7124-83b5-071a77fc3ab3", "action": "start", "error": "signal only works in main thread of the main interpreter"}
+{"op_state": "succeeded", "terminal_error_code": null, "terminal_error": "", "sbx": "sbx_01a11197-7970-7124-83b5-071a77fc3ab3", "action": "stop", "start": "2026-10-06T14:33:14Z", "end": "2026-10-06T14:33:16Z", "sandbox_state": "stopped"}
+{"op_state": "succeeded", "terminal_error_code": null, "terminal_error": "", "sbx": "sbx_01a11197-7970-7124-83b5-071a77fc3ab3", "action": "start", "start": "2026-10-06T14:33:16Z", "end": "2026-10-06T14:33:30Z", "sandbox_state": "running"}
+{"error": "slice(None, 400, None) ", "sbx": "sbx_01a11197-7970-7124-83b5-0719ea58695d", "action": "suspend", "start": "2026-10-06T14:33:14Z", "end": "2026-10-06T14:39:45Z", "sandbox_state": "failed"}
+{"op_state": "succeeded", "terminal_error_code": null, "terminal_error": "null", "sbx": "sbx_01a111ac-b0f4-7250-9f20-2e32a42a0ca7", "action": "suspend", "start": "2026-10-06T14:48:47Z", "end": "2026-10-06T14:48:51Z", "sandbox_state": "suspended"}
+{"op_state": "succeeded", "terminal_error_code": null, "terminal_error": "null", "sbx": "sbx_01a111ac-b0f4-7250-9f20-2e32a42a0ca7", "action": "wake", "start": "2026-10-06T14:48:51Z", "end": "2026-10-06T14:48:55Z", "sandbox_state": "running"}
