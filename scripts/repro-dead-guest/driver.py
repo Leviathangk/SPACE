@@ -119,10 +119,13 @@ def exec_cmd(args):
 LOOP = r'''#!/bin/sh
 LOG=/var/log/repro-stoploop.log
 STOP_MIN=$1; STOP_JITTER=$2; CONT=$3
-log() { m="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ) $*"; echo "$m" >> $LOG; echo "repro-stoploop: $m" > /dev/kmsg 2>/dev/null; }
+log() { m="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ) $*"; echo "$m" >> $LOG; echo "repro-stoploop: $m" > /dev/kmsg 2>/dev/null; }
 pid=$(systemctl show -p MainPID --value spaced.service)
 log "start pid=$pid self=$$ stop_min=$STOP_MIN stop_jitter=$STOP_JITTER cont=$CONT"
 trap 'kill -CONT $pid; log "exit CONT pid=$pid"; exit 0' TERM INT
+# Let the launching command exit and its data-plane stream close first, so no
+# open ingress connection defers the auto-lifecycle transition.
+sleep 5
 while :; do
   cur=$(systemctl show -p MainPID --value spaced.service 2>/dev/null)
   [ -n "$cur" ] && [ "$cur" != 0 ] && [ "$cur" != "$pid" ] && { log "mainpid changed $pid -> $cur"; pid=$cur; }
