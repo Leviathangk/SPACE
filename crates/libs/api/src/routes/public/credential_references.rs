@@ -46,7 +46,6 @@ fn reference_error(error: ReferenceError) -> PublicApiError {
         ReferenceError::IdempotencyConflict => {
             PublicApiError::idempotency_conflict(error.to_string())
         }
-        ReferenceError::Attached => PublicApiError::failed_precondition(error.to_string()),
         ReferenceError::Invalid(_) => PublicApiError::bad_request(error.to_string()),
         ReferenceError::Database(error) => error.into(),
     }

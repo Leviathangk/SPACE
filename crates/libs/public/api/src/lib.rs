@@ -2013,7 +2013,6 @@ impl From<RequestFingerprint> for String {
     }
 }
 
-pub mod credential_injection;
 pub mod credential_references;
 #[cfg(test)]
 mod tests;

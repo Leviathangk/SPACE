@@ -205,7 +205,6 @@ async fn exercise_peer(uid: u32) {
         ("Decrypt", false),
         ("GetOrIssueSandboxVolumeDek", false),
         ("SandboxVolumeEncryptionEnabled", false),
-        ("UnstableResolveCredentialInjectionBundle", false),
         ("ResolveNetworkCredentials", false),
         ("FutureMethod", false),
     ] {

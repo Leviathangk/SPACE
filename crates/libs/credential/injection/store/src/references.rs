@@ -34,7 +34,7 @@ impl Config {
         &self,
     ) -> Result<
         ValidatedCredentialReference,
-        pplx_space_credential_injection_core::validation::RulesetValidationError,
+        pplx_space_credential_injection_core::validation::ReferenceValidationError,
     > {
         match self {
             Self::AwsSecretsManager { secret_arn } => {
@@ -76,8 +76,7 @@ pub async fn create(
     Ok(id)
 }
 
-/// Lock order is the authorized sandbox first, then references in UUID order.
-/// Retirement takes the same reference lock, so it cannot race an attachment.
+/// Lock references in UUID order before using them in a transaction.
 pub async fn lock(
     executor: impl sqlx::PgExecutor<'_>,
     organization: OrgId,
@@ -100,11 +99,14 @@ pub async fn retire(
     executor: impl sqlx::PgExecutor<'_>,
     organization: OrgId,
     id: CredentialReferenceId,
-) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query(sql!(
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
         "UPDATE credential_references SET state = 'retired'
-         WHERE org_id = $1 AND id = $2 AND state = 'active'
-           AND NOT EXISTS (SELECT 1 FROM sandbox_network_credential_injection_rules WHERE credential_reference_id = $2)"
-    )).bind(organization).bind(id).execute(executor).await?;
-    Ok(result.rows_affected() == 1)
+         WHERE org_id = $1 AND id = $2 AND state = 'active'"
+    ))
+    .bind(organization)
+    .bind(id)
+    .execute(executor)
+    .await?;
+    Ok(())
 }
