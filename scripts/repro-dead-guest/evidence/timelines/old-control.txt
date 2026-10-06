@@ -1,0 +1,23 @@
+# old-control sbx_01a1109d-c44d-76df-b852-2d7385f7c5a6
+2026-10-06T09:48:58.400982Z  wake_requested               
+2026-10-06T09:49:00.086274Z  wake_completed               
+2026-10-06T09:50:06.831620Z  health                       Initializing->Healthy
+2026-10-06T09:50:31.833451Z  suspend_requested            auto_lifecycle
+2026-10-06T09:50:32.313561Z  suspend_artifact_published   
+{
+  "sandbox": "sbx_01a1109d-c44d-76df-b852-2d7385f7c5a6",
+  "attempts": 1,
+  "failures": 0,
+  "failure_reasons": {},
+  "first_attempt": "2026-10-06T09:50:31.833451Z",
+  "parked_at": [],
+  "suspended_at": "2026-10-06T09:50:32.313561Z",
+  "time_to_suspend_s": 0,
+  "attempts_before_suspend": 1,
+  "health_changes": [
+    [
+      "2026-10-06T09:50:06.831620Z",
+      "Initializing->Healthy"
+    ]
+  ]
+}

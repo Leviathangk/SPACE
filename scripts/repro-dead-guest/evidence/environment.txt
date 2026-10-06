@@ -1,0 +1,16 @@
+date: 2026-10-06T08:05:42Z
+host: Linux 6.12 x86_64 with KVM, 32 vCPU, 123 GiB RAM
+docker: 27.5.1
+kind: kind v0.30.0 go1.24.6 linux/amd64
+kubectl: v1.32.0
+NEW source: 45c545cc (main)
+NEW node-stack image: sha256:823aab6da2cd7b5dbdc66a17d64d58a1472d2c1ab9ea2cf52ad2e587ced2ff00
+NEW space-sbxmgr-svc sha256: 690945c7abc19e29a95a8d4c0b0add57ef1c19fd4f53ef88cca0879e5b130c0d
+node: space-local-control-plane Ready v1.34.0 GNU/Linux 12
+node: space-local-worker Ready v1.34.0 GNU/Linux 12
+node: space-local-worker2 Ready v1.34.0 GNU/Linux 12
+node: space-local-worker3 Ready v1.34.0 GNU/Linux 12
+node: space-local-worker4 Ready v1.34.0 GNU/Linux 12
+node: space-local-worker5 Ready v1.34.0 GNU/Linux 12
+OLD source: d778c139 (main 45c545cc + REPRO ONLY patch)
+OLD node-stack image: sha256:5200cf22b55402313bfe62ee31d9685282bc01fa9eeb147fe889b08a5b023650

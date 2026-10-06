@@ -181,6 +181,14 @@ def stoplog(args):
     print(f"[exit {code}]")
 
 
+def wake(args):
+    cfg = config()
+    result = fs.api(cfg, "POST", f"/v1/sandboxes/{args.sandbox}:wake", body={},
+                    key=f"repro-wake-{uuid.uuid4().hex}")
+    fs.wait_for_state(cfg, f"/v1/operations/{result['operation_id']}", "succeeded")
+    print(fs.api(cfg, "GET", f"/v1/sandboxes/{args.sandbox}")["state"])
+
+
 def get(args):
     result = fs.api(config(), "GET", f"/v1/sandboxes/{args.sandbox}")
     print(json.dumps(result if args.full else {k: result.get(k) for k in ("id", "state", "updated_at")}))
@@ -209,6 +217,9 @@ def main():
     p.add_argument("--stop", action="store_true")
     p.add_argument("--wait", type=int, default=6000)
     p.set_defaults(fn=stoplog)
+    p = sub.add_parser("wake")
+    p.add_argument("sandbox")
+    p.set_defaults(fn=wake)
     p = sub.add_parser("get")
     p.add_argument("sandbox")
     p.add_argument("--full", action="store_true")

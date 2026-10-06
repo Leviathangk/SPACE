@@ -1,0 +1,23 @@
+# smoke-new-example sbx_01a11037-ce67-75a1-9814-d5a5a2cd00df
+2026-10-06T07:57:36.305758Z  wake_requested               
+2026-10-06T07:57:37.286098Z  wake_completed               
+2026-10-06T07:58:35.318347Z  health                       Initializing->Degraded
+2026-10-06T07:59:14.726206Z  suspend_requested            auto_lifecycle
+2026-10-06T07:59:38.026015Z  suspend_artifact_published   
+{
+  "sandbox": "sbx_01a11037-ce67-75a1-9814-d5a5a2cd00df",
+  "attempts": 1,
+  "failures": 0,
+  "failure_reasons": {},
+  "first_attempt": "2026-10-06T07:59:14.726206Z",
+  "parked_at": [],
+  "suspended_at": "2026-10-06T07:59:38.026015Z",
+  "time_to_suspend_s": 23,
+  "attempts_before_suspend": 1,
+  "health_changes": [
+    [
+      "2026-10-06T07:58:35.318347Z",
+      "Initializing->Degraded"
+    ]
+  ]
+}

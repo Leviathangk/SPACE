@@ -1,0 +1,22 @@
+Tue Oct  6 10:58:39 AM UTC 2026
+old-control    attempts=  1 fail=  0 reasons={} parked=[] suspended=2026-10-06T09:50:32.313561Z t_suspend=0 n_before=1 health=Initializing->Healthy
+old-stall-1    attempts= 15 fail= 14 reasons={'guest_filesystem_flush/guest_fs_flush_failed': 14} parked=[] suspended=2026-10-06T10:35:41.333493Z t_suspend=2709 n_before=15 health=Healthy->Degraded
+old-stall-2    attempts= 22 fail= 21 reasons={'guest_filesystem_flush/guest_fs_flush_failed': 21} parked=[] suspended=2026-10-06T10:57:41.412640Z t_suspend=4030 n_before=22 health=Initializing->Degraded
+old-stall-3    attempts= 13 fail= 12 reasons={'guest_filesystem_flush/guest_fs_flush_failed': 12} parked=[] suspended=2026-10-06T10:29:43.431510Z t_suspend=2352 n_before=13 health=Initializing->Degraded
+old-stall-4    attempts= 21 fail= 20 reasons={'guest_filesystem_flush/guest_fs_flush_failed': 20} parked=[] suspended=2026-10-06T10:53:36.434511Z t_suspend=3784 n_before=21 health=Initializing->Degraded
+old-stall-5    attempts= 20 fail= 19 reasons={'guest_filesystem_flush/guest_fs_flush_failed': 19} parked=[] suspended=2026-10-06T10:51:10.487412Z t_suspend=3638 n_before=20 health=Initializing->Degraded
+old-stall-6    attempts= 19 fail= 18 reasons={'guest_filesystem_flush/guest_fs_flush_failed': 18} parked=[] suspended=2026-10-06T10:47:17.597176Z t_suspend=3405 n_before=19 health=Initializing->Degraded
+old-control {"id": "sbx_01a1109d-c44d-76df-b852-2d7385f7c5a6", "state": "suspended", "updated_at": "2026-10-06T09:50:33.406631Z"}
+old-stall-1 {"id": "sbx_01a1109d-c43e-71e9-868d-bb3969769800", "state": "suspended", "updated_at": "2026-10-06T10:35:42.384537Z"}
+old-stall-2 {"id": "sbx_01a1109d-c44d-76df-b852-2d720e0e0709", "state": "running", "updated_at": "2026-10-06T09:49:00.372701Z"}
+old-stall-3 {"id": "sbx_01a1109d-c44d-76df-b852-2d74e3ae753b", "state": "suspended", "updated_at": "2026-10-06T10:29:44.457695Z"}
+old-stall-4 {"id": "sbx_01a1109d-c43e-71e9-868d-bb3a508ecab6", "state": "running", "updated_at": "2026-10-06T09:49:01.084305Z"}
+old-stall-5 {"id": "sbx_01a1109d-c441-773b-896b-c7676dabe9b8", "state": "running", "updated_at": "2026-10-06T09:49:01.025318Z"}
+old-stall-6 {"id": "sbx_01a1109d-c43f-753f-9fc3-ab9c68124cf3", "state": "suspended", "updated_at": "2026-10-06T10:47:18.619005Z"}
+--- NEW sandboxes re-armed by the stoplog reader, now under OLD:
+new-stall-1 under OLD: attempts 804 first 2026-10-06T09:51:46.833548Z suspended None t None parked []
+new-stall-2 under OLD: attempts 842 first 2026-10-06T09:48:37.764548Z suspended None t None parked []
+new-stall-3 under OLD: attempts 804 first 2026-10-06T09:51:46.833584Z suspended None t None parked []
+new-stall-4 under OLD: attempts 804 first 2026-10-06T09:51:46.833612Z suspended None t None parked []
+new-stall-5 under OLD: attempts 804 first 2026-10-06T09:51:47.759765Z suspended None t None parked []
+new-stall-6 under OLD: attempts 804 first 2026-10-06T09:51:47.759659Z suspended None t None parked []

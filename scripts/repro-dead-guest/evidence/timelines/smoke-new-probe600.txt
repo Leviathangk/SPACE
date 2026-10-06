@@ -1,0 +1,23 @@
+# smoke-new-probe600 sbx_01a11036-3b78-73b9-a68d-1e53f0fde6c2
+2026-10-06T07:55:52.661006Z  wake_requested               
+2026-10-06T07:55:54.004218Z  wake_completed               
+2026-10-06T07:56:44.708058Z  health                       Initializing->Healthy
+2026-10-06T08:06:44.725741Z  suspend_requested            auto_lifecycle
+2026-10-06T08:06:45.237425Z  suspend_artifact_published   
+{
+  "sandbox": "sbx_01a11036-3b78-73b9-a68d-1e53f0fde6c2",
+  "attempts": 1,
+  "failures": 0,
+  "failure_reasons": {},
+  "first_attempt": "2026-10-06T08:06:44.725741Z",
+  "parked_at": [],
+  "suspended_at": "2026-10-06T08:06:45.237425Z",
+  "time_to_suspend_s": 1,
+  "attempts_before_suspend": 1,
+  "health_changes": [
+    [
+      "2026-10-06T07:56:44.708058Z",
+      "Initializing->Healthy"
+    ]
+  ]
+}

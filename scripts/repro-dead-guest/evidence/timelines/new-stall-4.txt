@@ -1,0 +1,56 @@
+# new-stall-4 sbx_01a1103a-4a04-75c2-9c82-f463c2062fff
+2026-10-06T08:00:18.526452Z  wake_requested               
+2026-10-06T08:00:20.234113Z  wake_completed               
+2026-10-06T08:01:05.323672Z  health                       Initializing->Degraded
+2026-10-06T08:01:54.725861Z  suspend_requested            auto_lifecycle
+2026-10-06T08:04:54.727579Z  suspend_failed               guest_filesystem_flush/guest_fs_flush_failed
+2026-10-06T08:04:54.728976Z  transition_failed            code: 'Internal error', message: "guest snapshot preparation before suspend failed: code: 'The operation was cancelled', message: \"Timeout 
+2026-10-06T08:05:04.725893Z  suspend_requested            auto_lifecycle
+2026-10-06T08:08:04.727416Z  suspend_failed               guest_filesystem_flush/guest_fs_flush_failed
+2026-10-06T08:08:04.727837Z  transition_failed            code: 'Internal error', message: "guest snapshot preparation before suspend failed: code: 'The operation was cancelled', message: \"Timeout 
+2026-10-06T08:08:24.726606Z  suspend_requested            auto_lifecycle
+2026-10-06T08:11:24.727518Z  suspend_failed               guest_filesystem_flush/guest_fs_flush_failed
+2026-10-06T08:11:24.728143Z  transition_failed            code: 'Internal error', message: "guest snapshot preparation before suspend failed: code: 'The operation was cancelled', message: \"Timeout 
+2026-10-06T08:12:04.725567Z  suspend_requested            auto_lifecycle
+2026-10-06T08:15:04.727375Z  suspend_failed               guest_filesystem_flush/guest_fs_flush_failed
+2026-10-06T08:15:04.727801Z  transition_failed            code: 'Internal error', message: "guest snapshot preparation before suspend failed: code: 'The operation was cancelled', message: \"Timeout 
+2026-10-06T08:16:24.726155Z  suspend_requested            auto_lifecycle
+2026-10-06T08:19:24.727432Z  suspend_failed               guest_filesystem_flush/guest_fs_flush_failed
+2026-10-06T08:19:24.727601Z  transition_failed            code: 'Internal error', message: "guest snapshot preparation before suspend failed: code: 'The operation was cancelled', message: \"Timeout 
+2026-10-06T08:22:04.726089Z  suspend_requested            auto_lifecycle
+2026-10-06T08:25:04.727361Z  suspend_failed               guest_filesystem_flush/guest_fs_flush_failed
+2026-10-06T08:25:04.728278Z  transition_failed            code: 'Internal error', message: "guest snapshot preparation before suspend failed: code: 'The operation was cancelled', message: \"Timeout 
+2026-10-06T08:30:24.726546Z  suspend_requested            auto_lifecycle
+2026-10-06T08:33:24.727610Z  suspend_failed               guest_filesystem_flush/guest_fs_flush_failed
+2026-10-06T08:33:24.728215Z  transition_failed            code: 'Internal error', message: "guest snapshot preparation before suspend failed: code: 'The operation was cancelled', message: \"Timeout 
+2026-10-06T08:43:24.726059Z  suspend_requested            auto_lifecycle
+2026-10-06T08:46:24.727580Z  suspend_failed               guest_filesystem_flush/guest_fs_flush_failed
+2026-10-06T08:46:24.727854Z  transition_failed            code: 'Internal error', message: "guest snapshot preparation before suspend failed: code: 'The operation was cancelled', message: \"Timeout 
+2026-10-06T08:56:24.726728Z  suspend_requested            auto_lifecycle
+2026-10-06T08:59:24.727772Z  suspend_failed               guest_filesystem_flush/guest_fs_flush_failed
+2026-10-06T08:59:24.728910Z  transition_failed            code: 'Internal error', message: "guest snapshot preparation before suspend failed: code: 'The operation was cancelled', message: \"Timeout 
+2026-10-06T09:09:24.726455Z  suspend_requested            auto_lifecycle
+2026-10-06T09:09:24.863889Z  suspend_failed               guest_filesystem_flush/guest_fs_flush_failed
+2026-10-06T09:09:24.864112Z  transition_failed            code: 'Internal error', message: "guest snapshot preparation before suspend failed: code: 'The service is currently unavailable', message: \
+2026-10-06T09:09:24.864180Z  PARKED                       
+{
+  "sandbox": "sbx_01a1103a-4a04-75c2-9c82-f463c2062fff",
+  "attempts": 10,
+  "failures": 10,
+  "failure_reasons": {
+    "guest_filesystem_flush/guest_fs_flush_failed": 10
+  },
+  "first_attempt": "2026-10-06T08:01:54.725861Z",
+  "parked_at": [
+    "2026-10-06T09:09:24.864180Z"
+  ],
+  "suspended_at": null,
+  "time_to_suspend_s": null,
+  "attempts_before_suspend": 10,
+  "health_changes": [
+    [
+      "2026-10-06T08:01:05.323672Z",
+      "Initializing->Degraded"
+    ]
+  ]
+}

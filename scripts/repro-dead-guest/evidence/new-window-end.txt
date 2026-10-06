@@ -1,0 +1,17 @@
+Tue Oct  6 09:45:19 AM UTC 2026
+new-control    attempts=  1 fail=  0 reasons={} parked=[] suspended=2026-10-06T08:01:55.154948Z t_suspend=0 n_before=1 health=Initializing->Healthy
+new-stall-1    attempts= 10 fail= 10 reasons={'guest_filesystem_flush/guest_fs_flush_failed': 10} parked=['2026-10-06T09:12:24.727858Z'] suspended=None t_suspend=None n_before=10 health=Healthy->Degraded
+new-stall-2    attempts=  7 fail=  6 reasons={'guest_filesystem_flush/guest_fs_flush_failed': 6} parked=[] suspended=2026-10-06T08:31:38.125138Z t_suspend=1783 n_before=7 health=Healthy->Degraded
+new-stall-3    attempts= 10 fail= 10 reasons={'guest_filesystem_flush/guest_fs_flush_failed': 10} parked=['2026-10-06T09:12:24.728549Z'] suspended=None t_suspend=None n_before=10 health=Initializing->Degraded
+new-stall-4    attempts= 10 fail= 10 reasons={'guest_filesystem_flush/guest_fs_flush_failed': 10} parked=['2026-10-06T09:09:24.864180Z'] suspended=None t_suspend=None n_before=10 health=Initializing->Degraded
+new-stall-5    attempts= 10 fail= 10 reasons={'guest_filesystem_flush/guest_fs_flush_failed': 10} parked=['2026-10-06T09:09:24.855621Z'] suspended=None t_suspend=None n_before=10 health=Initializing->Degraded
+new-stall-6    attempts= 10 fail= 10 reasons={'guest_filesystem_flush/guest_fs_flush_failed': 10} parked=['2026-10-06T09:09:24.855536Z'] suspended=None t_suspend=None n_before=10 health=Initializing->Degraded
+new-control {"id": "sbx_01a1103a-49b0-7751-95c7-3b9ae3d4b03b", "state": "suspended", "updated_at": "2026-10-06T08:01:56.716043Z"}
+new-stall-1 {"id": "sbx_01a1103a-49bd-7596-a7f5-9228ccb9a552", "state": "running", "updated_at": "2026-10-06T08:00:21.353822Z"}
+new-stall-2 {"id": "sbx_01a1103a-49c1-7755-a3c3-cde1840a7060", "state": "suspended", "updated_at": "2026-10-06T08:31:39.159984Z"}
+new-stall-3 {"id": "sbx_01a1103a-49d4-757a-bc9f-36b7354e6bb5", "state": "running", "updated_at": "2026-10-06T08:00:20.349347Z"}
+new-stall-4 {"id": "sbx_01a1103a-4a04-75c2-9c82-f463c2062fff", "state": "running", "updated_at": "2026-10-06T08:00:21.419033Z"}
+new-stall-5 {"id": "sbx_01a1103a-49e6-700c-8516-b8ecc4aba0db", "state": "running", "updated_at": "2026-10-06T08:00:20.44454Z"}
+new-stall-6 {"id": "sbx_01a1103a-49ba-765f-aec0-c553ffd0fc6b", "state": "running", "updated_at": "2026-10-06T08:00:20.436402Z"}
+space-local-worker gauge: 2026-10-06T09:45:19Z space.sandbox.guest.health:3.000|g|#env:local-runtime-b2ecbaeec4e8a5ed-0,version:local,cluster_id:kind-local,lifecycle:started,health:degraded
+space-local-worker2 gauge: 2026-10-06T09:45:19Z space.sandbox.guest.health:2.000|g|#env:local-runtime-b2ecbaeec4e8a5ed-0,version:local,cluster_id:kind-local,lifecycle:started,health:degraded

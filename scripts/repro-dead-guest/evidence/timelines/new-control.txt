@@ -1,0 +1,23 @@
+# new-control sbx_01a1103a-49b0-7751-95c7-3b9ae3d4b03b
+2026-10-06T08:00:18.437106Z  wake_requested               
+2026-10-06T08:00:20.226804Z  wake_completed               
+2026-10-06T08:00:59.710789Z  health                       Initializing->Healthy
+2026-10-06T08:01:54.725777Z  suspend_requested            auto_lifecycle
+2026-10-06T08:01:55.154948Z  suspend_artifact_published   
+{
+  "sandbox": "sbx_01a1103a-49b0-7751-95c7-3b9ae3d4b03b",
+  "attempts": 1,
+  "failures": 0,
+  "failure_reasons": {},
+  "first_attempt": "2026-10-06T08:01:54.725777Z",
+  "parked_at": [],
+  "suspended_at": "2026-10-06T08:01:55.154948Z",
+  "time_to_suspend_s": 0,
+  "attempts_before_suspend": 1,
+  "health_changes": [
+    [
+      "2026-10-06T08:00:59.710789Z",
+      "Initializing->Healthy"
+    ]
+  ]
+}

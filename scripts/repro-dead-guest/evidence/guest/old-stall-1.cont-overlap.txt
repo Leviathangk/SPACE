@@ -1,0 +1,20 @@
+sbx_01a1109d-c43e-71e9-868d-bb3969769800: 1 STOP periods, 2 CONT
+  attempt  1 09:50:32  180.0s failed  cont_inside=[]
+  attempt  2 09:53:37  180.0s failed  cont_inside=[]
+  attempt  3 09:56:42  180.0s failed  cont_inside=[]
+  attempt  4 09:59:47  180.0s failed  cont_inside=[]
+  attempt  5 10:02:52  180.0s failed  cont_inside=[]
+  attempt  6 10:05:57  180.0s failed  cont_inside=[]
+  attempt  7 10:09:02  180.0s failed  cont_inside=[]
+  attempt  8 10:12:07  180.0s failed  cont_inside=[]
+  attempt  9 10:15:12  180.0s failed  cont_inside=[]
+  attempt 10 10:18:17  180.0s failed  cont_inside=[]
+  attempt 11 10:21:22  180.0s failed  cont_inside=[]
+  attempt 12 10:24:27  180.0s failed  cont_inside=[]
+  attempt 13 10:27:32  180.0s failed  cont_inside=[]
+  attempt 14 10:30:37  180.0s failed  cont_inside=[]
+  attempt 15 10:33:42  118.6s SUCCESS cont_inside=['10:35:40']
+  attempt 16 11:01:47    0.4s SUCCESS cont_inside=[]
+  attempt 17 11:01:48    1.5s SUCCESS cont_inside=[]
+  attempts=17 with_CONT=1 succeeded=3 success_rate=0.176
+{"stop_periods": ["2026-10-06T09:49:06.754123650Z STOP pid=282 for=2794s"]}

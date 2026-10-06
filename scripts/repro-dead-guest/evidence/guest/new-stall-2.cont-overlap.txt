@@ -1,0 +1,10 @@
+sbx_01a1103a-49c1-7755-a3c3-cde1840a7060: 1 STOP periods, 2 CONT
+  attempt  1 08:01:54  180.0s failed  cont_inside=[]
+  attempt  2 08:05:04  180.0s failed  cont_inside=[]
+  attempt  3 08:08:24  180.0s failed  cont_inside=[]
+  attempt  4 08:12:04  180.0s failed  cont_inside=[]
+  attempt  5 08:16:24  180.0s failed  cont_inside=[]
+  attempt  6 08:22:04  180.0s failed  cont_inside=[]
+  attempt  7 08:30:24   73.4s SUCCESS cont_inside=['08:31:37']
+  attempts=7 with_CONT=1 succeeded=1 success_rate=0.143
+{"stop_periods": ["2026-10-06T08:00:27.554183597Z STOP pid=282 for=1870s"]}
