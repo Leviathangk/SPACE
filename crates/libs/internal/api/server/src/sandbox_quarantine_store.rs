@@ -2,6 +2,7 @@
 
 use pplx_space_common_core::types::NodeId;
 
+use std::collections::BTreeSet;
 use std::sync::LazyLock;
 
 use pplx_space_common_core::sql;
@@ -12,6 +13,7 @@ use pplx_space_common_core::types::{
     SandboxQuarantineRecoveryPolicy, SandboxQuarantineSource, SandboxTransitionReceiptKind,
     SandboxTransitionTargetState, SnapshotId,
 };
+use pplx_space_common_svc::types::{FACET_SANDBOX_DESIRED_STATE, SANDBOX_ABANDONED_ACTIVATION_KEY};
 use pplx_space_sandbox_portability::{
     current_suspend_origin_marker_snapshot_ready, exact_marker_snapshot_backup_current,
     node_published_suspend_evidence, pre_quarantine_suspend_snapshot_current,
@@ -407,6 +409,230 @@ pub(super) async fn consume_activation_completion_receipts(
         .map_err(|error| {
             Status::internal(format!("consume activation completion receipts: {error}"))
         })
+}
+
+/// A node-reported runtime for an execution generation that no current
+/// activation attempt owns, behind a dormant `stopped` row.
+#[derive(Debug)]
+pub(super) struct AbandonedActivationRuntime {
+    pub(super) sandbox_id: SandboxId,
+    pub(super) execution_generation: i64,
+    pub(super) pod_uid: PodUid,
+}
+
+/// Lock the sandboxes whose node reports a running VM that the control plane
+/// has already given up on.
+///
+/// A start that fails reports the failure to its client and leaves the row
+/// `stopped`, but the pod its last attempt created can keep retrying and boot
+/// later. Promoting that runtime would adopt a start the API already reported
+/// as failed, so the row stays `stopped` and the runtime is retired instead.
+/// It is a candidate only when all of these hold:
+///
+/// - The runtime names its execution generation, either in its own state or in
+///   its activation-completed receipt, and a pod UID the execution row does not
+///   contradict. Teardown is fenced on exactly that pod, so a report without
+///   one is left alone.
+/// - No unexpired activation attempt holds that generation's execution. A held
+///   attempt is a start still in flight. Its matching receipt is consumed by
+///   [`consume_activation_completion_receipts`] before this runs.
+/// - No newer generation is active. A newer start owns the sandbox, and the
+///   in-VM stop addresses the sandbox rather than one generation, so retiring
+///   the stale runtime is left to that start's replacement of older pods.
+/// - When the execution records its Kubernetes node, it is the publishing node.
+pub(super) async fn select_abandoned_activation_runtimes(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    rows_json: Json<serde_json::Value>,
+) -> Result<Vec<AbandonedActivationRuntime>, Status> {
+    let query = format!(
+        "SELECT s.id,
+                execution.generation,
+                COALESCE(
+                    NULLIF(BTRIM(input.pod_uid), ''),
+                    NULLIF(BTRIM(execution.pod_uid), '')
+                )
+           FROM jsonb_to_recordset($2::jsonb) AS input({TRANSITION_RECEIPT_RECORD_COLUMNS})
+           JOIN sandboxes s ON s.id = input.sandbox_id
+           JOIN sandbox_k8s_executions execution
+             ON execution.sandbox_id = s.id
+            AND execution.generation = COALESCE(
+                    input.execution_generation,
+                    CASE
+                        WHEN input.transition_receipt_kind = $3
+                        THEN input.transition_receipt_execution_generation
+                    END
+                )
+          WHERE s.managed_by = 'k8s'
+            AND LOWER(TRIM(s.lifecycle)) = 'stopped'
+            AND LOWER(TRIM(input.status)) IN ('started', 'paused')
+            AND COALESCE(
+                    NULLIF(BTRIM(input.pod_uid), ''),
+                    NULLIF(BTRIM(execution.pod_uid), '')
+                ) IS NOT NULL
+            AND (
+                NULLIF(BTRIM(input.pod_uid), '') IS NULL
+                OR NULLIF(BTRIM(execution.pod_uid), '') IS NULL
+                OR BTRIM(input.pod_uid) = BTRIM(execution.pod_uid)
+            )
+            AND (
+                execution.k8s_node_name IS NULL
+                OR EXISTS (
+                    SELECT 1
+                      FROM node_k8s node
+                     WHERE node.node_id = $1
+                       AND node.k8s_node_name = execution.k8s_node_name
+                )
+            )
+            AND NOT (
+                execution.active
+                AND execution.activation_attempt_id IS NOT NULL
+                AND (
+                    execution.activation_attempt_expires_at IS NULL
+                    OR execution.activation_attempt_expires_at > NOW()
+                )
+            )
+            AND NOT EXISTS (
+                SELECT 1
+                  FROM sandbox_k8s_executions newer
+                 WHERE newer.sandbox_id = s.id
+                   AND newer.active
+                   AND newer.generation > execution.generation
+            )
+          FOR UPDATE OF s, execution"
+    );
+    let rows: Vec<(SandboxId, i64, PodUid)> =
+        sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
+            .bind(node_id)
+            .bind(rows_json)
+            .bind(SandboxTransitionReceiptKind::ActivationCompleted.as_str())
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|error| {
+                Status::internal(format!("select abandoned activation runtimes: {error}"))
+            })?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(sandbox_id, execution_generation, pod_uid)| AbandonedActivationRuntime {
+                sandbox_id,
+                execution_generation,
+                pod_uid,
+            },
+        )
+        .collect())
+}
+
+/// Record each runtime as a node-scoped teardown request, fenced on the
+/// generation and pod UID the node reported. Returns the sandboxes whose
+/// request is new or now names a different runtime, so a node republishing the
+/// same report every sync does not repeat the request event.
+pub(super) async fn record_abandoned_activation_runtimes(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    runtimes: &[AbandonedActivationRuntime],
+) -> Result<BTreeSet<SandboxId>, Status> {
+    if runtimes.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let input = runtimes
+        .iter()
+        .map(|runtime| {
+            serde_json::json!({
+                "sandbox_id": runtime.sandbox_id,
+                "execution_generation": runtime.execution_generation,
+                "pod_uid": runtime.pod_uid.as_str(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let recorded: Vec<String> = sqlx::query_scalar(sql!(
+        "INSERT INTO node_facet_observed_status (
+             node_id, facet, element, observed_payload, observed_at, updated_at
+         )
+         SELECT $1,
+                $3,
+                input.sandbox_id::TEXT,
+                jsonb_build_object(
+                    $4::TEXT,
+                    jsonb_build_object(
+                        'execution_generation', input.execution_generation,
+                        'pod_uid', input.pod_uid
+                    )
+                ),
+                NOW(),
+                NOW()
+           FROM jsonb_to_recordset($2::jsonb) AS input(
+                sandbox_id UUID,
+                execution_generation BIGINT,
+                pod_uid TEXT
+           )
+         ON CONFLICT (node_id, facet, element) DO UPDATE
+         SET observed_payload = (
+                 COALESCE(node_facet_observed_status.observed_payload, '{}'::JSONB)
+                 - $4::TEXT
+             ) || EXCLUDED.observed_payload,
+             observed_at = EXCLUDED.observed_at,
+             updated_at = NOW()
+         WHERE node_facet_observed_status.observed_payload -> $4::TEXT
+               IS DISTINCT FROM EXCLUDED.observed_payload -> $4::TEXT
+         RETURNING element"
+    ))
+    .bind(node_id)
+    .bind(Json(serde_json::Value::Array(input)))
+    .bind(FACET_SANDBOX_DESIRED_STATE)
+    .bind(SANDBOX_ABANDONED_ACTIVATION_KEY)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|error| Status::internal(format!("record abandoned activation runtime: {error}")))?;
+    recorded
+        .iter()
+        .map(|element| {
+            element.parse::<SandboxId>().map_err(|error| {
+                Status::internal(format!(
+                    "parse recorded abandoned activation {element}: {error}"
+                ))
+            })
+        })
+        .collect()
+}
+
+/// Withdraw the teardown request for every sandbox this publication reported
+/// on, except those still reporting an abandoned runtime. A sandbox the node
+/// reports absent, dormant, or legitimately owned again needs no teardown.
+pub(super) async fn withdraw_abandoned_activation_runtimes(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    reported: &[SandboxId],
+    still_abandoned: &[AbandonedActivationRuntime],
+) -> Result<(), Status> {
+    if reported.is_empty() {
+        return Ok(());
+    }
+    let reported = reported.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let still_abandoned = still_abandoned
+        .iter()
+        .map(|runtime| runtime.sandbox_id.to_string())
+        .collect::<Vec<_>>();
+    sqlx::query(sql!(
+        "UPDATE node_facet_observed_status
+            SET observed_payload = observed_payload - $5::TEXT,
+                observed_at = NOW(),
+                updated_at = NOW()
+          WHERE node_id = $1
+            AND facet = $2
+            AND element = ANY($3::TEXT[])
+            AND NOT (element = ANY($4::TEXT[]))
+            AND observed_payload ? $5::TEXT"
+    ))
+    .bind(node_id)
+    .bind(FACET_SANDBOX_DESIRED_STATE)
+    .bind(reported)
+    .bind(still_abandoned)
+    .bind(SANDBOX_ABANDONED_ACTIVATION_KEY)
+    .execute(&mut *conn)
+    .await
+    .map_err(|error| Status::internal(format!("withdraw abandoned activation runtime: {error}")))?;
+    Ok(())
 }
 
 /// Lock only rollback receipts that still own the active central execution.

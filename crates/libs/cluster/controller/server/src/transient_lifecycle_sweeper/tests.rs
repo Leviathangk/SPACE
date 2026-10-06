@@ -204,6 +204,13 @@ struct FakeSinkState {
     /// All unrestorable fail CAS attempts, in order. CAS claims unless the id
     /// is in `cas_unclaimed`.
     unrestorable_fail_calls: Vec<SandboxId>,
+    /// Abandoned-activation candidates returned by
+    /// `list_abandoned_activations`.
+    abandoned_activation_queue: Vec<AbandonedActivationCandidate>,
+    /// Abandoned-activation IDs whose retire should return Err.
+    abandoned_activation_failures: BTreeSet<SandboxId>,
+    /// Every abandoned-activation retire, with the fence it carried, in order.
+    abandoned_activation_retires: Vec<(SandboxId, RetireFence)>,
 }
 
 struct FakeSink(StdMutex<FakeSinkState>);
@@ -279,6 +286,22 @@ impl FakeSink {
             .unwrap()
             .cleanup_pod_identity_changed
             .insert(sandbox_id, mismatch);
+    }
+
+    fn enqueue_abandoned_activations(&self, candidates: Vec<AbandonedActivationCandidate>) {
+        self.0.lock().unwrap().abandoned_activation_queue = candidates;
+    }
+
+    fn fail_abandoned_activation_retire(&self, sandbox_id: SandboxId) {
+        self.0
+            .lock()
+            .unwrap()
+            .abandoned_activation_failures
+            .insert(sandbox_id);
+    }
+
+    fn abandoned_activation_retires(&self) -> Vec<(SandboxId, RetireFence)> {
+        self.0.lock().unwrap().abandoned_activation_retires.clone()
     }
 
     fn enqueue_failed_cleanup(&self, candidates: Vec<FailedCleanupCandidate>) {
@@ -641,6 +664,39 @@ impl SweepSink for FakeSink {
             .take(limit)
             .cloned()
             .collect())
+    }
+
+    async fn list_abandoned_activations(
+        &self,
+        batch_size: i64,
+    ) -> Result<Vec<AbandonedActivationCandidate>, sqlx::Error> {
+        let state = self.0.lock().unwrap();
+        let limit = usize::try_from(batch_size).unwrap_or(0);
+        Ok(state
+            .abandoned_activation_queue
+            .iter()
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
+    async fn retire_abandoned_activation(
+        &self,
+        sandbox_id: SandboxId,
+        fence: RetireFence,
+    ) -> Result<RetireExecutionOutcome, String> {
+        let mut state = self.0.lock().unwrap();
+        state.abandoned_activation_retires.push((sandbox_id, fence));
+        if state.abandoned_activation_failures.contains(&sandbox_id) {
+            return Err("simulated abandoned activation retire error".to_string());
+        }
+        if let Some(mismatch) = state.cleanup_pod_identity_changed.get(&sandbox_id).copied() {
+            return Ok(RetireExecutionOutcome::PodIdentityChanged {
+                mismatch,
+                progress: TeardownProgress::NothingMutated,
+            });
+        }
+        Ok(RetireExecutionOutcome::Retired)
     }
 
     async fn note_failed_cleanup_attempt(&self, sandbox_id: SandboxId) -> Result<(), sqlx::Error> {
@@ -2435,6 +2491,61 @@ async fn f3_failed_cleanup_pod_identity_defer_is_not_a_failure() {
     );
 }
 
+fn abandoned_activation_candidate(sandbox_id: SandboxId) -> AbandonedActivationCandidate {
+    let pod_name = format!("space-sbx-{}-g7", sandbox_id.as_uuid().simple());
+    AbandonedActivationCandidate {
+        sandbox_id,
+        node_id: pplx_space_common_core::types::NodeId::new(),
+        execution_generation: 7,
+        pod_fence: RetireFence::AbandonedActivation(
+            PodIdentityFence::new(PodName::parse(pod_name).unwrap())
+                .with_generation(7)
+                .with_pod_uid(PodUid::parse("uid-late").unwrap()),
+        ),
+    }
+}
+
+/// Every runtime a node reports for an abandoned activation is handed to the
+/// substrate under the fence the listing built, and one candidate's outcome
+/// never stops the next: a retire, a refused fence, and an error are each
+/// counted for what they are. The pass runs without the transient age-out.
+#[tokio::test(flavor = "current_thread")]
+async fn f5_abandoned_activation_pass_retires_each_reported_runtime_under_its_fence() {
+    let sink = FakeSink::new();
+    let retired = SandboxId::new();
+    let superseded = SandboxId::new();
+    let failing = SandboxId::new();
+    let candidates = vec![
+        abandoned_activation_candidate(failing),
+        abandoned_activation_candidate(superseded),
+        abandoned_activation_candidate(retired),
+    ];
+    sink.enqueue_abandoned_activations(candidates.clone());
+    sink.fail_abandoned_activation_retire(failing);
+    sink.set_cleanup_pod_identity_changed(superseded, PodFenceMismatch::ExecutionSuperseded);
+    let reconciler = Reconciler::new(
+        ReconcilerConfig {
+            enabled: false,
+            failed_cleanup_enabled: true,
+            ..ReconcilerConfig::default()
+        },
+        sink,
+    );
+
+    let report = reconciler.tick().await;
+
+    assert_eq!(report.abandoned_activation_retired, 1);
+    assert_eq!(report.abandoned_activation_pod_identity_deferred, 1);
+    assert_eq!(report.abandoned_activation_failures, 1);
+    assert_eq!(
+        reconciler.sink.abandoned_activation_retires(),
+        candidates
+            .into_iter()
+            .map(|candidate| (candidate.sandbox_id, candidate.pod_fence))
+            .collect::<Vec<_>>()
+    );
+}
+
 /// A lost fence must stop the reap before its CAS, not after. That CAS flips
 /// the row to `failed`, and the transition's trigger clears
 /// `command_ready_pending` — so running it and only then refusing the teardown
@@ -2529,7 +2640,8 @@ fn f5_only_an_observed_pod_yields_a_verifiable_fence() {
 mod postgres_backed {
 
     use super::super::store::{
-        AgedTransientRow, HEAL_COMMAND_READY_PENDING_SQL, LIST_COMMAND_READY_PENDING_SQL,
+        AbandonedActivationRow, AgedTransientRow, HEAL_COMMAND_READY_PENDING_SQL,
+        LIST_ABANDONED_ACTIVATIONS_SQL, LIST_COMMAND_READY_PENDING_SQL,
         REAP_COMMAND_READY_PENDING_SQL, REPAIR_FAILED_ACTIVE_EXECUTION_SQL,
         converge_restoring_query, fail_candidate_query, fail_unrestorable_restoring_query,
         list_aged_transient_query, list_unrestorable_restoring_query, revert_to_suspended_query,
@@ -2542,6 +2654,152 @@ mod postgres_backed {
     use sqlx::PgPool;
 
     use pplx_space_test_env::TestResult;
+
+    /// The teardown requests a node publication records are what this listing
+    /// reads back, re-checked against the row: a request is listed only while
+    /// the row is still `stopped`, no start holds the reported generation, and
+    /// no newer generation is active. A malformed element under the same key
+    /// cannot fail the listing for everyone else.
+    #[tokio::test(flavor = "current_thread")]
+    async fn abandoned_activation_listing_rechecks_the_row_behind_each_request() -> TestResult {
+        let Some(db) = try_pg_test_db().await? else {
+            return Ok(());
+        };
+        let node_id = NodeId::new();
+        pplx_space_db_test_fixtures::insert_ready_worker_node(&db.pool, node_id).await?;
+        sqlx::query(pplx_space_common_core::sql!(
+            "INSERT INTO node_facet_observed_status (
+                 node_id, facet, element, observed_payload, observed_at, updated_at
+             )
+             VALUES ($1, $2, 'not-a-sandbox-id', jsonb_build_object($3::TEXT, '{}'::JSONB),
+                     NOW(), NOW())"
+        ))
+        .bind(node_id)
+        .bind(pplx_space_common_svc::types::FACET_SANDBOX_DESIRED_STATE)
+        .bind(pplx_space_common_svc::types::SANDBOX_ABANDONED_ACTIVATION_KEY)
+        .execute(&db.pool)
+        .await?;
+
+        let mut expected_listed = Vec::new();
+        for (case, lifecycle, attempt_held, newer_generation_active, listed) in [
+            (
+                "retired attempt",
+                SandboxLifecycle::Stopped,
+                false,
+                false,
+                true,
+            ),
+            (
+                "row started since",
+                SandboxLifecycle::Started,
+                false,
+                false,
+                false,
+            ),
+            (
+                "start holds the attempt",
+                SandboxLifecycle::Stopped,
+                true,
+                false,
+                false,
+            ),
+            (
+                "newer generation active",
+                SandboxLifecycle::Stopped,
+                false,
+                true,
+                false,
+            ),
+        ] {
+            let sandbox_id = SandboxId::new();
+            let attempt_id = Uuid::now_v7();
+            insert_sandbox_with_lifecycle_and_managed_by(
+                &db.pool, sandbox_id, lifecycle, 60, "k8s",
+            )
+            .await?;
+            sqlx::query(pplx_space_common_core::sql!(
+                "INSERT INTO sandbox_k8s_executions (
+                     sandbox_id, generation, pod_name, pod_namespace, pod_uid, state, active,
+                     activation_attempt_id, activation_attempt_expires_at,
+                     activation_attempt_target_state, route_activation_id
+                 )
+                 VALUES ($1, 7, $2, 'sandboxes', 'uid-7', 'running', $3, $4,
+                         NOW() + INTERVAL '5 minutes', 'started', $4)"
+            ))
+            .bind(sandbox_id)
+            .bind(format!("space-sbx-{}-g7", sandbox_id.as_uuid().simple()))
+            .bind(attempt_held)
+            .bind(attempt_id)
+            .execute(&db.pool)
+            .await?;
+            if newer_generation_active {
+                sqlx::query(pplx_space_common_core::sql!(
+                    "INSERT INTO sandbox_k8s_executions (
+                         sandbox_id, generation, pod_name, pod_namespace, state, active
+                     )
+                     VALUES ($1, 8, $2, 'sandboxes', 'creating', TRUE)"
+                ))
+                .bind(sandbox_id)
+                .bind(format!("space-sbx-{}-g8", sandbox_id.as_uuid().simple()))
+                .execute(&db.pool)
+                .await?;
+            }
+            sqlx::query(pplx_space_common_core::sql!(
+                "INSERT INTO node_facet_observed_status (
+                     node_id, facet, element, observed_payload, observed_at, updated_at
+                 )
+                 VALUES ($1, $2, $3, jsonb_build_object(
+                     $4::TEXT,
+                     jsonb_build_object('execution_generation', 7, 'pod_uid', 'uid-7')
+                 ), NOW(), NOW())"
+            ))
+            .bind(node_id)
+            .bind(pplx_space_common_svc::types::FACET_SANDBOX_DESIRED_STATE)
+            .bind(sandbox_id.to_string())
+            .bind(pplx_space_common_svc::types::SANDBOX_ABANDONED_ACTIVATION_KEY)
+            .execute(&db.pool)
+            .await?;
+            if listed {
+                expected_listed.push((case, sandbox_id, attempt_id));
+            }
+        }
+
+        let rows: Vec<AbandonedActivationRow> = sqlx::query_as(LIST_ABANDONED_ACTIVATIONS_SQL)
+            .bind(pplx_space_common_svc::types::FACET_SANDBOX_DESIRED_STATE)
+            .bind(pplx_space_common_svc::types::SANDBOX_ABANDONED_ACTIVATION_KEY)
+            .bind("k8s")
+            .bind(100_i64)
+            .fetch_all(&db.pool)
+            .await?;
+
+        let listed = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.sandbox_id,
+                    row.node_id,
+                    row.generation,
+                    row.observed_pod_uid.as_str(),
+                    row.activation_attempt_id.map(|id| id.as_uuid()),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            listed,
+            expected_listed
+                .iter()
+                .map(|(_, sandbox_id, attempt_id)| {
+                    (*sandbox_id, node_id, 7, "uid-7", Some(*attempt_id))
+                })
+                .collect::<Vec<_>>(),
+            "only {:?} is still an abandoned activation",
+            expected_listed
+                .iter()
+                .map(|(case, ..)| *case)
+                .collect::<Vec<_>>()
+        );
+        Ok(())
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn split_operation_expired_stopped_row_has_no_transient_sweep_owner_proof() -> TestResult

@@ -14,10 +14,11 @@ use pplx_space_api::controllers::substrate::{
     sandbox_states_with_client,
 };
 use pplx_space_common_core::types::{
-    NodeManagedBy, NodeRole, PodName, PodUid, PositiveDuration, SandboxActivationAttemptId,
+    NodeId, NodeManagedBy, NodeRole, PodName, PodUid, PositiveDuration, SandboxActivationAttemptId,
     SandboxId, SandboxLifecycle,
 };
 use pplx_space_common_svc::sql::sandbox_routability::routable_execution_or_non_k8s;
+use pplx_space_common_svc::types::{FACET_SANDBOX_DESIRED_STATE, SANDBOX_ABANDONED_ACTIVATION_KEY};
 use pplx_space_metrics::cluster_reconciler::{HydrationOutcome, OutcomeEvent};
 use pplx_space_sandbox_portability::{
     fresh_ready_snapshot_exists, inflight_suspend_upload_exists,
@@ -28,7 +29,9 @@ use sqlx::PgPool;
 
 use super::classify::{ExecutionRoutability, ProbeObservation};
 use super::probe::{ProbeNodeError, SweepCandidate};
-use super::{CommandReadyPendingCandidate, FailedCleanupCandidate, SweepSink};
+use super::{
+    AbandonedActivationCandidate, CommandReadyPendingCandidate, FailedCleanupCandidate, SweepSink,
+};
 
 /// Max preserved `command_ready_pending` rows resolved per tick. Each costs one
 /// non-recovering guest probe (bounded by the configured probe timeout), so the
@@ -219,6 +222,112 @@ fn evacuation_guards(lifecycle: SandboxLifecycle) -> String {
         "AND (sandboxes.evacuation_restore_target IS NULL OR sandboxes.lifecycle = 'suspending')
             AND sandboxes.lifecycle_changed_at < NOW() - make_interval(secs => $3::BIGINT){restore_lease_quiet_guard}{recoverable_snapshot_guard}"
     )
+}
+
+/// Candidate query for the abandoned-activation pass. Bind order: `$1` =
+/// the sandbox desired-state facet, `$2` = the abandoned-activation key, `$3` =
+/// `managed_by`, `$4` = batch limit.
+///
+/// Requests are node-scoped facet observations, so the query walks nodes and
+/// reads each node's sandbox desired-state observations through the
+/// `(node_id, facet)` primary-key prefix rather than scanning every
+/// observation. The element is cast only after the `CASE` proves it is a UUID,
+/// so an unrelated element can never fail the whole listing. The row re-checks
+/// repeat the publication's guards, since the row can move on between the
+/// node's report and this tick. Ordered by `random()` for the reason
+/// [`LIST_COMMAND_READY_PENDING_SQL`] is: a request that keeps deferring
+/// stays in the set until its node stops reporting the runtime, and must not
+/// hold the front of every batch.
+pub(super) const LIST_ABANDONED_ACTIVATIONS_SQL: &str = sql!(
+    "SELECT s.id AS sandbox_id,
+            observed.node_id,
+            execution.generation,
+            execution.pod_name,
+            observed.pod_uid AS observed_pod_uid,
+            execution.activation_attempt_id,
+            NULLIF(BTRIM(execution.pod_uid), '') AS recorded_pod_uid,
+            execution.route_activation_id
+       FROM nodes node
+      CROSS JOIN LATERAL (
+            SELECT nfos.node_id,
+                   CASE
+                       WHEN nfos.element ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                       THEN nfos.element::UUID
+                   END AS sandbox_id,
+                   (nfos.observed_payload -> $2::TEXT ->> 'execution_generation')::BIGINT
+                       AS execution_generation,
+                   NULLIF(BTRIM(nfos.observed_payload -> $2::TEXT ->> 'pod_uid'), '')
+                       AS pod_uid,
+                   nfos.observed_at
+              FROM node_facet_observed_status nfos
+             WHERE nfos.node_id = node.id
+               AND nfos.facet = $1
+               AND nfos.observed_payload ? $2::TEXT
+        ) observed
+       JOIN sandboxes s ON s.id = observed.sandbox_id
+       JOIN sandbox_k8s_executions execution
+         ON execution.sandbox_id = s.id
+        AND execution.generation = observed.execution_generation
+      WHERE observed.pod_uid IS NOT NULL
+        AND s.managed_by = $3
+        AND s.managed_by = 'k8s'
+        AND LOWER(TRIM(s.lifecycle)) = 'stopped'
+        AND NOT (
+            execution.active
+            AND execution.activation_attempt_id IS NOT NULL
+            AND (
+                execution.activation_attempt_expires_at IS NULL
+                OR execution.activation_attempt_expires_at > NOW()
+            )
+        )
+        AND NOT EXISTS (
+            SELECT 1
+              FROM sandbox_k8s_executions newer
+             WHERE newer.sandbox_id = s.id
+               AND newer.active
+               AND newer.generation > execution.generation
+        )
+      ORDER BY random()
+      LIMIT $4"
+);
+
+/// Raw row shape of the abandoned-activation listing.
+#[derive(Debug, sqlx::FromRow)]
+pub(super) struct AbandonedActivationRow {
+    pub(super) sandbox_id: SandboxId,
+    pub(super) node_id: NodeId,
+    pub(super) generation: i64,
+    pub(super) pod_name: String,
+    pub(super) observed_pod_uid: String,
+    pub(super) activation_attempt_id: Option<SandboxActivationAttemptId>,
+    pub(super) recorded_pod_uid: Option<PodUid>,
+    pub(super) route_activation_id: Option<SandboxActivationAttemptId>,
+}
+
+/// The fence for an abandoned activation: the generation and pod UID its node
+/// reported, plus what the execution row said about itself, so a start that
+/// re-claims that generation in the meantime is refused.
+fn abandoned_activation_candidate(
+    row: AbandonedActivationRow,
+) -> Result<AbandonedActivationCandidate, String> {
+    let pod_name = PodName::parse(&row.pod_name).map_err(|error| error.to_string())?;
+    let pod_uid = PodUid::parse(&row.observed_pod_uid).map_err(|error| error.to_string())?;
+    let mut fence = PodIdentityFence::new(pod_name)
+        .with_generation(row.generation)
+        .with_recorded(RecordedExecution::Read {
+            pod_uid: row.recorded_pod_uid,
+            route_activation_id: row.route_activation_id,
+        })
+        .with_pod_uid(pod_uid);
+    if let Some(attempt_id) = row.activation_attempt_id {
+        fence = fence.with_activation_attempt(attempt_id);
+    }
+    Ok(AbandonedActivationCandidate {
+        sandbox_id: row.sandbox_id,
+        node_id: row.node_id,
+        execution_generation: row.generation,
+        pod_fence: RetireFence::AbandonedActivation(fence),
+    })
 }
 
 /// Raw row shape of the failed-cleanup listing.
@@ -1223,6 +1332,47 @@ impl SweepSink for SubstrateSweepSink {
     }
 
     async fn cleanup_failed_execution(
+        &self,
+        sandbox_id: SandboxId,
+        fence: RetireFence,
+    ) -> Result<RetireExecutionOutcome, String> {
+        self.substrate
+            .retire_execution(RetireExecutionRequest { sandbox_id, fence })
+            .await
+            .map_err(|err| err.to_string())
+    }
+
+    async fn list_abandoned_activations(
+        &self,
+        batch_size: i64,
+    ) -> Result<Vec<AbandonedActivationCandidate>, sqlx::Error> {
+        let managed_by = self.substrate.managed_by();
+        let rows: Vec<AbandonedActivationRow> = sqlx::query_as(LIST_ABANDONED_ACTIVATIONS_SQL)
+            .bind(FACET_SANDBOX_DESIRED_STATE)
+            .bind(SANDBOX_ABANDONED_ACTIVATION_KEY)
+            .bind(managed_by)
+            .bind(batch_size)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let sandbox_id = row.sandbox_id;
+                abandoned_activation_candidate(row)
+                    .inspect_err(|error| {
+                        tracing::warn!(
+                            sandbox_id = %sandbox_id,
+                            %error,
+                            "transient_lifecycle_sweeper: abandoned activation names no \
+                             fenceable pod; leaving its runtime untouched"
+                        );
+                    })
+                    .ok()
+            })
+            .collect())
+    }
+
+    async fn retire_abandoned_activation(
         &self,
         sandbox_id: SandboxId,
         fence: RetireFence,

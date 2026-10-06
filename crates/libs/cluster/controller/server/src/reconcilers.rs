@@ -371,7 +371,9 @@ pub async fn run_reconcilers(
     // time any sandbox row can sit in a transient lifecycle (creating /
     // starting / pausing / resuming / suspending / restoring / stopping /
     // checkpointing). The same loop can also retry cleanup for k8s sandboxes
-    // already marked failed but still carrying active execution rows. Runs for
+    // already marked failed but still carrying active execution rows, and
+    // retire runtimes nodes report for abandoned activations behind stopped
+    // rows. Runs for
     // both substrates because a stuck row outside any drain context still
     // wedges future operations on the row, and the sink only needs DB access +
     // `SubstrateAdapter::delete_execution`, both of which the `Substrate` enum

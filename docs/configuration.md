@@ -28,7 +28,7 @@ because disabling it by mistake would leave every create queued forever.
 | --- | --- | --- |
 | `SPACE_FAILED_RESTORABLE_REPAIR_ENABLED` | on | Reverts failed restorable sandboxes. |
 | `SPACE_STARTED_SANDBOX_REPAIR_ENABLED` | on | |
-| `SPACE_FAILED_SANDBOX_CLEANUP_ENABLED` | on | Part of the transient lifecycle sweeper. |
+| `SPACE_FAILED_SANDBOX_CLEANUP_ENABLED` | on | Part of the transient lifecycle sweeper. Also retires a VM that boots behind a `stopped` row after its start was abandoned. |
 | `SPACE_INTERNAL_API_DELETED_PARTITION_ENABLED` | on | |
 | `SPACE_INTERNAL_API_DELETED_SUPPRESS_ABSOLUTE` | 500 | |
 | `SPACE_KUBE_NODE_SYNC_ENABLED` | on | |

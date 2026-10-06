@@ -113,6 +113,17 @@
 //! [`ProbeVerdict::permits_failed_retire`]). Attempts rotate by
 //! `sandbox_k8s_executions.updated_at` so a persistently bad row cannot
 //! starve later failed sandboxes.
+//!
+//! Under the same gate, the sweeper retires runtimes that nodes report for
+//! starts the control plane already abandoned. A start that fails reports the
+//! failure and leaves the row `stopped`, but its last pod can keep retrying and
+//! boot later. The node's publication of that running VM records a teardown
+//! request, fenced on the generation and pod UID it reported; this pass hands
+//! each request to [`SubstrateAdapter::retire_execution`] with a
+//! [`RetireFence::AbandonedActivation`], which stops the VM and deletes its pod
+//! while the row stays `stopped`. The request is withdrawn once the node stops
+//! reporting the runtime, and the pass leaves the sandbox alone once a newer
+//! start owns it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -121,7 +132,7 @@ use std::time::{Duration, Instant};
 use pplx_space_api::controllers::substrate::{
     CommandReadyProbe, PodFenceMismatch, RetireExecutionOutcome, RetireFence, Substrate,
 };
-use pplx_space_common_core::types::{PositiveDuration, SandboxId, SandboxLifecycle};
+use pplx_space_common_core::types::{NodeId, PositiveDuration, SandboxId, SandboxLifecycle};
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
@@ -301,6 +312,9 @@ enum CleanupPass {
     /// Retire retried against an authoritative `failed` row that still has an
     /// active execution.
     FailedCleanup,
+    /// Retire of a runtime its node still reports for a start the control
+    /// plane abandoned, behind an authoritative `stopped` row.
+    AbandonedActivation,
 }
 
 impl CleanupPass {
@@ -309,6 +323,7 @@ impl CleanupPass {
             Self::RevertToSuspended | Self::TransientAgeOut => "transient_lifecycle_sweep",
             Self::CommandReadyReap => "command_ready_pending_sweep",
             Self::FailedCleanup => "failed_sandbox_active_execution_cleanup",
+            Self::AbandonedActivation => ABANDONED_ACTIVATION_CLEANUP_OPERATION,
         }
     }
 
@@ -327,6 +342,10 @@ impl CleanupPass {
                 "cleanup deferred; the next pass re-reads the execution and fences on \
                  whatever is current"
             }
+            Self::AbandonedActivation => {
+                "row stays stopped; the runtime is retried while its node keeps reporting \
+                 it, and left alone once a newer start owns the sandbox"
+            }
         }
     }
 
@@ -336,6 +355,9 @@ impl CleanupPass {
                 report.cleanup_pod_identity_deferred += 1;
             }
             Self::FailedCleanup => report.failed_cleanup_pod_identity_deferred += 1,
+            Self::AbandonedActivation => {
+                report.abandoned_activation_pod_identity_deferred += 1;
+            }
         }
     }
 }
@@ -365,7 +387,7 @@ fn note_cleanup_pod_identity_deferral(
         .trigger(SandboxEventTrigger::System)
         .with_from_state(from_state)
         .result(mismatch.as_str());
-    if let RetireFence::Pod(fence) = fence {
+    if let RetireFence::Pod(fence) | RetireFence::AbandonedActivation(fence) = fence {
         details = details.pod_name(fence.pod_name.as_str());
         if let Some(pod_uid) = fence.pod_uid.as_ref() {
             details = details.pod_uid(pod_uid.as_str());
@@ -428,6 +450,44 @@ fn emit_failed_cleanup_event(
 
     SandboxEvent::new(
         sandbox_id,
+        event_type,
+        SandboxEventSource::ClusterController,
+    )
+    .emit_with(details);
+}
+
+/// The operation label of the abandoned-activation teardown pass.
+const ABANDONED_ACTIVATION_CLEANUP_OPERATION: &str = "abandoned_activation_cleanup";
+/// Why the abandoned-activation pass retires a runtime behind a `stopped` row.
+const ABANDONED_ACTIVATION_REASON: &str = "abandoned_activation";
+
+fn emit_abandoned_activation_cleanup_event(
+    candidate: &AbandonedActivationCandidate,
+    event_type: SandboxEventType,
+    result: Option<&str>,
+    error: Option<String>,
+) {
+    let mut details = SandboxEventDetails::default()
+        .reason(ABANDONED_ACTIVATION_REASON)
+        .operation(ABANDONED_ACTIVATION_CLEANUP_OPERATION)
+        .trigger(SandboxEventTrigger::System)
+        .lifecycle_state(SandboxLifecycle::Stopped.as_str())
+        .execution_generation(candidate.execution_generation.to_string())
+        .source_node_id(candidate.node_id.to_string());
+    if let RetireFence::AbandonedActivation(fence) = &candidate.pod_fence {
+        details = details.pod_name(fence.pod_name.as_str());
+        if let Some(pod_uid) = fence.pod_uid.as_ref() {
+            details = details.pod_uid(pod_uid.as_str());
+        }
+    }
+    if let Some(result) = result {
+        details = details.result(result);
+    }
+    if let Some(error) = error {
+        details = details.error(error);
+    }
+    SandboxEvent::new(
+        candidate.sandbox_id,
         event_type,
         SandboxEventSource::ClusterController,
     )
@@ -635,9 +695,10 @@ pub struct ReconcilerConfig {
     /// sweep and the failed-cleanup probe gate.
     pub probe_timeout: Duration,
     /// When true, retry cleanup for authoritative `failed` k8s sandboxes
-    /// that still have an active `sandbox_k8s_executions` row. This is
-    /// intentionally independent from `enabled`: operators can run only
-    /// failed cleanup without enabling transient lifecycle age-out.
+    /// that still have an active `sandbox_k8s_executions` row, and retire
+    /// runtimes nodes report for abandoned activations behind `stopped` rows.
+    /// This is intentionally independent from `enabled`: operators can run
+    /// only these cleanups without enabling transient lifecycle age-out.
     pub failed_cleanup_enabled: bool,
     pub failed_cleanup_batch_size: i64,
     /// When true, probe-and-resolve preserved `started` +
@@ -849,6 +910,20 @@ pub struct CommandReadyPendingCandidate {
     /// exposed of the three: the guest probe it acts on says nothing about the
     /// pod, and a create that finally converged between probe and retire looks
     /// identical to one that never will.
+    pub pod_fence: RetireFence,
+}
+
+/// A runtime a node still reports for a start the control plane abandoned,
+/// behind an authoritative `stopped` row, as the node's publication recorded
+/// it and the row still confirms it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbandonedActivationCandidate {
+    pub sandbox_id: SandboxId,
+    /// The node that reported the runtime.
+    pub node_id: NodeId,
+    pub execution_generation: i64,
+    /// Always [`RetireFence::AbandonedActivation`], pinned to the generation
+    /// and pod UID the node reported.
     pub pod_fence: RetireFence,
 }
 
@@ -1099,6 +1174,25 @@ pub trait SweepSink: Send + Sync + 'static {
         fence: RetireFence,
     ) -> impl std::future::Future<Output = Result<RetireExecutionOutcome, String>> + Send;
 
+    /// List runtimes nodes still report for abandoned activations behind
+    /// `stopped` rows, sampled so that requests which keep deferring cannot
+    /// starve the rest of the batch. Each candidate is re-checked
+    /// against the row: still `stopped`, no unexpired attempt on the reported
+    /// generation, and no newer generation active.
+    fn list_abandoned_activations(
+        &self,
+        batch_size: i64,
+    ) -> impl std::future::Future<Output = Result<Vec<AbandonedActivationCandidate>, sqlx::Error>> + Send;
+
+    /// Retire one abandoned activation's runtime under its fence: stop the
+    /// VM and delete its pod, leaving the row `stopped`. A refused fence is a
+    /// defer, not a failure.
+    fn retire_abandoned_activation(
+        &self,
+        sandbox_id: SandboxId,
+        fence: RetireFence,
+    ) -> impl std::future::Future<Output = Result<RetireExecutionOutcome, String>> + Send;
+
     /// CAS-repair a `failed` k8s sandbox that still has an active execution
     /// and whose owning node reports the sandbox as live and `started`.
     /// Returns whether the row was claimed; a concurrent lifecycle transition
@@ -1186,6 +1280,12 @@ pub struct TickReport {
     /// cleanup.
     pub failed_cleanup_repair_cas_lost: usize,
     pub failed_cleanup_repair_failures: usize,
+    /// Abandoned activations whose runtime was stopped and pod deleted.
+    pub abandoned_activation_retired: usize,
+    pub abandoned_activation_failures: usize,
+    /// Abandoned-activation retires the substrate refused on pod identity:
+    /// a newer start owns the sandbox, or the reported pod was replaced.
+    pub abandoned_activation_pod_identity_deferred: usize,
     pub command_ready_healed: usize,
     pub command_ready_reaped: usize,
     pub command_ready_deferred: usize,
@@ -1214,6 +1314,7 @@ impl<S: SweepSink> Reconciler<S> {
         }
         if self.config.failed_cleanup_enabled {
             self.cleanup_failed_active_executions(&mut report).await;
+            self.retire_abandoned_activations(&mut report).await;
         }
         if self.config.command_ready_pending_enabled {
             self.sweep_command_ready_pending(&mut report).await;
@@ -2508,6 +2609,87 @@ impl<S: SweepSink> Reconciler<S> {
                         SandboxEventType::CleanupFailed,
                         Some("failed"),
                         Some(error.clone()),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Retire runtimes that nodes report for starts the control plane already
+    /// abandoned. The row stays `stopped` throughout: the start was reported to
+    /// its client as failed, so its late runtime is retired, never adopted.
+    /// No probe gate: the evidence is the node's own report of a live runtime,
+    /// and the substrate re-proves the pod identity before acting.
+    async fn retire_abandoned_activations(&self, report: &mut TickReport) {
+        let candidates = match self
+            .sink
+            .list_abandoned_activations(self.config.failed_cleanup_batch_size)
+            .await
+        {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "transient_lifecycle_sweeper: list abandoned activations failed"
+                );
+                return;
+            }
+        };
+        for candidate in candidates {
+            let sandbox_id = candidate.sandbox_id;
+            emit_abandoned_activation_cleanup_event(
+                &candidate,
+                SandboxEventType::CleanupStarted,
+                None,
+                None,
+            );
+            match self
+                .sink
+                .retire_abandoned_activation(sandbox_id, candidate.pod_fence.clone())
+                .await
+            {
+                Ok(RetireExecutionOutcome::Retired) => {
+                    OutcomeEvent::substrate_cleanup(
+                        CleanupOutcome::Completed,
+                        SandboxLifecycle::Stopped.as_str(),
+                    )
+                    .sandbox_id(sandbox_id)
+                    .reason(ABANDONED_ACTIVATION_REASON)
+                    .info();
+                    report.abandoned_activation_retired += 1;
+                    emit_abandoned_activation_cleanup_event(
+                        &candidate,
+                        SandboxEventType::CleanupCompleted,
+                        Some("ok"),
+                        None,
+                    );
+                }
+                Ok(RetireExecutionOutcome::PodIdentityChanged { mismatch, .. }) => {
+                    note_cleanup_pod_identity_deferral(
+                        sandbox_id,
+                        CleanupPass::AbandonedActivation,
+                        SandboxLifecycle::Stopped.as_str(),
+                        &candidate.pod_fence,
+                        mismatch,
+                        report,
+                    );
+                }
+                Err(error) => {
+                    OutcomeEvent::substrate_cleanup(
+                        CleanupOutcome::Error,
+                        SandboxLifecycle::Stopped.as_str(),
+                    )
+                    .sandbox_id(sandbox_id)
+                    .reason(ABANDONED_ACTIVATION_REASON)
+                    .error(&error)
+                    .detail("runtime left running; retried while its node keeps reporting it")
+                    .warn();
+                    report.abandoned_activation_failures += 1;
+                    emit_abandoned_activation_cleanup_event(
+                        &candidate,
+                        SandboxEventType::CleanupFailed,
+                        Some("failed"),
+                        Some(error),
                     );
                 }
             }

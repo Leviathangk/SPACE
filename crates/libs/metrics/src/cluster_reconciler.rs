@@ -316,6 +316,9 @@ impl FailedCleanupOutcome {
 /// Best-effort substrate cleanup outcome (`sweep:substrate_cleanup`). No
 /// lifecycle transition: the flip already happened; this meters the teardown
 /// that follows it. `from_lifecycle` carries whose cleanup it was.
+/// `from_lifecycle:stopped` with `reason:abandoned_activation` is the retire of
+/// a runtime its node still reports for a start the control plane abandoned;
+/// that row stays `stopped`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CleanupOutcome {
     Completed,

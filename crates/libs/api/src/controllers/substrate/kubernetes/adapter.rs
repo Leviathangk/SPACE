@@ -453,7 +453,24 @@ fn fenced_runtime_pod_ip(
     if is_suspended_lifecycle(lifecycle) || execution_pod_lookup_in_flight(state) {
         return None;
     }
-    let live_pod = live_pod?;
+    live_pod_runtime_ip(live_pod?)
+}
+
+/// Where the execution generation named by a
+/// [`RetireFence::AbandonedActivation`] stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbandonedActivationExecution {
+    /// It is still the sandbox's active execution.
+    Active,
+    /// It was retired and no execution is active.
+    Retired,
+    /// A different generation is active.
+    Superseded,
+}
+
+/// The address of the runtime a live pod carries, or `None` when the pod is
+/// going away, has finished, or never reached a node.
+fn live_pod_runtime_ip(live_pod: &Pod) -> Option<PodIp> {
     if live_pod.metadata.deletion_timestamp.is_some()
         || terminal_pod_phase(live_pod.status.as_ref()).is_some()
         || pod_unschedulable_message(live_pod.status.as_ref()).is_some()
@@ -1303,6 +1320,121 @@ impl KubernetesSubstrate {
         }
     }
 
+    /// The in-VM half of a teardown, addressed to the runtime behind `pod_ip`.
+    ///
+    /// Retire preserves the stopped local disk by stopping the runtime and
+    /// enqueueing an explicit current-instance backup before pod tracking is
+    /// forgotten. Once tracking is inactive, the failed-cleanup retry scan no
+    /// longer has a source execution to address; abort on stop/backup failure
+    /// so the retry loop keeps the pod and execution row visible. Delete goes
+    /// straight to sbx-mgr's guarded delete: a pre-delete Stop would turn an
+    /// in-flight `Suspending` row into `Stopping` and erase the publication
+    /// fence.
+    async fn run_in_vm_teardown(
+        &self,
+        sandbox_id: SandboxId,
+        pod_ip: PodIp,
+        mode: ExecutionTeardown,
+    ) -> Result<TeardownProgress, SubstrateError> {
+        let mut progress = TeardownProgress::NothingMutated;
+        let endpoint_addr = format!("{pod_ip}:{}", self.k8s.sandbox_proxy_port);
+        let client = Self::pod_worker_client(
+            pod_ip,
+            self.k8s.sandbox_proxy_port,
+            POD_WORKER_CONNECT_TIMEOUT,
+        )
+        .await;
+        if let Some(mut client) = client {
+            if mode.sends_sandbox_stop() {
+                let stop_result = client
+                    .stop_sandbox(pplx_space_sbx_mgr_client::proto::StopRequest {
+                        sandbox_id: sandbox_id.to_string(),
+                        template_filter: None,
+                        blocking: true,
+                        immediate_kill: false,
+                    })
+                    .await;
+                if let Err(err) = stop_result {
+                    return Err(SubstrateError::Failed {
+                        message: format!(
+                            "in-VM stop failed during execution retire; keeping execution tracked for retry: {err}"
+                        ),
+                    });
+                }
+                // Past this point the sandbox is stopped whatever any
+                // later fence check says, so a refusal from here on must
+                // not read as "nothing happened".
+                progress = TeardownProgress::RuntimeStopped;
+                match enqueue_artifact_backup_with_client(
+                    &mut client,
+                    &endpoint_addr,
+                    sandbox_id,
+                    ArtifactKind::Disk,
+                    BackupSource::CurrentInstance,
+                )
+                .await
+                {
+                    Ok(_) => {}
+                    Err(err) if retire_can_skip_backup_enqueue_error(&err) => {
+                        tracing::info!(
+                            sandbox_id = %sandbox_id,
+                            error = %err,
+                            "stopped-disk backup skipped during execution retire because \
+                             sbx-mgr has no sandbox row or terminally refused the backup"
+                        );
+                    }
+                    Err(err) => {
+                        return Err(SubstrateError::Failed {
+                            message: format!(
+                                "stopped-disk backup enqueue failed during execution retire; keeping execution tracked for retry: {err}"
+                            ),
+                        });
+                    }
+                }
+            }
+            if mode.sends_sandbox_delete()
+                && let Err(error) = client
+                    .delete_sandbox(pplx_space_sbx_mgr_client::proto::DeleteRequest {
+                        sandbox_id: sandbox_id.to_string(),
+                        template_filter: None,
+                        blocking: true,
+                    })
+                    .await
+            {
+                match classify_sandbox_delete_rpc_error(&error) {
+                    SandboxDeleteRpcErrorDisposition::DeferTeardown => {
+                        return Err(SubstrateError::SuspendInFlight {
+                            message: format!(
+                                "sandbox {sandbox_id} node-local delete deferred while suspend publication is pending: {error}"
+                            ),
+                        });
+                    }
+                    SandboxDeleteRpcErrorDisposition::RetainedFilesystemOnlyCopy => {
+                        return Err(SubstrateError::RetainedFilesystemOnlyCopy {
+                            message: format!(
+                                "sandbox {sandbox_id} node-local delete refused because the retained filesystem may be the only copy: {error}"
+                            ),
+                        });
+                    }
+                    SandboxDeleteRpcErrorDisposition::ContinueTeardown => {
+                        tracing::warn!(
+                            sandbox_id = %sandbox_id,
+                            error = %error,
+                            "best-effort sandbox delete RPC failed during execution teardown"
+                        );
+                    }
+                }
+            }
+        } else if mode.requires_stop_success() {
+            return Err(SubstrateError::Failed {
+                message: "pod worker unreachable for in-VM stop during execution retire; \
+                          keeping execution tracked for retry"
+                    .to_string(),
+            });
+        }
+        Ok(progress)
+    }
+
     /// Shared body of [`SubstrateAdapter::delete_execution`] and
     /// [`SubstrateAdapter::retire_execution`]; `mode` decides whether the
     /// in-VM cleanup also destroys node-local sandbox state, and `fence` pins
@@ -1315,8 +1447,8 @@ impl KubernetesSubstrate {
         fence: &RetireFence,
     ) -> Result<RetireExecutionOutcome, SubstrateError> {
         let sandbox_uuid = sandbox_id;
-        let pod_fence = match fence {
-            RetireFence::Unobserved => None,
+        let (pod_fence, abandoned_activation) = match fence {
+            RetireFence::Unobserved => (None, false),
             RetireFence::NoExecution => {
                 // Having observed no execution authorizes exactly one thing:
                 // clearing the placement state such a sandbox is left holding.
@@ -1325,13 +1457,42 @@ impl KubernetesSubstrate {
                 // include a successor's.
                 return self.retire_with_no_active_execution(sandbox_id, mode).await;
             }
-            RetireFence::Pod(pod_fence) => Some(pod_fence),
+            RetireFence::Pod(pod_fence) => (Some(pod_fence), false),
+            RetireFence::AbandonedActivation(pod_fence) => {
+                match self
+                    .abandoned_activation_execution(sandbox_id, pod_fence)
+                    .await?
+                {
+                    AbandonedActivationExecution::Active => (Some(pod_fence), true),
+                    AbandonedActivationExecution::Retired => {
+                        return self
+                            .retire_abandoned_runtime(sandbox_id, mode, pod_fence)
+                            .await;
+                    }
+                    AbandonedActivationExecution::Superseded => {
+                        return Ok(self.refuse_fenced_teardown(
+                            sandbox_id,
+                            pod_fence,
+                            PodFenceMismatch::ExecutionSuperseded,
+                            TeardownProgress::NothingMutated,
+                        ));
+                    }
+                }
+            }
         };
         let fenced = match pod_fence {
             Some(pod_fence) => match self
                 .check_pod_fence(sandbox_id, pod_fence, FenceReadFreshness::CacheIsEnough)
                 .await?
             {
+                // The abandoned generation was retired since it was found
+                // active. Its pod is no longer tracked, but its runtime may
+                // still be live and must be stopped rather than released.
+                PodFenceCheck::AlreadyRetired if abandoned_activation => {
+                    return self
+                        .retire_abandoned_runtime(sandbox_id, mode, pod_fence)
+                        .await;
+                }
                 PodFenceCheck::AlreadyRetired => {
                     return self.retire_with_no_active_execution(sandbox_id, mode).await;
                 }
@@ -1374,109 +1535,7 @@ impl KubernetesSubstrate {
         // own transition is still honest.
         let mut progress = TeardownProgress::NothingMutated;
         if let Some(pod_ip) = pod_ip {
-            // Retire preserves the stopped local disk by stopping the runtime
-            // and enqueueing an explicit current-instance backup before pod
-            // tracking is forgotten. Once tracking is inactive, the
-            // failed-cleanup retry scan no longer has a source execution to
-            // address; abort on stop/backup failure so the retry loop keeps the
-            // pod and execution row visible. Delete goes straight to sbx-mgr's
-            // guarded delete: a pre-delete Stop would turn an in-flight
-            // `Suspending` row into `Stopping` and erase the publication fence.
-            let endpoint_addr = format!("{pod_ip}:{}", self.k8s.sandbox_proxy_port);
-            let client = Self::pod_worker_client(
-                pod_ip,
-                self.k8s.sandbox_proxy_port,
-                POD_WORKER_CONNECT_TIMEOUT,
-            )
-            .await;
-            if let Some(mut client) = client {
-                if mode.sends_sandbox_stop() {
-                    let stop_result = client
-                        .stop_sandbox(pplx_space_sbx_mgr_client::proto::StopRequest {
-                            sandbox_id: sandbox_id.to_string(),
-                            template_filter: None,
-                            blocking: true,
-                            immediate_kill: false,
-                        })
-                        .await;
-                    if let Err(err) = stop_result {
-                        return Err(SubstrateError::Failed {
-                            message: format!(
-                                "in-VM stop failed during execution retire; keeping execution tracked for retry: {err}"
-                            ),
-                        });
-                    }
-                    // Past this point the sandbox is stopped whatever any
-                    // later fence check says, so a refusal from here on must
-                    // not read as "nothing happened".
-                    progress = TeardownProgress::RuntimeStopped;
-                    match enqueue_artifact_backup_with_client(
-                        &mut client,
-                        &endpoint_addr,
-                        sandbox_id,
-                        ArtifactKind::Disk,
-                        BackupSource::CurrentInstance,
-                    )
-                    .await
-                    {
-                        Ok(_) => {}
-                        Err(err) if retire_can_skip_backup_enqueue_error(&err) => {
-                            tracing::info!(
-                                sandbox_id = %sandbox_id,
-                                error = %err,
-                                "stopped-disk backup skipped during execution retire because \
-                                 sbx-mgr has no sandbox row or terminally refused the backup"
-                            );
-                        }
-                        Err(err) => {
-                            return Err(SubstrateError::Failed {
-                                message: format!(
-                                    "stopped-disk backup enqueue failed during execution retire; keeping execution tracked for retry: {err}"
-                                ),
-                            });
-                        }
-                    }
-                }
-                if mode.sends_sandbox_delete()
-                    && let Err(error) = client
-                        .delete_sandbox(pplx_space_sbx_mgr_client::proto::DeleteRequest {
-                            sandbox_id: sandbox_id.to_string(),
-                            template_filter: None,
-                            blocking: true,
-                        })
-                        .await
-                {
-                    match classify_sandbox_delete_rpc_error(&error) {
-                        SandboxDeleteRpcErrorDisposition::DeferTeardown => {
-                            return Err(SubstrateError::SuspendInFlight {
-                                message: format!(
-                                    "sandbox {sandbox_id} node-local delete deferred while suspend publication is pending: {error}"
-                                ),
-                            });
-                        }
-                        SandboxDeleteRpcErrorDisposition::RetainedFilesystemOnlyCopy => {
-                            return Err(SubstrateError::RetainedFilesystemOnlyCopy {
-                                message: format!(
-                                    "sandbox {sandbox_id} node-local delete refused because the retained filesystem may be the only copy: {error}"
-                                ),
-                            });
-                        }
-                        SandboxDeleteRpcErrorDisposition::ContinueTeardown => {
-                            tracing::warn!(
-                                sandbox_id = %sandbox_id,
-                                error = %error,
-                                "best-effort sandbox delete RPC failed during execution teardown"
-                            );
-                        }
-                    }
-                }
-            } else if mode.requires_stop_success() {
-                return Err(SubstrateError::Failed {
-                    message: "pod worker unreachable for in-VM stop during execution retire; \
-                              keeping execution tracked for retry"
-                        .to_string(),
-                });
-            }
+            progress = self.run_in_vm_teardown(sandbox_id, pod_ip, mode).await?;
         }
 
         let placement_clock = if mode.preserves_placement_freshness() {
@@ -1724,6 +1783,109 @@ impl KubernetesSubstrate {
                      treating it as replaced, which is the half that defers"
                 );
                 PodFenceMismatch::DeletePreconditionRejected
+            }
+        }
+    }
+
+    /// Where the generation an abandoned-activation fence names stands now.
+    async fn abandoned_activation_execution(
+        &self,
+        sandbox_id: SandboxId,
+        fence: &PodIdentityFence,
+    ) -> Result<AbandonedActivationExecution, SubstrateError> {
+        Ok(
+            match self.store.active_execution_status(sandbox_id).await? {
+                None => AbandonedActivationExecution::Retired,
+                Some(active) if fence.generation == Some(active.generation) => {
+                    AbandonedActivationExecution::Active
+                }
+                Some(_) => AbandonedActivationExecution::Superseded,
+            },
+        )
+    }
+
+    /// Stop and delete the runtime of an abandoned activation whose execution
+    /// generation has already been retired, with no successor active.
+    ///
+    /// Nothing tracks this pod any more, so the apiserver is the only authority
+    /// on whether it is still the object the node reported: it is re-read
+    /// uncached and must carry the fenced UID. Its runtime is stopped through
+    /// the pod before the pod is deleted. A deletion alone would make the node
+    /// durably suspend a live VM, which neither matches the `stopped` row nor
+    /// succeeds when the sandbox's state can no longer be sealed. Once stopped,
+    /// the node releases the pod and keeps the stopped disk, as for any retire.
+    ///
+    /// Placement is left as the retirement left it: the row already holds no
+    /// active node, and its target node still names where the stopped disk is.
+    async fn retire_abandoned_runtime(
+        &self,
+        sandbox_id: SandboxId,
+        mode: ExecutionTeardown,
+        fence: &PodIdentityFence,
+    ) -> Result<RetireExecutionOutcome, SubstrateError> {
+        let Some(fenced_uid) = fence.pod_uid.as_ref() else {
+            return Ok(self.refuse_fenced_teardown(
+                sandbox_id,
+                fence,
+                PodFenceMismatch::PodIdentityUnverified,
+                TeardownProgress::NothingMutated,
+            ));
+        };
+        let Some(live_pod) = fetch_sandbox_pod_uncached(&self.k8s, fence.pod_name.as_str())
+            .await
+            .map_err(|err| SubstrateError::Failed {
+                message: format!("failed to read an abandoned activation's pod: {err}"),
+            })?
+        else {
+            return Ok(RetireExecutionOutcome::Retired);
+        };
+        if live_pod.metadata.uid.as_deref() != Some(fenced_uid.as_str()) {
+            return Ok(self.refuse_fenced_teardown(
+                sandbox_id,
+                fence,
+                PodFenceMismatch::PodUidChanged,
+                TeardownProgress::NothingMutated,
+            ));
+        }
+        let mut progress = TeardownProgress::NothingMutated;
+        if let Some(pod_ip) = live_pod_runtime_ip(&live_pod) {
+            // The stop addresses the sandbox, so re-prove as late as possible
+            // that no start has claimed it since the generation was found
+            // retired. A start that claims it between this read and the stop
+            // can still find the runtime stopped and must retry: the same
+            // window the tracked retire accepts between its fence check and
+            // its stop.
+            if self
+                .store
+                .active_execution_status(sandbox_id)
+                .await?
+                .is_some()
+            {
+                return Ok(self.refuse_fenced_teardown(
+                    sandbox_id,
+                    fence,
+                    PodFenceMismatch::ExecutionMissing,
+                    TeardownProgress::NothingMutated,
+                ));
+            }
+            progress = self.run_in_vm_teardown(sandbox_id, pod_ip, mode).await?;
+        }
+        // UID only: the stop moves the pod's resourceVersion on, and an
+        // inactive generation's pod is not adoptable by anything that could
+        // have moved it.
+        match delete_sandbox_pod_fenced(&self.k8s, &fence.pod_name, fenced_uid, None)
+            .await
+            .map_err(|err| SubstrateError::Failed {
+                message: format!("failed to delete an abandoned activation's pod: {err}"),
+            })? {
+            FencedPodDeleteOutcome::Deleted | FencedPodDeleteOutcome::NotFound => {
+                Ok(RetireExecutionOutcome::Retired)
+            }
+            FencedPodDeleteOutcome::PreconditionFailed => {
+                let mismatch = self
+                    .classify_delete_precondition_rejection(fenced_uid, &fence.pod_name)
+                    .await;
+                Ok(self.refuse_fenced_teardown(sandbox_id, fence, mismatch, progress))
             }
         }
     }
@@ -2674,6 +2836,30 @@ impl SubstrateAdapter for KubernetesSubstrate {
                     // it has already happened.
                     PodFenceCheck::Holds(_) | PodFenceCheck::AlreadyRetired => Ok(None),
                     PodFenceCheck::Mismatch(mismatch) => Ok(Some(mismatch)),
+                }
+            }
+            RetireFence::AbandonedActivation(pod_fence) => {
+                match self
+                    .abandoned_activation_execution(sandbox_id, pod_fence)
+                    .await?
+                {
+                    AbandonedActivationExecution::Active => {
+                        match self
+                            .check_pod_fence(
+                                sandbox_id,
+                                pod_fence,
+                                FenceReadFreshness::MustBeAuthoritative,
+                            )
+                            .await?
+                        {
+                            PodFenceCheck::Holds(_) | PodFenceCheck::AlreadyRetired => Ok(None),
+                            PodFenceCheck::Mismatch(mismatch) => Ok(Some(mismatch)),
+                        }
+                    }
+                    AbandonedActivationExecution::Retired => Ok(None),
+                    AbandonedActivationExecution::Superseded => {
+                        Ok(Some(PodFenceMismatch::ExecutionSuperseded))
+                    }
                 }
             }
         }

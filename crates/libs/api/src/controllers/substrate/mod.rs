@@ -1059,6 +1059,19 @@ pub enum RetireFence {
     NoExecution,
     /// The caller observed this pod.
     Pod(PodIdentityFence),
+    /// A node reported this pod's VM running for an execution generation no
+    /// current activation owns: a start the control plane abandoned whose pod
+    /// booted anyway. The fence must carry the generation and pod UID the node
+    /// reported.
+    ///
+    /// While that generation is still the active execution this is exactly
+    /// [`Self::Pod`]. Once a newer generation is active the retire refuses: the
+    /// in-VM stop addresses the sandbox, not one generation, so it could reach
+    /// the newer runtime. Once the generation has been retired without a
+    /// successor, nothing tracks the pod, but the runtime is still stopped
+    /// through it before the pod is deleted. Deleting a live runtime's pod
+    /// alone makes the node durably suspend the VM rather than stop it.
+    AbandonedActivation(PodIdentityFence),
 }
 
 /// A pod's identity as the substrate currently sees it.

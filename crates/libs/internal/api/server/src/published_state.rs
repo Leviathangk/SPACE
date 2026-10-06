@@ -1610,7 +1610,20 @@ pub struct StateConvergenceSample {
 }
 
 #[derive(Debug)]
-pub struct PostCommitSandboxEvent {
+pub enum PostCommitSandboxEvent {
+    /// A node-authored transition this publication projected onto the row.
+    Transition(PostCommitTransitionEvent),
+    /// A node-reported runtime for an abandoned activation, handed to
+    /// generation-fenced teardown while the row stays `stopped`.
+    AbandonedActivationTeardownRequested {
+        sandbox_id: SandboxId,
+        execution_generation: i64,
+        pod_uid: PodUid,
+    },
+}
+
+#[derive(Debug)]
+pub struct PostCommitTransitionEvent {
     sandbox_id: SandboxId,
     event_type: SandboxEventType,
     prior_lifecycle: SandboxLifecycle,
@@ -1621,20 +1634,49 @@ pub struct PostCommitSandboxEvent {
 
 impl PostCommitSandboxEvent {
     pub fn emit(self, node_id: NodeId) {
-        let mut details = SandboxEventDetails::default()
-            .reason(self.reason_code.as_str())
-            .operation("node_state_publish")
-            .trigger(SandboxEventTrigger::System)
-            .with_from_state(self.prior_lifecycle.as_str())
-            .with_to_state(self.target_lifecycle.as_str())
-            .source_node_id(node_id.to_string());
-        if let Some(error) = self.error {
-            details = details.error(error);
+        match self {
+            Self::Transition(event) => {
+                let mut details = SandboxEventDetails::default()
+                    .reason(event.reason_code.as_str())
+                    .operation("node_state_publish")
+                    .trigger(SandboxEventTrigger::System)
+                    .with_from_state(event.prior_lifecycle.as_str())
+                    .with_to_state(event.target_lifecycle.as_str())
+                    .source_node_id(node_id.to_string());
+                if let Some(error) = event.error {
+                    details = details.error(error);
+                }
+                SandboxEvent::new(event.sandbox_id, event.event_type, SandboxEventSource::Api)
+                    .emit_with(details);
+            }
+            Self::AbandonedActivationTeardownRequested {
+                sandbox_id,
+                execution_generation,
+                pod_uid,
+            } => {
+                SandboxEvent::new(
+                    sandbox_id,
+                    SandboxEventType::CleanupRequested,
+                    SandboxEventSource::Api,
+                )
+                .emit_with(
+                    SandboxEventDetails::default()
+                        .reason(ABANDONED_ACTIVATION_CLEANUP_REASON)
+                        .operation("node_state_publish")
+                        .trigger(SandboxEventTrigger::System)
+                        .lifecycle_state(SandboxLifecycle::Stopped.as_str())
+                        .execution_generation(execution_generation.to_string())
+                        .pod_uid(pod_uid.as_str())
+                        .source_node_id(node_id.to_string()),
+                );
+            }
         }
-        SandboxEvent::new(self.sandbox_id, self.event_type, SandboxEventSource::Api)
-            .emit_with(details);
     }
 }
+
+/// Why a node-reported runtime behind a `stopped` row was handed to teardown:
+/// it belongs to a start the control plane had already abandoned.
+const ABANDONED_ACTIVATION_CLEANUP_REASON: &str = "abandoned_activation";
 
 fn published_spaced_version(
     node_id: NodeId,
@@ -1756,11 +1798,16 @@ pub async fn publish_sandbox_states(
     let mut post_commit_events = Vec::new();
     let mut post_commit_state_convergence = Vec::new();
     let mut publishes_network_policy = false;
+    // Sandboxes whose runtime this publication fully described, present or
+    // absent. A degraded or partly unparseable report says too little to
+    // withdraw an abandoned-activation teardown request.
+    let mut reported_runtime_ids = Vec::new();
 
     for (sandbox_id, state) in states_by_id {
         let sandbox_uuid = sandbox_id;
         if !state.present {
             absent_ids.push(sandbox_uuid);
+            reported_runtime_ids.push(sandbox_uuid);
             continue;
         }
         if state.state_degraded {
@@ -2109,6 +2156,7 @@ pub async fn publish_sandbox_states(
         } else {
             failure_episode_rows.push(failure_episode_input(sandbox_uuid, state, false));
             publishes_network_policy |= row_publishes_network_policy;
+            reported_runtime_ids.push(sandbox_uuid);
         }
     }
 
@@ -2891,15 +2939,52 @@ pub async fn publish_sandbox_states(
     )
     .await?;
     post_commit_events.extend(applied_rollbacks.into_iter().map(|rollback| {
-        PostCommitSandboxEvent {
+        PostCommitSandboxEvent::Transition(PostCommitTransitionEvent {
             sandbox_id: rollback.sandbox_id,
             event_type: SandboxEventType::ActivationRollbackCompleted,
             prior_lifecycle: rollback.prior_lifecycle,
             target_lifecycle: rollback.target_state,
             reason_code: rollback.reason_code,
             error: rollback.failure_message,
-        }
+        })
     }));
+
+    // A start that failed has already told its client so. Should its pod boot
+    // later, the runtime is retired rather than adopted: the row stays
+    // `stopped`, and the runtime is handed to teardown fenced on the exact
+    // generation and pod the node reported. Runs after receipt consumption, so
+    // an attempt that still owns its runtime has already converged.
+    let abandoned_runtimes = sandbox_quarantine_store::select_abandoned_activation_runtimes(
+        conn,
+        node_id,
+        rows_json.clone(),
+    )
+    .await?;
+    let newly_requested = sandbox_quarantine_store::record_abandoned_activation_runtimes(
+        conn,
+        node_id,
+        &abandoned_runtimes,
+    )
+    .await?;
+    sandbox_quarantine_store::withdraw_abandoned_activation_runtimes(
+        conn,
+        node_id,
+        &reported_runtime_ids,
+        &abandoned_runtimes,
+    )
+    .await?;
+    post_commit_events.extend(
+        abandoned_runtimes
+            .into_iter()
+            .filter(|runtime| newly_requested.contains(&runtime.sandbox_id))
+            .map(
+                |runtime| PostCommitSandboxEvent::AbandonedActivationTeardownRequested {
+                    sandbox_id: runtime.sandbox_id,
+                    execution_generation: runtime.execution_generation,
+                    pod_uid: runtime.pod_uid,
+                },
+            ),
+    );
 
     let suspended_projection =
         project_node_published_suspended_sandboxes(conn, node_id, rows_json.clone()).await?;
@@ -2922,13 +3007,15 @@ pub async fn publish_sandbox_states(
         "suspended",
     );
     post_commit_events.extend(suspended_projection.recoveries.iter().map(
-        |(sandbox_id, prior_lifecycle, reason_code)| PostCommitSandboxEvent {
-            sandbox_id: *sandbox_id,
-            event_type: SandboxEventType::QuarantineRecovered,
-            prior_lifecycle: *prior_lifecycle,
-            target_lifecycle: SandboxTransitionTargetState::Suspended,
-            reason_code: *reason_code,
-            error: None,
+        |(sandbox_id, prior_lifecycle, reason_code)| {
+            PostCommitSandboxEvent::Transition(PostCommitTransitionEvent {
+                sandbox_id: *sandbox_id,
+                event_type: SandboxEventType::QuarantineRecovered,
+                prior_lifecycle: *prior_lifecycle,
+                target_lifecycle: SandboxTransitionTargetState::Suspended,
+                reason_code: *reason_code,
+                error: None,
+            })
         },
     ));
 
@@ -3230,14 +3317,14 @@ pub async fn publish_sandbox_states(
         )
         .await?;
     post_commit_events.extend(pause_failed_recoveries.into_iter().map(|recovery| {
-        PostCommitSandboxEvent {
+        PostCommitSandboxEvent::Transition(PostCommitTransitionEvent {
             sandbox_id: recovery.sandbox_id,
             event_type: SandboxEventType::QuarantineRecovered,
             prior_lifecycle: SandboxLifecycle::Quarantined,
             target_lifecycle: recovery.target_state,
             reason_code: SandboxQuarantineReasonCode::PauseFailed,
             error: None,
-        }
+        })
     }));
 
     queue_policy_reconcile_refs_for_new_inventory(
