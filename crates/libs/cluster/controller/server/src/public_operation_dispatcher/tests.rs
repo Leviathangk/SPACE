@@ -139,6 +139,52 @@ async fn tick_fails_operation_after_retry_budget() -> TestResult {
 }
 
 #[tokio::test]
+async fn retry_exhaustion_compensates_once_before_recording_failure() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = seed_org(&db.pool).await?;
+    let store = PublicOperationStore::new(db.pool.clone());
+    let operation_id = create_queued_operation(
+        &store,
+        OrgId::from_uuid(org_id),
+        ApiProduct::Native,
+        OperationKind::StartSandbox,
+        "sbx_start_exhausts",
+    )
+    .await?;
+    let executor = CompensationRecordingExecutor::new(db.pool.clone());
+    let config = ReconcilerConfig {
+        max_retry_attempts: 2,
+        ..single_claim_config()
+    };
+
+    // A retry that still has budget left is not abandoned.
+    let first = tick(&config, &store, &executor).await?;
+    assert_eq!(first.retried, 1);
+    assert!(executor.compensated_states().is_empty());
+
+    make_due(&db.pool, operation_id).await?;
+    let exhausted = tick(&config, &store, &executor).await?;
+    assert_eq!(exhausted.failed, 1);
+    assert_eq!(
+        executor.compensated_states(),
+        vec![OperationState::Running.as_str().to_string()],
+        "the last attempt is compensated once, while the claim is still held"
+    );
+    assert_eq!(
+        operation_state(&db.pool, operation_id).await?,
+        OperationState::Failed.as_str()
+    );
+
+    make_due(&db.pool, operation_id).await?;
+    let after = tick(&config, &store, &executor).await?;
+    assert_eq!(after.claimed, 0);
+    assert_eq!(executor.compensated_states().len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn tick_does_not_exhaust_backpressure_retries() -> TestResult {
     let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
         return Ok(());
@@ -1146,6 +1192,65 @@ impl PublicOperationExecutor for AlwaysRetryExecutor {
             requeue_reason: PublicOperationRequeueReason::TransientFailure,
         }
     }
+}
+
+/// Always asks for a transient retry, and records the operation's persisted
+/// state each time the dispatcher asks it to compensate.
+#[derive(Clone)]
+struct CompensationRecordingExecutor {
+    pool: PgPool,
+    compensated_states: Arc<Mutex<Vec<String>>>,
+}
+
+impl CompensationRecordingExecutor {
+    fn new(pool: PgPool) -> Self {
+        Self {
+            pool,
+            compensated_states: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn compensated_states(&self) -> Vec<String> {
+        self.compensated_states
+            .lock()
+            .expect("compensation record lock is available")
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl PublicOperationExecutor for CompensationRecordingExecutor {
+    fn supported_kinds(&self) -> &'static [OperationKind] {
+        &[OperationKind::StartSandbox]
+    }
+
+    async fn execute(
+        &self,
+        claim_token: &str,
+        operation: ClaimedPublicOperation,
+    ) -> OperationExecutionResult {
+        AlwaysRetryExecutor.execute(claim_token, operation).await
+    }
+
+    async fn compensate_exhausted(&self, operation: &ClaimedPublicOperation) {
+        let state = operation_state(&self.pool, operation.id)
+            .await
+            .expect("operation state query succeeds");
+        self.compensated_states
+            .lock()
+            .expect("compensation record lock is available")
+            .push(state);
+    }
+}
+
+async fn make_due(pool: &PgPool, operation_id: OperationId) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "UPDATE public_operations SET next_attempt_at = NOW() WHERE operation_id = $1"
+    ))
+    .bind(operation_id.as_uuid())
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 #[derive(Clone)]

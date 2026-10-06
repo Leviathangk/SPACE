@@ -159,6 +159,15 @@ pub trait PublicOperationExecutor: Send + Sync + 'static {
         claim_token: &str,
         operation: ClaimedPublicOperation,
     ) -> OperationExecutionResult;
+
+    /// Undo what the operation's retried attempts left behind, once the
+    /// dispatcher has stopped retrying it.
+    ///
+    /// Called once, after the last attempt asked for another retry and the
+    /// retry budget is exhausted, while the claim is still held and before the
+    /// failure is recorded. A failure here is the executor's to report: the
+    /// operation fails either way, because the budget is spent.
+    async fn compensate_exhausted(&self, _operation: &ClaimedPublicOperation) {}
 }
 
 #[derive(Clone)]

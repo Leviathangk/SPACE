@@ -1174,6 +1174,46 @@ impl std::fmt::Display for PodFenceMismatch {
     }
 }
 
+/// Result of [`SubstrateAdapter::retire_abandoned_start`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbandonedStartRetirement {
+    /// Nothing a start created since the sandbox stopped is left: the sandbox
+    /// is not `stopped`, its active execution is the one the stop left, or
+    /// there is no runtime object to collect.
+    NothingToRetire,
+    /// The abandoned start's execution was retired and its pod deleted, or
+    /// pods recorded only on inactive execution rows were collected.
+    Retired,
+    /// Another activation may own the execution, so it was left alone.
+    Deferred(AbandonedStartDeferral),
+}
+
+/// Why [`SubstrateAdapter::retire_abandoned_start`] left an execution alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbandonedStartDeferral {
+    /// The execution holds a live activation lease. It may be the abandoned
+    /// start's own lease or a newer start that joined or replaced it; the
+    /// lease alone cannot tell them apart.
+    ActivationLeaseHeld,
+    /// The execution changed between selection and teardown.
+    PodIdentityChanged(PodFenceMismatch),
+}
+
+impl AbandonedStartRetirement {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NothingToRetire => "nothing_to_retire",
+            Self::Retired => "retired",
+            Self::Deferred(AbandonedStartDeferral::ActivationLeaseHeld) => {
+                "deferred_activation_lease_held"
+            }
+            Self::Deferred(AbandonedStartDeferral::PodIdentityChanged(_)) => {
+                "deferred_pod_identity_changed"
+            }
+        }
+    }
+}
+
 /// Result of [`SubstrateAdapter::retire_execution`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetireExecutionOutcome {
@@ -2214,6 +2254,27 @@ pub trait SubstrateAdapter: Send + Sync {
         _fence: &RetireFence,
     ) -> Result<Option<PodFenceMismatch>, SubstrateError> {
         Ok(None)
+    }
+
+    /// Retire what an abandoned `start` of a `stopped` sandbox left behind.
+    ///
+    /// A start materializes a runtime before it can tell whether the sandbox
+    /// will boot, and each failed attempt deliberately leaves that runtime for
+    /// the next attempt to reuse. Once the caller has stopped retrying, nothing
+    /// else reuses it, and a runtime left on a `stopped` sandbox can still boot
+    /// a VM the control plane reports as stopped. The caller must have proven
+    /// that no other operation is driving this sandbox.
+    ///
+    /// Only an execution created after the sandbox's current stop is in scope,
+    /// never the one the stop itself left, and the teardown is fenced on the
+    /// identity read here, so a newer start that claims the execution first
+    /// makes this defer rather than tear it down. A substrate with no runtime
+    /// object that outlives a failed start has nothing to retire.
+    async fn retire_abandoned_start(
+        &self,
+        _sandbox_id: SandboxId,
+    ) -> Result<AbandonedStartRetirement, SubstrateError> {
+        Ok(AbandonedStartRetirement::NothingToRetire)
     }
 
     /// Snapshot how the substrate currently sees these pods.
@@ -3299,6 +3360,17 @@ impl SubstrateAdapter for Substrate {
             Self::Direct(substrate) => substrate.retire_fence_mismatch(sandbox_id, fence).await,
             #[cfg(feature = "kubernetes")]
             Self::Kubernetes(substrate) => substrate.retire_fence_mismatch(sandbox_id, fence).await,
+        }
+    }
+
+    async fn retire_abandoned_start(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<AbandonedStartRetirement, SubstrateError> {
+        match self {
+            Self::Direct(substrate) => substrate.retire_abandoned_start(sandbox_id).await,
+            #[cfg(feature = "kubernetes")]
+            Self::Kubernetes(substrate) => substrate.retire_abandoned_start(sandbox_id).await,
         }
     }
 

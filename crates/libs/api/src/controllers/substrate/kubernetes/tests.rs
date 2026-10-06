@@ -33,8 +33,8 @@ mod kubernetes_tests {
         ActivationFenceOwnership, ActivationRoutePublication, classify_activation_route_publication,
     };
     use crate::controllers::substrate::{
-        NodeApiTarget, PooledExecutionClaim, PublishedLocalArtifact, RecordedExecution, Substrate,
-        SubstrateAdapter, TeardownProgress,
+        AbandonedStartDeferral, AbandonedStartRetirement, NodeApiTarget, PooledExecutionClaim,
+        PublishedLocalArtifact, RecordedExecution, Substrate, SubstrateAdapter, TeardownProgress,
     };
     use axum::http::{Method, Request, Response, StatusCode};
     use http_body_util::BodyExt;
@@ -14411,6 +14411,263 @@ mod kubernetes_tests {
         .fetch_all(pool)
         .await
         .expect("active execution generations must be queryable")
+    }
+
+    /// A `stopped` sandbox whose stop retired generation 1 a minute ago, as
+    /// every start attempt since then found it.
+    async fn insert_stopped_sandbox_after_stop(
+        pool: &PgPool,
+        sandbox_id: SandboxId,
+    ) -> Result<(), BoxError> {
+        insert_test_sandbox_row(pool, sandbox_id, "stopped").await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes
+                SET lifecycle_changed_at = NOW() - INTERVAL '1 minute'
+              WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .execute(pool)
+        .await?;
+        insert_k8s_execution(
+            pool,
+            sandbox_id,
+            1,
+            &format!("space-sbx-{}-g1", sandbox_id.as_uuid().simple()),
+            "uid-stopped",
+            None,
+            false,
+        )
+        .await?;
+        sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions
+                SET created_at = NOW() - INTERVAL '2 minutes'
+              WHERE sandbox_id = $1 AND generation = 1"
+        ))
+        .bind(sandbox_id)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// An execution a start created after the stop, with a scheduled pod
+    /// that never got an IP: kubelet is still retrying its sandbox creation.
+    async fn insert_start_attempt_execution(
+        pool: &PgPool,
+        sandbox_id: SandboxId,
+        generation: i64,
+        live_lease: bool,
+    ) -> Result<Pod, BoxError> {
+        let pod_name = format!("space-sbx-{}-g{generation}", sandbox_id.as_uuid().simple());
+        let pod_uid = format!("uid-start-g{generation}");
+        let attempt_id = SandboxActivationAttemptId::new();
+        sqlx::query(sql!(
+            "INSERT INTO sandbox_k8s_executions
+                 (sandbox_id, generation, pod_name, pod_namespace, pod_uid, state, active,
+                  route_activation_id, activation_attempt_id, activation_attempt_expires_at,
+                  activation_attempt_target_state)
+             VALUES ($1, $2, $3, 'space', $4, 'created', TRUE, $5,
+                     CASE WHEN $6 THEN $5 END,
+                     CASE WHEN $6 THEN NOW() + INTERVAL '5 minutes' END,
+                     CASE WHEN $6 THEN 'started' END)"
+        ))
+        .bind(sandbox_id)
+        .bind(generation)
+        .bind(&pod_name)
+        .bind(&pod_uid)
+        .bind(attempt_id)
+        .bind(live_lease)
+        .execute(pool)
+        .await?;
+        Ok(Pod {
+            metadata: kube::api::ObjectMeta {
+                name: Some(pod_name),
+                namespace: Some("space".to_string()),
+                uid: Some(pod_uid),
+                resource_version: Some("17".to_string()),
+                ..Default::default()
+            },
+            status: Some(PodStatus {
+                phase: Some("Pending".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    }
+
+    async fn sandbox_lifecycle(pool: &PgPool, sandbox_id: SandboxId) -> String {
+        sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
+            .bind(sandbox_id)
+            .fetch_one(pool)
+            .await
+            .expect("sandbox lifecycle must be queryable")
+    }
+
+    /// The pod an exhausted start left is deleted under the identity of the
+    /// attempt that made it, and its execution is retired, so the `stopped`
+    /// sandbox has no runtime left to boot behind the control plane's back.
+    #[tokio::test(flavor = "current_thread")]
+    async fn abandoned_start_retires_the_failed_attempts_pod() -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        insert_stopped_sandbox_after_stop(&pool, sandbox_id).await?;
+        let pod = insert_start_attempt_execution(&pool, sandbox_id, 2, false).await?;
+        let pod_name = pod.metadata.name.clone().expect("pod has a name");
+        let captured_deletes = Arc::new(Mutex::new(Vec::new()));
+        let substrate = substrate_with_store_client_proxy_port_and_pod(
+            pool.clone(),
+            delete_capturing_kubernetes_client(Arc::clone(&captured_deletes), Some(pod.clone())),
+            DEFAULT_SANDBOX_PROXY_PORT,
+            Some(pod),
+        );
+
+        let outcome = substrate.retire_abandoned_start(sandbox_id).await?;
+
+        assert_eq!(outcome, AbandonedStartRetirement::Retired);
+        let deletes = captured_deletes
+            .lock()
+            .expect("capture mutex poisoned")
+            .clone();
+        let (_, options) = deletes
+            .iter()
+            .find(|(name, _)| *name == pod_name)
+            .expect("the failed attempt's pod is deleted");
+        assert_eq!(options["preconditions"]["uid"], "uid-start-g2");
+        assert_eq!(options["preconditions"]["resourceVersion"], "17");
+        assert!(
+            active_execution_generations(&pool, sandbox_id)
+                .await
+                .is_empty()
+        );
+        assert_eq!(sandbox_lifecycle(&pool, sandbox_id).await, "stopped");
+        Ok(())
+    }
+
+    /// A newer start that holds the activation lease on a newer generation
+    /// owns the sandbox: neither its pod nor its execution may be touched,
+    /// even though the exhausted start's own execution is gone.
+    #[tokio::test(flavor = "current_thread")]
+    async fn abandoned_start_leaves_a_newer_leased_start_alone() -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        insert_stopped_sandbox_after_stop(&pool, sandbox_id).await?;
+        insert_start_attempt_execution(&pool, sandbox_id, 2, false).await?;
+        sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions SET active = FALSE
+              WHERE sandbox_id = $1 AND generation = 2"
+        ))
+        .bind(sandbox_id)
+        .execute(&pool)
+        .await?;
+        let newer = insert_start_attempt_execution(&pool, sandbox_id, 3, true).await?;
+        let captured_deletes = Arc::new(Mutex::new(Vec::new()));
+        let substrate = substrate_with_store_client_proxy_port_and_pod(
+            pool.clone(),
+            delete_capturing_kubernetes_client(Arc::clone(&captured_deletes), Some(newer.clone())),
+            DEFAULT_SANDBOX_PROXY_PORT,
+            Some(newer),
+        );
+
+        let outcome = substrate.retire_abandoned_start(sandbox_id).await?;
+
+        assert_eq!(
+            outcome,
+            AbandonedStartRetirement::Deferred(AbandonedStartDeferral::ActivationLeaseHeld)
+        );
+        assert!(
+            captured_deletes
+                .lock()
+                .expect("capture mutex poisoned")
+                .is_empty()
+        );
+        assert_eq!(
+            active_execution_generations(&pool, sandbox_id).await,
+            vec![3]
+        );
+        Ok(())
+    }
+
+    /// The execution the stop itself left is the stopped sandbox's own, not
+    /// an abandoned start's: compensating a start that failed before it
+    /// materialized anything must not retire it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn abandoned_start_keeps_the_execution_the_stop_left() -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        insert_stopped_sandbox_after_stop(&pool, sandbox_id).await?;
+        sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions SET active = TRUE
+              WHERE sandbox_id = $1 AND generation = 1"
+        ))
+        .bind(sandbox_id)
+        .execute(&pool)
+        .await?;
+        let captured_deletes = Arc::new(Mutex::new(Vec::new()));
+        let substrate = substrate_with_store_client_proxy_port_and_pod(
+            pool.clone(),
+            delete_capturing_kubernetes_client(Arc::clone(&captured_deletes), None),
+            DEFAULT_SANDBOX_PROXY_PORT,
+            None,
+        );
+
+        let outcome = substrate.retire_abandoned_start(sandbox_id).await?;
+
+        assert_eq!(outcome, AbandonedStartRetirement::NothingToRetire);
+        assert!(
+            captured_deletes
+                .lock()
+                .expect("capture mutex poisoned")
+                .is_empty()
+        );
+        assert_eq!(
+            active_execution_generations(&pool, sandbox_id).await,
+            vec![1]
+        );
+        Ok(())
+    }
+
+    /// A start attempt whose execution was retired underneath it can still
+    /// leave its pod behind; with no active execution left, only that
+    /// inactive row names the pod, and nothing else collects it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn abandoned_start_collects_a_pod_left_on_an_inactive_execution() -> Result<(), BoxError>
+    {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        insert_stopped_sandbox_after_stop(&pool, sandbox_id).await?;
+        let pod = insert_start_attempt_execution(&pool, sandbox_id, 2, false).await?;
+        let pod_name = pod.metadata.name.clone().expect("pod has a name");
+        sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions SET active = FALSE
+              WHERE sandbox_id = $1 AND generation = 2"
+        ))
+        .bind(sandbox_id)
+        .execute(&pool)
+        .await?;
+        let captured_deletes = Arc::new(Mutex::new(Vec::new()));
+        let substrate = substrate_with_store_client_proxy_port_and_pod(
+            pool.clone(),
+            delete_capturing_kubernetes_client(Arc::clone(&captured_deletes), Some(pod.clone())),
+            DEFAULT_SANDBOX_PROXY_PORT,
+            Some(pod),
+        );
+
+        let outcome = substrate.retire_abandoned_start(sandbox_id).await?;
+
+        assert_eq!(outcome, AbandonedStartRetirement::Retired);
+        assert!(
+            captured_deletes
+                .lock()
+                .expect("capture mutex poisoned")
+                .iter()
+                .any(|(name, _)| *name == pod_name),
+            "the leftover pod is deleted"
+        );
+        assert_eq!(sandbox_lifecycle(&pool, sandbox_id).await, "stopped");
+        Ok(())
     }
 
     /// End to end: a retire whose fenced pod was replaced must tear down
