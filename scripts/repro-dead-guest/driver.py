@@ -160,10 +160,23 @@ def stoplog(args):
     window; the stream timeout must exceed the longest STOP period. This is
     guest activity and resets the idle clock: use it only after the window.
     """
-    script = ("pkill -TERM -f /usr/local/bin/repro-stoploop; sleep 1; "
-              "cat /var/log/repro-stoploop.log" if args.stop else "cat /var/log/repro-stoploop.log")
-    code, out = run(config(), args.sandbox, ["sh", "-c", script], user="root",
-                    timeout="3h", stream_timeout=args.wait)
+    # The bracket keeps pkill from matching this command's own `sh -c` line.
+    script = ("pkill -TERM -f '^/bin/sh /usr/local/bin/[r]epro-stoploop'; sleep 1; "
+              "pgrep -af '[r]epro-stoploop'; cat /var/log/repro-stoploop.log" if args.stop
+              else "cat /var/log/repro-stoploop.log")
+    # A stopped agent makes command creation fail (503); retry until a CONT window.
+    deadline = time.monotonic() + args.wait
+    while True:
+        try:
+            code, out = run(config(), args.sandbox, ["sh", "-c", script], user="root",
+                            timeout="5m", stream_timeout=300)
+            break
+        except Exception as error:  # noqa: BLE001 - retried until the deadline
+            if time.monotonic() > deadline:
+                raise
+            print(f"{time.strftime('%H:%M:%S', time.gmtime())} retry: {str(error)[:120]}",
+                  file=sys.stderr, flush=True)
+            time.sleep(2)
     sys.stdout.write(out)
     print(f"[exit {code}]")
 
