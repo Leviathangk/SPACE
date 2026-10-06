@@ -8,6 +8,8 @@ while :; do
   alive=$(pgrep -f '[a]si_workload.py run' | wc -l)
   [ "$now" -gt "$seen" ] && { echo "NEW INCIDENT"; break; }
   [ "$alive" -lt "${EXPECT:-12}" ] && { echo "workload processes alive: $alive"; break; }
+  avail=$(docker exec space-local-worker3 df -k --output=avail /var | tail -1 | tr -d ' ')
+  [ "$avail" -lt 2000000 ] && { echo "DISK LOW: /var avail ${avail} kB"; break; }
   [ $(( $(date +%s) - t0 )) -ge "$max" ] && { echo "checkpoint"; break; }
   sleep 20
 done

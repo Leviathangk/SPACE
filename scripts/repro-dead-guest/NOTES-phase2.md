@@ -52,3 +52,24 @@ are fine until their node's next restart.
 warm 10 min, then 3 cycles (odd: cross,same,cross; even: same,cross,same) of
 suspend -> portable -> forced restore -> 60 min busy. Expected end ~18:50Z, then a
 stress variant.
+
+### Attempt 1 aborted (15:33–15:52Z): Docker data disk full — harness artifact
+
+- At 15:46:58Z the Kind nodes' shared `/var` filesystem (the devbox's 50 GB Docker
+  data disk, also holding ~35 GB of shared Docker images/build cache that this task
+  must not prune) reached 100%. The sparse worker cache images could not allocate:
+  `critical space allocation error, dev loopN`, btrfs `Transaction aborted (error -5)`,
+  `forced readonly`. Guests got EIO; 8/12 workload processes opened incidents within
+  30 s (`Read-only file system (os error 30)` on files:write, 500 on commands).
+  Postgres (same disk) could not write, so API deletes returned 500.
+- Not a guest death. Evidence: `~/repro-logs/phase2/e1-attempt1-diskfull/`.
+- Leftover per-sandbox `space-spaced-host-svc`/`space-netgtw-svc` processes survived the
+  node-stack pod deletion (reparented to init, own cgroups) and pinned the old pod's
+  mount namespace, so the deleted images' loop devices stayed attached until killed.
+- Fix (local harness only): worker cache images and SeaweedFS data moved to the
+  400 GB /home disk via bind mounts inside the Kind node containers
+  (`/var/lib/space-cache.img` <- `/var/lib/containerd/repro-space-cache/space-cache.img`,
+  `/var/lib/space-seaweedfs` <- `/var/lib/containerd/repro-seaweedfs`; the node's
+  /var/lib/containerd is the host's ~/.kind-data/<node>/containerd). Same code paths;
+  the bind mounts do not survive a Kind node container restart.
+- Attempt 2 started 15:57:08Z with a disk guard (monitor disk.log; watcher stops <2 GB).

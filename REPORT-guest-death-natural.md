@@ -229,8 +229,23 @@ is a local experiment. It was reverted before experiment 1, which runs on
   one image file. Each has its own allocator and its own transaction commits.
   This can corrupt the cache filesystem.
 - Both workers' cache devices already showed non-zero `corrupt` counters
-  (15 and 26) at their 14:12Z mount, from before this task. Restarts with live
-  VMs in the earlier sessions are a plausible cause, but this is not proven.
+  (15 and 26) at their 14:12Z mount, from before this task.
+- After this experiment's restarts, which left up to three instances of each
+  image mounted at once, `btrfs scrub` found **3,944 and 2,964 uncorrectable
+  checksum errors** on the two worker caches. The VMs that held the old
+  instances had just exited, and the caches were back on a single instance.
+  The errors were in jail files (for example a quarantined jail's `firecracker`
+  binary copy).
+- When the old instances unmounted, the kernel logged a different fsid for
+  the duplicate (`e60a4e99…` vs the image's `3eb62a85…`). That is consistent
+  with btrfs's temp-fsid handling of a second mount of an already-mounted
+  filesystem.
+- The data was not inspected file by file, so the double mount is the likely
+  cause, not a proven one.
+- Both images were recreated (the chart's documented clean start: delete the
+  file on the node) and scrub-clean before experiment 1.
+- This alone makes the harness fix worth doing: on today's chart, any Kind test
+  that restarts the node-stack with live VMs can corrupt the worker cache.
 
 ### What it implies for production
 
