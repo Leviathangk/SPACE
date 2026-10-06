@@ -1,6 +1,4 @@
 {
-  "source_revision": "a214babe3dd3c0b92d35cb2359a45aa3c0208687",
-  "baseline_revision": "80f73bccefb8cc5b223db3e62ea1ed3aadb37778",
   "stores": {
     "postgres": {
       "baseline_version": 20261002070625,
