@@ -56,6 +56,66 @@ fn cluster_delete_must_defer_control_plane(err: &SubstrateError) -> bool {
     )
 }
 
+/// Whether a delete whose runtime teardown could not be confirmed may still
+/// finalize the sandbox row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnconfirmedTeardown {
+    /// Finalize and record the miss. The direct substrate's leftover is
+    /// node-local state on a node the delete could not get an answer from,
+    /// and an unreachable node must not make a sandbox undeletable.
+    FinalizeRow,
+    /// Keep the row. A leftover Kubernetes pod is a cluster object that only
+    /// row-driven reconcilers look for, so finalizing, which cascades the
+    /// execution rows that name its pods, leaves nothing that would delete
+    /// it, and kubelet keeps retrying it.
+    KeepRow,
+}
+
+impl UnconfirmedTeardown {
+    fn for_substrate(substrate: &crate::controllers::substrate::Substrate) -> Self {
+        match substrate {
+            crate::controllers::substrate::Substrate::Direct(_) => Self::FinalizeRow,
+            #[cfg(feature = "kubernetes")]
+            crate::controllers::substrate::Substrate::Kubernetes(_) => Self::KeepRow,
+        }
+    }
+}
+
+/// A runtime teardown that stopped a delete short of finalizing the row, and
+/// what the row must be left as.
+#[derive(Debug)]
+pub(crate) struct DeleteTeardownFailure {
+    error: ControllerError,
+    row: DeleteTeardownRow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteTeardownRow {
+    /// The substrate refused before tearing anything down, so the pre-delete
+    /// lifecycle is restored and the caller can retry once the refusal clears.
+    RestorePriorLifecycle,
+    /// Teardown may have removed part of the runtime and could not confirm
+    /// the rest. The row stays `deleting` with its execution rows: they are
+    /// what the delete retry and the orphaned-sandbox reconciler read to find
+    /// the leftovers, and the pre-delete lifecycle would no longer be true.
+    KeepDeleting,
+}
+
+impl DeleteTeardownFailure {
+    fn restore_prior_lifecycle(error: impl Into<ControllerError>) -> Self {
+        Self {
+            error: error.into(),
+            row: DeleteTeardownRow::RestorePriorLifecycle,
+        }
+    }
+}
+
+impl From<DeleteTeardownFailure> for ControllerError {
+    fn from(failure: DeleteTeardownFailure) -> Self {
+        failure.error
+    }
+}
+
 fn record_dormant_activation_if_needed(
     sandbox: &Sandbox,
     metric_identity: SandboxApiMetricIdentity,
@@ -1244,29 +1304,49 @@ impl SandboxController {
         Ok(())
     }
 
-    pub async fn delete(
+    pub(crate) async fn delete(
         &self,
         pool: &PgPool,
         id: SandboxId,
         sandbox: Option<&Sandbox>,
-    ) -> Result<(), ControllerError> {
+    ) -> Result<(), DeleteTeardownFailure> {
         if sandbox.is_none() {
-            return self.delete_observed_sandbox(pool, id).await;
+            return self
+                .delete_observed_sandbox(pool, id)
+                .await
+                .map_err(DeleteTeardownFailure::restore_prior_lifecycle);
         }
 
-        if let Err(err) = self.substrate.delete_execution(id).await {
-            if cluster_delete_must_defer_control_plane(&err) {
-                return Err(ControllerError::from(err));
-            }
+        let Err(err) = self.substrate.delete_execution(id).await else {
+            return Ok(());
+        };
+        if cluster_delete_must_defer_control_plane(&err) {
+            return Err(DeleteTeardownFailure::restore_prior_lifecycle(err));
+        }
+        // `NotFound` is the node reporting the sandbox already gone, which is
+        // a confirmation rather than a miss.
+        if !matches!(err, SubstrateError::NotFound { .. })
+            && UnconfirmedTeardown::for_substrate(&self.substrate) == UnconfirmedTeardown::KeepRow
+        {
             tracing::warn!(
                 sandbox_id = %id,
                 reason = cluster_delete_miss_reason(&err),
                 error = %err,
-                "cluster delete removing sandbox DB row without confirmed node-local teardown; \
-                 node may retain an orphaned local sandbox row + snapshot (no cluster row)"
+                "cluster delete keeping the sandbox row: runtime teardown is unconfirmed and \
+                 the row names pods that may outlive it"
             );
+            return Err(DeleteTeardownFailure {
+                error: ControllerError::from(err),
+                row: DeleteTeardownRow::KeepDeleting,
+            });
         }
-        let _ = pool;
+        tracing::warn!(
+            sandbox_id = %id,
+            reason = cluster_delete_miss_reason(&err),
+            error = %err,
+            "cluster delete removing sandbox DB row without confirmed node-local teardown; \
+             node may retain an orphaned local sandbox row + snapshot (no cluster row)"
+        );
         Ok(())
     }
 
@@ -1380,7 +1460,7 @@ impl SandboxController {
         tracing::info!(sandbox_id = %id, phase = "substrate_teardown", result = "started", "sandbox delete phase started");
         let delete_result = self.delete(pool, id, sandbox).await;
         tracing::info!(sandbox_id = %id, phase = "substrate_teardown", result = if delete_result.is_ok() { "completed" } else { "failed" }, elapsed_ms = phase_started.elapsed().as_millis(), "sandbox delete phase completed");
-        if let Err(err) = delete_result {
+        if let Err(DeleteTeardownFailure { error, row }) = delete_result {
             SandboxEvent::new(
                 event_sandbox_id,
                 SandboxEventType::DeleteFailed,
@@ -1390,13 +1470,15 @@ impl SandboxController {
                 SandboxEventDetails::default()
                     .action("delete")
                     .reason("delete_execution_failed")
-                    .error(err.to_string())
+                    .error(error.to_string())
                     .trigger(SandboxEventTrigger::User),
             );
-            if let Some(previous_lifecycle) = previous_lifecycle {
+            if row == DeleteTeardownRow::RestorePriorLifecycle
+                && let Some(previous_lifecycle) = previous_lifecycle
+            {
                 restore_lifecycle_after_failed_delete(pool, id, previous_lifecycle).await?;
             }
-            return Err(err);
+            return Err(error);
         }
         let phase_started = std::time::Instant::now();
         tracing::info!(sandbox_id = %id, phase = "database_finalization", result = "started", "sandbox delete phase started");

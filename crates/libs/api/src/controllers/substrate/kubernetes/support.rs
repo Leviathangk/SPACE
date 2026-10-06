@@ -897,6 +897,18 @@ pub(super) fn delete_can_skip_runtime_cleanup(err: &SubstrateError) -> bool {
     matches!(err, SubstrateError::Unavailable { .. })
 }
 
+/// Whether a delete may still remove the tracked pods after `resolve_pod_ip`
+/// failed with `err`. Deleting a pod needs no address, so it may, except when
+/// the error defers the delete to work that still needs the pod: a suspend
+/// that may yet publish from it, or a node-local copy that may be the only
+/// one. Those deferrals keep the pod and its tracking for that owner.
+pub(super) fn delete_can_remove_pods_after_runtime_lookup_error(err: &SubstrateError) -> bool {
+    !matches!(
+        err,
+        SubstrateError::SuspendInFlight { .. } | SubstrateError::RetainedFilesystemOnlyCopy { .. }
+    )
+}
+
 /// Whether an execution teardown destroys node-local sandbox state or
 /// preserves it.
 ///
@@ -954,6 +966,15 @@ impl ExecutionTeardown {
     /// enqueued.
     pub(super) fn requires_stop_success(self) -> bool {
         matches!(self, Self::Retire)
+    }
+
+    /// Whether the teardown deletes the tracked pods when the runtime cannot
+    /// be addressed at all. `Delete` does: its in-VM cleanup is best-effort,
+    /// and the pods are what keep a VM retrying on the node. `Retire` does
+    /// not: it must stop the VM and enqueue the stopped-disk backup before
+    /// releasing the pods, and neither can run without an address.
+    pub(super) fn deletes_pods_without_runtime(self) -> bool {
+        matches!(self, Self::Delete)
     }
 
     /// Whether pod-tracking teardown should preserve `placement_changed_at`

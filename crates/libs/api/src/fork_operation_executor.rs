@@ -1227,7 +1227,9 @@ impl ForkSandboxOperationExecutor {
             self.controller
                 .delete(self.store.pool(), target_id, Some(sandbox))
                 .await
-                .map_err(ForkExecutionError::retry_error)?;
+                .map_err(|failure| {
+                    ForkExecutionError::retry_error(ControllerError::from(failure))
+                })?;
         }
         crate::reconcile_queue::finalize_sandbox_db_delete_user_initiated(
             self.store.pool(),

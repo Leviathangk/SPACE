@@ -1353,7 +1353,8 @@ impl KubernetesSubstrate {
         // pod has nothing to talk to — no IP yet, or `Pending+Unschedulable` —
         // `resolve_pod_ip` returns `Unavailable`; treat that as "no live
         // runtime" and fall through to the pod-delete loop instead of
-        // short-circuiting. Genuine infra faults still propagate.
+        // short-circuiting. Genuine infra faults still propagate, but only
+        // after a delete has issued the pod deletes, which need no address.
         let pod_ip = match &fenced {
             Some(fenced) => fenced.runtime_pod_ip,
             None => match self.resolve_pod_ip(sandbox_uuid).await {
@@ -1366,7 +1367,15 @@ impl KubernetesSubstrate {
                     );
                     None
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    if mode.deletes_pods_without_runtime()
+                        && delete_can_remove_pods_after_runtime_lookup_error(&err)
+                    {
+                        self.delete_tracked_pods_after_unresolved_runtime(sandbox_id, &err)
+                            .await;
+                    }
+                    return Err(err);
+                }
             },
         };
         // Tracks whether anything has actually been done yet, so a refusal
@@ -1587,6 +1596,39 @@ impl KubernetesSubstrate {
             .await?;
 
         Ok(RetireExecutionOutcome::Retired)
+    }
+
+    /// The pod-delete half of a delete whose runtime could not be resolved.
+    /// The in-VM cleanup needs the pod's address; deleting the pods does not,
+    /// and skipping them leaves kubelet retrying a pod nobody asked to stop.
+    /// Tracking stays in place and the caller still gets the lookup error: the
+    /// teardown did not complete, and the rows naming these pods are what a
+    /// retry reads to confirm them gone. Failures are logged rather than
+    /// returned because the lookup error is the one the caller acts on.
+    async fn delete_tracked_pods_after_unresolved_runtime(
+        &self,
+        sandbox_id: SandboxId,
+        lookup_error: &SubstrateError,
+    ) {
+        let deleted = match self.store.tracked_execution_pod_names(sandbox_id).await {
+            Ok(pod_names) => self.delete_tracked_pods(pod_names).await,
+            Err(error) => Err(error),
+        };
+        match deleted {
+            Ok(()) => tracing::warn!(
+                sandbox_id = %sandbox_id,
+                error = %lookup_error,
+                "could not resolve the sandbox runtime for delete; deleted its tracked pods and \
+                 kept their tracking for the retry"
+            ),
+            Err(delete_error) => tracing::warn!(
+                sandbox_id = %sandbox_id,
+                error = %lookup_error,
+                %delete_error,
+                "could not resolve the sandbox runtime for delete, and its tracked pods were \
+                 not all deleted"
+            ),
+        }
     }
 
     /// Idempotent best-effort delete of each tracked pod name. An already-gone
