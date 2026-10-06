@@ -404,6 +404,27 @@ All 12 sandboxes ran their full plan.
   production pattern. The pre-reset smoke run did use btrfs-send
   (`rootfs.btrfs-send`). See "Side findings" for the race.
 
+### Stress A — memory near the limit + 12 concurrent restores onto one node (19:13Z → 20:22Z)
+
+Same 12 sandboxes after the baseline (`stress.py burst --mem-mb 1750
+--target-node space-local-worker`, then `asi_workload.py --attach`).
+
+- memhog was raised to 1,750 MB and every guest reached it (1,744 MB resident).
+  Guest `free` showed 1,926–1,947 of 1,991 MiB used and 44–86 MB available for
+  the rest of the run.
+- All 12 were suspended concurrently, each taking 51–161 s with near-full
+  memory images. Portable 4 s after the last suspend.
+- With `space-local-worker2` cordoned, all 12 were woken at once and landed on
+  `space-local-worker`: **8 cross-node, 4 same-node, all succeeded**.
+- API-side wake durations were 14 s to 303 s. For a02, the slowest, the node
+  log shows three concurrent artifact pulls finishing at 19:19:07,
+  `restore_completed` at 19:19:10, and the API operation completing at
+  19:21:57. The node-to-API lag is the same symptom as the first report's
+  "API shows a stale state" oddity, not a guest problem.
+- After that, 60 min busy at that memory level: **5,324 operations, 0
+  failed, no incident, no guest OOM kill** (telemetry dmesg),
+  `started/degraded` gauge 0 in every minute, and no raw vsock failure.
+
 ## Side findings
 
 - `network_policy_update_failed` (`network policy generation conflict`) is
