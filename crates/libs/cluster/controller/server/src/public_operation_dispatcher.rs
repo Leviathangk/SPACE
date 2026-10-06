@@ -325,6 +325,16 @@ impl PublicOperationExecutor for NativePublicOperationExecutor {
             },
         }
     }
+
+    async fn compensate_exhausted(&self, operation: &ClaimedPublicOperation) {
+        // A start is the operation whose attempts each leave a runtime for
+        // the next one to reuse; once none is coming, that runtime is orphaned.
+        if operation.kind == OperationKind::StartSandbox {
+            self.sandbox_lifecycle
+                .compensate_exhausted_start(operation)
+                .await;
+        }
+    }
 }
 
 impl From<PublicOperationExecutionResult> for OperationExecutionResult {
@@ -541,34 +551,17 @@ where
     let kind = operation.kind;
     let attempts = operation.attempts;
     pplx_space_metrics::operations::claimed(api_product_label, kind.as_str());
-    let renew_every = (config.claim_stale_after / 3).max(Duration::from_millis(10));
-    let mut renewal = tokio::time::interval(renew_every);
-    renewal.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    renewal.tick().await;
     let execution_claim_token = claim_token.clone();
-    let execution = executor.execute(&execution_claim_token, operation.clone());
-    tokio::pin!(execution);
-    let result = loop {
-        tokio::select! {
-            result = &mut execution => break result,
-            _ = renewal.tick() => {
-                let started = Instant::now();
-                let renewed = store
-                    .renew_claimed_operation(&claim_token, &operation)
-                    .await?;
-                tracing::info!(
-                    operation_id = %operation_id,
-                    claim_generation = operation.claim_generation,
-                    phase = "claim_renewal",
-                    result = if renewed { "renewed" } else { "lost" },
-                    elapsed_ms = started.elapsed().as_millis(),
-                    "public operation lease renewal completed"
-                );
-                if !renewed {
-                    return Ok(TickReport::default());
-                }
-            }
-        }
+    let Some(result) = while_renewing_claim(
+        &store,
+        &claim_token,
+        &operation,
+        config.claim_stale_after,
+        executor.execute(&execution_claim_token, operation.clone()),
+    )
+    .await?
+    else {
+        return Ok(TickReport::default());
     };
     let mut report = TickReport::default();
     let updated = match result.state {
@@ -722,6 +715,20 @@ where
             } else if !preserve_retry_budget
                 && retry_budget_exhausted(attempts, config.max_retry_attempts)
             {
+                // Before the failure is recorded, so a crash here re-claims
+                // the operation and compensates again rather than never.
+                if while_renewing_claim(
+                    &store,
+                    &claim_token,
+                    &operation,
+                    config.claim_stale_after,
+                    executor.compensate_exhausted(&operation),
+                )
+                .await?
+                .is_none()
+                {
+                    return Ok(TickReport::default());
+                }
                 let terminal_error_code = result
                     .terminal_error_code
                     .unwrap_or(PublicErrorCode::Internal);
@@ -799,6 +806,48 @@ where
     }
 
     Ok(report)
+}
+
+/// Drive `work` while keeping the operation's claim fresh. `None` when the
+/// claim was lost: another dispatcher may own the operation now, so the caller
+/// must not record any outcome.
+async fn while_renewing_claim<F>(
+    store: &PublicOperationStore,
+    claim_token: &str,
+    operation: &ClaimedPublicOperation,
+    claim_stale_after: Duration,
+    work: F,
+) -> Result<Option<F::Output>, pplx_space_api::public_operations::PublicOperationStoreError>
+where
+    F: std::future::Future,
+{
+    let renew_every = (claim_stale_after / 3).max(Duration::from_millis(10));
+    let mut renewal = tokio::time::interval(renew_every);
+    renewal.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    renewal.tick().await;
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            output = &mut work => return Ok(Some(output)),
+            _ = renewal.tick() => {
+                let started = Instant::now();
+                let renewed = store
+                    .renew_claimed_operation(claim_token, operation)
+                    .await?;
+                tracing::info!(
+                    operation_id = %operation.id,
+                    claim_generation = operation.claim_generation,
+                    phase = "claim_renewal",
+                    result = if renewed { "renewed" } else { "lost" },
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "public operation lease renewal completed"
+                );
+                if !renewed {
+                    return Ok(None);
+                }
+            }
+        }
+    }
 }
 
 fn retry_budget_exhausted(attempts: i32, max_retry_attempts: i32) -> bool {

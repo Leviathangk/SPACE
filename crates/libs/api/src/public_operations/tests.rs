@@ -294,6 +294,69 @@ fn delete_operation_input(org_id: OrgId, target_id: &str) -> CreatePublicOperati
 }
 
 #[tokio::test]
+async fn other_unfinished_sandbox_operation_ignores_itself_finished_and_other_tenants() -> TestResult
+{
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let other_org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let target_id = PublicSandboxId::new().to_string();
+    let create = |org_id, kind| {
+        let store = store.clone();
+        let target_id = target_id.clone();
+        async move {
+            match store
+                .create_operation(CreatePublicOperation {
+                    org_id,
+                    actor_user_id: None,
+                    api_product: ApiProduct::Native,
+                    kind,
+                    target_type: Some(OperationTargetType::Sandbox),
+                    target_id: Some(&target_id),
+                    payload_json: serde_json::json!({}),
+                    idempotency: None,
+                })
+                .await?
+            {
+                CreatePublicOperationResult::Created(id) => TestResult::Ok(id),
+                other => Err(format!("operation was not created: {other:?}").into()),
+            }
+        }
+    };
+    let exhausted = create(org_id, OperationKind::StartSandbox).await?;
+    create(other_org_id, OperationKind::StartSandbox).await?;
+
+    assert!(
+        !store
+            .other_sandbox_operation_unfinished(org_id, &target_id, exhausted)
+            .await?,
+        "an operation does not wait on itself, nor on another tenant's"
+    );
+
+    let newer = create(org_id, OperationKind::StartSandbox).await?;
+    assert!(
+        store
+            .other_sandbox_operation_unfinished(org_id, &target_id, exhausted)
+            .await?
+    );
+
+    sqlx::query(sql!(
+        "UPDATE public_operations SET state = 'failed' WHERE operation_id = $1"
+    ))
+    .bind(newer.as_uuid())
+    .execute(&db.pool)
+    .await?;
+    assert!(
+        !store
+            .other_sandbox_operation_unfinished(org_id, &target_id, exhausted)
+            .await?
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn active_sandbox_deletes_coalesce_per_tenant_and_target() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());

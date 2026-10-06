@@ -14628,9 +14628,11 @@ mod kubernetes_tests {
         Ok(())
     }
 
-    /// A start attempt whose execution was retired underneath it can still
-    /// leave its pod behind; with no active execution left, only that
-    /// inactive row names the pod, and nothing else collects it.
+    /// A failed cold activation is rolled back by the node's receipt, which
+    /// retires the attempt's execution but neither deletes its pod nor clears
+    /// its lease. With no active execution left, only that inactive row names
+    /// the pod, and nothing else collects it; a lease on a retired row
+    /// protects nothing.
     #[tokio::test(flavor = "current_thread")]
     async fn abandoned_start_collects_a_pod_left_on_an_inactive_execution() -> Result<(), BoxError>
     {
@@ -14638,7 +14640,7 @@ mod kubernetes_tests {
         let pool = db.pool.clone();
         let sandbox_id = SandboxId::new();
         insert_stopped_sandbox_after_stop(&pool, sandbox_id).await?;
-        let pod = insert_start_attempt_execution(&pool, sandbox_id, 2, false).await?;
+        let pod = insert_start_attempt_execution(&pool, sandbox_id, 2, true).await?;
         let pod_name = pod.metadata.name.clone().expect("pod has a name");
         sqlx::query(sql!(
             "UPDATE sandbox_k8s_executions SET active = FALSE

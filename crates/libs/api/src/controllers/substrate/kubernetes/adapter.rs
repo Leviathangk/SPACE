@@ -10,10 +10,10 @@ use crate::controllers::db_contention_error;
 use crate::controllers::substrate::DbContext;
 use crate::controllers::substrate::PooledClaimRefusal;
 use crate::controllers::substrate::{
-    AdmissionPoolClaim, AdmittedPoolClaim, AdmittedPoolClaimLookup, CreateBootMode,
-    PooledExecutionClaim, PooledExecutionClaimAttempt, PooledExecutionClaimRequest,
-    PooledPrepareFailureCleanup, PublishedLocalArtifact, create_wait_should_preserve_node_work,
-    enqueue_artifact_backup_with_client,
+    AbandonedStartDeferral, AbandonedStartRetirement, AdmissionPoolClaim, AdmittedPoolClaim,
+    AdmittedPoolClaimLookup, CreateBootMode, PooledExecutionClaim, PooledExecutionClaimAttempt,
+    PooledExecutionClaimRequest, PooledPrepareFailureCleanup, PublishedLocalArtifact,
+    create_wait_should_preserve_node_work, enqueue_artifact_backup_with_client,
 };
 use crate::models::{ClusterPoolConfigRequest, ClusterPoolConfigResponse};
 use crate::node_group_placement::{
@@ -2675,6 +2675,101 @@ impl SubstrateAdapter for KubernetesSubstrate {
                     PodFenceCheck::Holds(_) | PodFenceCheck::AlreadyRetired => Ok(None),
                     PodFenceCheck::Mismatch(mismatch) => Ok(Some(mismatch)),
                 }
+            }
+        }
+    }
+
+    async fn retire_abandoned_start(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<AbandonedStartRetirement, SubstrateError> {
+        // Any other lifecycle means something else has taken the sandbox
+        // since the start gave up, and owns whatever runtime it has.
+        match self.store.require_sandbox(sandbox_id).await {
+            Ok(sandbox) if normalize_lifecycle(&sandbox.lifecycle) == "stopped" => {}
+            Ok(_) | Err(SubstrateError::NotFound { .. }) => {
+                return Ok(AbandonedStartRetirement::NothingToRetire);
+            }
+            Err(err) => return Err(err),
+        }
+        let fence = match self
+            .store
+            .stopped_sandbox_active_execution(sandbox_id)
+            .await?
+        {
+            // No active execution: a failed cold activation's rollback
+            // receipt retires the attempt's execution but not its pod, so
+            // that pod is recorded only on an inactive row, which nothing else
+            // collects. Pods on inactive rows cannot be a successor's, and the
+            // absence is re-proven under the sandbox lock before any tracking
+            // is cleared, so a start that creates an execution meanwhile keeps
+            // both.
+            None => RetireFence::NoExecution,
+            Some(row) if row.predates_stop => {
+                return Ok(AbandonedStartRetirement::NothingToRetire);
+            }
+            // Its own attempt's lease, or a newer start that joined or
+            // replaced it: the lease cannot say which, and tearing down a
+            // joined start is exactly what this must never do.
+            Some(row) if row.activation_lease_live => {
+                return Ok(AbandonedStartRetirement::Deferred(
+                    AbandonedStartDeferral::ActivationLeaseHeld,
+                ));
+            }
+            Some(row) => {
+                let execution = row.execution;
+                let pod_name =
+                    PodName::parse(&execution.pod_name).map_err(|err| SubstrateError::Failed {
+                        message: format!("invalid abandoned start pod name: {err}"),
+                    })?;
+                let live_pod = fetch_sandbox_pod_uncached(&self.k8s, pod_name.as_str())
+                    .await
+                    .map_err(|err| SubstrateError::Failed {
+                        message: format!("failed to read abandoned start pod: {err}"),
+                    })?;
+                // Fenced on everything this read saw: the generation, the
+                // attempt (none live), what the row records, and the live
+                // object's UID and resourceVersion. A start that claims the
+                // execution or replaces its pod before the delete makes the
+                // teardown refuse.
+                let mut fence = PodIdentityFence::new(pod_name)
+                    .with_generation(execution.generation)
+                    .with_recorded(RecordedExecution::Read {
+                        pod_uid: execution.pod_uid.clone(),
+                        route_activation_id: execution.route_activation_id,
+                    });
+                if let Some(attempt_id) = execution.activation_attempt_id {
+                    fence = fence.with_activation_attempt(attempt_id);
+                }
+                if let Some(pod_uid) = live_pod
+                    .as_ref()
+                    .and_then(|pod| pod.metadata.uid.as_deref())
+                    .and_then(|uid| PodUid::parse(uid).ok())
+                {
+                    fence = fence.with_pod_uid(pod_uid);
+                    if let Some(resource_version) = live_pod
+                        .as_ref()
+                        .and_then(|pod| pod.metadata.resource_version.as_deref())
+                        .and_then(|version| PodResourceVersion::parse(version).ok())
+                    {
+                        fence = fence.with_resource_version(resource_version);
+                    }
+                }
+                RetireFence::Pod(fence)
+            }
+        };
+        // Retire, not delete: a pod that did boot holds the only copy of what
+        // the guest wrote since the stop, so it is stopped and backed up like
+        // any other retire before its pod goes.
+        match self
+            .teardown_execution(sandbox_id, ExecutionTeardown::Retire, &fence)
+            .await?
+        {
+            RetireExecutionOutcome::Retired => Ok(AbandonedStartRetirement::Retired),
+            RetireExecutionOutcome::PodIdentityChanged { mismatch, .. } => {
+                Ok(AbandonedStartRetirement::Deferred(
+                    AbandonedStartDeferral::PodIdentityChanged(mismatch),
+                ))
             }
         }
     }

@@ -268,6 +268,15 @@ pub(super) struct ActiveExecutionStatusRow {
     pub(super) route_activation_id: Option<SandboxActivationAttemptId>,
 }
 
+#[derive(sqlx::FromRow)]
+pub(super) struct StoppedSandboxExecutionRow {
+    #[sqlx(flatten)]
+    pub(super) execution: ActiveExecutionStatusRow,
+    /// The stop left this execution; no start has created one since.
+    pub(super) predates_stop: bool,
+    pub(super) activation_lease_live: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ActivationFenceOwnership {
     Owned(SandboxActivationAttemptId),
@@ -2454,6 +2463,37 @@ impl K8sStore {
         .fetch_one(&self.pool)
         .await
         .db_context("failed to identify execution retired by stop")
+    }
+
+    /// The active execution of a `stopped` sandbox, with the two facts that
+    /// decide whether an abandoned start may retire it. One read, so the
+    /// identity the retire is fenced on is the identity those facts describe.
+    pub(super) async fn stopped_sandbox_active_execution(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<Option<StoppedSandboxExecutionRow>, SubstrateError> {
+        sqlx::query_as(sql!(
+            "SELECT e.generation, e.pod_name, NULLIF(BTRIM(e.pod_uid), '') AS pod_uid,
+                    host(e.pod_ip) AS pod_ip, s.active_node_id AS current_node_id,
+                    e.k8s_node_name, e.state, s.lifecycle,
+                    e.updated_at <= NOW() - make_interval(secs => $2) AS create_age_expired,
+                    e.activation_attempt_id,
+                    e.route_activation_id,
+                    e.created_at <= s.lifecycle_changed_at AS predates_stop,
+                    COALESCE(
+                        e.activation_attempt_id IS NOT NULL
+                            AND e.activation_attempt_expires_at > NOW(),
+                        FALSE
+                    ) AS activation_lease_live
+             FROM sandbox_k8s_executions e
+             JOIN sandboxes s ON s.id = e.sandbox_id
+             WHERE e.sandbox_id = $1 AND e.active AND s.lifecycle = 'stopped'"
+        ))
+        .bind(sandbox_id)
+        .bind(super::RESTORE_EXECUTION_OWNERSHIP_TTL_SECS)
+        .fetch_optional(&self.pool)
+        .await
+        .db_context("failed to query stopped sandbox execution")
     }
 
     pub(super) async fn complete_activation_attempt(

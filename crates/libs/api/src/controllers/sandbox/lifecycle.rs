@@ -1473,6 +1473,19 @@ impl SandboxController {
         Ok(())
     }
 
+    /// Retire what a `start` its caller has stopped retrying left behind.
+    /// The caller must already know no other operation is driving the
+    /// sandbox; see [`SubstrateAdapter::retire_abandoned_start`].
+    pub async fn retire_abandoned_start(
+        &self,
+        id: SandboxId,
+    ) -> Result<crate::controllers::substrate::AbandonedStartRetirement, ControllerError> {
+        self.substrate
+            .retire_abandoned_start(id)
+            .await
+            .map_err(ControllerError::from)
+    }
+
     pub async fn action(
         &self,
         pool: &PgPool,

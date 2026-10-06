@@ -480,29 +480,71 @@ impl SandboxLifecycleOperationExecutor {
         }
     }
 
+    /// Retire what a `start` left behind once the dispatcher has stopped
+    /// retrying it: without this, the last attempt's runtime outlives the
+    /// failed operation on a sandbox the control plane reports as stopped.
+    ///
+    /// Best-effort, because the operation fails either way; every outcome is
+    /// logged here. Any other unfinished operation on the sandbox may be a
+    /// newer start about to reuse that runtime, so this defers to it, and the
+    /// substrate fences the teardown against a start that claims the runtime
+    /// after this check.
+    pub async fn compensate_exhausted_start(&self, operation: &ClaimedPublicOperation) {
+        match self.compensate_exhausted_start_inner(operation).await {
+            Ok(outcome) => tracing::info!(
+                operation_id = %operation.id,
+                target_id = operation.target_id.as_deref().unwrap_or_default(),
+                outcome = outcome.as_str(),
+                "compensated exhausted sandbox start"
+            ),
+            Err(error) => tracing::warn!(
+                operation_id = %operation.id,
+                target_id = operation.target_id.as_deref().unwrap_or_default(),
+                error = %error,
+                "failed to compensate exhausted sandbox start; its runtime may remain"
+            ),
+        }
+    }
+
+    async fn compensate_exhausted_start_inner(
+        &self,
+        operation: &ClaimedPublicOperation,
+    ) -> Result<ExhaustedStartCompensation, SandboxLifecycleExecutionError> {
+        let payload = validated_lifecycle_payload(operation)?;
+        if payload.action != SandboxLifecycleAction::Start {
+            return Err(SandboxLifecycleExecutionError::UnsupportedAction(
+                payload.action,
+            ));
+        }
+        let Some(sandbox) = fetch_sandbox(&self.pool, payload.sandbox_id.into()).await? else {
+            return Ok(ExhaustedStartCompensation::SandboxMissing);
+        };
+        if sandbox.org_id != operation.org_id {
+            return Err(SandboxLifecycleExecutionError::TargetOrgMismatch);
+        }
+        if crate::public_operations::PublicOperationStore::new(self.pool.clone())
+            .other_sandbox_operation_unfinished(
+                operation.org_id,
+                &payload.sandbox_id.to_string(),
+                operation.id,
+            )
+            .await
+            .map_err(SandboxLifecycleExecutionError::OperationStore)?
+        {
+            return Ok(ExhaustedStartCompensation::OtherOperationInFlight);
+        }
+        Ok(ExhaustedStartCompensation::Substrate(
+            self.controller
+                .retire_abandoned_start(payload.sandbox_id.into())
+                .await?,
+        ))
+    }
+
     async fn execute_inner(
         &self,
         operation: &ClaimedPublicOperation,
     ) -> Result<PublicOperationExecutionResult, SandboxLifecycleExecutionError> {
-        let payload: SandboxLifecycleOperationPayload =
-            serde_json::from_value(operation.payload.clone())
-                .map_err(SandboxLifecycleExecutionError::InvalidPayload)?;
-        let target_id = operation
-            .target_id
-            .as_deref()
-            .ok_or(SandboxLifecycleExecutionError::MissingTargetId)?;
-        if target_id != payload.sandbox_id.to_string() {
-            return Err(SandboxLifecycleExecutionError::TargetMismatch {
-                target_id: target_id.to_string(),
-                payload_sandbox_id: payload.sandbox_id,
-            });
-        }
-        if payload.action.operation_kind() != operation.kind {
-            return Err(SandboxLifecycleExecutionError::KindMismatch {
-                operation_kind: operation.kind,
-                action: payload.action,
-            });
-        }
+        let payload = validated_lifecycle_payload(operation)?;
 
         let sandbox_uuid = payload.sandbox_id;
         let sandbox = fetch_sandbox(&self.pool, sandbox_uuid.into()).await?;
@@ -617,6 +659,47 @@ impl SandboxLifecycleOperationExecutor {
             body,
             "sandbox lifecycle action dispatched",
         ))
+    }
+}
+
+fn validated_lifecycle_payload(
+    operation: &ClaimedPublicOperation,
+) -> Result<SandboxLifecycleOperationPayload, SandboxLifecycleExecutionError> {
+    let payload: SandboxLifecycleOperationPayload =
+        serde_json::from_value(operation.payload.clone())
+            .map_err(SandboxLifecycleExecutionError::InvalidPayload)?;
+    let target_id = operation
+        .target_id
+        .as_deref()
+        .ok_or(SandboxLifecycleExecutionError::MissingTargetId)?;
+    if target_id != payload.sandbox_id.to_string() {
+        return Err(SandboxLifecycleExecutionError::TargetMismatch {
+            target_id: target_id.to_string(),
+            payload_sandbox_id: payload.sandbox_id,
+        });
+    }
+    if payload.action.operation_kind() != operation.kind {
+        return Err(SandboxLifecycleExecutionError::KindMismatch {
+            operation_kind: operation.kind,
+            action: payload.action,
+        });
+    }
+    Ok(payload)
+}
+
+enum ExhaustedStartCompensation {
+    SandboxMissing,
+    OtherOperationInFlight,
+    Substrate(crate::controllers::substrate::AbandonedStartRetirement),
+}
+
+impl ExhaustedStartCompensation {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::SandboxMissing => "sandbox_missing",
+            Self::OtherOperationInFlight => "deferred_other_operation_in_flight",
+            Self::Substrate(outcome) => outcome.as_str(),
+        }
     }
 }
 
@@ -921,6 +1004,8 @@ enum SandboxLifecycleExecutionError {
     Sql(#[from] sqlx::Error),
     #[error("sandbox lifecycle action failed: {0}")]
     Controller(#[from] ControllerError),
+    #[error("public operation store error: {0}")]
+    OperationStore(#[source] crate::public_operations::PublicOperationStoreError),
 }
 
 impl SandboxLifecycleExecutionError {
@@ -949,6 +1034,17 @@ impl SandboxLifecycleExecutionError {
                     operation_id = %operation.id,
                     error = %error,
                     "retrying sandbox lifecycle operation after database error"
+                );
+                PublicOperationExecutionResult::retry(
+                    "database unavailable while applying sandbox lifecycle action",
+                    CREATE_RETRY_AFTER,
+                )
+            }
+            Self::OperationStore(error) => {
+                tracing::warn!(
+                    operation_id = %operation.id,
+                    error = %error,
+                    "retrying sandbox lifecycle operation after operation store error"
                 );
                 PublicOperationExecutionResult::retry(
                     "database unavailable while applying sandbox lifecycle action",

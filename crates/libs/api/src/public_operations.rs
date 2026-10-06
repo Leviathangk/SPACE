@@ -519,6 +519,32 @@ impl PublicOperationStore {
         Ok(result)
     }
 
+    /// Whether any operation on this tenant's sandbox other than `except` is
+    /// still queued or running.
+    pub async fn other_sandbox_operation_unfinished(
+        &self,
+        org_id: OrgId,
+        target_id: &str,
+        except: OperationId,
+    ) -> Result<bool, PublicOperationStoreError> {
+        Ok(sqlx::query_scalar(sql!(
+            "SELECT EXISTS (
+                SELECT 1
+                  FROM public_operations
+                 WHERE org_id = $1
+                   AND target_type = 'sandbox'
+                   AND target_id = $2
+                   AND operation_id <> $3
+                   AND state IN ('queued', 'running')
+            )"
+        ))
+        .bind(org_id)
+        .bind(target_id)
+        .bind(except.as_uuid())
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     /// Create or join the one active sandbox delete for this tenant and target.
     ///
     /// The transaction-scoped advisory lock makes the lookup plus insert atomic
