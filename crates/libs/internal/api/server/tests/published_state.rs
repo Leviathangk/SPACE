@@ -16,7 +16,8 @@ use pplx_space_common_core::{
 };
 use pplx_space_common_svc::types::{
     AutoLifecyclePolicyFingerprint, FACET_NETWORK_POLICY, FACET_SANDBOX_DESIRED_STATE,
-    NetworkPolicyTarget, SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY, SANDBOX_FAILURE_EPISODE_KEY,
+    NetworkPolicyTarget, SANDBOX_ABANDONED_ACTIVATION_KEY,
+    SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY, SANDBOX_FAILURE_EPISODE_KEY,
     SANDBOX_FAILURE_EXECUTION_GENERATION_KEY,
 };
 use pplx_space_db_test_fixtures::{
@@ -260,6 +261,51 @@ fn activation_completed_state(
         }),
         ..PublishedSandboxState::default()
     }
+}
+
+/// What a node publishes once a pod's VM boots: the runtime's own execution
+/// identity and, when it activated under an operation, that operation's
+/// completion receipt.
+fn booted_runtime_state(
+    sandbox_id: SandboxId,
+    execution_generation: i64,
+    activation_attempt_id: Option<Uuid>,
+) -> PublishedSandboxState {
+    let mut state = match activation_attempt_id {
+        Some(attempt_id) => activation_completed_state(
+            sandbox_id,
+            Uuid::now_v7(),
+            "started",
+            execution_generation,
+            attempt_id,
+        ),
+        None => published_sandbox_state(sandbox_id, "started"),
+    };
+    state.execution_generation = Some(execution_generation);
+    state.pod_uid = Some(format!("pod-uid-{execution_generation}"));
+    state.activation_attempt_id = activation_attempt_id.map(|id| id.to_string());
+    state
+}
+
+/// The node-scoped teardown request a publication recorded for an abandoned
+/// activation's runtime, if any.
+async fn abandoned_activation_observation(
+    pool: &PgPool,
+    node_id: NodeId,
+    sandbox_id: SandboxId,
+) -> TestResult<Option<serde_json::Value>> {
+    Ok(sqlx::query_scalar(sql!(
+        "SELECT observed_payload -> $4::TEXT
+           FROM node_facet_observed_status
+          WHERE node_id = $1 AND facet = $2 AND element = $3
+            AND observed_payload ? $4::TEXT"
+    ))
+    .bind(node_id)
+    .bind(FACET_SANDBOX_DESIRED_STATE)
+    .bind(sandbox_id.to_string())
+    .bind(SANDBOX_ABANDONED_ACTIVATION_KEY)
+    .fetch_optional(pool)
+    .await?)
 }
 
 fn activation_rollback_state(
@@ -3857,6 +3903,11 @@ async fn activation_completion_receipt_converges_and_releases_only_its_attempt()
     let mut conn = db.pool.acquire().await?;
     publish_sandbox_states(&mut conn, node_id, &[receipt.clone()]).await?;
     assert_eq!(sandbox_lifecycle(&db.pool, sandbox_id).await?, "stopped");
+    assert_eq!(
+        abandoned_activation_observation(&db.pool, node_id, sandbox_id).await?,
+        None,
+        "a runtime its current attempt still owns is never handed to teardown"
+    );
     let still_owned = sqlx::query_scalar::<_, Option<Uuid>>(
         "SELECT activation_attempt_id
            FROM sandbox_k8s_executions
@@ -3909,6 +3960,10 @@ async fn activation_completion_receipt_converges_and_releases_only_its_attempt()
     .await?;
     publish_sandbox_states(&mut conn, node_id, &[receipt.clone()]).await?;
     assert_eq!(sandbox_lifecycle(&db.pool, sandbox_id).await?, "started");
+    assert_eq!(
+        abandoned_activation_observation(&db.pool, node_id, sandbox_id).await?,
+        None
+    );
     let released = sqlx::query_scalar::<_, Option<Uuid>>(
         "SELECT activation_attempt_id
            FROM sandbox_k8s_executions
@@ -3998,6 +4053,222 @@ async fn activation_completion_receipt_cannot_overwrite_a_newer_suspend_claim() 
             "the exact completed attempt should still be released instead of being republished forever"
         );
     }
+    Ok(())
+}
+
+/// How a start abandoned the attempt whose pod later booted anyway.
+#[derive(Clone, Copy, Debug)]
+enum AbandonedAttempt {
+    /// The node rolled the failed activation back, retiring its execution and
+    /// unplacing the row; kubelet then retried the same pod until it booted.
+    RolledBack,
+    /// The start released its attempt without converging the lifecycle.
+    Released,
+    /// The attempt's lease expired before the runtime published.
+    Expired,
+}
+
+/// A start that failed told its client so and left the row `stopped`. When the
+/// pod it left behind boots later, the node's report must neither promote the
+/// row to `started` nor be ignored: the runtime is handed to teardown, fenced
+/// on the exact generation and pod the node reported, until the node stops
+/// reporting it.
+#[tokio::test(flavor = "current_thread")]
+async fn late_runtime_behind_a_stopped_row_is_handed_to_teardown_without_promotion() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    insert_ready_worker_node(&db.pool, node_id).await?;
+    for abandoned in [
+        AbandonedAttempt::RolledBack,
+        AbandonedAttempt::Released,
+        AbandonedAttempt::Expired,
+    ] {
+        let sandbox_id = SandboxId::new();
+        let attempt_id = Uuid::now_v7();
+        insert_active_sandbox(&db.pool, sandbox_id, node_id, "stopped").await?;
+        insert_k8s_execution(&db.pool, sandbox_id, 7, "creating", None).await?;
+        sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions
+                SET activation_attempt_id = $2,
+                    route_activation_id = $2,
+                    activation_attempt_expires_at = NOW() + INTERVAL '5 minutes',
+                    activation_attempt_target_state = 'started'
+              WHERE sandbox_id = $1 AND generation = 7"
+        ))
+        .bind(sandbox_id)
+        .bind(attempt_id)
+        .execute(&db.pool)
+        .await?;
+        let mut conn = db.pool.acquire().await?;
+        let late_runtime = match abandoned {
+            AbandonedAttempt::RolledBack => {
+                let rollback = activation_rollback_state(
+                    sandbox_id,
+                    Uuid::now_v7(),
+                    "stopped",
+                    7,
+                    attempt_id,
+                    SandboxQuarantineReasonCode::ColdActivationInterrupted,
+                );
+                publish_sandbox_states(&mut conn, node_id, &[rollback]).await?;
+                booted_runtime_state(sandbox_id, 7, Some(attempt_id))
+            }
+            AbandonedAttempt::Released => {
+                sqlx::query(sql!(
+                    "UPDATE sandbox_k8s_executions
+                        SET state = 'running',
+                            pod_ip = '100.64.0.7',
+                            activation_attempt_id = NULL,
+                            activation_attempt_expires_at = NULL,
+                            activation_attempt_target_state = NULL
+                      WHERE sandbox_id = $1 AND generation = 7"
+                ))
+                .bind(sandbox_id)
+                .execute(&db.pool)
+                .await?;
+                booted_runtime_state(sandbox_id, 7, None)
+            }
+            AbandonedAttempt::Expired => {
+                sqlx::query(sql!(
+                    "UPDATE sandbox_k8s_executions
+                        SET state = 'created',
+                            activation_attempt_expires_at = NOW() - INTERVAL '1 minute'
+                      WHERE sandbox_id = $1 AND generation = 7"
+                ))
+                .bind(sandbox_id)
+                .execute(&db.pool)
+                .await?;
+                booted_runtime_state(sandbox_id, 7, Some(attempt_id))
+            }
+        };
+
+        publish_sandbox_states(&mut conn, node_id, std::slice::from_ref(&late_runtime)).await?;
+        assert_eq!(
+            sandbox_lifecycle(&db.pool, sandbox_id).await?,
+            "stopped",
+            "{abandoned:?}: a start the API reported as failed must not be adopted"
+        );
+        assert_eq!(
+            abandoned_activation_observation(&db.pool, node_id, sandbox_id).await?,
+            Some(serde_json::json!({
+                "execution_generation": 7,
+                "pod_uid": "pod-uid-7",
+            })),
+            "{abandoned:?}: the runtime is handed to teardown fenced on its generation and pod"
+        );
+
+        // A republished report keeps the same request; one the node no longer
+        // backs with a running VM withdraws it.
+        publish_sandbox_states(&mut conn, node_id, std::slice::from_ref(&late_runtime)).await?;
+        assert!(
+            abandoned_activation_observation(&db.pool, node_id, sandbox_id)
+                .await?
+                .is_some(),
+            "{abandoned:?}"
+        );
+        publish_sandbox_states(
+            &mut conn,
+            node_id,
+            &[published_sandbox_state(sandbox_id, "stopped")],
+        )
+        .await?;
+        assert_eq!(
+            abandoned_activation_observation(&db.pool, node_id, sandbox_id).await?,
+            None,
+            "{abandoned:?}: a runtime the node no longer reports needs no teardown"
+        );
+        assert_eq!(sandbox_lifecycle(&db.pool, sandbox_id).await?, "stopped");
+    }
+    Ok(())
+}
+
+/// Teardown of a late runtime is pinned to the generation the node reported.
+/// Once a newer start owns the sandbox, its execution, attempt, and pod are not
+/// this report's to touch, and the stale runtime is left to the newer
+/// execution's own replacement sweep.
+#[tokio::test(flavor = "current_thread")]
+async fn late_runtime_of_an_older_generation_leaves_a_newer_activation_untouched() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    let abandoned_attempt = Uuid::now_v7();
+    let current_attempt = Uuid::now_v7();
+    insert_ready_worker_node(&db.pool, node_id).await?;
+    insert_active_sandbox(&db.pool, sandbox_id, node_id, "stopped").await?;
+    insert_k8s_execution(&db.pool, sandbox_id, 7, "creating", None).await?;
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+            SET activation_attempt_id = $2,
+                route_activation_id = $2,
+                activation_attempt_expires_at = NOW() + INTERVAL '5 minutes',
+                activation_attempt_target_state = 'started'
+          WHERE sandbox_id = $1 AND generation = 7"
+    ))
+    .bind(sandbox_id)
+    .bind(abandoned_attempt)
+    .execute(&db.pool)
+    .await?;
+    let mut conn = db.pool.acquire().await?;
+    publish_sandbox_states(
+        &mut conn,
+        node_id,
+        &[activation_rollback_state(
+            sandbox_id,
+            Uuid::now_v7(),
+            "stopped",
+            7,
+            abandoned_attempt,
+            SandboxQuarantineReasonCode::ColdActivationInterrupted,
+        )],
+    )
+    .await?;
+    insert_k8s_execution(&db.pool, sandbox_id, 8, "creating", None).await?;
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+            SET activation_attempt_id = $2,
+                route_activation_id = $2,
+                activation_attempt_expires_at = NOW() + INTERVAL '5 minutes',
+                activation_attempt_target_state = 'started'
+          WHERE sandbox_id = $1 AND generation = 8"
+    ))
+    .bind(sandbox_id)
+    .bind(current_attempt)
+    .execute(&db.pool)
+    .await?;
+
+    publish_sandbox_states(
+        &mut conn,
+        node_id,
+        &[booted_runtime_state(sandbox_id, 7, Some(abandoned_attempt))],
+    )
+    .await?;
+
+    assert_eq!(sandbox_lifecycle(&db.pool, sandbox_id).await?, "stopped");
+    assert_eq!(
+        abandoned_activation_observation(&db.pool, node_id, sandbox_id).await?,
+        None
+    );
+    let newer = sqlx::query_as::<_, (bool, String, Option<Uuid>, Option<String>)>(sql!(
+        "SELECT active, state, activation_attempt_id, pod_uid
+           FROM sandbox_k8s_executions
+          WHERE sandbox_id = $1 AND generation = 8"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        newer,
+        (
+            true,
+            "creating".to_string(),
+            Some(current_attempt),
+            Some("pod-uid-8".to_string()),
+        )
+    );
     Ok(())
 }
 

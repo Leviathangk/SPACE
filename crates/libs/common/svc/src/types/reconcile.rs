@@ -19,6 +19,11 @@ pub const SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY: &str = "activation_attempt_
 /// Exact node-local suspend identity, before durable backup finalization.
 /// This facet observation permits waiting only, never restoring artifact bytes.
 pub const SANDBOX_LOCAL_SUSPEND_KEY: &str = "local_suspend";
+/// A node-reported runtime for an execution generation the control plane no
+/// longer activates, behind a dormant `stopped` row. Its payload names the
+/// exact generation and pod UID that teardown is fenced on; the observation
+/// authorizes retiring that runtime only, never adopting it.
+pub const SANDBOX_ABANDONED_ACTIVATION_KEY: &str = "abandoned_activation";
 
 pub const NETWORK_POLICY_TARGET_TEMPLATE_PREFIX: &str = "template:";
 pub const NETWORK_POLICY_TARGET_SANDBOX_PREFIX: &str = "sandbox:";
