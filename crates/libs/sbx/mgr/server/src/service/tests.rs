@@ -19793,6 +19793,7 @@ pub(crate) mod service_tests {
     ) -> ActivationAdmissionConfig {
         ActivationAdmissionConfig {
             max_concurrent_activations,
+            max_concurrent_restores: None,
             refill_rps,
             burst,
         }

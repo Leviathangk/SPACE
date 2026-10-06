@@ -18,6 +18,15 @@ const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const CONCURRENCY_RETRY_AFTER: Duration = Duration::from_millis(200);
 const MIN_CONSUMING_BURST: f64 = 1.0;
 const MAX_CONCURRENT_ENV: &str = "SPACE_SBXMGR_ACTIVATION_ADMISSION_MAX_CONCURRENT";
+/// Restore-specific per-node concurrency ceiling. Unset (`None`) disables the
+/// sub-cap: restores are then bounded only by the shared
+/// `max_concurrent_activations`, matching the pre-cap behavior. When set, a node
+/// admits at most this many concurrent restore activations, so a burst of
+/// cross-node fallback restores can't monopolize one node's decompress/VolMgr
+/// budget and starve everything else — the node backpressures instead, and the
+/// restore re-drives to a less-loaded node.
+const MAX_CONCURRENT_RESTORES_ENV: &str =
+    "SPACE_SBXMGR_ACTIVATION_ADMISSION_MAX_CONCURRENT_RESTORES";
 
 type ActivationCleanup = Box<
     dyn FnOnce(
@@ -181,6 +190,9 @@ pub(super) const START_NODE_METADATA_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct ActivationAdmissionConfig {
     pub(super) max_concurrent_activations: usize,
+    /// Restore-specific per-node sub-cap. `None` disables it (restores bounded
+    /// only by `max_concurrent_activations`). See [`MAX_CONCURRENT_RESTORES_ENV`].
+    pub(super) max_concurrent_restores: Option<usize>,
     pub(super) refill_rps: f64,
     pub(super) burst: f64,
 }
@@ -189,6 +201,7 @@ impl Default for ActivationAdmissionConfig {
     fn default() -> Self {
         Self {
             max_concurrent_activations: DEFAULT_MAX_CONCURRENT_ACTIVATIONS,
+            max_concurrent_restores: None,
             refill_rps: DEFAULT_REFILL_RPS,
             burst: DEFAULT_BURST,
         }
@@ -203,6 +216,7 @@ impl ActivationAdmissionConfig {
                 MAX_CONCURRENT_ENV,
                 defaults.max_concurrent_activations,
             ),
+            max_concurrent_restores: parse_optional_positive_usize_env(MAX_CONCURRENT_RESTORES_ENV),
             refill_rps: defaults.refill_rps,
             burst: defaults.burst,
         }
@@ -311,6 +325,10 @@ struct TokenBucket {
 pub(super) struct ActivationAdmissionLimiter {
     config: ActivationAdmissionConfig,
     semaphore: Arc<Semaphore>,
+    /// Restore-specific sub-cap, present only when `max_concurrent_restores` is
+    /// configured. A restore must hold both this permit and a shared
+    /// `semaphore` permit; cold activations only take the shared permit.
+    restore_semaphore: Option<Arc<Semaphore>>,
     in_flight: Arc<AtomicUsize>,
     in_flight_by_kind: Arc<ActivationInFlight>,
     bucket: std::sync::Mutex<TokenBucket>,
@@ -373,9 +391,15 @@ impl ActivationAdmissionLimiter {
         pplx_space_metrics::sandbox::admission::node_max_concurrent(
             config.max_concurrent_activations,
         );
+        pplx_space_metrics::sandbox::admission::node_restore_max_concurrent(
+            config.max_concurrent_restores,
+        );
         Self {
             config,
             semaphore: Arc::new(Semaphore::new(config.max_concurrent_activations)),
+            restore_semaphore: config
+                .max_concurrent_restores
+                .map(|cap| Arc::new(Semaphore::new(cap))),
             in_flight: Arc::new(AtomicUsize::new(0)),
             in_flight_by_kind: Arc::new(ActivationInFlight {
                 cold: AtomicUsize::new(0),
@@ -415,6 +439,9 @@ impl ActivationAdmissionLimiter {
         pplx_space_metrics::sandbox::admission::node_refill_rps(self.config.refill_rps);
         pplx_space_metrics::sandbox::admission::node_max_concurrent(
             self.config.max_concurrent_activations,
+        );
+        pplx_space_metrics::sandbox::admission::node_restore_max_concurrent(
+            self.config.max_concurrent_restores,
         );
         let queued_at = Instant::now();
         let queue_metric = AdmissionQueueMetricGuard::new(kind, queued_at);
@@ -504,6 +531,33 @@ impl ActivationAdmissionLimiter {
             }
         };
 
+        // Restore-specific sub-cap: a restore must additionally hold a permit
+        // from the restore semaphore. Acquiring the shared permit first, then
+        // this one, means a capped-out restore never consumes a rate-limit
+        // token — it backpressures at the concurrency gate and the caller
+        // re-drives to a less-loaded node. Cold activations skip this gate.
+        let restore_permit = match (kind, self.restore_semaphore.as_ref()) {
+            (ActivationAdmissionKind::Restore, Some(restore_semaphore)) => {
+                match restore_semaphore.clone().try_acquire_owned() {
+                    Ok(restore_permit) => Some(restore_permit),
+                    Err(_) => {
+                        drop(permit);
+                        return Err(ActivationAdmissionRejection {
+                            status: rate_limited_status(
+                                format!(
+                                    "sandbox restore admission concurrency full (max_concurrent_restores={})",
+                                    self.config.max_concurrent_restores.unwrap_or_default()
+                                ),
+                                CONCURRENCY_RETRY_AFTER,
+                            ),
+                            reason: AdmissionRejectReason::ConcurrencyFull,
+                        });
+                    }
+                }
+            }
+            _ => None,
+        };
+
         if let Err(retry_after) = self.consume_token() {
             drop(permit);
             return Err(ActivationAdmissionRejection {
@@ -538,6 +592,7 @@ impl ActivationAdmissionLimiter {
         );
         Ok(ActivationAdmissionPermit {
             _permit: permit,
+            _restore_permit: restore_permit,
             in_flight: self.in_flight.clone(),
             in_flight_by_kind: Arc::clone(&self.in_flight_by_kind),
             kind,
@@ -579,6 +634,10 @@ impl ActivationAdmissionLimiter {
 #[derive(Debug)]
 pub(super) struct ActivationAdmissionPermit {
     _permit: OwnedSemaphorePermit,
+    /// Restore sub-cap permit, held for the operation's lifetime and released
+    /// on drop alongside `_permit`. `None` for cold activations and when the
+    /// restore sub-cap is disabled.
+    _restore_permit: Option<OwnedSemaphorePermit>,
     in_flight: Arc<AtomicUsize>,
     in_flight_by_kind: Arc<ActivationInFlight>,
     kind: ActivationAdmissionKind,
@@ -629,6 +688,9 @@ pub(super) fn sanitize_config(config: ActivationAdmissionConfig) -> ActivationAd
     ActivationAdmissionConfig {
         max_concurrent_activations: valid_max_concurrent(config.max_concurrent_activations)
             .unwrap_or(defaults.max_concurrent_activations),
+        max_concurrent_restores: config
+            .max_concurrent_restores
+            .and_then(valid_max_concurrent),
         refill_rps: valid_positive_f64(config.refill_rps).unwrap_or(defaults.refill_rps),
         burst: valid_burst(config.burst).unwrap_or(defaults.burst),
     }
@@ -665,6 +727,29 @@ fn parse_positive_usize_env(var: &str, default: usize) -> usize {
                 default
             }),
         Err(_) => default,
+    }
+}
+
+/// Parses an optional positive-usize env var. Unset → `None` (feature off). Set
+/// but non-positive / unparsable / out of range → `None` with a warning, so a
+/// typo disables the sub-cap rather than silently clamping to a surprising value.
+fn parse_optional_positive_usize_env(var: &str) -> Option<usize> {
+    let raw = std::env::var(var).ok()?;
+    match raw
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .and_then(valid_max_concurrent)
+    {
+        Some(value) => Some(value),
+        None => {
+            tracing::warn!(
+                var,
+                raw = %raw,
+                "env var is not a positive activation-admission integer; disabling the sub-cap"
+            );
+            None
+        }
     }
 }
 

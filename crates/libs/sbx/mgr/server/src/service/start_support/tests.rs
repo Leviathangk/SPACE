@@ -5,6 +5,7 @@ async fn admission_wait_cleanup_runs_when_wait_is_cancelled() {
     let limiter = Arc::new(ActivationAdmissionLimiter::with_config(
         ActivationAdmissionConfig {
             max_concurrent_activations: 1,
+            max_concurrent_restores: None,
             refill_rps: 1_000.0,
             burst: 10.0,
         },
@@ -80,6 +81,7 @@ async fn restore_activation_cleanup_runs_before_admitted_permit_is_released() {
     let limiter = Arc::new(ActivationAdmissionLimiter::with_config(
         ActivationAdmissionConfig {
             max_concurrent_activations: 1,
+            max_concurrent_restores: None,
             refill_rps: 1_000.0,
             burst: 1.0,
         },
@@ -124,6 +126,7 @@ async fn activation_cleanup_remains_armed_after_permit_release() {
     let limiter = Arc::new(ActivationAdmissionLimiter::with_config(
         ActivationAdmissionConfig {
             max_concurrent_activations: 1,
+            max_concurrent_restores: None,
             refill_rps: 1_000.0,
             burst: 1.0,
         },
@@ -204,6 +207,7 @@ fn activation_failure_preserves_the_concrete_error_for_cleanup() {
 async fn activation_success_atomically_releases_admission_and_disarms_cleanup() {
     let limiter = ActivationAdmissionLimiter::with_config(ActivationAdmissionConfig {
         max_concurrent_activations: 1,
+        max_concurrent_restores: None,
         refill_rps: 1_000.0,
         burst: 1.0,
     });
@@ -226,6 +230,126 @@ async fn activation_success_atomically_releases_admission_and_disarms_cleanup() 
 
     assert_eq!(limiter.in_flight(), 0);
     assert!(cleanup_rx.await.is_err());
+}
+
+fn subcap_config(
+    max_concurrent_activations: usize,
+    max_concurrent_restores: Option<usize>,
+) -> ActivationAdmissionConfig {
+    ActivationAdmissionConfig {
+        max_concurrent_activations,
+        max_concurrent_restores,
+        refill_rps: 1_000.0,
+        burst: 1_000.0,
+    }
+}
+
+#[test]
+fn restore_subcap_rejects_restores_beyond_its_ceiling() {
+    // Shared cap has room for 5, but the restore sub-cap is 2: the third
+    // concurrent restore must be rejected even though the shared semaphore and
+    // token bucket are nowhere near full.
+    let limiter = ActivationAdmissionLimiter::with_config(subcap_config(5, Some(2)));
+
+    let _r1 = limiter
+        .try_acquire(ActivationAdmissionKind::Restore)
+        .expect("first restore fits under the sub-cap");
+    let _r2 = limiter
+        .try_acquire(ActivationAdmissionKind::Restore)
+        .expect("second restore fits under the sub-cap");
+
+    let third = limiter.try_acquire(ActivationAdmissionKind::Restore);
+    assert!(
+        third.is_err(),
+        "third concurrent restore must be rejected by the restore sub-cap (limit 2)"
+    );
+    assert_eq!(
+        limiter.in_flight_for(ActivationAdmissionKind::Restore),
+        2,
+        "a rejected restore must not count as in-flight"
+    );
+}
+
+#[test]
+fn restore_subcap_does_not_block_cold_activations() {
+    // The restore sub-cap is exhausted, but cold activations draw only on the
+    // shared semaphore, which still has room — they must still be admitted.
+    let limiter = ActivationAdmissionLimiter::with_config(subcap_config(5, Some(1)));
+
+    let _r1 = limiter
+        .try_acquire(ActivationAdmissionKind::Restore)
+        .expect("restore fits under the sub-cap");
+    assert!(
+        limiter
+            .try_acquire(ActivationAdmissionKind::Restore)
+            .is_err(),
+        "restore sub-cap of 1 must reject the second restore"
+    );
+
+    let _c1 = limiter
+        .try_acquire(ActivationAdmissionKind::Cold)
+        .expect("cold activation must not be blocked by the restore sub-cap");
+    let _c2 = limiter
+        .try_acquire(ActivationAdmissionKind::Cold)
+        .expect("a second cold activation still fits under the shared cap");
+}
+
+#[test]
+fn restore_subcap_slot_is_released_when_permit_drops() {
+    let limiter = ActivationAdmissionLimiter::with_config(subcap_config(5, Some(1)));
+
+    let first = limiter
+        .try_acquire(ActivationAdmissionKind::Restore)
+        .expect("first restore fits under the sub-cap");
+    assert!(
+        limiter
+            .try_acquire(ActivationAdmissionKind::Restore)
+            .is_err(),
+        "sub-cap of 1 rejects a concurrent restore"
+    );
+
+    drop(first);
+
+    limiter
+        .try_acquire(ActivationAdmissionKind::Restore)
+        .expect("dropping the prior restore permit must free the sub-cap slot");
+}
+
+#[test]
+fn sanitize_disables_an_invalid_restore_subcap_rather_than_defaulting_it() {
+    // A configured-but-invalid restore cap (0) must sanitize to None (disabled),
+    // not silently clamp to some surprising positive value. A valid cap passes
+    // through unchanged.
+    let disabled = sanitize_config(subcap_config(5, Some(0)));
+    assert_eq!(disabled.max_concurrent_restores, None);
+
+    let kept = sanitize_config(subcap_config(5, Some(3)));
+    assert_eq!(kept.max_concurrent_restores, Some(3));
+
+    let off = sanitize_config(subcap_config(5, None));
+    assert_eq!(off.max_concurrent_restores, None);
+}
+
+#[test]
+fn restore_subcap_disabled_allows_restores_up_to_shared_cap() {
+    // No sub-cap configured: restores are bounded only by the shared cap of 3.
+    let limiter = ActivationAdmissionLimiter::with_config(subcap_config(3, None));
+
+    let _r1 = limiter
+        .try_acquire(ActivationAdmissionKind::Restore)
+        .unwrap();
+    let _r2 = limiter
+        .try_acquire(ActivationAdmissionKind::Restore)
+        .unwrap();
+    let _r3 = limiter
+        .try_acquire(ActivationAdmissionKind::Restore)
+        .unwrap();
+    assert!(
+        limiter
+            .try_acquire(ActivationAdmissionKind::Restore)
+            .is_err(),
+        "with the sub-cap disabled, restores are still bounded by the shared cap (3)"
+    );
 }
 
 #[tokio::test]

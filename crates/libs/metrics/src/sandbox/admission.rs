@@ -170,6 +170,18 @@ pub fn node_max_concurrent(value: usize) {
     gauge("node.sandbox_admission.max_concurrent", value as f64, &[]);
 }
 
+/// Restore-specific per-node concurrency ceiling. Emits `-1` when the sub-cap is
+/// disabled (unset) so the panel can distinguish "no restore ceiling" from a
+/// ceiling of 0, and overlay the live `restore` in_flight gauge against it.
+pub fn node_restore_max_concurrent(value: Option<usize>) {
+    let reported = value.map(|cap| cap as f64).unwrap_or(-1.0);
+    gauge(
+        "node.sandbox_admission.restore_max_concurrent",
+        reported,
+        &[],
+    );
+}
+
 pub fn node_queue_wait(
     operation_class: AdmissionOperationClass,
     outcome: AdmissionQueueOutcome,
