@@ -13,6 +13,9 @@
 #
 # Sourced, never executed. Callers need nothing set up first.
 
+# shellcheck source=scripts/lib/verified-download.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/verified-download.sh"
+
 # Prerequisites apt carries, named by command. The package name matches the
 # command for each of these; a prerequisite whose package differs would need
 # that mapping reintroduced here rather than assumed at the call sites.
@@ -168,12 +171,9 @@ space_smoke_install_aws_cli() {
     set -e
     tmp="$(mktemp -d)"
     trap 'rm -rf "$tmp"' EXIT
-    # Retry policy matches every other devbox download rather than giving up on
-    # the first 5xx. The URL is a literal: an env var that redirected what runs
-    # next under sudo would be a poor trade for testability.
-    curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors \
+    space_download_verified \
       "https://awscli.amazonaws.com/awscli-exe-linux-${arch}-${SPACE_AWS_CLI_VERSION}.zip" \
-      -o "$tmp/awscliv2.zip"
+      "$tmp/awscliv2.zip" || exit 1
     unzip -q "$tmp/awscliv2.zip" -d "$tmp"
     # `--update` so a box that already has a bundle installed somewhere PATH does
     # not reach is repaired rather than refused.

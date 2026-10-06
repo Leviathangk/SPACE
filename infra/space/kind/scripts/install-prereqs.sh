@@ -83,12 +83,7 @@ want_version() {
 }
 
 download() {
-  # download <url> <dest>
-  # GitHub release downloads (grpcurl, tilt) can answer 500 for longer than
-  # fixed 2 s retries last: four attempts over ~6 s have all failed. Match
-  # install-fc-vendor.sh: curl's doubling backoff spreads seven attempts over
-  # about a minute, and --retry-all-errors also retries a reset connection.
-  curl -fsSL --retry 6 --retry-all-errors "$1" -o "$2"
+  space_download_verified "$1" "$2"
 }
 
 install_kind() {
@@ -97,7 +92,7 @@ install_kind() {
     return
   fi
   log "downloading kind $KIND_VERSION → $INSTALL_DIR/kind"
-  download "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-${OS}-${ARCH}" \
+  download "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-${OS}-${ARCH}" \
     "$INSTALL_DIR/kind"
   chmod +x "$INSTALL_DIR/kind"
 }

@@ -27,7 +27,7 @@ The example follows this sequence:
 1. **Create:** Request a Firecracker sandbox from `seed:latest`. Save its sandbox ID and operation ID.
 2. **Wait:** Poll for operation success and a `running` sandbox, then check the guest process endpoint.
 3. **Execute:** Create a command session, then attach to its event stream to start the process.
-4. **Check:** Decode stdout and stderr from base64 and display them as they arrive. Require `process_exited` with exit code `0`, with no `error`, `resync_required`, or incomplete frame.
+4. **Check:** Decode stdout and stderr from base64 and display them with non-printable and non-ASCII bytes escaped. Require `process_exited` with exit code `0`, with no `error`, `resync_required`, or incomplete frame.
 5. **Inspect:** List sandboxes, inspect this sandbox and its operation, and list its currently running processes.
 6. **Choose cleanup:** After displaying the result, ask whether to delete the sandbox and remove its transcripts. Enter `y` to delete; Enter or any other answer keeps them.
 
@@ -83,7 +83,7 @@ Read `/openapi-m1.json` for exact request constraints and supported fields. This
 
 ## Read command output
 
-The example displays decoded stdout and stderr and saves the raw event stream in its run directory. Handle binary output separately rather than displaying it in a terminal.
+Guest output is untrusted, including terminal escape sequences. The example displays printable ASCII, tabs, and newlines, and renders every other byte as `\xNN`. This also escapes non-ASCII UTF-8 bytes. The saved raw event stream retains the original base64 payloads for binary or Unicode processing; do not replay decoded untrusted output directly into a terminal.
 
 Command output is a live stream, not durable log storage. Reconnecting with `Last-Event-ID` produces `resync_required`, not a replay of missed output. Keep the transcript when a stream fails; repeat a command only if repeating its effects is safe.
 

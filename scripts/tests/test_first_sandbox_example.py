@@ -2,6 +2,7 @@
 
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import base64
 import importlib.util
 import io
 import json
@@ -238,6 +239,20 @@ class FirstSandboxExampleTests(unittest.TestCase):
         for stream in bad:
             with self.subTest(stream=stream), self.assertRaises((ValueError, RuntimeError)):
                 example.consume_events(io.BytesIO(stream), io.BytesIO(), io.BytesIO(), io.BytesIO())
+
+    def test_guest_terminal_controls_are_escaped_but_transcript_is_unchanged(self):
+        payload = b"hello\tworld\n\x1b[2J\x1b]52;c;dGVzdA==\x07\r\b\x7f\x9b31m\xc3\xa9\xff"
+        expected = b"hello\tworld\n\\x1b[2J\\x1b]52;c;dGVzdA==\\x07\\x0d\\x08\\x7f\\x9b31m\\xc3\\xa9\\xff"
+        for chunks in ([payload], [bytes([byte]) for byte in payload]):
+            stream = b"".join(
+                b"data: " + json.dumps({"type": kind, "data_base64": base64.b64encode(chunk).decode()}).encode() + b"\n\n"
+                for kind in ("stdout", "stderr") for chunk in chunks
+            ) + GOOD
+            transcript, stdout, stderr = io.BytesIO(), io.BytesIO(), io.BytesIO()
+            example.consume_events(io.BytesIO(stream), transcript, stdout, stderr)
+            self.assertEqual(stdout.getvalue(), expected)
+            self.assertEqual(stderr.getvalue(), expected)
+            self.assertEqual(transcript.getvalue(), stream)
 
     def test_failed_stream_retains_transcript_and_command_request(self):
         self.state["sandbox_id"] = "sbx_test"

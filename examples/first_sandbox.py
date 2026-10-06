@@ -210,7 +210,10 @@ def consume_events(response, transcript, stdout, stderr):
             raise RuntimeError(f"Command stream reported {kind}; keep the transcript")
         if kind in {"stdout", "stderr"}:
             output = stdout if kind == "stdout" else stderr
-            output.write(base64.b64decode(frame["data_base64"], validate=True))
+            data = base64.b64decode(frame["data_base64"], validate=True)
+            # ponytail: ASCII display; use an incremental UTF-8 decoder if Unicode display is needed.
+            # Escape guest-controlled terminal sequences; the transcript retains the original bytes.
+            output.write(re.sub(rb"[^\t\n\x20-\x7e]", lambda match: f"\\x{match[0][0]:02x}".encode(), data))
             output.flush()
         if kind == "process_exited":
             code = frame.get("exit_code")

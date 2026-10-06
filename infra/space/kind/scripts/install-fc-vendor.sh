@@ -26,12 +26,13 @@
 set -euo pipefail
 
 FC_VERSION="${SPACE_FC_VERSION:-v1.15.1}"
-# firecracker-ci publishes upstream guest kernels keyed by CI version. v1.15
-# ships kernel 5.10.x and 6.1.x; pick 6.1 (matches the kernel digest the
-# production seed manifests reference).
+# Keep the exact kernel release and its checksum pin in sync.
 FC_CI_VERSION="${SPACE_FC_CI_VERSION:-v1.15}"
 KERNEL_SERIES="${SPACE_FC_KERNEL_SERIES:-vmlinux-6.1}"
+KERNEL_VERSION="${SPACE_FC_KERNEL_VERSION:-${KERNEL_SERIES}.155}"
 ARCH="${SPACE_FC_ARCH:-x86_64}"
+# shellcheck source=scripts/lib/verified-download.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)/scripts/lib/verified-download.sh"
 # shellcheck source=lib/kind-host-paths.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/kind-host-paths.sh"
 kind_host_paths__require SPACE_VENDOR_ROOT
@@ -164,9 +165,9 @@ if [[ ! -x "$version_dir/bin/firecracker" ]]; then
   # retries last: six attempts over 13 s have all failed. curl's doubling
   # backoff spreads seven attempts over about a minute, and --retry-all-errors
   # also retries a reset connection.
-  curl -fsSL --retry 6 --retry-all-errors \
+  space_download_verified \
     "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VERSION}/firecracker-${FC_VERSION}-${ARCH}.tgz" \
-    -o "$tmp/fc.tgz"
+    "$tmp/fc.tgz"
   tar -xzf "$tmp/fc.tgz" -C "$tmp"
   mkdir -p "$version_dir/bin"
   install -m 0755 "$tmp/release-${FC_VERSION}-${ARCH}/firecracker-${FC_VERSION}-${ARCH}" "$version_dir/bin/firecracker"
@@ -203,18 +204,9 @@ elif [[ -n "$image_kernel" && -f "$image_kernel" ]]; then
   rm -f "$kernel_dir/vmlinux.bin"
   install -m 0644 "$image_kernel" "$kernel_dir/vmlinux.bin"
 else
-  log "discovering latest $KERNEL_SERIES kernel under firecracker-ci/$FC_CI_VERSION/$ARCH"
-  # firecracker-ci publishes kernels as flat files keyed by vmlinux-MAJ.MIN.PATCH.
-  # Pull the bucket listing (XML) and pick the newest patch matching our series.
-  listing=$(curl -fsSL "https://s3.amazonaws.com/spec.ccfc.min/?prefix=firecracker-ci/${FC_CI_VERSION}/${ARCH}/${KERNEL_SERIES}.&list-type=2") \
-    || die "failed to list firecracker-ci S3 bucket; check network egress to s3.amazonaws.com"
-  kernel_key=$(echo "$listing" \
-    | grep -Eo "firecracker-ci/${FC_CI_VERSION}/${ARCH}/${KERNEL_SERIES}\\.[0-9]+" \
-    | sort -V | uniq | tail -1)
-  [[ -n "$kernel_key" ]] || die "no $KERNEL_SERIES kernel found in firecracker-ci/$FC_CI_VERSION/$ARCH"
+  kernel_key="firecracker-ci/${FC_CI_VERSION}/${ARCH}/${KERNEL_VERSION}"
   log "downloading $kernel_key"
-  rm -f "$kernel_dir/vmlinux.bin"   # in case a stale symlink survived
-  curl -fsSL "https://s3.amazonaws.com/spec.ccfc.min/${kernel_key}" -o "$kernel_dir/vmlinux.bin"
+  space_download_verified "https://s3.amazonaws.com/spec.ccfc.min/${kernel_key}" "$kernel_dir/vmlinux.bin"
   log "vmlinux installed at $kernel_dir/vmlinux.bin"
 fi
 

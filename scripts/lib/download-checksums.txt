@@ -1,0 +1,36 @@
+# SHA256  exact HTTPS download URL
+# Kind and Firecracker: SHA256 digests from their GitHub release asset metadata.
+# grpcurl and Tilt: checksums.txt from their respective pinned GitHub releases.
+# kubectl and Helm: upstream .sha256 / .sha256sum files beside each archive.
+# Go: https://go.dev/dl/?mode=json&include=all release index.
+# AWS CLI and Firecracker kernels: SHA256 measured from the versioned upstream
+# HTTPS payloads below on 2026-10-02; these are content pins, not signer attestations.
+# Review new versions and their upstream provenance before updating these pins.
+f2eb71f9a9412d51670cd7f2f383691262c5c5f0646be60369499e6a9aaa7168  https://awscli.amazonaws.com/awscli-exe-linux-aarch64-2.36.25.zip
+7c09cb85649d9fafef78993df08cd0672c8615c97f9b9f657c229fa5445f35c8  https://awscli.amazonaws.com/awscli-exe-linux-x86_64-2.36.25.zip
+516585916f499077fac8c2fdd2a382818683f831020277472e6bcf8d1a6f9be4  https://dl.k8s.io/release/v1.32.0/bin/darwin/amd64/kubectl
+5bfd5de53a054b4ef614c60748e28bf47441c7ed4db47ec3c19a3e2fa0eb5555  https://dl.k8s.io/release/v1.32.0/bin/darwin/arm64/kubectl
+646d58f6d98ee670a71d9cdffbf6625aeea2849d567f214bc43a35f8ccb7bf70  https://dl.k8s.io/release/v1.32.0/bin/linux/amd64/kubectl
+ba4004f98f3d3a7b7d2954ff0a424caa2c2b06b78c17b1dccf2acc76a311a896  https://dl.k8s.io/release/v1.32.0/bin/linux/arm64/kubectl
+8dc25671120a4af197afe7ad9041fb8e1dd71bc01e5ef73dba1139cbc9e9f44b  https://get.helm.sh/helm-v3.16.4-darwin-amd64.tar.gz
+e2442d8f05d53d84c39b869bc5fe5affad247ee2f4c706a040919c146edb1f94  https://get.helm.sh/helm-v3.16.4-darwin-arm64.tar.gz
+fc307327959aa38ed8f9f7e66d45492bb022a66c3e5da6063958254b9767d179  https://get.helm.sh/helm-v3.16.4-linux-amd64.tar.gz
+d3f8f15b3d9ec8c8678fbf3280c3e5902efabe5912e2f9fcf29107efbc8ead69  https://get.helm.sh/helm-v3.16.4-linux-arm64.tar.gz
+00654ac1e702a22744121ea9f10a4f792ebd7c3a744cba587dfac9fcb79b41a5  https://github.com/firecracker-microvm/firecracker/releases/download/v1.15.1/firecracker-v1.15.1-aarch64.tgz
+d4a32ab2322d887ca1bc4a4e7afa9cc35393e6362dfc2b3becb389d362e4275a  https://github.com/firecracker-microvm/firecracker/releases/download/v1.15.1/firecracker-v1.15.1-x86_64.tgz
+b20a00c1cb82ab81ec32696766d4076e99b4cb5ca0823a71767ba64dbea0f263  https://github.com/fullstorydev/grpcurl/releases/download/v1.9.3/grpcurl_1.9.3_linux_arm64.tar.gz
+a926b62a85787ccf73ef8736b3ae554f1242e39d92bb8767a79d6dd23b11d1d5  https://github.com/fullstorydev/grpcurl/releases/download/v1.9.3/grpcurl_1.9.3_linux_x86_64.tar.gz
+d8391485e99a728a3a4e82af3fd621f9fdea0c417a74e5122803ad20b207b623  https://github.com/fullstorydev/grpcurl/releases/download/v1.9.3/grpcurl_1.9.3_osx_arm64.tar.gz
+246a6669e58c282dcaf0e9dcb06dd1c8681833d59df24eb83d3123ec64c2d2e5  https://github.com/fullstorydev/grpcurl/releases/download/v1.9.3/grpcurl_1.9.3_osx_x86_64.tar.gz
+4f0b6e3b88bdc66d922c08469f05ef507d4903dd236e6319199bb9c868eed274  https://github.com/kubernetes-sigs/kind/releases/download/v0.30.0/kind-darwin-amd64
+ceaf40df1d1551c481fb50e3deb5c3deecad5fd599df5469626b70ddf52a1518  https://github.com/kubernetes-sigs/kind/releases/download/v0.30.0/kind-darwin-arm64
+517ab7fc89ddeed5fa65abf71530d90648d9638ef0c4cde22c2c11f8097b8889  https://github.com/kubernetes-sigs/kind/releases/download/v0.30.0/kind-linux-amd64
+7ea2de9d2d190022ed4a8a4e3ac0636c8a455e460b9a13ccf19f15d07f4f00eb  https://github.com/kubernetes-sigs/kind/releases/download/v0.30.0/kind-linux-arm64
+1f9c62dcce0608aeb0c63533b14e260fc2e8c5797f81589b0914c398ba53d5b0  https://github.com/tilt-dev/tilt/releases/download/v0.37.5/tilt.0.37.5.linux.arm64.tar.gz
+9efb56969c48ddea4adfb56a604b9ca5ed254924ddf140fc3e068a305cacf558  https://github.com/tilt-dev/tilt/releases/download/v0.37.5/tilt.0.37.5.linux.x86_64.tar.gz
+d8c701ada9d3ee29c983651a8f344d8a4c13363e6c25a843b478aa4444ee6f30  https://github.com/tilt-dev/tilt/releases/download/v0.37.5/tilt.0.37.5.mac.arm64.tar.gz
+5db0bd3a690db4d12ddf22afbe14df5a56f0d6351731694c2e1e59158b3eb00c  https://github.com/tilt-dev/tilt/releases/download/v0.37.5/tilt.0.37.5.mac.x86_64.tar.gz
+0335f314b6e7bfe08c3d0cfaa7c19db961b7b99fb20be62b0a826c992ad14e0f  https://go.dev/dl/go1.25.3.linux-amd64.tar.gz
+1d42ebc84999b5e2069f5e31b67d6fc5d67308adad3e178d5a2ee2c9ff2001f5  https://go.dev/dl/go1.25.3.linux-arm64.tar.gz
+e3544b10603acbf3db492cb52e000d22ba202cb4b63b9add027565683e11c591  https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/aarch64/vmlinux-6.1.155
+e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2  https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/x86_64/vmlinux-6.1.155

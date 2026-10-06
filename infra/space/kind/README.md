@@ -25,6 +25,18 @@ bash infra/space/kind/scripts/bootstrap.sh          # creates space-local and de
 tilt up                                             # from the repository root
 ```
 
+The prerequisite and Firecracker installers verify new downloads against
+[`scripts/lib/download-checksums.txt`](../../../scripts/lib/download-checksums.txt)
+before extraction or installation, including the AWS CLI bundle. Downloads and
+redirects require HTTPS. The default downloaded kernel is `vmlinux-6.1.155`;
+`SPACE_FC_KERNEL_VERSION` selects an exact download. Version overrides need a
+matching URL and SHA256 entry in the manifest, or in an operator-reviewed file
+selected with `SPACE_DOWNLOAD_CHECKSUMS`; a missing or mismatched pin fails closed.
+Update version defaults and pins together after checking upstream provenance.
+Already-installed tools and artifacts supplied by a trusted host image retain
+their existing reuse paths; this does not attest the host image or retroactively
+verify installed binaries.
+
 Do not create the cluster by hand: `kind-cluster.yaml` bind-mounts per-node
 containerd host directories and the staged vendor tree, which must exist
 before `kind create`, and Tilt's bootstrap resources run only after the
