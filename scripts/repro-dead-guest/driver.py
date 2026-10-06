@@ -153,9 +153,24 @@ def stoploop(args):
     print(f"[exit {code}]")
 
 
+def stoplog(args):
+    """Stop the loop (its TERM trap CONTs the agent) and print its log.
+
+    The command is delivered by the agent itself, so it runs at the next CONT
+    window; the stream timeout must exceed the longest STOP period. This is
+    guest activity and resets the idle clock: use it only after the window.
+    """
+    script = ("pkill -TERM -f /usr/local/bin/repro-stoploop; sleep 1; "
+              "cat /var/log/repro-stoploop.log" if args.stop else "cat /var/log/repro-stoploop.log")
+    code, out = run(config(), args.sandbox, ["sh", "-c", script], user="root",
+                    timeout="3h", stream_timeout=args.wait)
+    sys.stdout.write(out)
+    print(f"[exit {code}]")
+
+
 def get(args):
     result = fs.api(config(), "GET", f"/v1/sandboxes/{args.sandbox}")
-    print(json.dumps(result if args.full else {k: result.get(k) for k in ("sandbox_id", "state", "updated_at")}))
+    print(json.dumps(result if args.full else {k: result.get(k) for k in ("id", "state", "updated_at")}))
 
 
 def main():
@@ -176,6 +191,11 @@ def main():
     p.add_argument("--stop-jitter", type=int, required=True)
     p.add_argument("--cont", type=int, default=2)
     p.set_defaults(fn=stoploop)
+    p = sub.add_parser("stoplog")
+    p.add_argument("sandbox")
+    p.add_argument("--stop", action="store_true")
+    p.add_argument("--wait", type=int, default=6000)
+    p.set_defaults(fn=stoplog)
     p = sub.add_parser("get")
     p.add_argument("sandbox")
     p.add_argument("--full", action="store_true")
