@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use oci_spec::distribution::Reference as OciReference;
@@ -22,6 +23,17 @@ const NATIVE_SNAPSHOTTER: &str = "native";
 const IMAGE_CHAIN_ID_PREFIX: &str = "image chain ID: ";
 const MAX_COMMAND_ERROR_BYTES: usize = 4096;
 const FALLBACK_CLEANUP_ATTEMPTS: usize = 2;
+/// Waits between attempts to unmount a rootfs that `umount` reports busy,
+/// about 3 s in total. On builders `/space/cache` propagates bidirectionally,
+/// so a short-lived reference from any mount namespace holding a copy of the
+/// bind mount (a process scanning the cache, say) blocks the unmount.
+const BUSY_UNMOUNT_RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_millis(100),
+    Duration::from_millis(200),
+    Duration::from_millis(400),
+    Duration::from_millis(800),
+    Duration::from_millis(1_600),
+];
 const NATIVE_SNAPSHOT_PATH_PREFIX: &str =
     "/var/lib/containerd/io.containerd.snapshotter.v1.native/snapshots/";
 static OCI_PULL_LOCK: LazyLock<Arc<AsyncMutex<()>>> =
@@ -309,6 +321,8 @@ enum CommandRunError {
     SnapshotViewNotFound { snapshot_key: ContainerdSnapshotKey },
     #[error("image record no longer exists")]
     ImageNotFound,
+    #[error("mount is still in use: {stderr}")]
+    MountBusy { stderr: String },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -322,6 +336,10 @@ impl OciCommandFailure {
 
     fn is_image_not_found(&self) -> bool {
         matches!(self.0, CommandRunError::ImageNotFound)
+    }
+
+    fn is_mount_busy(&self) -> bool {
+        matches!(self.0, CommandRunError::MountBusy { .. })
     }
 }
 
@@ -463,6 +481,10 @@ fn record_command_output(
                 OciCommand::RemoveImage { .. } if stderr.contains("not found") => {
                     CommandRunError::ImageNotFound
                 }
+                // util-linux reports EBUSY as "umount: <path>: target is busy."
+                OciCommand::UnmountSnapshot { .. } if stderr.contains("target is busy") => {
+                    CommandRunError::MountBusy { stderr }
+                }
                 OciCommand::PullImage { .. }
                 | OciCommand::TagImage { .. }
                 | OciCommand::RemoveImage { .. } => CommandRunError::RedactedExit {
@@ -585,13 +607,7 @@ impl OciCleanup {
 
     async fn run(&mut self) -> Result<(), OciBuildError> {
         if let Some(mount_path) = &self.active_mount {
-            run(
-                self.runner.as_ref(),
-                OciCommand::UnmountSnapshot {
-                    mount_path: mount_path.clone(),
-                },
-            )
-            .await?;
+            unmount_snapshot(self.runner.as_ref(), mount_path, &BUSY_UNMOUNT_RETRY_DELAYS).await?;
             self.active_mount = None;
         }
         if let Some(snapshot_key) = &self.snapshot_key {
@@ -1098,6 +1114,132 @@ async fn run(
             operation,
             source: OciCommandFailure(source),
         })
+}
+
+/// Unmounts an OCI rootfs, retrying while `umount` reports it busy.
+///
+/// Waits each of `retry_delays` in turn between attempts, so a busy mount is
+/// given up on after their sum plus the attempts' own time. Any other failure
+/// returns at once. A mount still busy after the last attempt is logged with
+/// the processes holding it before the error is returned.
+async fn unmount_snapshot(
+    runner: &dyn CommandRunner,
+    mount_path: &Path,
+    retry_delays: &[Duration],
+) -> Result<(), OciBuildError> {
+    let mut delays = retry_delays.iter();
+    let mut attempt = 0_usize;
+    loop {
+        attempt += 1;
+        let command = OciCommand::UnmountSnapshot {
+            mount_path: mount_path.to_path_buf(),
+        };
+        let error = match run(runner, command).await {
+            Ok(_) => return Ok(()),
+            Err(error) => error,
+        };
+        let busy =
+            matches!(&error, OciBuildError::Command { source, .. } if source.is_mount_busy());
+        if !busy {
+            return Err(error);
+        }
+        let Some(delay) = delays.next() else {
+            let proc_mount_path = mount_path.to_path_buf();
+            let holders = tokio::task::spawn_blocking(move || {
+                mount_holders(Path::new("/proc"), &proc_mount_path)
+            })
+            .await;
+            match holders {
+                Ok(holders) => tracing::warn!(
+                    %error,
+                    attempt,
+                    mount_path = %mount_path.display(),
+                    ?holders,
+                    "OCI rootfs mount is still busy after retries"
+                ),
+                Err(join_error) => tracing::warn!(
+                    %error,
+                    %join_error,
+                    attempt,
+                    mount_path = %mount_path.display(),
+                    "OCI rootfs mount is still busy after retries; listing its holders failed"
+                ),
+            }
+            return Err(error);
+        };
+        tracing::warn!(
+            %error,
+            attempt,
+            mount_path = %mount_path.display(),
+            retry_in_ms = delay.as_millis(),
+            "OCI rootfs mount is busy; retrying the unmount"
+        );
+        tokio::time::sleep(*delay).await;
+    }
+}
+
+/// A process reference that keeps a mount busy, as `/proc` reports it.
+#[derive(Debug, Eq, PartialEq)]
+struct MountHolder {
+    pid: u32,
+    command: String,
+    /// `cwd`, `root` or `fd <n>`.
+    reference: String,
+}
+
+/// At most this many holders are listed, to keep the log line bounded.
+const MAX_LISTED_MOUNT_HOLDERS: usize = 32;
+
+/// Processes whose working directory, root or an open file lies under
+/// `mount_path`, ordered by pid.
+///
+/// Best effort, for diagnosing a mount that stays busy. Builders share the
+/// host PID namespace, so this also sees processes in the node's mount
+/// namespace, which name the same `/space/cache` host path. Entries that
+/// cannot be read (a process that exited, a denied link) are skipped.
+fn mount_holders(proc_root: &Path, mount_path: &Path) -> Vec<MountHolder> {
+    let Ok(processes) = fs::read_dir(proc_root) else {
+        return Vec::new();
+    };
+    let mut holders = Vec::new();
+    for process in processes.flatten() {
+        let Some(pid) = process
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let process_dir = process.path();
+        let mut references = vec![
+            ("cwd".to_string(), process_dir.join("cwd")),
+            ("root".to_string(), process_dir.join("root")),
+        ];
+        if let Ok(fds) = fs::read_dir(process_dir.join("fd")) {
+            references.extend(fds.flatten().map(|fd| {
+                let name = format!("fd {}", fd.file_name().to_string_lossy());
+                (name, fd.path())
+            }));
+        }
+        let mut command = None;
+        for (reference, link) in references {
+            if fs::read_link(&link).is_ok_and(|target| target.starts_with(mount_path)) {
+                let command = command.get_or_insert_with(|| {
+                    fs::read_to_string(process_dir.join("comm"))
+                        .map(|comm| comm.trim().to_string())
+                        .unwrap_or_else(|_| "?".to_string())
+                });
+                holders.push(MountHolder {
+                    pid,
+                    command: command.clone(),
+                    reference,
+                });
+            }
+        }
+    }
+    holders.sort_by_key(|holder| holder.pid);
+    holders.truncate(MAX_LISTED_MOUNT_HOLDERS);
+    holders
 }
 
 async fn run_pull_with_budget(

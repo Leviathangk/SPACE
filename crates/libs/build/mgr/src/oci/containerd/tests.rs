@@ -110,6 +110,7 @@ struct RecordingRunner {
     mount_barrier: Option<Arc<tokio::sync::Barrier>>,
     blocked_operation: Option<(OciOperation, Arc<tokio::sync::Barrier>)>,
     snapshot_missing_on_remove: bool,
+    failures_are_busy_mounts: bool,
 }
 
 #[derive(Debug)]
@@ -218,6 +219,16 @@ impl RecordingRunner {
         }
     }
 
+    fn busy_unmounts(count: usize) -> Self {
+        Self {
+            failures_are_busy_mounts: true,
+            ..Self::failing_times(
+                |command| matches!(command, OciCommand::UnmountSnapshot { .. }),
+                count,
+            )
+        }
+    }
+
     fn slow_cleanup(delay: Duration) -> Self {
         Self {
             cleanup_delay: delay,
@@ -271,6 +282,11 @@ impl CommandRunner for RecordingRunner {
             OciCommand::UnmountSnapshot { .. } | OciCommand::RemoveSnapshotView { .. }
         ) {
             tokio::time::sleep(self.cleanup_delay).await;
+        }
+        if failed && self.failures_are_busy_mounts {
+            return Err(CommandRunError::MountBusy {
+                stderr: "umount: fixture: target is busy.".to_string(),
+            });
         }
         if failed {
             return Err(CommandRunError::Exit {
@@ -532,6 +548,125 @@ fn cleanup_accepts_an_already_unmounted_snapshot(oci_fixture: OciFixture) {
     assert_eq!(
         result.expect("already unmounted is successful cleanup"),
         CommandResult::default()
+    );
+}
+
+#[cfg(unix)]
+#[rstest]
+fn a_busy_unmount_is_classified_for_retry(oci_fixture: OciFixture) {
+    let mount_path = oci_fixture.request.cache_dir.join("mount");
+    let output = std::process::Output {
+        status: std::process::ExitStatus::from_raw(32 << 8),
+        stdout: Vec::new(),
+        stderr: format!("umount: {}: target is busy.", mount_path.display()).into_bytes(),
+    };
+
+    let error = record_command_output(&oci_fixture.unmount_command(&mount_path), Ok(output))
+        .expect_err("a busy unmount fails");
+
+    assert!(matches!(error, CommandRunError::MountBusy { .. }));
+}
+
+#[derive(Debug)]
+enum UnmountOutcome {
+    Unmounted,
+    StillBusy,
+    Failed,
+}
+
+#[rstest]
+#[case::released_while_retrying(RecordingRunner::busy_unmounts(2), 3, UnmountOutcome::Unmounted)]
+#[case::busy_after_the_last_retry(
+    RecordingRunner::busy_unmounts(usize::MAX),
+    4,
+    UnmountOutcome::StillBusy
+)]
+#[case::other_failures_are_not_retried(
+    RecordingRunner::failing(|command| matches!(command, OciCommand::UnmountSnapshot { .. })),
+    1,
+    UnmountOutcome::Failed
+)]
+#[tokio::test]
+async fn unmount_retries_only_a_busy_mount(
+    oci_fixture: OciFixture,
+    #[case] runner: RecordingRunner,
+    #[case] attempts: usize,
+    #[case] outcome: UnmountOutcome,
+) {
+    let mount_path = oci_fixture.request.cache_dir.join("mount");
+
+    let result = unmount_snapshot(&runner, &mount_path, &[Duration::ZERO; 3]).await;
+
+    assert_eq!(
+        runner.commands(),
+        vec![oci_fixture.unmount_command(&mount_path); attempts]
+    );
+    match (outcome, result) {
+        (UnmountOutcome::Unmounted, Ok(())) => {}
+        (
+            UnmountOutcome::StillBusy,
+            Err(OciBuildError::Command {
+                operation: OciOperation::UnmountSnapshot,
+                source,
+            }),
+        ) if source.is_mount_busy() => {}
+        (
+            UnmountOutcome::Failed,
+            Err(OciBuildError::Command {
+                operation: OciOperation::UnmountSnapshot,
+                source,
+            }),
+        ) if !source.is_mount_busy() => {}
+        (outcome, result) => panic!("expected {outcome:?}, got {result:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn mount_holders_lists_only_references_under_the_mount() {
+    let tempdir = tempfile::tempdir().expect("create proc fixture");
+    let mount = tempdir.path().join("space-oci-rootfs-a");
+    // Shares the mount's name as a string prefix but is a different directory.
+    let sibling = tempdir.path().join("space-oci-rootfs-ab");
+    let proc_root = tempdir.path().join("proc");
+    let process = |pid: u32, comm: &str, links: &[(&str, PathBuf)]| {
+        let process_dir = proc_root.join(pid.to_string());
+        std::fs::create_dir_all(process_dir.join("fd")).expect("create fake process");
+        std::fs::write(process_dir.join("comm"), format!("{comm}\n")).expect("write comm");
+        for (name, target) in links {
+            std::os::unix::fs::symlink(target, process_dir.join(name)).expect("link reference");
+        }
+    };
+    process(
+        9,
+        "tar",
+        &[("cwd", PathBuf::from("/")), ("fd/4", mount.clone())],
+    );
+    process(
+        7,
+        "scanner",
+        &[
+            ("cwd", mount.join("usr")),
+            ("root", PathBuf::from("/")),
+            ("fd/3", sibling.join("file")),
+        ],
+    );
+    std::fs::create_dir_all(proc_root.join("self")).expect("create a non-process entry");
+
+    assert_eq!(
+        mount_holders(&proc_root, &mount),
+        vec![
+            MountHolder {
+                pid: 7,
+                command: "scanner".to_string(),
+                reference: "cwd".to_string(),
+            },
+            MountHolder {
+                pid: 9,
+                command: "tar".to_string(),
+                reference: "fd 4".to_string(),
+            },
+        ]
     );
 }
 
