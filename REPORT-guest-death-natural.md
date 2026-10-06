@@ -374,9 +374,35 @@ disk headroom, and a copy of `/space/logs`. The DogStatsD sink records
   containers (same code paths), and the run was restarted with a disk guard.
 - Evidence is kept outside the repository.
 
-### Attempt 2 (started 15:57:08Z)
+### Attempt 2 — baseline (15:57:08Z → 19:12:52Z)
 
-*(running; results to follow)*
+All 12 sandboxes ran their full plan.
+
+| | |
+|---|---|
+| Busy after restore | **35.9 sandbox-hours** (36 × 60 min), plus 2.0 sandbox-hours of post-create warm-up |
+| Restores | **36: 18 cross-node** (snapshot pulled from object storage), **18 same-node** (`local_only`); all succeeded in 2–10 s; landed on the intended node every time |
+| Operations | **16,870, 0 failed**: 6,077 Process.Start-equivalent commands of the short mix, 2,280 telemetry, 913 upload + 913 verified download, 528 wrapper backfills, 48 connects |
+| Latency p50 / p99 / max (ms) | short commands about 40–75 / 60–220 / ≤ 1,550; upload 65 / 153 / 482; download 21 / 41 / 78 |
+| Memory | limit 2048 MiB (guest `MemTotal` 1991 MiB); memhog reached 1,200 MB (ramp 200 → 1500 MB over 4 h, so the 3 h 15 min baseline reached 1,200); peak Firecracker RSS 1,341–1,368 MB |
+| Composed health (`space-sbxmgr list`, per minute, about 190 samples per sandbox) | never `Degraded`. Outside each sandbox's own suspend/restore windows: only `✅`, one `⏳` at creation, and a few `suspended` samples while the snapshot became portable |
+| `space.sandbox.guest.health{lifecycle:started,health:degraded}` | 0 in every one of 196 minutes |
+| Raw `CONNECT 5002` (2,280 samples) | 0 failures outside suspend/restore windows; 9 three-second timeouts, each during that VM's own suspend (VM paused for the snapshot) |
+| sbxmgr log, these sandboxes | only `Healthy` composed-health transitions (48); no `guest_process_start_failed`, no `suspend_failed` |
+
+**Coverage gap:**
+- Every suspend in attempt 2 used the **Full** rootfs codec, not btrfs-send:
+  `btrfs-send precondition not met; suspending with Full codec instead`, 36 times.
+- When the workers came back on fresh cache images, template-manager's on-demand
+  pull of `seed` ran before node-manager's socket was up (`nodemgr btrfs
+  subvolume create failed; falling back to plain directory … failed to connect
+  to node-manager … transport error`). The durable retry then failed for good
+  (`digest dir is not a btrfs subvolume; btrfs-send codec permanently
+  unavailable for this build`).
+- So the baseline's cross-node restores staged a Full rootfs and the memory
+  image from object storage. They did not use the btrfs-send codec named in the
+  production pattern. The pre-reset smoke run did use btrfs-send
+  (`rootfs.btrfs-send`). See "Side findings" for the race.
 
 ## Side findings
 
