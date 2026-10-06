@@ -365,7 +365,6 @@ fn public_openapi_value() -> Value {
     insert_snapshot_paths(paths);
     insert_port_paths(paths, &idempotency_key_parameter);
     insert_file_mutation_paths(paths, &idempotency_key_parameter);
-    insert_credential_paths(paths);
     insert_path_parameters(&mut spec);
     complete_control_plane_responses(&mut spec);
     add_generator_safe_enum_names(&mut spec);
@@ -442,47 +441,6 @@ pub(crate) fn m1_sdk_openapi_value() -> Value {
         });
     retain_referenced_schemas(&mut spec);
     spec
-}
-
-fn insert_credential_paths(paths: &mut Map<String, Value>) {
-    paths.insert(
-        "/credentials".to_string(),
-        json!({
-            "get": {
-                "summary": "List credentials owned by the current user",
-                "responses": {
-                    "200": { "description": "Credential metadata list" }
-                }
-            },
-            "post": {
-                "summary": "Create a sealed current-user credential",
-                "responses": {
-                    "201": { "description": "Credential metadata" },
-                    "400": { "description": "Invalid credential request" },
-                    "409": { "description": "Credential name conflict" }
-                }
-            }
-        }),
-    );
-    paths.insert(
-        "/credentials/{credential_id}".to_string(),
-        json!({
-            "put": {
-                "summary": "Replace a sealed current-user credential",
-                "responses": {
-                    "200": { "description": "Credential metadata" },
-                    "404": { "description": "Credential not found" }
-                }
-            },
-            "delete": {
-                "summary": "Delete a current-user credential",
-                "responses": {
-                    "204": { "description": "Deleted" },
-                    "404": { "description": "Credential not found" }
-                }
-            }
-        }),
-    );
 }
 
 fn insert_sandbox_extra_paths(paths: &mut Map<String, Value>) {
@@ -618,7 +576,10 @@ fn insert_file_mutation_paths(paths: &mut Map<String, Value>, idempotency_key_pa
         json!({
             "post": {
                 "summary": "Write bounded bytes to a guest file path",
-                "description": "`data_base64` carries at most 16 MiB of file content. The request body limit covers that payload's base64 and the other fields, plus room for encoders that escape `/` as `\\/` at up to twice the rate of uniformly distributed data. A payload near 16 MiB whose base64 is mostly `/` (long runs of 0xff bytes) can exceed the limit when escaped; send it without escaping `/`, or split it across writes with `append`. Creating a file, or overwriting a regular file that the writing user owns with no other hard links and no access ACL, replaces the destination with a temporary file where it can, which publishes the new content atomically: readers see the previous content (or no file) or the new, never a partial file. A destination that cannot be renamed over (such as a bind mount), a directory that refuses the temporary file, appends and other files are written in place, without that guarantee, and synced before the write is acknowledged. Acknowledgement does not guarantee that a created or overwritten file persists across a sandbox crash, a forced stop or a host failure, and a writeback error can surface after it. An ordinary stop attempts to flush the sandbox's root filesystem first, but proceeds if that attempt fails or times out. No persistence deadline is promised.",
+                "description": format!(
+                    "`data_base64` carries at most 16 MiB of file content. The request body limit covers that payload's base64 and the other fields, plus room for encoders that escape `/` as `\\/` at up to twice the rate of uniformly distributed data. A payload near 16 MiB whose base64 is mostly `/` (long runs of 0xff bytes) can exceed the limit when escaped; send it without escaping `/`, or split it across writes with `append`. Creating a file, or overwriting a regular file that the writing user owns with no other hard links and no access ACL, replaces the destination with a temporary file where it can, which publishes the new content atomically: readers see the previous content (or no file) or the new, never a partial file. A destination that cannot be renamed over (such as a bind mount), a directory that refuses the temporary file, appends and other files are written in place, without that guarantee, and synced before the write is acknowledged. Acknowledgement does not guarantee that a created or overwritten file persists across a sandbox crash, a forced stop or a host failure, and a writeback error can surface after it. An ordinary stop attempts to flush the sandbox's root filesystem first, but proceeds if that attempt fails or times out. No persistence deadline is promised. The request body is limited to {} bytes, counting any JSON escaping.",
+                    super::public::WRITE_FILE_BODY_LIMIT_BYTES
+                ),
                 "parameters": [idempotency_key_parameter.clone()],
                 "responses": {
                     "200": { "description": "Write result" },
@@ -635,11 +596,19 @@ fn insert_file_mutation_paths(paths: &mut Map<String, Value>, idempotency_key_pa
         json!({
             "post": {
                 "summary": "Write a bounded batch of guest files",
+                "description": format!(
+                    "A batch holds at most {} entries, and their decoded data and paths together may total at most {} bytes (3 MiB), because the batch travels to the sandbox as one gRPC message of at most {} bytes. A larger batch gets 400. The request body is limited to {} bytes, counting any JSON escaping. Use `files:write` for larger files.",
+                    pplx_space_common_core::spaced::MAX_WRITE_BATCH_ENTRIES,
+                    super::public::MAX_FILE_WRITE_BATCH_BYTES,
+                    pplx_space_common_core::spaced::MAX_MESSAGE_BYTES,
+                    super::public::WRITE_FILE_BATCH_BODY_LIMIT_BYTES
+                ),
                 "parameters": [idempotency_key_parameter.clone()],
                 "responses": {
                     "200": { "description": "Batch write result" },
-                    "400": { "description": "Invalid file write batch request" },
-                    "404": { "description": "Sandbox or parent path not found" }
+                    "400": { "description": "Invalid file write batch request, including a batch over its data and path limit" },
+                    "404": { "description": "Sandbox or parent path not found" },
+                    "413": { "description": "The request body exceeds the batch limit" }
                 }
             }
         }),

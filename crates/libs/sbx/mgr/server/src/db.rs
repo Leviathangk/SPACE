@@ -34,6 +34,7 @@ use rusqlite::{Connection, OptionalExtension, Result, params};
 
 pub(crate) mod cleanup_jobs;
 pub(crate) mod cleanup_target_scan;
+pub(crate) mod guest_health;
 pub(crate) mod inventory;
 pub(crate) mod inventory_read;
 pub(crate) mod quarantine_history;
@@ -4641,6 +4642,7 @@ pub fn mark_quarantined(
         reason_code,
         reason_message,
         next_action,
+        None,
     )?;
     Ok(())
 }
@@ -5955,9 +5957,14 @@ pub(crate) fn mark_quarantined_from_state(
         reason_code,
         reason_message,
         next_action,
+        None,
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "quarantine admission includes optional probe ownership evidence"
+)]
 fn mark_quarantined_inner(
     conn: &Connection,
     id: &str,
@@ -5966,6 +5973,7 @@ fn mark_quarantined_inner(
     reason_code: SandboxQuarantineReasonCode,
     reason_message: &str,
     next_action: SandboxQuarantineNextAction,
+    probe_authority: Option<&guest_health::GuestProbeAuthority>,
 ) -> std::result::Result<bool, MarkQuarantinedError> {
     let reason_message = reason_message.trim();
     let reason_message = (!reason_message.is_empty()).then_some(reason_message);
@@ -5990,6 +5998,11 @@ fn mark_quarantined_inner(
     let ts = now()?;
 
     let tx = conn.unchecked_transaction()?;
+    if let Some(authority) = probe_authority
+        && guest_health::load_probe_authority(&tx, id)?.as_ref() != Some(authority)
+    {
+        return Ok(false);
+    }
     let changed = tx.execute(
         "UPDATE sandboxes
          SET state = 'quarantined',
@@ -6709,6 +6722,9 @@ fn apply_cleanup_state(
         upsert_suspend_local_artifact(tx, sandbox_id, local_artifact_id, local_path)?;
     }
     let published_artifact_id = published_suspend_artifact.map(|(id, _)| id.to_string());
+    // An ordinary STOP retains only generation/pod identity as teardown proof;
+    // routing credentials and live runtime fields are always cleared. Activation
+    // rollback instead uses its explicit receipt and must clear the identity.
     let changed = tx.execute(
         "UPDATE sandboxes
             SET state = ?1,
@@ -6723,7 +6739,7 @@ fn apply_cleanup_state(
                 space_api_route_generation = NULL,
                 space_api_route_node_id = NULL,
                 space_api_route_execution_generation = CASE
-                    WHEN ?1 = 'suspended'
+                    WHEN (?1 = 'stopped' AND ?4 IS NULL) OR (?1 = 'suspended'
                          AND (
                              ?11 IS NOT NULL
                              OR (
@@ -6731,12 +6747,12 @@ fn apply_cleanup_state(
                                  AND current_local_artifact_kind = 'full'
                                  AND current_local_artifact_origin = 'suspend'
                              )
-                         )
+                         ))
                     THEN space_api_route_execution_generation
                     ELSE NULL
                 END,
                 space_api_route_pod_uid = CASE
-                    WHEN ?1 = 'suspended'
+                    WHEN (?1 = 'stopped' AND ?4 IS NULL) OR (?1 = 'suspended'
                          AND (
                              ?11 IS NOT NULL
                              OR (
@@ -6744,7 +6760,7 @@ fn apply_cleanup_state(
                                  AND current_local_artifact_kind = 'full'
                                  AND current_local_artifact_origin = 'suspend'
                              )
-                         )
+                         ))
                     THEN space_api_route_pod_uid
                     ELSE NULL
                 END,
@@ -9422,6 +9438,24 @@ pub fn claim_quarantined_sandbox_for_eviction(
         "UPDATE sandboxes
          SET state = 'deleting', state_changed_at = ?1, updated_at = ?1
          WHERE id = ?2 AND state = 'quarantined' AND updated_at = ?3",
+        params![now()?, id, expected_updated_at],
+    )?;
+    Ok(changed == 1)
+}
+
+/// Reclaim retained stopped bytes only after an authoritative cluster deletion.
+/// The caller holds the cleanup fence and checks ownership and quiescence;
+/// the exact row-version CAS prevents racing a subsequent activation.
+pub fn claim_stopped_sandbox_for_eviction(
+    conn: &Connection,
+    id: &str,
+    expected_updated_at: &str,
+) -> Result<bool> {
+    let changed = conn.execute(
+        sql!(
+            "UPDATE sandboxes SET state = 'deleting', state_changed_at = ?1, updated_at = ?1
+              WHERE id = ?2 AND state = 'stopped' AND updated_at = ?3"
+        ),
         params![now()?, id, expected_updated_at],
     )?;
     Ok(changed == 1)

@@ -10,7 +10,7 @@ bash scripts/netgtw/traffic/run.sh
 The command installs the pinned peer libraries with `uv`, builds the gateway and
 its control fixture, then requests `sudo` on a devbox. It needs Linux, Python
 3.11+, a preinstalled `uv`, OpenSSL, `iproute2`, `nftables`, `procps`, `mount`,
-and `util-linux`, plus the repository's Rust/protobuf build tools. The SPACE devbox
+`util-linux`, plus the repository's Rust/protobuf build tools. The SPACE devbox
 and Buildkite command image supply these dependencies. The CI image pins and verifies its `uv`
 binary. The launcher requires `uv` on `PATH` and fails if it is missing; tool
 installation belongs to the CI image or developer setup.
@@ -116,8 +116,8 @@ WebSocket, and QUIC probes require `host`.
 HTTP/2 opens three streams concurrently with binary bodies larger than the
 initial stream and connection flow-control windows, checking full replies and
 stream completion. The TLS client requires `h2` ALPN, with no HTTP/1 fallback.
-TLS probes may set `alpn` plus `downstream_alpn` and `upstream_alpn` to assert
-the independently negotiated protocols on an intercepted connection.
+TLS and CONNECT probes may set `alpn` plus `downstream_alpn` and `upstream_alpn`
+to assert the independently negotiated protocols on an intercepted connection.
 gRPC uses grpcio clients and a grpcio server with protobuf `BytesValue` messages,
 checking unary replies, streaming message order/content, and final OK trailers.
 WebSockets check text and fragmented binary messages, pong contents, and a clean
@@ -309,6 +309,11 @@ Results go to a unique `target/gateway-traffic/run.*` directory: `results.json`,
 `junit.xml`, gateway/fixture logs, and `events.jsonl`. `manifest.json` records the
 commit, binary hashes, and exact selected TOML files. Each probe prints its
 result and elapsed time. The manifest also hashes the pinned peer dependencies.
+Direct TCP health checks connect from the destination's own address in its
+namespace. Their receipts go to `health-events.jsonl`, including late protocol
+control frames, so they cannot be mistaken for traffic from a denied probe.
+Gateway connections arrive from a different namespace and retain every receipt
+in `events.jsonl`.
 These are correctness timings; use the adjacent [performance bench](../bench/README.md)
 for throughput/CPU comparisons.
 

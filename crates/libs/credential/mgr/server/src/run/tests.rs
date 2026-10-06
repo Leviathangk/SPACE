@@ -43,6 +43,7 @@ fn node_local_config() -> CredmgrRunConfig {
     CredmgrRunConfig {
         role: CredmgrRole::Authority,
         socket_path: PathBuf::from(crate::CREDMGR_SOCKET),
+        volume_socket_path: None,
         tcp_listen: None,
         tls_cert: None,
         tls_key: None,
@@ -210,6 +211,66 @@ fn control_plane_authority_is_allowed() {
 }
 
 #[tokio::test]
+async fn invalid_volume_socket_keeps_predecessor_serving() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = tempdir().unwrap();
+    let mutex_path = dir.path().join("service.mutex");
+    let socket = dir.path().join("standard.sock");
+    let health = dir.path().join("successor-health.sock");
+    let predecessor = ServiceMutex::acquire(
+        &mutex_path,
+        CancellationToken::new(),
+        Duration::from_millis(10),
+        None,
+    )
+    .await
+    .unwrap();
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let serving = tokio::spawn(async move {
+        let (mut connection, _) = listener.accept().await.unwrap();
+        connection.write_all(b"predecessor").await.unwrap();
+    });
+    let config = CredmgrRunConfig {
+        socket_path: socket.clone(),
+        volume_socket_path: Some(dir.path().join("unprovisioned/volume.sock")),
+        health_socket_path: Some(health.clone()),
+        ..node_local_config()
+    };
+    let result = tokio::time::timeout(
+        Duration::from_millis(300),
+        initialize_node_local(&config, &CancellationToken::new(), &mutex_path, async {
+            Ok(())
+        }),
+    )
+    .await;
+    // A fresh connection must still reach the old listener, not just an
+    // established connection whose pathname could already have been replaced.
+    let mut reply = Vec::new();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::net::UnixStream::connect(&socket)
+            .await
+            .unwrap()
+            .read_to_end(&mut reply)
+            .await
+            .unwrap();
+    })
+    .await
+    .unwrap();
+    serving.await.unwrap();
+    drop(predecessor);
+    assert_eq!(reply, b"predecessor");
+    assert!(
+        matches!(result, Ok(Err(_))),
+        "bad provisioning must fail before waiting for the predecessor"
+    );
+    assert!(
+        !health.exists(),
+        "a failed successor must never advertise passive readiness"
+    );
+}
+
+#[tokio::test]
 async fn preflight_completes_before_passive_health_is_exposed() {
     let dir = tempdir().expect("tempdir");
     let mutex_path = dir.path().join("service.mutex");
@@ -315,3 +376,23 @@ async fn early_server_exit_stops_parent_and_releases_mutex() {
     .expect("replacement should acquire the released mutex");
     drop(replacement);
 }
+
+#[test]
+fn volume_socket_requires_a_distinct_uds_listener() {
+    let mut config = node_local_config();
+    config.volume_socket_path = Some(config.socket_path.clone());
+    assert!(matches!(
+        validate_flag_shape(&config),
+        Err(RunCredmgrError::InvalidVolumeSocket)
+    ));
+    config.volume_socket_path = Some(PathBuf::from("/space/run/volume-credentials/credmgr.sock"));
+    validate_flag_shape(&config).unwrap();
+    config.no_uds = true;
+    assert!(matches!(
+        validate_flag_shape(&config),
+        Err(RunCredmgrError::InvalidVolumeSocket)
+    ));
+}
+
+#[cfg(target_os = "linux")]
+mod volume_socket;

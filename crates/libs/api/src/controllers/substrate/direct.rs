@@ -395,6 +395,7 @@ fn direct_restore_start_request(
 
 fn direct_wake_request(
     sandbox_id: SandboxId,
+    vcpu: Option<u32>,
     route_identity: Option<pplx_space_sbx_mgr_client::proto::SpaceApiRouteIdentity>,
     wake_activity: Option<ExecutionActivityKind>,
 ) -> pplx_space_sbx_mgr_client::proto::WakeRequest {
@@ -402,9 +403,10 @@ fn direct_wake_request(
         implicit_wake_source: wake_activity.map_or(0, ExecutionActivityKind::wake_source),
         sandbox_id: sandbox_id.to_string(),
         blocking: true,
-        start_context: route_identity.map(|route_identity| {
+        start_context: (route_identity.is_some() || vcpu.is_some()).then(|| {
             pplx_space_sbx_mgr_client::proto::WakeStartContext {
-                route_identity: Some(route_identity),
+                route_identity,
+                vcpu,
                 ..Default::default()
             }
         }),
@@ -666,7 +668,8 @@ impl DirectSubstrate {
         activity: Option<ExecutionActivityKind>,
     ) -> Result<pplx_space_sbx_mgr_client::proto::WakeRequest, SubstrateError> {
         let sandbox_id = sandbox.id;
-        let mut request = direct_wake_request(sandbox_id, route_identity, activity);
+        let vcpu = sandbox.vcpu.and_then(|value| u32::try_from(value).ok());
+        let mut request = direct_wake_request(sandbox_id, vcpu, route_identity, activity);
         let context = request.start_context.get_or_insert_default();
         context.activation_auto_lifecycle = Some(self.activation_auto_lifecycle(sandbox_id).await?);
         context.expected_execution_generation = expected_execution_generation;
@@ -3526,6 +3529,7 @@ impl SubstrateAdapter for DirectSubstrate {
                 .await?;
             let execution_generation = receipt_execution_generation(route_identity.as_ref());
             return Ok(CreateExecutionOutcome {
+                lease_completion: None,
                 sandbox_id,
                 binding: Some(ExecutionBinding {
                     execution_object_id: sandbox_id.to_string(),
@@ -3584,6 +3588,7 @@ impl SubstrateAdapter for DirectSubstrate {
             let execution_generation = receipt_execution_generation(route_identity.as_ref());
 
             return Ok(CreateExecutionOutcome {
+                lease_completion: None,
                 sandbox_id,
                 binding: Some(ExecutionBinding {
                     execution_object_id: sandbox_id.to_string(),
@@ -3705,6 +3710,7 @@ impl SubstrateAdapter for DirectSubstrate {
         let execution_generation = receipt_execution_generation(route_identity.as_ref());
 
         Ok(CreateExecutionOutcome {
+            lease_completion: None,
             sandbox_id,
             binding: Some(ExecutionBinding {
                 execution_object_id: sandbox_id.to_string(),

@@ -24,6 +24,7 @@ use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::ServerTlsConfig;
 
+use crate::auth::CredentialUdsAccess;
 use crate::aws_secrets_manager::AwsSecretsManagerResolver;
 use crate::credential_injection_authority::CredentialInjectionAuthority;
 use crate::credential_injection_bundle::{
@@ -64,6 +65,8 @@ const PLATFORM_KEK_IDENTIFIER_ENV: &str = "SPACE_PLATFORM_KEK_IDENTIFIER";
 // different mutex files and both acquire concurrently.
 const SERVICE_MUTEX_PATH: &str = "/space/run/credential-manager/service.mutex";
 
+mod volume_socket;
+
 /// Which side of the control-plane split this process runs as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CredmgrRole {
@@ -87,6 +90,8 @@ pub struct CredmgrRunConfig {
     pub role: CredmgrRole,
     /// Unix socket path for the gRPC service.
     pub socket_path: PathBuf,
+    /// Optional restricted listener for volume-manager, provisioned before enabling.
+    pub volume_socket_path: Option<PathBuf>,
     /// TCP listen address for the control-plane deployment. Without TLS
     /// material this requires `allow_plaintext`.
     pub tcp_listen: Option<SocketAddr>,
@@ -118,6 +123,8 @@ pub enum RunCredmgrError {
          be given DATABASE_URL."
     )]
     KeylessNodeAuthority,
+    #[error("--volume-socket requires UDS and a path distinct from --socket")]
+    InvalidVolumeSocket,
     #[error("invalid peer-process check mode: {0}")]
     PeerProcessCheck(#[source] pplx_space_common_svc::PeerProcessCheckModeEnvError),
     #[error("invalid {EXCHANGE_TOKEN_MODE_ENV}: {0}")]
@@ -210,6 +217,14 @@ pub enum RunCredmgrError {
     ServiceMutex(#[source] pplx_space_common_svc::service_mutex::AcquireError),
     #[error("failed to bind the credential-manager socket: {0}")]
     BindSocket(#[source] pplx_space_common_svc::bootstrap::BindUnixSocketError),
+    #[error("volume credential socket preflight failed for {path}: {source}")]
+    VolumeSocketPreflight {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("volume credential socket preflight task failed: {0}")]
+    VolumeSocketPreflightTask(#[source] tokio::task::JoinError),
     #[error(
         "the node credential agent serves the node-local Unix socket; \
          --no-uds is invalid in agent mode"
@@ -335,6 +350,13 @@ fn validate_startup_config(
 /// gets the same shapes rejected as a typed error, instead of a panic or a
 /// listener it did not ask for.
 fn validate_flag_shape(config: &CredmgrRunConfig) -> Result<(), RunCredmgrError> {
+    if config
+        .volume_socket_path
+        .as_ref()
+        .is_some_and(|path| config.no_uds || path == &config.socket_path)
+    {
+        return Err(RunCredmgrError::InvalidVolumeSocket);
+    }
     if config.no_uds && config.tcp_listen.is_none() {
         return Err(RunCredmgrError::NoUdsWithoutTcpListen);
     }
@@ -449,7 +471,7 @@ pub async fn run(
     else {
         return Ok(());
     };
-    let listener = bind_credential_manager_socket(&config.socket_path)?;
+    let listener = CredentialListeners::bind(&config)?;
 
     tracing::info!(
         socket_path = %config.socket_path.display(),
@@ -853,6 +875,17 @@ where
     F: Future<Output = Result<T, RunCredmgrError>>,
 {
     let initialized = initialize.await?;
+    if let Some(path) = config.volume_socket_path.clone() {
+        let standard_socket = config.socket_path.clone();
+        // Passive readiness lets the rollout retire the predecessor, so even
+        // publishing health must wait until the new listener can be provisioned.
+        tokio::task::spawn_blocking(move || {
+            volume_socket::preflight(&path, &standard_socket)
+                .map_err(|source| RunCredmgrError::VolumeSocketPreflight { path, source })
+        })
+        .await
+        .map_err(RunCredmgrError::VolumeSocketPreflightTask)??;
+    }
     let Some(node_local) = prepare_node_local(config, shutdown_token, service_mutex_path).await?
     else {
         return Ok(None);
@@ -922,22 +955,68 @@ fn bind_credential_manager_socket(
     .map_err(RunCredmgrError::BindSocket)
 }
 
+struct CredentialListeners {
+    standard: tokio::net::UnixListener,
+    volume: Option<tokio::net::UnixListener>,
+}
+
+impl CredentialListeners {
+    fn bind(config: &CredmgrRunConfig) -> Result<Self, RunCredmgrError> {
+        let volume = config
+            .volume_socket_path
+            .as_ref()
+            .map(|path| {
+                pplx_space_common_svc::bind_unix_socket(path, volume_socket::options())
+                    .map_err(RunCredmgrError::BindSocket)
+            })
+            .transpose()?;
+        Ok(Self {
+            standard: bind_credential_manager_socket(&config.socket_path)?,
+            volume,
+        })
+    }
+
+    fn spawn<S: CredentialManager + Clone + Send + 'static>(
+        self,
+        servers: &mut JoinSet<(CredentialManagerServerKind, Result<(), ServeError>)>,
+        service: S,
+        shutdown: &CancellationToken,
+    ) {
+        let mut listeners = vec![(self.standard, CredentialUdsAccess::Standard)];
+        if let Some(volume) = self.volume {
+            listeners.push((volume, CredentialUdsAccess::Volume));
+        }
+        for (listener, access) in listeners {
+            let service = service.clone();
+            let shutdown = shutdown.clone();
+            servers.spawn(async move {
+                (
+                    CredentialManagerServerKind::Uds,
+                    serve_uds_until(listener, service, shutdown, access).await,
+                )
+            });
+        }
+    }
+}
+
 async fn serve_uds_until<S>(
     listener: tokio::net::UnixListener,
     service: S,
     shutdown_token: CancellationToken,
+    access: CredentialUdsAccess,
 ) -> Result<(), ServeError>
 where
     S: CredentialManager,
 {
     let (_, health_service) = pplx_space_common_svc::grpc_health_service();
     pplx_space_common_svc::grpc_server_builder()
+        .layer(pplx_space_common_svc::grpc_trace_layer())
         .layer(
             pplx_space_common_svc::conservative_uds_grpc_rate_limiter_layer(
                 "space-credential-manager",
             ),
         )
-        .layer(pplx_space_common_svc::grpc_trace_layer())
+        .layer(access)
         .add_service(health_service)
         .add_service(CredentialManagerServer::new(service))
         .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async move {
@@ -948,24 +1027,18 @@ where
 }
 
 async fn serve_node_local_uds<S>(
-    listener: tokio::net::UnixListener,
+    listener: CredentialListeners,
     service: S,
     production_socket: PathBuf,
     node_local: NodeLocalActivation,
     shutdown_token: CancellationToken,
 ) -> Result<(), RunCredmgrError>
 where
-    S: CredentialManager + Send + 'static,
+    S: CredentialManager + Clone + Send + 'static,
 {
     let production_shutdown_token = CancellationToken::new();
     let mut servers = JoinSet::new();
-    let server_shutdown_token = production_shutdown_token.clone();
-    servers.spawn(async move {
-        (
-            CredentialManagerServerKind::Uds,
-            serve_uds_until(listener, service, server_shutdown_token).await,
-        )
-    });
+    listener.spawn(&mut servers, service, &production_shutdown_token);
 
     tracing::info!(
         socket_path = %production_socket.display(),
@@ -983,7 +1056,7 @@ where
 }
 
 async fn serve_node_local_uds_and_tcp(
-    listener: tokio::net::UnixListener,
+    listener: CredentialListeners,
     addr: SocketAddr,
     security: TcpSecurity,
     service: CredentialManagerService,
@@ -993,14 +1066,7 @@ async fn serve_node_local_uds_and_tcp(
 ) -> Result<(), RunCredmgrError> {
     let production_shutdown_token = CancellationToken::new();
     let mut servers = JoinSet::new();
-    let uds_shutdown_token = production_shutdown_token.clone();
-    let uds_service = service.clone();
-    servers.spawn(async move {
-        (
-            CredentialManagerServerKind::Uds,
-            serve_uds_until(listener, uds_service, uds_shutdown_token).await,
-        )
-    });
+    listener.spawn(&mut servers, service.clone(), &production_shutdown_token);
     let tcp_shutdown_token = production_shutdown_token.clone();
     servers.spawn(async move {
         (
@@ -1151,7 +1217,7 @@ async fn run_agent(
     else {
         return Ok(());
     };
-    let listener = bind_credential_manager_socket(&config.socket_path)?;
+    let listener = CredentialListeners::bind(&config)?;
 
     tracing::info!(
         socket_path = %config.socket_path.display(),

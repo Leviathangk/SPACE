@@ -13,6 +13,7 @@ fn svc_binary_allowlists_derive_from_the_bin_dir_constants() {
             paths::SPACE_SBXMGR_UID_BINARIES,
             &["space-sbxmgr-svc", "space-volmgr-svc"][..],
         ),
+        (paths::SPACE_VOLMGR_SVC_BINARIES, &["space-volmgr-svc"][..]),
         (
             paths::SPACE_TMPLMGR_SVC_BINARIES,
             &["space-tmplmgr-svc"][..],

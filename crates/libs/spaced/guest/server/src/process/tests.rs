@@ -416,6 +416,7 @@ async fn pending_process_stream_stops_when_receiver_closes() {
             journal: Arc::downgrade(&journal),
             changed: journal.subscribe(),
             next_sequence: 0,
+            primary: None,
         }),
     );
 
@@ -499,6 +500,7 @@ async fn process_journal_reports_lag_when_local_ring_evicts_output() {
                 journal: Arc::downgrade(&journal),
                 changed: journal.subscribe(),
                 next_sequence: 0,
+                primary: None,
             }),
         );
         for _ in 0..count {
@@ -523,6 +525,116 @@ async fn process_journal_reports_lag_when_local_ring_evicts_output() {
         assert!(slow.next().await.is_none());
         assert_eq!(journal.changed.receiver_count(), 0);
     }
+}
+
+#[tokio::test]
+async fn attached_output_backpressures_and_disconnect_releases_the_producer() {
+    // Exercise both the per-process limit and exhaustion of the shared pool.
+    for shared_bytes in [0, PROCESS_OUTPUT_SHARED_BYTES] {
+        let journal = Arc::new(ProcessEventJournal::new(Arc::new(Semaphore::new(
+            shared_bytes,
+        ))));
+        let process_id = ProcessId::new();
+        let cursor = journal.cursor(Some(0));
+        let event = process_stdout_event(&process_id, Some(1), vec![b'a'; 8192]);
+        while journal.try_append_output(event.clone()).is_none() {}
+        let tail = journal.tail_cursor();
+        let mut stream = process_event_stream_with_prefix(Vec::new(), Some(cursor));
+        let pending = journal.publish_output(event.clone());
+        tokio::pin!(pending);
+        assert!(futures_util::poll!(&mut pending).is_pending());
+        assert!(matches!(journal.read(0), ProcessJournalRead::Event(_)));
+        assert_eq!(stream.next().await.unwrap().unwrap(), event);
+        pending.await;
+        assert_eq!(journal.tail_cursor(), tail + 1);
+
+        let pending = journal.publish_output(event);
+        tokio::pin!(pending);
+        assert!(futures_util::poll!(&mut pending).is_pending());
+        drop(stream);
+        pending.await;
+        assert_eq!(journal.tail_cursor(), tail + 2);
+        assert_eq!(journal.blocked_readers.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[tokio::test]
+async fn kill_reaped_process_releases_stalled_output_and_capacity() {
+    let service = cancellation_service();
+    let mut stream = Process::start(
+        &service,
+        Request::new(StartRequest {
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "read line; printf '%8192s' x".into(),
+            ],
+            idempotency_key: Some("kill-reaped".into()),
+            stdin: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    let started = stream.next().await.unwrap().unwrap();
+    let process_id = ProcessId::parse(started.process_id.clone()).unwrap();
+    let record = service.inner.processes.get_running(&process_id).unwrap();
+    // Fill the attached reader's journal before letting the child write and exit.
+    let event = process_stdout_event(&process_id, Some(record.info.pid), vec![0; 8192]);
+    while record.journal.try_append_output(event.clone()).is_none() {}
+    record.write_stdin(b"exit\n").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let gone =
+                nix::sys::signal::kill(nix::unistd::Pid::from_raw(record.info.pid as i32), None)
+                    == Err(nix::errno::Errno::ESRCH);
+            if gone && record.journal.blocked_readers.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("leader must be reaped while output remains blocked");
+    let missing = Process::send_signal(
+        &service,
+        Request::new(SendSignalRequest {
+            process_id: started.process_id.clone(),
+            signal: libc::SIGTERM,
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(missing.code(), tonic::Code::NotFound);
+    assert!(!record.journal.is_completed());
+    let result = Process::send_signal(
+        &service,
+        Request::new(SendSignalRequest {
+            process_id: started.process_id,
+            signal: libc::SIGKILL,
+        }),
+    )
+    .await;
+    let completed = tokio::time::timeout(Duration::from_secs(2), async {
+        while !service.inner.processes.list().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    // Clean up even on the unfixed implementation, without releasing the reader first.
+    service.inner.shutdown.cancel();
+    service.inner.process_tasks.close();
+    service.inner.process_tasks.wait().await;
+    result.expect("kill of an exited leader must release output");
+    completed.expect("stalled reader must not prevent process cleanup");
+    drop(record);
+    service.inner.processes.records.remove(&process_id);
+    assert_eq!(
+        service.inner.processes.record_slots.available_permits(),
+        PROCESS_RECORD_LIMIT
+    );
+    drop(stream);
 }
 
 #[test]
@@ -590,6 +702,7 @@ async fn completed_cursor_keeps_terminal_event_without_retaining_journal() {
         journal: Arc::downgrade(&journal),
         changed: journal.subscribe(),
         next_sequence: 0,
+        primary: None,
     };
     journal.complete(exit.clone());
     drop(journal);
@@ -616,6 +729,7 @@ async fn evicted_cursor_reports_lag_before_terminal_event() {
         journal: Arc::downgrade(&journal),
         changed: journal.subscribe(),
         next_sequence: 0,
+        primary: None,
     };
     journal.complete(exit);
     drop(journal);

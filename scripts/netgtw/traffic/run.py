@@ -237,7 +237,7 @@ def load_cases(directory, pattern):
                     )
                 if "alpn" in probe:
                     require(
-                        kind == "tls"
+                        kind in ("tls", "connect")
                         and isinstance(probe["alpn"], list)
                         and probe["alpn"]
                         and all(
@@ -247,10 +247,23 @@ def load_cases(directory, pattern):
                         and len(probe["alpn"]) == len(set(probe["alpn"])),
                         f"{name}: alpn requires unique supported fixture protocols",
                     )
+                    if kind == "connect":
+                        require(
+                            not any(
+                                field in probe
+                                for field in (
+                                    "proxy_anyauth", "tunnel_authority", "tunnel_method"
+                                )
+                            ),
+                            f"{name}: CONNECT alpn requires an unmodified tunnel probe",
+                        )
                 for field in ("downstream_alpn", "upstream_alpn"):
                     if field in probe:
                         require(
-                            kind == "tls"
+                            (
+                                kind == "tls"
+                                or (kind == "connect" and "alpn" in probe)
+                            )
                             and probe[field] in ("h2", "http/1.1"),
                             f"{name}: {field} requires a supported TLS protocol",
                         )
@@ -567,9 +580,10 @@ def assert_result(spec, result, events):
             f"payload was not delivered in both directions: {result}",
         )
         if "downstream_alpn" in spec:
+            negotiated = result.get("downstream_alpn", result.get("protocol"))
             require(
-                result.get("protocol") == spec["downstream_alpn"],
-                f"downstream selected {result.get('protocol')}; wanted {spec['downstream_alpn']}",
+                negotiated == spec["downstream_alpn"],
+                f"downstream selected {negotiated}; wanted {spec['downstream_alpn']}",
             )
         if "upstream_alpn" in spec:
             negotiated = [
@@ -986,6 +1000,8 @@ def run(args, cases):
                 zone,
                 "--events",
                 events_path,
+                "--health-events",
+                output / "health-events.jsonl",
                 "--certificate",
                 certificate,
                 "--key",
