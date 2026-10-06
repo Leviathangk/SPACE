@@ -382,7 +382,7 @@ All 12 sandboxes ran their full plan.
 |---|---|
 | Busy after restore | **35.9 sandbox-hours** (36 × 60 min), plus 2.0 sandbox-hours of post-create warm-up |
 | Restores | **36: 18 cross-node** (snapshot pulled from object storage), **18 same-node** (`local_only`); all succeeded in 2–10 s; landed on the intended node every time |
-| Operations | **16,870, 0 failed**: 6,077 Process.Start-equivalent commands of the short mix, 2,280 telemetry, 913 upload + 913 verified download, 528 wrapper backfills, 48 connects |
+| Operations | **16,870, 0 failed**: 14,516 commands (native Process.Start), of which 10,819 are the short mix, 2,280 telemetry, 913 upload rotations, 408 memory-target updates and 96 connect/mkdir; plus 2,354 file calls (913 uploads, 913 verified downloads, 528 backfill writes) |
 | Latency p50 / p99 / max (ms) | short commands about 40–75 / 60–220 / ≤ 1,550; upload 65 / 153 / 482; download 21 / 41 / 78 |
 | Memory | limit 2048 MiB (guest `MemTotal` 1991 MiB); memhog reached 1,200 MB (ramp 200 → 1500 MB over 4 h, so the 3 h 15 min baseline reached 1,200); peak Firecracker RSS 1,341–1,368 MB |
 | Composed health (`space-sbxmgr list`, per minute, about 190 samples per sandbox) | never `Degraded`. Outside each sandbox's own suspend/restore windows: only `✅`, one `⏳` at creation, and a few `suspended` samples while the snapshot became portable |
