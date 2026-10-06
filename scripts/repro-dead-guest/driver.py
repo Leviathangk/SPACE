@@ -189,6 +189,40 @@ def wake(args):
     print(fs.api(cfg, "GET", f"/v1/sandboxes/{args.sandbox}")["state"])
 
 
+def suspend(args):
+    cfg = config()
+    result = fs.api(cfg, "POST", f"/v1/sandboxes/{args.sandbox}:suspend", body={},
+                    key=f"repro-suspend-{uuid.uuid4().hex}")
+    fs.wait_for_state(cfg, f"/v1/operations/{result['operation_id']}", "succeeded")
+    print(fs.api(cfg, "GET", f"/v1/sandboxes/{args.sandbox}")["state"])
+
+
+def delete(args):
+    cfg = config()
+    for sbx in args.sandboxes:
+        try:
+            result = fs.api(cfg, "DELETE", f"/v1/sandboxes/{sbx}", key=f"repro-del-{uuid.uuid4().hex}")
+            print(sbx, result.get("operation_id"))
+        except Exception as error:  # noqa: BLE001 - report and continue with the rest
+            print(sbx, "error:", str(error)[:200])
+
+
+def probe(args):
+    """One Process.Start reachability sample per sandbox: ok/error and latency."""
+    cfg = config()
+    for sbx in args.sandboxes:
+        start = time.monotonic()
+        try:
+            code, out = run(cfg, sbx, ["sh", "-c", "echo ok"], timeout="20s", stream_timeout=30)
+            result = {"ok": code == 0 and out.strip() == "ok", "exit": code}
+        except Exception as error:  # noqa: BLE001 - recorded as a failed sample
+            body = getattr(error, "read", lambda: b"")()
+            result = {"ok": False, "error": (str(error) + " " + body.decode(errors="replace"))[:300]}
+        result.update(ts=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), sbx=sbx,
+                      ms=round((time.monotonic() - start) * 1e3, 1))
+        print(json.dumps(result), flush=True)
+
+
 def get(args):
     result = fs.api(config(), "GET", f"/v1/sandboxes/{args.sandbox}")
     print(json.dumps(result if args.full else {k: result.get(k) for k in ("id", "state", "updated_at")}))
@@ -220,6 +254,15 @@ def main():
     p = sub.add_parser("wake")
     p.add_argument("sandbox")
     p.set_defaults(fn=wake)
+    p = sub.add_parser("suspend")
+    p.add_argument("sandbox")
+    p.set_defaults(fn=suspend)
+    p = sub.add_parser("delete")
+    p.add_argument("sandboxes", nargs="+")
+    p.set_defaults(fn=delete)
+    p = sub.add_parser("probe")
+    p.add_argument("sandboxes", nargs="+")
+    p.set_defaults(fn=probe)
     p = sub.add_parser("get")
     p.add_argument("sandbox")
     p.add_argument("--full", action="store_true")
