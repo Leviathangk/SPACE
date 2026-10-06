@@ -32,3 +32,23 @@ no; spaced-host respawn no; explicit suspend -> Firecracker API `connection
 refused` -> `fc_pause_failed` -> quarantined -> API `failed`; stop+start yes
 (cold boot on the current mount). Sandboxes created/restored after the restart
 are fine until their node's next restart.
+
+## Between experiments (15:29–15:33Z)
+
+- Stranded controls: e2a-1 stranded 14:29:13 -> 15:29:36Z (60 min) with no recovery;
+  e2a-3 47 min. Raw CONNECT 5002 OK on every sample. All exp-2 sandboxes then deleted.
+- dmesg on VM exit: the second instance's "last unmount" names a different fsid
+  (e60a4e99… vs 3eb62a85…), consistent with btrfs temp-fsid for a duplicate mount.
+- Workers returned to main's chart (`reset-cache-mounts.sh`; DaemonSet template
+  identical to the pre-patch rendering). `btrfs scrub` then found 3944 / 2964
+  uncorrectable csum errors on the two worker caches (they read 15 / 26 at the 14:12Z
+  mount). Both cache images were recreated (`recreate-cache-images.sh`), scrub-clean,
+  and the seed template was re-pulled before experiment 1.
+
+## Experiment 1 (started 15:33:31Z)
+
+`run-exp1.sh ~/repro-logs/phase2/e1/run 12` + `monitor.sh ~/repro-logs/phase2/e1/mon 60`.
+12 sandboxes, 2 vCPU / 2048 MiB / 4096 MiB disk, memhog 200 -> 1500 MB over 4 h,
+warm 10 min, then 3 cycles (odd: cross,same,cross; even: same,cross,same) of
+suspend -> portable -> forced restore -> 60 min busy. Expected end ~18:50Z, then a
+stress variant.
