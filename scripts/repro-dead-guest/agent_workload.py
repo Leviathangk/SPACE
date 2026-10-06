@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""ASI-like busy workload over create -> suspend -> restore cycles (phase 2, experiment 1).
+"""agent-like busy workload over create -> suspend -> restore cycles (phase 2, experiment 1).
 
 One process per sandbox (examples/first_sandbox.py's request deadline uses
 SIGALRM, which only works on the main thread):
 
-  asi_workload.py run LABEL --out DIR --plan same,cross,cross --warm 600 --busy 3600 \
+  agent_workload.py run LABEL --out DIR --plan same,cross,cross --warm 600 --busy 3600 \
       [--memory-mib 2048 --disk-mib 4096 --mem-start-mb 200 --mem-final-mb 1500 --ramp 14400]
-  asi_workload.py run LABEL --out DIR --attach --plan cross ...   # continue an existing sandbox
+  agent_workload.py run LABEL --out DIR --attach --plan cross ...   # continue an existing sandbox
 
 Each sandbox emulates an agent worker:
   * at every connect (after create and after each restore) it backfills CLI
@@ -83,26 +83,26 @@ while True:
 '''
 
 WRAPPERS = {
-    "asi-ls": "#!/bin/sh\nexec ls -la \"${1:-.}\"\n",
-    "asi-grep": "#!/bin/sh\nexec grep -rn \"${1:-x}\" \"${2:-.}\" 2>/dev/null | head -50\n",
-    "asi-py": "#!/usr/bin/env python3\nimport sys, json, platform\nprint(json.dumps({'py': platform.python_version(), 'argv': sys.argv[1:]}))\n",
-    "asi-hash": "#!/bin/sh\nfind \"${1:-.}\" -maxdepth 2 -type f 2>/dev/null | sort | head -200 | xargs -r sha1sum | sha1sum\n",
-    "asi-fetch": "#!/bin/sh\nexec curl -s -o /dev/null -w '%{http_code} %{size_download}\\n' \"http://127.0.0.1:8000/${1:-}\"\n",
-    "asi-env": "#!/bin/sh\nenv | sort | head -40 | wc -l\n",
-    "asi-tree": "#!/bin/sh\ncd \"${1:-.}\" && find . -maxdepth 3 | sort | head -300 | wc -l\n",
-    "asi-note": "#!/bin/sh\nmkdir -p \"$HOME/work/notes\" && date -u >> \"$HOME/work/notes/log.md\" && tail -n 3 \"$HOME/work/notes/log.md\"\n",
+    "agw-ls": "#!/bin/sh\nexec ls -la \"${1:-.}\"\n",
+    "agw-grep": "#!/bin/sh\nexec grep -rn \"${1:-x}\" \"${2:-.}\" 2>/dev/null | head -50\n",
+    "agw-py": "#!/usr/bin/env python3\nimport sys, json, platform\nprint(json.dumps({'py': platform.python_version(), 'argv': sys.argv[1:]}))\n",
+    "agw-hash": "#!/bin/sh\nfind \"${1:-.}\" -maxdepth 2 -type f 2>/dev/null | sort | head -200 | xargs -r sha1sum | sha1sum\n",
+    "agw-fetch": "#!/bin/sh\nexec curl -s -o /dev/null -w '%{http_code} %{size_download}\\n' \"http://127.0.0.1:8000/${1:-}\"\n",
+    "agw-env": "#!/bin/sh\nenv | sort | head -40 | wc -l\n",
+    "agw-tree": "#!/bin/sh\ncd \"${1:-.}\" && find . -maxdepth 3 | sort | head -300 | wc -l\n",
+    "agw-note": "#!/bin/sh\nmkdir -p \"$HOME/work/notes\" && date -u >> \"$HOME/work/notes/log.md\" && tail -n 3 \"$HOME/work/notes/log.md\"\n",
 }
 
 # Long-lived processes, started from a script file so `pgrep -f` never matches
 # the launching shell's own command line.
 LAUNCHER = f"""#!/bin/sh
 pgrep -f 'python3 -m http.server 8000' >/dev/null || {{ setsid nohup python3 -m http.server 8000 --directory {WORK} </dev/null >/dev/null 2>&1 & }}
-pgrep -f '{BIN}/asi-logwriter' >/dev/null || {{ setsid nohup {BIN}/asi-logwriter </dev/null >/dev/null 2>&1 & }}
+pgrep -f '{BIN}/agw-logwriter' >/dev/null || {{ setsid nohup {BIN}/agw-logwriter </dev/null >/dev/null 2>&1 & }}
 pgrep -f 'python3 /home/user/.local/memhog.py' >/dev/null || {{ setsid nohup python3 /home/user/.local/memhog.py </dev/null >/dev/null 2>&1 & }}
 sleep 1
-pgrep -af 'http.server|asi-logwriter|memhog' | cut -c1-80
+pgrep -af 'http.server|agw-logwriter|memhog' | cut -c1-80
 """
-WRAPPERS["asi-logwriter"] = f"#!/bin/sh\nwhile :; do date -u >> {WORK}/bg.log; sleep 2; done\n"
+WRAPPERS["agw-logwriter"] = f"#!/bin/sh\nwhile :; do date -u >> {WORK}/bg.log; sleep 2; done\n"
 
 SHORT_COMMANDS = [
     ("sh", f"ls -la {WORK} | head -20; df -h / | tail -1"),
@@ -230,7 +230,7 @@ class Run:
         try:
             fs.api(self.cfg, "POST", f"/v1/sandboxes/{self.state['sandbox_id']}/files:write",
                    body={"path": path, "data_base64": base64.b64encode(data).decode()},
-                   key=f"asi-w-{uuid.uuid4().hex}", timeout=120)
+                   key=f"agw-w-{uuid.uuid4().hex}", timeout=120)
             self.record("file", kind=kind, ok=True, bytes=len(data), ms=round((now() - start) * 1e3, 1))
             self.outcome(True, kind)
             return True
@@ -275,15 +275,15 @@ class Run:
         return int(a.mem_start_mb + (a.mem_final_mb - a.mem_start_mb) * frac)
 
     def connect(self):
-        """What an ASI worker does on (re)connect: backfill wrappers, ensure background processes."""
+        """What an agent worker does on (re)connect: backfill wrappers, ensure background processes."""
         self.connected_at = now()
         self.command("mkdirs", f"mkdir -p {WORK} {BIN}")
         for name, body in WRAPPERS.items():
             self.write_file(f"{BIN}/{name}", body.encode(), kind="backfill")
         self.write_file("/home/user/.local/memhog.py", MEMHOG.encode(), kind="backfill")
-        self.write_file("/home/user/.local/asi-bg.sh", LAUNCHER.encode(), kind="backfill")
-        script = (f"chmod 755 {BIN}/* /home/user/.local/asi-bg.sh; echo {self.mem_target()} > /tmp/memtarget; "
-                  "/home/user/.local/asi-bg.sh; free -m | sed -n 2p")
+        self.write_file("/home/user/.local/agw-bg.sh", LAUNCHER.encode(), kind="backfill")
+        script = (f"chmod 755 {BIN}/* /home/user/.local/agw-bg.sh; echo {self.mem_target()} > /tmp/memtarget; "
+                  "/home/user/.local/agw-bg.sh; free -m | sed -n 2p")
         self.command("connect", script)
 
     def busy(self, seconds, label):
@@ -313,7 +313,7 @@ class Run:
                 tel_count += 1
                 extra = "; dmesg 2>/dev/null | tail -20" if tel_count % 5 == 0 else ""
                 self.command("telemetry", "free -m | sed -n 2p; cat /proc/loadavg; "
-                                          "cat /tmp/memhog.mb 2>/dev/null; pgrep -c -f 'http.serve[r]|asi-logwrite[r]|memho[g].py'"
+                                          "cat /tmp/memhog.mb 2>/dev/null; pgrep -c -f 'http.serve[r]|agw-logwrite[r]|memho[g].py'"
                                           + extra, user="root")
                 next_tel = t + 60
             if t >= next_file:
@@ -323,8 +323,8 @@ class Run:
                 kind, script = random.choice(SHORT_COMMANDS)
                 if kind == "wrapper":
                     script = f"PATH={BIN}:$PATH; " + random.choice([
-                        f"asi-ls {WORK}", f"asi-grep UTC {WORK}/notes", "asi-py a b", f"asi-hash {WORK}",
-                        "asi-fetch", "asi-env", f"asi-tree {WORK}", "asi-note"])
+                        f"agw-ls {WORK}", f"agw-grep UTC {WORK}/notes", "agw-py a b", f"agw-hash {WORK}",
+                        "agw-fetch", "agw-env", f"agw-tree {WORK}", "agw-note"])
                 self.command(kind, script)
                 # while an incident is open, probe every 15 s
                 next_cmd = now() + (15 if self.incident else random.uniform(5, 20))
@@ -355,7 +355,7 @@ class Run:
     def op(self, action):
         start = now()
         result = fs.api(self.cfg, "POST", f"/v1/sandboxes/{self.state['sandbox_id']}:{action}", body={},
-                        key=f"asi-{action}-{uuid.uuid4().hex}")
+                        key=f"agw-{action}-{uuid.uuid4().hex}")
         deadline = now() + 900
         while True:
             op = fs.api(self.cfg, "GET", f"/v1/operations/{result['operation_id']}")
@@ -366,11 +366,11 @@ class Run:
 
     def create(self):
         a = self.args
-        body = {"template": self.cfg["template"], "runtime": "fc", "name": f"asi-{self.label}",
+        body = {"template": self.cfg["template"], "runtime": "fc", "name": f"agw-{self.label}",
                 "metadata": {"repro": "phase2-exp1", "label": self.label},
                 "resources": {"vcpu": 2, "memory_mib": a.memory_mib, "disk_mib": a.disk_mib},
                 "auto_lifecycle": driver.policy("8h")}
-        result = fs.api(self.cfg, "POST", "/v1/sandboxes", body=body, key=f"asi-{self.label}-{uuid.uuid4().hex}")
+        result = fs.api(self.cfg, "POST", "/v1/sandboxes", body=body, key=f"agw-{self.label}-{uuid.uuid4().hex}")
         self.state.update(sandbox_id=result["sandbox_id"], created_at=iso())
         self.save()
         fs.wait_for_state(self.cfg, f"/v1/operations/{result['operation_id']}", "succeeded")

@@ -1,0 +1,51 @@
+sandboxes: 12
+busy post-restore: 14.0 sandbox-hours; warm (post-create): 3.0 sandbox-hours
+restores (requested kind, result, landed cross-node): {('cross', 'succeeded', True): 12}
+operations: 7954, failed: 0
+latency ms (p50/p99/max) by kind:
+  backfill: 12.9/401.0/504.5 n=528
+  connect: 1109.6/1384.1/1384.1 n=48
+  curl: 44.7/309.4/566.8 n=607
+  download: 22.4/112.1/187.6 n=411
+  mem_target: 38.8/1861.9/1862.2 n=168
+  mkdirs: 49.3/586.3/586.3 n=48
+  ps: 39.8/103.2/1249.9 n=594
+  python: 52.6/269.8/918.2 n=590
+  python_json: 71.7/413.6/766.2 n=602
+  rotate_uploads: 40.0/70.5/114.5 n=411
+  sh: 42.7/237.4/396.6 n=637
+  telemetry: 45.8/204.4/1969.0 n=1032
+  upload: 74.0/208.1/454.5 n=411
+  vcs_emul: 68.1/489.8/1833.9 n=609
+  wrapper: 47.4/229.8/2433.0 n=657
+  write: 61.9/244.8/1061.2 n=601
+memhog peak MB per sandbox: {'a01': 1200, 'a02': 1200, 'a03': 1200, 'a04': 1200, 'a05': 1200, 'a06': 1200, 'a07': 1200, 'a08': 1200, 'a09': 1200, 'a10': 1200, 'a11': 1200, 'a12': 1200}
+incident lines: 0
+per-VM peak Firecracker RSS MB / raw vsock ok:fail
+  a01 6c3733ea rss_peak=1343 vsock=88:2
+  a02 b1cda0bc rss_peak=1306 vsock=88:0
+  a03 47ded6e7 rss_peak=1328 vsock=87:2
+  a04 0b14a7db rss_peak=1311 vsock=87:1
+  a05 0fb6cbab rss_peak=1343 vsock=87:2
+  a06 f9f695c7 rss_peak=1327 vsock=88:0
+  a07 16d52e7f rss_peak=1346 vsock=86:1
+  a08 59048a92 rss_peak=1327 vsock=86:2
+  a09 6beb0b97 rss_peak=1356 vsock=87:0
+  a10 f884abe8 rss_peak=1319 vsock=86:0
+  a11 fe991514 rss_peak=1322 vsock=85:2
+  a12 1d8aa7bd rss_peak=1359 vsock=86:1
+composed health samples per sandbox (state, HP, in own suspend/restore window): count
+  a01 6c3733ea {('started', '⏳', False): 1, ('started', '✅', False): 68, ('started', '✅', True): 18, ('suspended', '-', True): 2, ('restoring', '-', True): 1, ('suspending', '-', True): 1, ('started', '⏳', True): 1}
+  a02 b1cda0bc {('started', '⏳', False): 1, ('started', '✅', False): 69, ('started', '✅', True): 17, ('suspended', '-', True): 3, ('restoring', '-', True): 1, ('started', '⏳', True): 1}
+  a03 47ded6e7 {('starting', '-', False): 1, ('started', '✅', False): 68, ('started', '✅', True): 17, ('restoring', '-', True): 1, ('started', '⏳', True): 2, ('suspended', '-', True): 2}
+  a04 0b14a7db {('started', '✅', False): 69, ('started', '✅', True): 15, ('suspending', '-', True): 2, ('suspended', '-', True): 2, ('restoring', '-', True): 1, ('started', '⏳', True): 2}
+  a05 0fb6cbab {('started', '⏳', False): 1, ('started', '✅', False): 69, ('started', '✅', True): 16, ('suspending', '-', True): 1, ('restoring', '-', True): 1, ('suspended', '-', True): 2, ('started', '⏳', True): 1}
+  a06 f9f695c7 {('started', '⏳', False): 1, ('started', '✅', False): 69, ('started', '✅', True): 15, ('suspending', '-', True): 1, ('suspended', '-', True): 3, ('started', '⏳', True): 2}
+  a07 16d52e7f {('started', '⏳', False): 1, ('started', '✅', False): 68, ('started', '✅', True): 15, ('suspended', '-', True): 2, ('restoring', '-', True): 1, ('started', '⏳', True): 2, ('suspending', '-', True): 1}
+  a08 59048a92 {('started', '⏳', False): 1, ('started', '✅', False): 68, ('started', '✅', True): 16, ('suspending', '-', True): 2, ('suspended', '-', True): 2, ('restoring', '-', True): 1, ('started', '⏳', True): 1}
+  a09 6beb0b97 {('started', '⏳', False): 1, ('started', '✅', False): 69, ('started', '✅', True): 15, ('suspended', '-', True): 3, ('restoring', '-', True): 1, ('started', '⏳', True): 2}
+  a10 f884abe8 {('started', '⏳', False): 1, ('started', '✅', False): 68, ('started', '✅', True): 15, ('suspended', '-', True): 3, ('restoring', '-', True): 1, ('started', '⏳', True): 2}
+  a11 fe991514 {('started', '⏳', False): 1, ('started', '✅', False): 67, ('started', '✅', True): 15, ('suspended', '-', True): 2, ('restoring', '-', True): 1, ('started', '⏳', True): 2, ('suspending', '-', True): 1}
+  a12 1d8aa7bd {('started', '⏳', False): 1, ('started', '✅', False): 67, ('started', '✅', True): 15, ('suspending', '-', True): 2, ('suspended', '-', True): 2, ('restoring', '-', True): 1, ('started', '⏳', True): 2}
+raw vsock failures outside suspend/restore windows: 1
+   {"ts": "2026-10-06T20:24:14Z", "node": "space-local-worker", "sbx": "01a112e3-5b80-765e-abf9-d4dc47ded6e7", "pid": 3391360, "rss_kb": 81120, "cpu_ticks": 31, "vsock_ok": false, "vsock_reply": "", "vso

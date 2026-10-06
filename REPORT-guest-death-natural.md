@@ -1,34 +1,68 @@
 # Natural guest death and the node-stack restart attestation effect (Kind reproduction)
 
-Status: **DRAFT — experiment 2 complete, experiment 1 running.** The final
-version replaces this line.
-
 ## Summary
 
-- **Experiment 2: node-stack restart attestation effect. Root-caused; a
-  Kind harness defect.**
-  - A restart that starts a *new node-stack container* (container restart or
-    pod replacement) strands every guest already running on that node. The
-    guest stays alive, but the host can no longer reach it.
-  - Restarting only sandbox-manager, only node-manager, or only a spaced-host
-    process does not strand guests.
-  - Cause: the Kind *worker* chart mounts `/space/cache` as an `emptyDir`
-    without mount propagation. The entrypoint therefore loop-mounts
-    `/var/lib/space-cache.img` again inside every new container's private mount
-    namespace. With the old mount still held by the running jails, the kernel
-    brings up a **second, independent btrfs instance of the same image file**
-    (same fsid, new `st_dev`).
-  - From then on, every host-side path lookup of a running jail's
-    `…/root/v.sock` (and `firecracker.sock`) lands on a different superblock
-    than the one Firecracker listens on. Node-manager's endpoint attestation
-    sees the device change, and the spaced bridge dial gets a fast
-    `transport error`.
-  - Giving worker pods the builder role's hostPath + `Bidirectional` cache mount
-    removes the effect (0 of 6 stranded vs 9 of 9).
-  - EKS mounts `/space/cache` once per boot in the host namespace, so this
-    mechanism should not apply there, pending a check of the production worker
-    values, which are not in this repository.
-- **Experiment 1:** see below.
+**Experiment 1: no natural guest death was reproduced.**
+- Coverage:
+  - 12 sandboxes ran an agent-like busy workload through **72 restores**: 38
+    cross-node (26 with the Full rootfs codec, 12 with btrfs-send) and 34
+    same-node.
+  - **61.9 sandbox-hours** of busy time after restore, plus 5 sandbox-hours
+    after create.
+  - **30,184 Process.Start and file operations: 0 failed.**
+- Composed health was never `Degraded`. The
+  `space.sandbox.guest.health{lifecycle:started,health:degraded}` gauge read 0
+  in every minute, and raw `CONNECT 5002` never failed outside a VM's own
+  suspend or boot.
+- The two stress variants also passed:
+  - memory at about 97% of the guest's limit, with all 12 restored concurrently
+    onto one node;
+  - restores right after a node-stack restart.
+- With 0 deaths in 72 restores, the per-restore chance of a permanent death in
+  this setup is below about 4% (95% one-sided, rule of three). For deaths within the
+  first hour after a restore, 48 restores were watched for the full 60 min,
+  giving a bound below about 6%.
+- That does not rule out a production rate that is rare per restore. It does
+  show the deaths are not a generic consequence of suspend/restore, cross-node
+  restore, memory pressure or restore load as reproduced here.
+
+**Experiment 2: the restart attestation effect is root-caused. It is a Kind
+harness defect that should not apply to EKS.**
+- A restart that starts a *new node-stack container* (container restart or pod
+  replacement) strands every guest already running on that node. The guest is
+  alive, but the host can't reach it.
+- Restarting only sandbox-manager, only node-manager, or only spaced-host
+  doesn't.
+- Cause:
+  - The Kind *worker* chart mounts `/space/cache` as an `emptyDir` with no mount
+    propagation, so every new container loop-mounts the same cache image again.
+  - The running jails (and leftover per-sandbox sidecars) keep the old mount, so
+    the kernel runs **two independent btrfs instances of one image file**.
+  - Host-side path lookups of a running jail's `v.sock`/`firecracker.sock` then
+    land on the new superblock, where nothing listens.
+- The resulting failures match the production signature word for word:
+  - node-manager's endpoint attestation fails (`vsock endpoint identity
+    changed`, surfaced as `spaced endpoint attestation failed`);
+  - the bridge dial and the pre-suspend flush fail with `failed to connect to
+    spaced bridge guest at firecracker vsock …/v.sock:5002: transport error`;
+  - composed health goes `Degraded`, the auto-suspend budget parks the sandbox,
+    and the gauge steps up at the restart.
+- Nothing recovers it except stop/start, and an explicit suspend quarantines the
+  sandbox. The worker cache filesystems also ended up corrupted, with thousands
+  of uncorrectable checksum errors.
+- Using the builder role's hostPath + `Bidirectional` cache mount for workers
+  removes the effect: **0 of 6 stranded, against 9 of 9 without it.**
+- EKS mounts `/space/cache` once per boot in the host namespace, so the
+  mechanism should not apply there. The production worker values aren't in this
+  repository, though, so someone with access needs to confirm.
+
+**Side findings:**
+- a template-manager / node-manager startup race that silently disables the
+  btrfs-send codec for a template build on a fresh node;
+- per-sandbox sidecars outliving the node-stack pod;
+- node-to-API completion lag under concurrent restores;
+- the Kind harness's shared Docker disk filling up, which looks like a mass
+  guest death.
 
 ## Public-safety note
 
@@ -54,6 +88,241 @@ The Kind node containers restarted once at about 14:12Z, before this work
 started; the cause was outside this task. Every running VM died with them. The
 three probes left by the first report (`repro-rst-*`) were captured, then
 deleted (see "Earlier probes").
+
+## Experiment 1 — natural guest death after restore
+
+### Workload (`agent_workload.py`, one process per sandbox; `run-exp1.sh`)
+
+The repository has no recipe for the production agent template. The closest recipe,
+`templates/firecracker/recipes/code-runtime.toml`, needs a networked builder
+pool. The workload therefore emulates an agent worker on `seed:latest` (python3
+and curl, no git).
+
+**Sandbox:** 2 vCPU, `memory_mib` 2048 (the guest sees `MemTotal` 1991 MiB;
+Firecracker reports `memory_mib` 2176), `disk_mib` 4096. Auto-lifecycle is
+access-idle → suspend at 8 h, so it never fires during the run.
+
+**At every connect** (after create and after every restore):
+- 9 CLI wrapper scripts, the memory grower, and a launcher are backfilled with
+  `files:write`;
+- three long-lived processes are ensured: `python3 -m http.server`, a log
+  writer, and `memhog.py`.
+- `memhog.py` keeps `/tmp/memtarget` MB resident in 16 MB chunks with every
+  page touched, and re-touches part of the set every 10 s. The driver raises
+  the target every 5 min from 200 MB toward 1500 MB over 4 h (about 75% of
+  the limit).
+- The long-lived processes survive suspend/restore (same PIDs after restore).
+
+**Busy loop:**
+- a short command every 5–20 s, picked at random from:
+  - shell `ls`/`df`;
+  - python (sha256 of 1 MiB; JSON of 20k objects);
+  - a VCS-like tree hash (`find | sha1sum`, standing in for git);
+  - one of the wrappers;
+  - `curl` to the local server;
+  - 2 MB workspace writes with rotation;
+  - `ps`.
+- telemetry every 60 s (`free`, loadavg, memhog MB, live process count, and
+  `dmesg | tail` every 5th time);
+- a 1–6 MB `files:write` upload plus a verified `files:read` download every
+  2–3 min.
+
+All calls go through the native API (`POST /commands` is the native
+Process.Start), and every call is recorded with its latency.
+
+**Cycles:**
+- create, then 10 min warm-up;
+- then 3 cycles, each: explicit `:suspend` → wait until the snapshot is
+  portable (the smoke suite's `RESTORE_PORTABLE_SQL`) → `:wake` with the
+  *other* sandbox worker cordoned → 60 min busy.
+- Odd labels restore cross, same, cross; even labels same, cross, same.
+- Restores are serialized cluster-wide.
+- Cross-node restores pull `rootfs.btrfs-send` and the memory image from
+  object storage (`runtime_activated`: `boot_type=snapshot`,
+  `restore_provenance=remote_matches_local`, `remote_snapshot_staged=true`).
+  Same-node restores are `local_only`.
+
+**Detection:**
+- Three consecutive failed operations open an incident. `capture.sh` then
+  records:
+  - raw `CONNECT 5002`;
+  - Firecracker thread states and wchan;
+  - `fc.log` and the Firecracker API state;
+  - `space-sbxmgr health/doctor`;
+  - `space-nodemgr inspect`;
+  - 30 min of node-stack log lines for the sandbox;
+  - a guest dmesg attempt;
+  - a 30 min follow-up of vsock and health.
+- The workload keeps probing every 15 s.
+
+**Per minute, host side (`monitor.sh`):** raw `CONNECT 5002` and latency,
+Firecracker RSS and CPU for every VM, `space-sbxmgr list` (composed health),
+disk headroom, and a copy of `/space/logs`. The DogStatsD sink records
+`space.sandbox.guest.health`.
+
+### Attempt 1 (aborted, harness artifact)
+
+- Attempt 1 started at 15:33Z.
+- At 15:46:58Z the Kind nodes' shared `/var` filesystem filled up. That
+  filesystem is the devbox's 50 GB Docker data disk, about 35 GB of which is
+  shared Docker images and build cache, which this task does not prune.
+- The sparse cache images could no longer allocate
+  (`critical space allocation error, dev loopN`; btrfs `Transaction aborted
+  (error -5)`, `forced readonly`).
+- Within 30 s, 8 of 12 sandboxes failed `files:write` with `Read-only file
+  system (os error 30)` and commands with 500. Postgres, on the same disk,
+  stopped accepting writes.
+- This was not a guest death. The worker cache images and the SeaweedFS data
+  were moved to the 400 GB home disk with bind mounts inside the Kind node
+  containers (same code paths), and the run was restarted with a disk guard.
+- Evidence is kept outside the repository.
+
+### Attempt 2 — baseline (15:57:08Z → 19:12:52Z)
+
+All 12 sandboxes ran their full plan.
+
+| | |
+|---|---|
+| Busy after restore | **35.9 sandbox-hours** (36 × 60 min), plus 2.0 sandbox-hours of post-create warm-up |
+| Restores | **36: 18 cross-node** (snapshot pulled from object storage), **18 same-node** (`local_only`); all succeeded in 2–10 s; landed on the intended node every time |
+| Operations | **16,870, 0 failed**: 14,516 commands (native Process.Start), of which 10,819 are the short mix, 2,280 telemetry, 913 upload rotations, 408 memory-target updates and 96 connect/mkdir; plus 2,354 file calls (913 uploads, 913 verified downloads, 528 backfill writes) |
+| Latency p50 / p99 / max (ms) | short commands about 40–75 / 60–220 / ≤ 1,550; upload 65 / 153 / 482; download 21 / 41 / 78 |
+| Memory | limit 2048 MiB (guest `MemTotal` 1991 MiB); memhog reached 1,200 MB (ramp 200 → 1500 MB over 4 h, so the 3 h 15 min baseline reached 1,200); peak Firecracker RSS 1,341–1,368 MB |
+| Composed health (`space-sbxmgr list`, per minute, about 190 samples per sandbox) | never `Degraded`. Outside each sandbox's own suspend/restore windows: only `✅`, one `⏳` at creation, and a few `suspended` samples while the snapshot became portable |
+| `space.sandbox.guest.health{lifecycle:started,health:degraded}` | 0 in every one of 196 minutes |
+| Raw `CONNECT 5002` (2,280 samples) | 0 failures outside suspend/restore windows; 9 three-second timeouts, each during that VM's own suspend (VM paused for the snapshot) |
+| sbxmgr log, these sandboxes | only `Healthy` composed-health transitions (48); no `guest_process_start_failed`, no `suspend_failed` |
+
+**Coverage gap:**
+- Every suspend in attempt 2 used the **Full** rootfs codec, not btrfs-send:
+  `btrfs-send precondition not met; suspending with Full codec instead`, 36 times.
+- When the workers came back on fresh cache images, template-manager's on-demand
+  pull of `seed` ran before node-manager's socket was up (`nodemgr btrfs
+  subvolume create failed; falling back to plain directory … failed to connect
+  to node-manager … transport error`). The durable retry then failed for good
+  (`digest dir is not a btrfs subvolume; btrfs-send codec permanently
+  unavailable for this build`).
+- So the baseline's cross-node restores staged a Full rootfs and the memory
+  image from object storage. They did not use the btrfs-send codec named in the
+  production pattern. The pre-reset smoke run did use btrfs-send
+  (`rootfs.btrfs-send`). See "Side findings" for the race.
+
+### Stress A — memory near the limit + 12 concurrent restores onto one node (19:13Z → 20:22Z)
+
+Same 12 sandboxes after the baseline (`stress.py burst --mem-mb 1750
+--target-node space-local-worker`, then `agent_workload.py --attach`).
+
+- memhog was raised to 1,750 MB and every guest reached it (1,744 MB resident).
+  Guest `free` showed 1,926–1,947 of 1,991 MiB used and 44–86 MB available for
+  the rest of the run.
+- All 12 were suspended concurrently, each taking 51–161 s with near-full
+  memory images. Portable 4 s after the last suspend.
+- With `space-local-worker2` cordoned, all 12 were woken at once and landed on
+  `space-local-worker`: **8 cross-node, 4 same-node, all succeeded**.
+- API-side wake durations were 14 s to 303 s. For a02, the slowest, the node
+  log shows three concurrent artifact pulls finishing at 19:19:07,
+  `restore_completed` at 19:19:10, and the API operation completing at
+  19:21:57. The node-to-API lag is the same symptom as the first report's
+  "API shows a stale state" oddity, not a guest problem.
+- After that, 60 min busy at that memory level: **5,324 operations, 0
+  failed, no incident, no guest OOM kill** (telemetry dmesg),
+  `started/degraded` gauge 0 in every minute, and no raw vsock failure.
+
+### Stress B — restores right after a node-stack restart, btrfs-send codec (20:23Z → 21:30Z)
+
+- **Fresh cohort.** The 12 baseline sandboxes were deleted, and the
+  directory-form `seed` build was removed (`space-tmplmgr delete-build`) and
+  re-pulled with node-manager up. Suspends then logged `btrfs-send codec: rootfs
+  encoded as btrfs send -p stream`.
+- Then 12 new sandboxes of the same shape: 15 min busy warm-up with memhog
+  ramped to 1,200 MB (0 failures).
+- **Burst** (`stress.py burst --restart-node-stack`):
+  - all 12 were suspended concurrently and were portable after 4 s;
+  - `kubectl rollout restart ds/space-node-stack` replaced both worker pods while
+    every sandbox was suspended. One loop device per image remained, so the
+    restart was clean.
+  - All 12 were woken concurrently 60 s later, with no cordon. **All 12
+    succeeded in 17–41 s**, and the planner put every one back on its source
+    node (12 same-node).
+- 45 min busy afterwards: **4,025 operations, 0 failed, no incident**.
+
+### Final cycle — cross-node restores through the btrfs-send codec (21:31Z → 21:58Z)
+
+- Same 12 sandboxes, one more cycle: explicit suspend → portable → cordoned
+  cross-node wake.
+- **All 12 landed on the other node** and staged `rootfs_btrfs_send` from
+  object storage (`restore_provenance=remote_matches_local`).
+- Then 25 min busy: 0 failed operations, no incident.
+- Across the second cohort (warm-up, stress B and this cycle): 7,954 operations, 0 failed. The gauge was 0
+  in all 96 minutes. The only raw-vsock failure came seconds after a VM booted.
+
+### Coverage (experiment 1, attempt 2 + stress variants)
+
+| | Restores | Post-restore busy | Operations (failed) |
+|---|---|---|---|
+| Baseline, 3 cycles | 18 cross (Full codec) + 18 same | 35.9 sandbox-h (60 min each) | 16,870 (0) |
+| Stress A: memory 1,750/1,991 MiB, 12 concurrent onto one node | 8 cross (Full) + 4 same | 12.0 sandbox-h (60 min each) | 5,360, including the orchestrator's 36 (0) |
+| Stress B: restore right after node-stack pod replacement | 12 same (btrfs-send snapshots) | 9.0 sandbox-h (45 min each) | 4,025, plus 1,442 in the new cohort's warm-up (0) |
+| Final cycle: cross-node via btrfs-send | 12 cross (btrfs-send) | 5.0 sandbox-h (25 min each) | 2,307, plus 180 at reconnect (0) |
+| **Total** | **72: 38 cross-node, 34 same-node** | **61.9 sandbox-hours** (+ 5.0 post-create) | **30,184 (0)** |
+
+**Deaths found: none.**
+- No sandbox opened an incident.
+- No composed-health transition other than `Initializing → Healthy` was logged
+  for any experiment-1 sandbox.
+- No `guest_process_start_failed` or `suspend_failed`.
+- Raw `CONNECT 5002` never failed outside a VM's own suspend or boot.
+
+Wall clock for attempt 2 was 15:57Z → 21:58Z, about 6 h. Attempt 1 (aborted)
+used another 20 min.
+
+### What it implies for production
+
+- The production pattern is permanent deaths within the first hour after a
+  restore, all on the production agent template. It does **not** come from suspend/restore itself, from
+  cross-node restore through object storage (Full or btrfs-send codec), from
+  memory near the sandbox limit, or from many concurrent restores on one node,
+  at least on `seed` with this workload.
+- What is still not covered, and is a candidate cause:
+  - **The production agent template and guest kernel.** On `seed` the guest
+    runs a small userland, and `kernel_version` here is `legacy-e20e46d0c36c`.
+  - **Real host pressure.** NVMe cache, many more VMs per node, CPU
+    overcommit, and real S3 latency or throughput during restores.
+  - **The real agent workload's I/O and network behaviour.** Egress, large
+    repositories and git, many concurrent processes.
+  - **Restore generations.** Sandboxes restored dozens of times over days,
+    not 3–4 times in hours.
+  - **Production's actual per-restore death rate.** It may be below what 72
+    restores can detect.
+- The production signature (`…v.sock:5002: transport error` → `Degraded` →
+  `guest_fs_flush_failed`) is exactly what experiment 2 produced with a live
+  guest and a broken host path. The message alone does not distinguish "guest
+  dead" from "host can't reach a live guest".
+
+### Recommended next steps (experiment 1)
+
+1. **On the next production dead guest, run the raw check before anything
+   else:** `CONNECT 5002\n` on `/proc/<firecracker pid>/root/v.sock` from the
+   node (`node_probe.py` here).
+   - `OK` means the guest is alive and the problem is host-side. Then compare
+     `stat` of the jail's `v.sock` (dev:ino) from sandbox-manager's and
+     node-manager's namespaces against Firecracker's view, as `mountcheck.sh`
+     does.
+   - No answer means the guest is hung. Then capture Firecracker's per-thread
+     state and wchan (`capture.sh`) and `fc.log`.
+2. **Get guest-side evidence from a canary pool.**
+   - Enable `SPACE_ENABLE_GUEST_CONSOLE_LOGS=1` there, so serial console and
+     dmesg survive a hung agent.
+   - It only applies to cold-booted sandboxes and their snapshots, so it needs
+     a fresh cohort.
+3. **Correlate dead guests with restore attributes already in
+   `runtime_activated`.** Look at `restore_provenance`, rootfs codec,
+   `kernel_version`, template digest, `memory_mib` and node, and check how often
+   the node logged the btrfs-send fallback from side finding 1.
+4. **If a Kind follow-up is wanted:** run the same driver against the
+   production agent template, built with the `code-runtime` recipe as a stand-in
+   if needed, with real network egress and days-long restore chains. Keep the
+   Kind cache images off the shared Docker disk.
 
 ## Experiment 2 — the restart attestation effect
 
@@ -286,153 +555,53 @@ is a local experiment. It was reverted before experiment 1, which runs on
    `/proc/<pid>/root/v.sock` answers, sandbox-manager could log it as a distinct
    reason. That would separate "host path broken" from "guest hung" in metrics.
 
-## Experiment 1 — natural guest death after restore
-
-### Workload (`asi_workload.py`, one process per sandbox; `run-exp1.sh`)
-
-The repository has no ASI template or recipe. The closest recipe,
-`templates/firecracker/recipes/code-runtime.toml`, needs a networked builder
-pool. The workload therefore emulates an ASI worker on `seed:latest` (python3
-and curl, no git).
-
-**Sandbox:** 2 vCPU, `memory_mib` 2048 (the guest sees `MemTotal` 1991 MiB;
-Firecracker reports `memory_mib` 2176), `disk_mib` 4096. Auto-lifecycle is
-access-idle → suspend at 8 h, so it never fires during the run.
-
-**At every connect** (after create and after every restore):
-- 9 CLI wrapper scripts, the memory grower, and a launcher are backfilled with
-  `files:write`;
-- three long-lived processes are ensured: `python3 -m http.server`, a log
-  writer, and `memhog.py`.
-- `memhog.py` keeps `/tmp/memtarget` MB resident in 16 MB chunks with every
-  page touched, and re-touches part of the set every 10 s. The driver raises
-  the target every 5 min from 200 MB toward 1500 MB over 4 h (about 75% of
-  the limit).
-- The long-lived processes survive suspend/restore (same PIDs after restore).
-
-**Busy loop:**
-- a short command every 5–20 s, picked at random from:
-  - shell `ls`/`df`;
-  - python (sha256 of 1 MiB; JSON of 20k objects);
-  - a VCS-like tree hash (`find | sha1sum`, standing in for git);
-  - one of the wrappers;
-  - `curl` to the local server;
-  - 2 MB workspace writes with rotation;
-  - `ps`.
-- telemetry every 60 s (`free`, loadavg, memhog MB, live process count, and
-  `dmesg | tail` every 5th time);
-- a 1–6 MB `files:write` upload plus a verified `files:read` download every
-  2–3 min.
-
-All calls go through the native API (`POST /commands` is the native
-Process.Start), and every call is recorded with its latency.
-
-**Cycles:**
-- create, then 10 min warm-up;
-- then 3 cycles, each: explicit `:suspend` → wait until the snapshot is
-  portable (the smoke suite's `RESTORE_PORTABLE_SQL`) → `:wake` with the
-  *other* sandbox worker cordoned → 60 min busy.
-- Odd labels restore cross, same, cross; even labels same, cross, same.
-- Restores are serialized cluster-wide.
-- Cross-node restores pull `rootfs.btrfs-send` and the memory image from
-  object storage (`runtime_activated`: `boot_type=snapshot`,
-  `restore_provenance=remote_matches_local`, `remote_snapshot_staged=true`).
-  Same-node restores are `local_only`.
-
-**Detection:**
-- Three consecutive failed operations open an incident. `capture.sh` then
-  records:
-  - raw `CONNECT 5002`;
-  - Firecracker thread states and wchan;
-  - `fc.log` and the Firecracker API state;
-  - `space-sbxmgr health/doctor`;
-  - `space-nodemgr inspect`;
-  - 30 min of node-stack log lines for the sandbox;
-  - a guest dmesg attempt;
-  - a 30 min follow-up of vsock and health.
-- The workload keeps probing every 15 s.
-
-**Per minute, host side (`monitor.sh`):** raw `CONNECT 5002` and latency,
-Firecracker RSS and CPU for every VM, `space-sbxmgr list` (composed health),
-disk headroom, and a copy of `/space/logs`. The DogStatsD sink records
-`space.sandbox.guest.health`.
-
-### Attempt 1 (aborted, harness artifact)
-
-- Attempt 1 started at 15:33Z.
-- At 15:46:58Z the Kind nodes' shared `/var` filesystem filled up. That
-  filesystem is the devbox's 50 GB Docker data disk, about 35 GB of which is
-  shared Docker images and build cache, which this task does not prune.
-- The sparse cache images could no longer allocate
-  (`critical space allocation error, dev loopN`; btrfs `Transaction aborted
-  (error -5)`, `forced readonly`).
-- Within 30 s, 8 of 12 sandboxes failed `files:write` with `Read-only file
-  system (os error 30)` and commands with 500. Postgres, on the same disk,
-  stopped accepting writes.
-- This was not a guest death. The worker cache images and the SeaweedFS data
-  were moved to the 400 GB home disk with bind mounts inside the Kind node
-  containers (same code paths), and the run was restarted with a disk guard.
-- Evidence is kept outside the repository.
-
-### Attempt 2 — baseline (15:57:08Z → 19:12:52Z)
-
-All 12 sandboxes ran their full plan.
-
-| | |
-|---|---|
-| Busy after restore | **35.9 sandbox-hours** (36 × 60 min), plus 2.0 sandbox-hours of post-create warm-up |
-| Restores | **36: 18 cross-node** (snapshot pulled from object storage), **18 same-node** (`local_only`); all succeeded in 2–10 s; landed on the intended node every time |
-| Operations | **16,870, 0 failed**: 14,516 commands (native Process.Start), of which 10,819 are the short mix, 2,280 telemetry, 913 upload rotations, 408 memory-target updates and 96 connect/mkdir; plus 2,354 file calls (913 uploads, 913 verified downloads, 528 backfill writes) |
-| Latency p50 / p99 / max (ms) | short commands about 40–75 / 60–220 / ≤ 1,550; upload 65 / 153 / 482; download 21 / 41 / 78 |
-| Memory | limit 2048 MiB (guest `MemTotal` 1991 MiB); memhog reached 1,200 MB (ramp 200 → 1500 MB over 4 h, so the 3 h 15 min baseline reached 1,200); peak Firecracker RSS 1,341–1,368 MB |
-| Composed health (`space-sbxmgr list`, per minute, about 190 samples per sandbox) | never `Degraded`. Outside each sandbox's own suspend/restore windows: only `✅`, one `⏳` at creation, and a few `suspended` samples while the snapshot became portable |
-| `space.sandbox.guest.health{lifecycle:started,health:degraded}` | 0 in every one of 196 minutes |
-| Raw `CONNECT 5002` (2,280 samples) | 0 failures outside suspend/restore windows; 9 three-second timeouts, each during that VM's own suspend (VM paused for the snapshot) |
-| sbxmgr log, these sandboxes | only `Healthy` composed-health transitions (48); no `guest_process_start_failed`, no `suspend_failed` |
-
-**Coverage gap:**
-- Every suspend in attempt 2 used the **Full** rootfs codec, not btrfs-send:
-  `btrfs-send precondition not met; suspending with Full codec instead`, 36 times.
-- When the workers came back on fresh cache images, template-manager's on-demand
-  pull of `seed` ran before node-manager's socket was up (`nodemgr btrfs
-  subvolume create failed; falling back to plain directory … failed to connect
-  to node-manager … transport error`). The durable retry then failed for good
-  (`digest dir is not a btrfs subvolume; btrfs-send codec permanently
-  unavailable for this build`).
-- So the baseline's cross-node restores staged a Full rootfs and the memory
-  image from object storage. They did not use the btrfs-send codec named in the
-  production pattern. The pre-reset smoke run did use btrfs-send
-  (`rootfs.btrfs-send`). See "Side findings" for the race.
-
-### Stress A — memory near the limit + 12 concurrent restores onto one node (19:13Z → 20:22Z)
-
-Same 12 sandboxes after the baseline (`stress.py burst --mem-mb 1750
---target-node space-local-worker`, then `asi_workload.py --attach`).
-
-- memhog was raised to 1,750 MB and every guest reached it (1,744 MB resident).
-  Guest `free` showed 1,926–1,947 of 1,991 MiB used and 44–86 MB available for
-  the rest of the run.
-- All 12 were suspended concurrently, each taking 51–161 s with near-full
-  memory images. Portable 4 s after the last suspend.
-- With `space-local-worker2` cordoned, all 12 were woken at once and landed on
-  `space-local-worker`: **8 cross-node, 4 same-node, all succeeded**.
-- API-side wake durations were 14 s to 303 s. For a02, the slowest, the node
-  log shows three concurrent artifact pulls finishing at 19:19:07,
-  `restore_completed` at 19:19:10, and the API operation completing at
-  19:21:57. The node-to-API lag is the same symptom as the first report's
-  "API shows a stale state" oddity, not a guest problem.
-- After that, 60 min busy at that memory level: **5,324 operations, 0
-  failed, no incident, no guest OOM kill** (telemetry dmesg),
-  `started/degraded` gauge 0 in every minute, and no raw vsock failure.
-
 ## Side findings
 
-- `network_policy_update_failed` (`network policy generation conflict`) is
-  emitted about every 60 s per sandbox, on healthy sandboxes as well. node-ctl
-  re-pushes generation 1 with a body that differs from the stored row
-  (`grpc_lifecycle.rs:2269-2279`, `db.rs:10579-10584`, re-push loop
-  `node/ctl/server/src/lib.rs:71`). Not investigated further, and not linked to
-  guest reachability.
+1. **Template-manager / node-manager startup race (product-relevant).**
+   - On a node-stack start with an empty cache, template-manager's on-demand
+     pull of the latest template ran before node-manager's socket accepted
+     connections. It then fell back to a plain directory (`on-demand pull:
+     nodemgr btrfs subvolume create failed; falling back to plain directory …
+     failed to connect to node-manager at
+     /space/run/node-manager/node-manager.sock: transport error`).
+   - The durable retry then gave up (`job failed permanently … digest dir is
+     not a btrfs subvolume; btrfs-send codec permanently unavailable for this
+     build`). Every later suspend of that build on that node silently used the
+     Full rootfs codec (`btrfs-send precondition not met; suspending with Full
+     codec instead`).
+   - It cleared only after `space-tmplmgr delete-build`, once nothing
+     referenced the build, followed by a re-pull.
+   - Seen on both workers at once. On EKS a freshly booted node also starts with
+     an empty cache, so it may apply there. Worth checking how often production
+     suspends log that fallback.
+   - Suggested fix: have the pull wait for node-manager (or retry the subvolume
+     create) instead of committing a directory-form build, and make the stamp
+     job retryable.
+2. **Per-sandbox sidecars outlive the node-stack pod.**
+   - `space-spaced-host-svc` and `space-netgtw-svc` run in per-sandbox cgroups
+     and survive the node-stack container. After a pod deletion they were found
+     reparented to init, pinning the old pod's mount namespace and its btrfs
+     instance.
+   - This is part of why old cache instances stay mounted on Kind, and why a
+     deleted cache image's space was not released.
+3. **API completion lags node-side restore by up to about 3 min under
+   concurrent restores** (stress A, a02). This is the same symptom as the first
+   report's "API state stale" oddity. Not investigated.
+4. **Kind harness: shared Docker data disk.**
+   - The Kind nodes' `/var` (cache images, SeaweedFS, Postgres) shares the
+     devbox's 50 GB Docker data disk with about 35 GB of shared images and build
+     cache. Twelve 2 GiB sandboxes with memory snapshots filled it in 14 min.
+   - btrfs on the loop images then went read-only and guests got EIO, which
+     looks like a mass guest death.
+   - Long Kind runs should keep cache images off that disk: this run used bind
+     mounts into the nodes' `/var/lib/containerd`, which is on the home disk.
+5. `network_policy_update_failed` (`network policy generation conflict`,
+   generation 1, `inherit_template_default`) is emitted about every 60 s per
+   sandbox, healthy ones included.
+   - node-ctl re-pushes generation 1 with a body that differs from the stored
+     row (`grpc_lifecycle.rs:2269-2279`, `db.rs:10579-10584`, re-push loop
+     `node/ctl/server/src/lib.rs:71`).
+   - Not linked to guest reachability; not investigated further.
 
 ## Earlier probes (from the first report)
 
@@ -449,3 +618,48 @@ died, and the API marked them `failed`. Each reached its 1 h idle stage, failed
 | rst2-fresh | 11:20:58Z | 12:22–13:02Z | 13:02:38Z |
 
 Their state was captured, then they were deleted (`DELETE /v1/sandboxes/{id}`).
+
+## Reproduce
+
+Run from the repository root with the Kind stack up (`docs/installation.md`) and
+the API port-forwarded on `127.0.0.1:8080` and `:8090`. All scripts are in
+`scripts/repro-dead-guest/`.
+
+**Experiment 2, trigger matrix:**
+- Start the probes and monitor:
+  `driver.py create <label> --idle 6h`, then
+  `monitor.sh <out> 60` and `probe-loop.sh <ids> <out>/probe.jsonl`.
+- Triggers:
+  - `restart-one.sh sbxmgr|nodemgr`, run inside the node-stack container;
+  - kill a `space-spaced-host-svc`;
+  - kill any supervised service, which restarts the container;
+  - `kubectl delete pod`.
+- Inspect with `mountcheck.sh` and `e2-summary.py <out>`.
+- Proof: `cache-mount-patch.sh apply`, repeat the triggers, then `revert`.
+  Afterwards run `reset-cache-mounts.sh` and `recreate-cache-images.sh` to
+  return to a single, clean cache instance.
+
+**Experiment 1:**
+- Run `run-exp1.sh <out> 12` and `monitor.sh <out>/mon 60`. Watch with
+  `watch-exp1.sh`, summarize with `exp1-summary.py <out> <out>/mon`.
+- Stress variants:
+  `run-stress.sh <out> <name> <phase> <cycle> <busy-secs> <mem-mb> -- [--mem-mb N] [--target-node NODE] [--restart-node-stack]`.
+
+Derived evidence is in `scripts/repro-dead-guest/evidence/phase2/`. Raw logs
+stay outside the repository.
+
+## State left on this box
+
+- Kind cluster `space-local` is up, on `main` 84a1d9ea's node-stack image and
+  chart (DaemonSet template identical to the pre-experiment rendering). It has
+  no sandboxes.
+- Harness deviations still in place, in the Kind node containers only:
+  - the worker cache images are bind-mounted from
+    `/var/lib/containerd/repro-space-cache/` (the host's
+    `~/.kind-data/<node>/containerd`);
+  - SeaweedFS data is bind-mounted from `/var/lib/containerd/repro-seaweedfs`.
+  - Both are lost if a Kind node container restarts. To undo, scale the
+    consumers down, unmount, and delete those directories.
+- The statsd sink containers and the monitors are stopped. Port-forward loops
+  (`pf.sh`, outside the repo) keep the API reachable; stop them with
+  `pkill -f pf.sh`.

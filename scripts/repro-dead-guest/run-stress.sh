@@ -8,7 +8,7 @@ python3 "$here/driver.py" login
 python3 "$here/stress.py" burst "$run" --name "$name" "$@" > "$run/stress-$name.stdout" 2>&1 || exit 1
 for f in "$run"/a*.json; do
   label=$(basename "$f" .json)
-  setsid nohup python3 "$here/asi_workload.py" run "$label" --out "$run" --attach --attach-phase "$phase" \
+  setsid nohup python3 "$here/agent_workload.py" run "$label" --out "$run" --attach --attach-phase "$phase" \
     --cycle "$cycle" --plan "" --warm "$busy" --mem-start-mb "$mem" --mem-final-mb "$mem" --ramp 1 \
     </dev/null >> "$run/$label.stdout" 2>&1 &
 done

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Coverage and failure summary for experiment 1 (asi_workload.py runs).
+"""Coverage and failure summary for experiment 1 (agent_workload.py runs).
 
   exp1-summary.py RUN_DIR [MONITOR_DIR]
 
@@ -139,7 +139,8 @@ if monitor:
     bad = []
     for line in open(monitor / "vm-samples.jsonl"):
         v = json.loads(line)
-        if not v["vsock_ok"] and not in_window(v["sbx"], ts(v["ts"])):
+        mine = {u.removeprefix("sbx_") for u in sbx_of.values()}
+        if v["sbx"] in mine and not v["vsock_ok"] and not in_window(v["sbx"], ts(v["ts"])):
             bad.append(v)
     print(f"raw vsock failures outside suspend/restore windows: {len(bad)}")
     for v in bad[:10]:

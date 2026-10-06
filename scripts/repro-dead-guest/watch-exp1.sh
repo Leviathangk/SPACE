@@ -5,7 +5,7 @@ run=${1:?}; max=${2:-1500}; t0=$(date +%s)
 seen=$(cat "$run"/*.cycles.jsonl 2>/dev/null | grep -c incident_opened)
 while :; do
   now=$(cat "$run"/*.cycles.jsonl 2>/dev/null | grep -c incident_opened)
-  alive=$(pgrep -f '[a]si_workload.py run' | wc -l)
+  alive=$(pgrep -f '[a]gent_workload.py run' | wc -l)
   [ "$now" -gt "$seen" ] && { echo "NEW INCIDENT"; break; }
   [ "$alive" -lt "${EXPECT:-12}" ] && { echo "workload processes alive: $alive"; break; }
   avail=$(docker exec space-local-worker3 df -k --output=avail /var | tail -1 | tr -d ' ')

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Experiment 1 stress variants, run between asi_workload.py phases.
+"""Experiment 1 stress variants, run between agent_workload.py phases.
 
   stress.py burst RUN_DIR --name NAME [--mem-mb N] [--target-node NODE] [--restart-node-stack]
 
-For every sandbox in RUN_DIR (the <label>.json files asi_workload.py writes):
+For every sandbox in RUN_DIR (the <label>.json files agent_workload.py writes):
   1. optionally raise memhog's target to N MB and wait until it is resident;
   2. suspend all sandboxes concurrently and wait until each snapshot is portable;
   3. optionally replace the sandbox-worker node-stack pods (rollout restart) while
@@ -11,7 +11,7 @@ For every sandbox in RUN_DIR (the <label>.json files asi_workload.py writes):
   4. with --target-node, cordon every other sandbox worker so all restores land
      on one node; wake all sandboxes concurrently; uncordon.
 Results: RUN_DIR/stress-NAME.jsonl. Afterwards resume the workload with
-`asi_workload.py run LABEL --out RUN_DIR --attach --attach-phase ... --plan ''`.
+`agent_workload.py run LABEL --out RUN_DIR --attach --attach-phase ... --plan ''`.
 """
 import argparse
 import json
@@ -22,9 +22,9 @@ import time
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-import asi_workload as asi  # noqa: E402
+import agent_workload as agent  # noqa: E402
 
-KCTX = asi.KCTX
+KCTX = agent.KCTX
 
 
 def iso():
@@ -45,7 +45,7 @@ def burst(args):
     workers = {}
     for label in labels:
         a = argparse.Namespace(out=str(run), label=label)
-        workers[label] = asi.Run(a)
+        workers[label] = agent.Run(a)
     log(step="start", labels=labels, mem_mb=args.mem_mb, target=args.target_node,
         restart=args.restart_node_stack)
 
@@ -86,7 +86,7 @@ def burst(args):
         time.sleep(args.settle)
         log(step="node_stack_restarted")
 
-    cordoned = [n for n in asi.WORKERS if args.target_node and n != args.target_node]
+    cordoned = [n for n in agent.WORKERS if args.target_node and n != args.target_node]
     for node in cordoned:
         subprocess.run(KCTX[:3] + ["cordon", node], check=True)
     try:
