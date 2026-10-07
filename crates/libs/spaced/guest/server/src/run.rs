@@ -171,7 +171,10 @@ pub async fn serve(
 /// with the `test-hooks` feature) and additive: unset leaves the
 /// Firecracker/vsock auto-detect defaults untouched.
 fn service_config_from_environment() -> SpacedGuestServiceConfig {
-    let mut config = SpacedGuestServiceConfig::default();
+    let mut config = SpacedGuestServiceConfig {
+        runtime_state_directory: Some("/run/space-runtime".into()),
+        ..SpacedGuestServiceConfig::default()
+    };
     if let Some(path) =
         pplx_space_common_core::env::test_hook_var("SPACE_SPACED_GUEST_BRIDGE_SOCKET")
     {

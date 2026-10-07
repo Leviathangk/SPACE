@@ -62,21 +62,22 @@ uuid = { workspace = true, features = ["v7"] }
 
 # internal
 pplx-space-common-connection-admission = { workspace = true }
-pplx-space-common-core = { workspace = true }
+pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-common-grpc = { workspace = true }
 pplx-space-common-svc = { workspace = true, optional = true }
 pplx-space-metrics = { workspace = true }
 pplx-space-spaced-common = { workspace = true }
 prost-types = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["test-hooks"] }
 opentelemetry-proto = { workspace = true, features = ["gen-tonic", "metrics"] }
 pplx-space-spaced-guest-client = { workspace = true }
 h2 = { workspace = true }
 prost = { workspace = true }
 pplx-space-test-env = { workspace = true }
-tempfile = { workspace = true }
 # `test-util` enables `#[tokio::test(start_paused = true)]` so the
 # port-forward bind-retry/backoff tests run on virtual time.
 tokio = { workspace = true, features = ["test-util"] }
