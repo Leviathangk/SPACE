@@ -1414,7 +1414,7 @@ mod responses;
 #[cfg(test)]
 mod sandbox_portability_tests;
 pub(crate) mod spaced;
-pub use ingress::IngressActivationFactory;
+pub(crate) use ingress::ingress_activation;
 mod wake_completion;
 pub use spaced::SpacedListOptions;
 #[cfg(test)]

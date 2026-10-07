@@ -25,6 +25,7 @@ pub mod models;
 // Resolving a node-group candidate set produces a `NodeGroupPlacement`, which
 // lives behind common-core's `kubernetes` feature.
 mod credential_injection;
+mod ingress_activation;
 #[cfg(feature = "kubernetes")]
 pub mod node_group_placement;
 pub mod public_operations;
