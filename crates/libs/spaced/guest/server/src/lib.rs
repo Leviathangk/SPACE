@@ -198,6 +198,7 @@ mod memlock;
 mod meta;
 mod networking;
 mod port_forward;
+pub mod template_runtime;
 #[cfg(test)]
 mod transport;
 
@@ -287,6 +288,8 @@ pub struct SpacedGuestServiceConfig {
     /// observe a slot being recycled without waiting out the deployed
     /// deadline; the deployed configuration never moves it.
     pub http2_preface_timeout: Duration,
+    /// Per-boot receipt directory; None for embedded services without a guest filesystem.
+    pub runtime_state_directory: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -315,6 +318,7 @@ impl Default for SpacedGuestServiceConfig {
             },
             cancellation_grace: filesystem::router::DEFAULT_CANCELLATION_GRACE,
             http2_preface_timeout: DEFAULT_GUEST_HTTP2_PREFACE_TIMEOUT,
+            runtime_state_directory: None,
         }
     }
 }
@@ -356,6 +360,8 @@ struct SpacedGuestServiceInner {
     ready: watch::Sender<bool>,
     ready_events: watch::Sender<u64>,
     process_env: RwLock<EnvMap>,
+    runtime_boot_ready: std::sync::atomic::AtomicBool,
+    runtime_state_directory: Option<PathBuf>,
     processes: ProcessRegistry,
     idempotency: IdempotencyStore,
     filesystem: filesystem::FilesystemRouter,
@@ -424,6 +430,8 @@ impl SpacedGuestService {
                 ready,
                 ready_events,
                 process_env: RwLock::new(EnvMap::empty()),
+                runtime_boot_ready: std::sync::atomic::AtomicBool::new(false),
+                runtime_state_directory: config.runtime_state_directory,
                 processes: ProcessRegistry::new(process::ProcessOutputBudget::for_guest_memory(
                     meta::guest_mem_total_bytes(),
                 )),

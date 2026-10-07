@@ -1,0 +1,31 @@
+[Unit]
+Description=SPACE template runtime
+DefaultDependencies=no
+ConditionPathExists=/etc/space/runtime.json
+After=local-fs.target space.target
+Before=shutdown.target
+Conflicts=shutdown.target
+StartLimitIntervalSec=30
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=all
+ExecStart=/usr/local/bin/spaced-svc --runtime-runner
+Slice=space-sessions.slice
+TasksMax=infinity
+OOMScoreAdjust=0
+# A kernel OOM in one application child must not stop all sibling sessions.
+OOMPolicy=continue
+KillMode=control-group
+Restart=on-failure
+RestartSec=2
+TimeoutStartSec=60
+TimeoutStopSec=5
+RuntimeDirectory=space-runtime
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+StandardOutput=null
+StandardError=journal
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=20
