@@ -25,7 +25,7 @@ use pplx_space_db_test_fixtures::{
     try_pg_test_db, try_pg_test_db_with_max_connections,
 };
 use pplx_space_internal_api_server::{
-    ClusterApiService,
+    ClusterApiService, PostCommitSandboxEvent,
     proto::{
         GetQuarantineRecoveryPlanRequest, NodeRole as ProtoNodeRole, PublishNodeStateRequest,
         PublishedSandboxState, cluster_api_server::ClusterApi,
@@ -283,7 +283,11 @@ fn booted_runtime_state(
     };
     state.execution_generation = Some(execution_generation);
     state.pod_uid = Some(format!("pod-uid-{execution_generation}"));
-    state.state_changed_at = Some(timestamp(time::OffsetDateTime::now_utc().unix_timestamp()));
+    let booted_at = time::OffsetDateTime::now_utc();
+    state.state_changed_at = Some(prost_types::Timestamp {
+        seconds: booted_at.unix_timestamp(),
+        nanos: i32::try_from(booted_at.nanosecond()).expect("nanoseconds fit"),
+    });
     state.activation_attempt_id = activation_attempt_id.map(|id| id.to_string());
     state
 }
@@ -4088,6 +4092,25 @@ impl LateRuntime {
     }
 }
 
+/// The teardown requests a publication hands to its post-commit events.
+fn teardown_requests(events: &[PostCommitSandboxEvent]) -> Vec<(SandboxId, i64, String)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            PostCommitSandboxEvent::AbandonedActivationTeardownRequested {
+                sandbox_id,
+                execution_generation,
+                pod_uid,
+            } => Some((
+                *sandbox_id,
+                *execution_generation,
+                pod_uid.as_str().to_string(),
+            )),
+            PostCommitSandboxEvent::Transition(_) => None,
+        })
+        .collect()
+}
+
 async fn abandoned_activation_observed_at(
     pool: &PgPool,
     node_id: NodeId,
@@ -4231,11 +4254,21 @@ async fn publish_late_runtimes(shapes: &[LateRuntime]) -> TestResult {
             }
         };
 
-        publish_sandbox_states(&mut conn, node_id, std::slice::from_ref(&late_runtime)).await?;
+        let outcome =
+            publish_sandbox_states(&mut conn, node_id, std::slice::from_ref(&late_runtime)).await?;
         assert_eq!(
             sandbox_lifecycle(&db.pool, sandbox_id).await?,
             "stopped",
             "{shape:?}: a `stopped` row is never promoted by a runtime no attempt owns"
+        );
+        assert_eq!(
+            teardown_requests(&outcome.post_commit_events),
+            if shape.abandoned() {
+                vec![(sandbox_id, 7, "pod-uid-7".to_string())]
+            } else {
+                Vec::new()
+            },
+            "{shape:?}: the request is announced once the publication commits"
         );
         if !shape.abandoned() {
             assert_eq!(
@@ -4268,7 +4301,12 @@ async fn publish_late_runtimes(shapes: &[LateRuntime]) -> TestResult {
         .bind(sandbox_id.to_string())
         .execute(&db.pool)
         .await?;
-        publish_sandbox_states(&mut conn, node_id, std::slice::from_ref(&late_runtime)).await?;
+        let republished =
+            publish_sandbox_states(&mut conn, node_id, std::slice::from_ref(&late_runtime)).await?;
+        assert!(
+            teardown_requests(&republished.post_commit_events).is_empty(),
+            "{shape:?}: re-asserting an unchanged request is not announced again"
+        );
         assert!(
             abandoned_activation_observation(&db.pool, node_id, sandbox_id)
                 .await?

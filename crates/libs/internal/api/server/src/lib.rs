@@ -141,7 +141,7 @@ impl FinalizedSnapshotRow {
 #[path = "published_state.rs"]
 mod published_state;
 /// Re-exported so Space's Datadog DBM query tests (private to Space) can drive the publish path.
-pub use published_state::publish_sandbox_states;
+pub use published_state::{PostCommitSandboxEvent, publish_sandbox_states};
 mod sandbox_quarantine_store;
 use published_state::{
     project_ready_suspend_snapshot, prune_absent_node_templates, publish_execution_inventory,

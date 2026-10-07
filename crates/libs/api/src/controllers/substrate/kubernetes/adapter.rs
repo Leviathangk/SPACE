@@ -10,8 +10,8 @@ use crate::controllers::db_contention_error;
 use crate::controllers::substrate::DbContext;
 use crate::controllers::substrate::PooledClaimRefusal;
 use crate::controllers::substrate::{
-    AdmissionPoolClaim, AdmittedPoolClaim, AdmittedPoolClaimLookup, CreateBootMode,
-    PooledExecutionClaim, PooledExecutionClaimAttempt, PooledExecutionClaimRequest,
+    AbandonedActivationFence, AdmissionPoolClaim, AdmittedPoolClaim, AdmittedPoolClaimLookup,
+    CreateBootMode, PooledExecutionClaim, PooledExecutionClaimAttempt, PooledExecutionClaimRequest,
     PooledPrepareFailureCleanup, PublishedLocalArtifact, create_wait_should_preserve_node_work,
     enqueue_artifact_backup_with_client,
 };
@@ -456,16 +456,16 @@ fn fenced_runtime_pod_ip(
     live_pod_runtime_ip(live_pod?)
 }
 
-/// Where the execution generation named by a
-/// [`RetireFence::AbandonedActivation`] stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AbandonedActivationExecution {
-    /// It is still the sandbox's active execution.
-    Active,
-    /// It was retired and no execution is active.
-    Retired,
-    /// A different generation is active.
-    Superseded,
+/// What [`KubernetesSubstrate::prove_abandoned_activation`] established
+/// immediately before the in-VM stop.
+struct AbandonedActivationProof {
+    /// The execution row as it reads now, while the reported generation is
+    /// still the active execution; `None` once it was retired.
+    tracked: Option<ExecutionIdentity>,
+    /// The live pod's UID, the precondition its delete carries.
+    pod_uid: PodUid,
+    /// The address of the live pod's runtime.
+    pod_ip: PodIp,
 }
 
 /// The address of the runtime a live pod carries, or `None` when the pod is
@@ -1447,8 +1447,8 @@ impl KubernetesSubstrate {
         fence: &RetireFence,
     ) -> Result<RetireExecutionOutcome, SubstrateError> {
         let sandbox_uuid = sandbox_id;
-        let (pod_fence, abandoned_activation) = match fence {
-            RetireFence::Unobserved => (None, false),
+        let pod_fence = match fence {
+            RetireFence::Unobserved => None,
             RetireFence::NoExecution => {
                 // Having observed no execution authorizes exactly one thing:
                 // clearing the placement state such a sandbox is left holding.
@@ -1457,27 +1457,11 @@ impl KubernetesSubstrate {
                 // include a successor's.
                 return self.retire_with_no_active_execution(sandbox_id, mode).await;
             }
-            RetireFence::Pod(pod_fence) => (Some(pod_fence), false),
-            RetireFence::AbandonedActivation(pod_fence) => {
-                match self
-                    .abandoned_activation_execution(sandbox_id, pod_fence)
-                    .await?
-                {
-                    AbandonedActivationExecution::Active => (Some(pod_fence), true),
-                    AbandonedActivationExecution::Retired => {
-                        return self
-                            .retire_abandoned_runtime(sandbox_id, mode, pod_fence)
-                            .await;
-                    }
-                    AbandonedActivationExecution::Superseded => {
-                        return Ok(self.refuse_fenced_teardown(
-                            sandbox_id,
-                            pod_fence,
-                            PodFenceMismatch::ExecutionSuperseded,
-                            TeardownProgress::NothingMutated,
-                        ));
-                    }
-                }
+            RetireFence::Pod(pod_fence) => Some(pod_fence),
+            RetireFence::AbandonedActivation(fence) => {
+                return self
+                    .retire_abandoned_activation(sandbox_id, mode, fence)
+                    .await;
             }
         };
         let fenced = match pod_fence {
@@ -1485,14 +1469,6 @@ impl KubernetesSubstrate {
                 .check_pod_fence(sandbox_id, pod_fence, FenceReadFreshness::CacheIsEnough)
                 .await?
             {
-                // The abandoned generation was retired since it was found
-                // active. Its pod is no longer tracked, but its runtime may
-                // still be live and must be stopped rather than released.
-                PodFenceCheck::AlreadyRetired if abandoned_activation => {
-                    return self
-                        .retire_abandoned_runtime(sandbox_id, mode, pod_fence)
-                        .await;
-                }
                 PodFenceCheck::AlreadyRetired => {
                     return self.retire_with_no_active_execution(sandbox_id, mode).await;
                 }
@@ -1787,107 +1763,139 @@ impl KubernetesSubstrate {
         }
     }
 
-    /// Where the generation an abandoned-activation fence names stands now.
-    async fn abandoned_activation_execution(
+    /// Re-prove an abandoned activation's fence against the world as it is
+    /// now, without acting. Every condition of [`AbandonedActivationFence`]
+    /// is read here; an `Err` names the first one that failed.
+    async fn prove_abandoned_activation(
         &self,
         sandbox_id: SandboxId,
-        fence: &PodIdentityFence,
-    ) -> Result<AbandonedActivationExecution, SubstrateError> {
-        Ok(
-            match self.store.active_execution_status(sandbox_id).await? {
-                None => AbandonedActivationExecution::Retired,
-                Some(active) if fence.generation == Some(active.generation) => {
-                    AbandonedActivationExecution::Active
-                }
-                Some(_) => AbandonedActivationExecution::Superseded,
-            },
-        )
-    }
-
-    /// Stop and delete the runtime of an abandoned activation whose execution
-    /// generation has already been retired, with no successor active.
-    ///
-    /// Nothing tracks this pod any more, so the apiserver is the only authority
-    /// on whether it is still the object the node reported: it is re-read
-    /// uncached and must carry the fenced UID. Its runtime is stopped through
-    /// the pod before the pod is deleted. A deletion alone would make the node
-    /// durably suspend a live VM, which neither matches the `stopped` row nor
-    /// succeeds when the sandbox's state can no longer be sealed. Once stopped,
-    /// the node releases the pod and keeps the stopped disk, as for any retire.
-    ///
-    /// Placement is left as the retirement left it: the row already holds no
-    /// active node, and its target node still names where the stopped disk is.
-    async fn retire_abandoned_runtime(
-        &self,
-        sandbox_id: SandboxId,
-        mode: ExecutionTeardown,
-        fence: &PodIdentityFence,
-    ) -> Result<RetireExecutionOutcome, SubstrateError> {
-        let Some(fenced_uid) = fence.pod_uid.as_ref() else {
-            return Ok(self.refuse_fenced_teardown(
-                sandbox_id,
-                fence,
-                PodFenceMismatch::PodIdentityUnverified,
-                TeardownProgress::NothingMutated,
-            ));
+        fence: &AbandonedActivationFence,
+    ) -> Result<Result<AbandonedActivationProof, PodFenceMismatch>, SubstrateError> {
+        let pod_fence = &fence.pod;
+        let (Some(fenced_uid), Some(generation)) =
+            (pod_fence.pod_uid.as_ref(), pod_fence.generation)
+        else {
+            return Ok(Err(PodFenceMismatch::PodIdentityUnverified));
         };
-        let Some(live_pod) = fetch_sandbox_pod_uncached(&self.k8s, fence.pod_name.as_str())
+        let active = self.store.active_execution_status(sandbox_id).await?;
+        let lifecycle = match &active {
+            Some(active) => Some(active.lifecycle.clone()),
+            None => match self.store.require_sandbox(sandbox_id).await {
+                Ok(sandbox) => Some(sandbox.lifecycle),
+                Err(SubstrateError::NotFound { .. }) => None,
+                Err(error) => return Err(error),
+            },
+        };
+        if lifecycle.as_deref().map(normalize_lifecycle).as_deref()
+            != Some(fence.expected_lifecycle.as_str())
+        {
+            return Ok(Err(PodFenceMismatch::LifecycleChanged));
+        }
+        if active
+            .as_ref()
+            .is_some_and(|active| active.generation != generation)
+        {
+            return Ok(Err(PodFenceMismatch::ExecutionSuperseded));
+        }
+        // Retired generations are tracked by nothing, and the tracked one's
+        // cached copy must not authorize a stop, so the apiserver answers.
+        let Some(live_pod) = fetch_sandbox_pod_uncached(&self.k8s, pod_fence.pod_name.as_str())
             .await
             .map_err(|err| SubstrateError::Failed {
                 message: format!("failed to read an abandoned activation's pod: {err}"),
             })?
         else {
-            return Ok(RetireExecutionOutcome::Retired);
+            return Ok(Err(PodFenceMismatch::RuntimeUnreachable));
         };
         if live_pod.metadata.uid.as_deref() != Some(fenced_uid.as_str()) {
-            return Ok(self.refuse_fenced_teardown(
-                sandbox_id,
-                fence,
-                PodFenceMismatch::PodUidChanged,
-                TeardownProgress::NothingMutated,
-            ));
+            return Ok(Err(PodFenceMismatch::PodUidChanged));
         }
-        let mut progress = TeardownProgress::NothingMutated;
-        if let Some(pod_ip) = live_pod_runtime_ip(&live_pod) {
-            // The stop addresses the sandbox, so re-prove as late as possible
-            // that no start has claimed it since the generation was found
-            // retired. A start that claims it between this read and the stop
-            // can still find the runtime stopped and must retry: the same
-            // window the tracked retire accepts between its fence check and
-            // its stop.
-            if self
-                .store
-                .active_execution_status(sandbox_id)
-                .await?
-                .is_some()
-            {
+        let tracked = match &active {
+            Some(active) => {
+                let current = current_execution_identity(active, Some(&live_pod));
+                if let Err(mismatch) = pod_fence.observed().reconcile(&current) {
+                    return Ok(Err(mismatch));
+                }
+                Some(current)
+            }
+            None => None,
+        };
+        // The runtime is addressed through the live pod, whatever state the
+        // execution row recorded: a row still `creating` can carry a VM its
+        // node booted, and only a stop releases that VM without a suspend.
+        let Some(pod_ip) = live_pod_runtime_ip(&live_pod) else {
+            return Ok(Err(PodFenceMismatch::RuntimeUnreachable));
+        };
+        Ok(Ok(AbandonedActivationProof {
+            tracked,
+            pod_uid: fenced_uid.clone(),
+            pod_ip,
+        }))
+    }
+
+    /// Stop and delete the runtime of an abandoned activation, leaving the row
+    /// in the lifecycle the fence expects.
+    ///
+    /// The fence is re-proved immediately before the in-VM stop. The stop goes
+    /// through the reported pod, then that pod is deleted under its UID: once
+    /// stopped, the node releases the pod and keeps the stopped disk, as for
+    /// any retire. A deletion alone would make the node durably suspend a live
+    /// VM, which neither matches a `stopped` row nor succeeds when the
+    /// sandbox's state can no longer be sealed. If the generation is still the
+    /// active execution, its tracking is then released in a transaction that
+    /// re-checks the lifecycle under the sandbox row lock. A retired
+    /// generation's placement is left as its retirement left it.
+    ///
+    /// Answers `Retired` only once the runtime was stopped and its pod
+    /// deleted. Anything that prevents that is a defer.
+    async fn retire_abandoned_activation(
+        &self,
+        sandbox_id: SandboxId,
+        mode: ExecutionTeardown,
+        fence: &AbandonedActivationFence,
+    ) -> Result<RetireExecutionOutcome, SubstrateError> {
+        let pod_fence = &fence.pod;
+        let proof = match self.prove_abandoned_activation(sandbox_id, fence).await? {
+            Ok(proof) => proof,
+            Err(mismatch) => {
                 return Ok(self.refuse_fenced_teardown(
                     sandbox_id,
-                    fence,
-                    PodFenceMismatch::ExecutionMissing,
+                    pod_fence,
+                    mismatch,
                     TeardownProgress::NothingMutated,
                 ));
             }
-            progress = self.run_in_vm_teardown(sandbox_id, pod_ip, mode).await?;
-        }
-        // UID only: the stop moves the pod's resourceVersion on, and an
-        // inactive generation's pod is not adoptable by anything that could
-        // have moved it.
-        match delete_sandbox_pod_fenced(&self.k8s, &fence.pod_name, fenced_uid, None)
+        };
+        let progress = self
+            .run_in_vm_teardown(sandbox_id, proof.pod_ip, mode)
+            .await?;
+        // UID only: the stop moves the pod's resourceVersion on.
+        match delete_sandbox_pod_fenced(&self.k8s, &pod_fence.pod_name, &proof.pod_uid, None)
             .await
             .map_err(|err| SubstrateError::Failed {
                 message: format!("failed to delete an abandoned activation's pod: {err}"),
             })? {
-            FencedPodDeleteOutcome::Deleted | FencedPodDeleteOutcome::NotFound => {
-                Ok(RetireExecutionOutcome::Retired)
-            }
+            FencedPodDeleteOutcome::Deleted | FencedPodDeleteOutcome::NotFound => {}
             FencedPodDeleteOutcome::PreconditionFailed => {
                 let mismatch = self
-                    .classify_delete_precondition_rejection(fenced_uid, &fence.pod_name)
+                    .classify_delete_precondition_rejection(&proof.pod_uid, &pod_fence.pod_name)
                     .await;
-                Ok(self.refuse_fenced_teardown(sandbox_id, fence, mismatch, progress))
+                return Ok(self.refuse_fenced_teardown(sandbox_id, pod_fence, mismatch, progress));
             }
         }
+        if let Some(identity) = proof.tracked
+            && let Err(mismatch) = self
+                .store
+                .forget_abandoned_activation_tracking(
+                    sandbox_id,
+                    &identity,
+                    fence.expected_lifecycle,
+                )
+                .await?
+        {
+            return Ok(self.refuse_fenced_teardown(sandbox_id, pod_fence, mismatch, progress));
+        }
+        Ok(RetireExecutionOutcome::Retired)
     }
 
     /// Log and report a teardown the fence refused. Every refusal path funnels
@@ -2838,30 +2846,10 @@ impl SubstrateAdapter for KubernetesSubstrate {
                     PodFenceCheck::Mismatch(mismatch) => Ok(Some(mismatch)),
                 }
             }
-            RetireFence::AbandonedActivation(pod_fence) => {
-                match self
-                    .abandoned_activation_execution(sandbox_id, pod_fence)
-                    .await?
-                {
-                    AbandonedActivationExecution::Active => {
-                        match self
-                            .check_pod_fence(
-                                sandbox_id,
-                                pod_fence,
-                                FenceReadFreshness::MustBeAuthoritative,
-                            )
-                            .await?
-                        {
-                            PodFenceCheck::Holds(_) | PodFenceCheck::AlreadyRetired => Ok(None),
-                            PodFenceCheck::Mismatch(mismatch) => Ok(Some(mismatch)),
-                        }
-                    }
-                    AbandonedActivationExecution::Retired => Ok(None),
-                    AbandonedActivationExecution::Superseded => {
-                        Ok(Some(PodFenceMismatch::ExecutionSuperseded))
-                    }
-                }
-            }
+            RetireFence::AbandonedActivation(fence) => Ok(self
+                .prove_abandoned_activation(sandbox_id, fence)
+                .await?
+                .err()),
         }
     }
 

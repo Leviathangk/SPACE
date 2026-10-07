@@ -8,10 +8,10 @@ use std::time::Duration;
 #[cfg(feature = "kubernetes")]
 use pplx_space_api::controllers::substrate::kubernetes::ExecutionHydrationOutcome;
 use pplx_space_api::controllers::substrate::{
-    CommandReadyProbe, NodeApiTarget, ObservedPodIdentity, PodFenceMismatch, PodIdentityFence,
-    RecordedExecution, RetireExecutionOutcome, RetireExecutionRequest, RetireFence, RuntimeClient,
-    Substrate, SubstrateAdapter, SubstrateError, connect_node_api_client_for_target,
-    sandbox_states_with_client,
+    AbandonedActivationFence, CommandReadyProbe, NodeApiTarget, ObservedPodIdentity,
+    PodFenceMismatch, PodIdentityFence, RecordedExecution, RetireExecutionOutcome,
+    RetireExecutionRequest, RetireFence, RuntimeClient, Substrate, SubstrateAdapter,
+    SubstrateError, connect_node_api_client_for_target, sandbox_states_with_client,
 };
 use pplx_space_common_core::types::{
     NodeId, NodeManagedBy, NodeRole, PodName, PodUid, PositiveDuration, SandboxActivationAttemptId,
@@ -228,16 +228,23 @@ fn evacuation_guards(lifecycle: SandboxLifecycle) -> String {
 /// the sandbox desired-state facet, `$2` = the abandoned-activation key, `$3` =
 /// `managed_by`, `$4` = batch limit.
 ///
-/// Requests are node-scoped facet observations, so the query walks nodes and
-/// reads each node's sandbox desired-state observations through the
-/// `(node_id, facet)` primary-key prefix rather than scanning every
-/// observation. The element is cast only after the `CASE` proves it is a UUID,
-/// so an unrelated element can never fail the whole listing. The row re-checks
-/// repeat the publication's guards, since the row can move on between the
-/// node's report and this tick. Ordered by `random()` for the reason
-/// [`LIST_COMMAND_READY_PENDING_SQL`] is: a request that keeps deferring
-/// stays in the set until its node stops reporting the runtime, and must not
-/// hold the front of every batch.
+/// Requests are node-scoped facet observations. The query walks nodes and,
+/// per node, reads every sandbox desired-state observation through the
+/// `(node_id, facet)` primary-key prefix, filtering on the request key. That
+/// is every desired-state row in the table, though never another facet's.
+/// The element is cast only after the `CASE` proves it is a UUID, so an
+/// unrelated element can never fail the whole listing.
+///
+/// Only a request its node re-asserted within the last five minutes is
+/// listed. Nodes republish every minute, so a request outlives the reports
+/// that back it by at most that window. The row re-checks repeat the
+/// publication's guards, including that an active execution was created
+/// after the row's lifecycle last changed, since the row can move on between
+/// the node's report and this tick.
+///
+/// Ordered by `random()` for the reason [`LIST_COMMAND_READY_PENDING_SQL`] is:
+/// a request that keeps deferring stays in the set until its node stops
+/// reporting the runtime, and must not hold the front of every batch.
 pub(super) const LIST_ABANDONED_ACTIVATIONS_SQL: &str = sql!(
     "SELECT s.id AS sandbox_id,
             observed.node_id,
@@ -263,6 +270,7 @@ pub(super) const LIST_ABANDONED_ACTIVATIONS_SQL: &str = sql!(
              WHERE nfos.node_id = node.id
                AND nfos.facet = $1
                AND nfos.observed_payload ? $2::TEXT
+               AND nfos.observed_at > NOW() - INTERVAL '5 minutes'
         ) observed
        JOIN sandboxes s ON s.id = observed.sandbox_id
        JOIN sandbox_k8s_executions execution
@@ -272,6 +280,7 @@ pub(super) const LIST_ABANDONED_ACTIVATIONS_SQL: &str = sql!(
         AND s.managed_by = $3
         AND s.managed_by = 'k8s'
         AND LOWER(TRIM(s.lifecycle)) = 'stopped'
+        AND (NOT execution.active OR execution.created_at > s.lifecycle_changed_at)
         AND NOT (
             execution.active
             AND execution.activation_attempt_id IS NOT NULL
@@ -326,7 +335,9 @@ fn abandoned_activation_candidate(
         sandbox_id: row.sandbox_id,
         node_id: row.node_id,
         execution_generation: row.generation,
-        pod_fence: RetireFence::AbandonedActivation(fence),
+        pod_fence: RetireFence::AbandonedActivation(AbandonedActivationFence::behind_stopped_row(
+            fence,
+        )),
     })
 }
 

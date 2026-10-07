@@ -1061,17 +1061,42 @@ pub enum RetireFence {
     Pod(PodIdentityFence),
     /// A node reported this pod's VM running for an execution generation no
     /// current activation owns: a start the control plane abandoned whose pod
-    /// booted anyway. The fence must carry the generation and pod UID the node
-    /// reported.
-    ///
-    /// While that generation is still the active execution this is exactly
-    /// [`Self::Pod`]. Once a newer generation is active the retire refuses: the
-    /// in-VM stop addresses the sandbox, not one generation, so it could reach
-    /// the newer runtime. Once the generation has been retired without a
-    /// successor, nothing tracks the pod, but the runtime is still stopped
-    /// through it before the pod is deleted. Deleting a live runtime's pod
-    /// alone makes the node durably suspend the VM rather than stop it.
-    AbandonedActivation(PodIdentityFence),
+    /// booted anyway. See [`AbandonedActivationFence`].
+    AbandonedActivation(AbandonedActivationFence),
+}
+
+/// What a retire of an abandoned activation's runtime must re-prove before it
+/// stops anything: the pod the node reported, at the generation it reported,
+/// behind a row still in the lifecycle the request was recorded against.
+///
+/// The substrate checks all of it immediately before the in-VM stop, and the
+/// lifecycle again inside the transaction that releases pod tracking:
+///
+/// - A different lifecycle means the sandbox moved on, for example a start
+///   that converged after all, and nothing is torn down.
+/// - A newer active generation owns the sandbox. The in-VM stop addresses the
+///   sandbox, not one generation, so it could reach the newer runtime.
+/// - The reported pod must still carry the reported UID and a runtime the stop
+///   can reach. Deleting a live runtime's pod alone makes the node durably
+///   suspend the VM rather than stop it, so a pod that is gone, terminating,
+///   or unreachable defers instead of being released.
+/// - While the generation is still the active execution, the execution row
+///   must also still read as the caller recorded it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbandonedActivationFence {
+    pub pod: PodIdentityFence,
+    pub expected_lifecycle: SandboxLifecycle,
+}
+
+impl AbandonedActivationFence {
+    /// A runtime that booted behind a `stopped` row, the only shape the
+    /// abandoned-activation teardown acts on.
+    pub fn behind_stopped_row(pod: PodIdentityFence) -> Self {
+        Self {
+            pod,
+            expected_lifecycle: SandboxLifecycle::Stopped,
+        }
+    }
 }
 
 /// A pod's identity as the substrate currently sees it.
@@ -1126,6 +1151,13 @@ pub enum PodFenceMismatch {
     /// there is nothing to prove the object is the one the caller observed.
     /// A name-only fence may only act on an absent pod.
     PodIdentityUnverified,
+    /// The sandbox's lifecycle is no longer the one the caller's request was
+    /// recorded against.
+    LifecycleChanged,
+    /// No live pod at the fenced name carries a runtime the in-VM stop can
+    /// reach (the pod is gone, terminating, finished, or has no address), so
+    /// the runtime cannot be stopped and its pod is not released.
+    RuntimeUnreachable,
 }
 
 impl PodFenceMismatch {
@@ -1164,7 +1196,10 @@ impl PodFenceMismatch {
             // costs a re-evaluation.
             | Self::DeletePreconditionRejected
             // Nothing could be proven about what is there.
-            | Self::PodIdentityUnverified => true,
+            | Self::PodIdentityUnverified
+            // The sandbox moved on, or the runtime could not be reached.
+            | Self::LifecycleChanged
+            | Self::RuntimeUnreachable => true,
         }
     }
 
@@ -1177,6 +1212,8 @@ impl PodFenceMismatch {
             Self::PodResourceVersionChanged => "pod_resource_version_changed",
             Self::DeletePreconditionRejected => "delete_precondition_rejected",
             Self::PodIdentityUnverified => "pod_identity_unverified",
+            Self::LifecycleChanged => "lifecycle_changed",
+            Self::RuntimeUnreachable => "runtime_unreachable",
         }
     }
 }

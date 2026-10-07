@@ -370,12 +370,14 @@ pub(super) async fn maybe_update_sandbox_lifecycle(pool: &PgPool, id: SandboxId,
 /// a terminal state. Same terminal-state guard as
 /// [`maybe_update_sandbox_lifecycle`]; see that function's doc for the
 /// transient-lifecycle-sweeper safety contract.
+/// Best-effort lifecycle publication. Answers whether the write reached the
+/// database; a row in a terminal lifecycle it deliberately skips still counts.
 pub(super) async fn maybe_update_sandbox_state(
     pool: &PgPool,
     id: SandboxId,
     lifecycle: &str,
     placement: &str,
-) {
+) -> bool {
     if let Err(err) = sqlx::query(sql!(
         "UPDATE sandboxes
             SET lifecycle = $1, placement = $2
@@ -395,7 +397,9 @@ pub(super) async fn maybe_update_sandbox_state(
             error = %err,
             "best-effort sandbox state update failed"
         );
+        return false;
     }
+    true
 }
 
 pub(super) async fn fetch_sandbox_observed_states(

@@ -27,9 +27,9 @@ use pplx_space_common_svc::{
     types::{
         FACET_NETWORK_POLICY, FACET_SANDBOX_DESIRED_STATE, FACET_TEMPLATE_BASE_SNAPSHOT_POLICY,
         FACET_TEMPLATE_DESIRED_STATE, NetworkPolicyTarget, ReconcileReason,
-        SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY, SANDBOX_FAILURE_EPISODE_KEY,
-        SANDBOX_FAILURE_EXECUTION_GENERATION_KEY, SANDBOX_FAILURE_POD_UID_KEY,
-        SANDBOX_LOCAL_SUSPEND_KEY,
+        SANDBOX_ABANDONED_ACTIVATION_REASON, SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY,
+        SANDBOX_FAILURE_EPISODE_KEY, SANDBOX_FAILURE_EXECUTION_GENERATION_KEY,
+        SANDBOX_FAILURE_POD_UID_KEY, SANDBOX_LOCAL_SUSPEND_KEY,
     },
 };
 use pplx_space_events::{
@@ -1661,7 +1661,7 @@ impl PostCommitSandboxEvent {
                 )
                 .emit_with(
                     SandboxEventDetails::default()
-                        .reason(ABANDONED_ACTIVATION_CLEANUP_REASON)
+                        .reason(SANDBOX_ABANDONED_ACTIVATION_REASON)
                         .operation("node_state_publish")
                         .trigger(SandboxEventTrigger::System)
                         .lifecycle_state(SandboxLifecycle::Stopped.as_str())
@@ -1673,10 +1673,6 @@ impl PostCommitSandboxEvent {
         }
     }
 }
-
-/// Why a node-reported runtime behind a `stopped` row was handed to teardown:
-/// it belongs to a start the control plane had already abandoned.
-const ABANDONED_ACTIVATION_CLEANUP_REASON: &str = "abandoned_activation";
 
 fn published_spaced_version(
     node_id: NodeId,
@@ -2960,31 +2956,20 @@ pub async fn publish_sandbox_states(
         rows_json.clone(),
     )
     .await?;
-    let newly_requested = sandbox_quarantine_store::record_abandoned_activation_runtimes(
-        conn,
-        node_id,
-        &abandoned_runtimes,
-    )
-    .await?;
-    sandbox_quarantine_store::withdraw_abandoned_activation_runtimes(
+    let newly_requested = sandbox_quarantine_store::reconcile_abandoned_activation_requests(
         conn,
         node_id,
         &reported_runtime_ids,
         &abandoned_runtimes,
     )
     .await?;
-    post_commit_events.extend(
-        abandoned_runtimes
-            .into_iter()
-            .filter(|runtime| newly_requested.contains(&runtime.sandbox_id))
-            .map(
-                |runtime| PostCommitSandboxEvent::AbandonedActivationTeardownRequested {
-                    sandbox_id: runtime.sandbox_id,
-                    execution_generation: runtime.execution_generation,
-                    pod_uid: runtime.pod_uid,
-                },
-            ),
-    );
+    post_commit_events.extend(newly_requested.into_iter().map(|runtime| {
+        PostCommitSandboxEvent::AbandonedActivationTeardownRequested {
+            sandbox_id: runtime.sandbox_id,
+            execution_generation: runtime.execution_generation,
+            pod_uid: runtime.pod_uid,
+        }
+    }));
 
     let suspended_projection =
         project_node_published_suspended_sandboxes(conn, node_id, rows_json.clone()).await?;

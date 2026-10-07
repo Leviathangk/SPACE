@@ -33,8 +33,8 @@ mod kubernetes_tests {
         ActivationFenceOwnership, ActivationRoutePublication, classify_activation_route_publication,
     };
     use crate::controllers::substrate::{
-        NodeApiTarget, PooledExecutionClaim, PublishedLocalArtifact, RecordedExecution, Substrate,
-        SubstrateAdapter, TeardownProgress,
+        AbandonedActivationFence, NodeApiTarget, PooledExecutionClaim, PublishedLocalArtifact,
+        RecordedExecution, Substrate, SubstrateAdapter, TeardownProgress,
     };
     use axum::http::{Method, Request, Response, StatusCode};
     use http_body_util::BodyExt;
@@ -14460,7 +14460,7 @@ mod kubernetes_tests {
         route_activation_id: SandboxActivationAttemptId,
         activation_attempt_id: SandboxActivationAttemptId,
     ) -> RetireFence {
-        RetireFence::AbandonedActivation(
+        RetireFence::AbandonedActivation(AbandonedActivationFence::behind_stopped_row(
             PodIdentityFence::new(PodName::parse(pod_name).expect("pod name"))
                 .with_generation(7)
                 .with_recorded(RecordedExecution::Read {
@@ -14469,7 +14469,7 @@ mod kubernetes_tests {
                 })
                 .with_activation_attempt(activation_attempt_id)
                 .with_pod_uid(PodUid::parse("uid-late").expect("pod uid")),
-        )
+        ))
     }
 
     /// Seed a sandbox whose node reports the VM of generation 7's pod

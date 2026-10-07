@@ -24,6 +24,9 @@ pub const SANDBOX_LOCAL_SUSPEND_KEY: &str = "local_suspend";
 /// exact generation and pod UID that teardown is fenced on; the observation
 /// authorizes retiring that runtime only, never adopting it.
 pub const SANDBOX_ABANDONED_ACTIVATION_KEY: &str = "abandoned_activation";
+/// The event and metric `reason` for every step of an abandoned activation's
+/// teardown, from the publication that requests it to the retire that runs it.
+pub const SANDBOX_ABANDONED_ACTIVATION_REASON: &str = "abandoned_activation";
 
 pub const NETWORK_POLICY_TARGET_TEMPLATE_PREFIX: &str = "template:";
 pub const NETWORK_POLICY_TARGET_SANDBOX_PREFIX: &str = "sandbox:";

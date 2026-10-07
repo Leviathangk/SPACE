@@ -1633,10 +1633,18 @@ impl SandboxController {
                     if !execution.completion.should_finalize_lifecycle() {
                         return Ok(body);
                     }
-                    maybe_update_sandbox_state(pool, id, "started", "on_node").await;
-                    self.substrate
-                        .complete_activation_lease(typed_id, execution.lease_completion)
-                        .await;
+                    // A lost `started` write keeps the attempt: while it is
+                    // held, the node's activation-completed receipt converges
+                    // the row, and the runtime is never mistaken for an
+                    // abandoned start. Releasing it unconditionally would leave
+                    // a running VM behind a `stopped` row that no receipt can
+                    // promote. A write that landed releases as before, even if
+                    // a STOP has already moved the row on.
+                    if maybe_update_sandbox_state(pool, id, "started", "on_node").await {
+                        self.substrate
+                            .complete_activation_lease(typed_id, execution.lease_completion)
+                            .await;
+                    }
                     Ok((Some(SandboxLifecycleStatus::Started), body))
                 }
                 SandboxAction::Wake | SandboxAction::ImplicitWake(_) => {

@@ -93,6 +93,7 @@ pub enum Sweep {
     SubstrateCleanup,
     CommandReadyPending,
     UnrestorableRestoring,
+    AbandonedActivationCleanup,
 }
 
 impl Sweep {
@@ -105,6 +106,7 @@ impl Sweep {
             Self::SubstrateCleanup => "substrate_cleanup",
             Self::CommandReadyPending => "command_ready_pending",
             Self::UnrestorableRestoring => "unrestorable_restoring",
+            Self::AbandonedActivationCleanup => "abandoned_activation_cleanup",
         }
     }
 }
@@ -158,6 +160,7 @@ impl WakeLifecycle {
 const LIFECYCLE_SUSPENDED: &str = "suspended";
 const LIFECYCLE_STARTED: &str = "started";
 const LIFECYCLE_FAILED: &str = "failed";
+const LIFECYCLE_STOPPED: &str = "stopped";
 
 const OUTCOME_DEFERRED: &str = "deferred";
 const OUTCOME_SKIPPED: &str = "skipped";
@@ -313,12 +316,36 @@ impl FailedCleanupOutcome {
     }
 }
 
+/// Outcome of retiring one runtime its node reports for a start the control
+/// plane abandoned, behind a `stopped` row
+/// (`sweep:abandoned_activation_cleanup`). No lifecycle transition: the row
+/// stays `stopped`, so `from_lifecycle` is always `stopped` and there is no
+/// `to_lifecycle`. Carries `mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbandonedActivationOutcome {
+    /// The runtime was stopped and its pod deleted (`mode:live`), or would
+    /// have been (`mode:dry_run`).
+    Retired,
+    /// The substrate refused or could not stop the runtime; the cause is in
+    /// `reason` (a pod-fence mismatch such as `lifecycle_changed` or
+    /// `runtime_unreachable`).
+    Deferred,
+    Error,
+}
+
+impl AbandonedActivationOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Retired => "retired_abandoned_activation_runtime",
+            Self::Deferred => OUTCOME_DEFERRED,
+            Self::Error => OUTCOME_ERROR,
+        }
+    }
+}
+
 /// Best-effort substrate cleanup outcome (`sweep:substrate_cleanup`). No
 /// lifecycle transition: the flip already happened; this meters the teardown
 /// that follows it. `from_lifecycle` carries whose cleanup it was.
-/// `from_lifecycle:stopped` with `reason:abandoned_activation` is the retire of
-/// a runtime its node still reports for a start the control plane abandoned;
-/// that row stays `stopped`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CleanupOutcome {
     Completed,
@@ -814,6 +841,17 @@ impl OutcomeEvent {
         event.from_lifecycle = Some(LIFECYCLE_FAILED.to_string());
         event.to_lifecycle = outcome.to_lifecycle();
         event.verdict = Some(verdict.to_string());
+        event
+    }
+
+    pub fn abandoned_activation_cleanup(outcome: AbandonedActivationOutcome, mode: Mode) -> Self {
+        let mut event = Self::new(
+            Loop::TransientLifecycleSweeper,
+            Sweep::AbandonedActivationCleanup,
+            outcome.as_str(),
+        );
+        event.from_lifecycle = Some(LIFECYCLE_STOPPED.to_string());
+        event.mode = Some(mode);
         event
     }
 

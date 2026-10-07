@@ -114,16 +114,24 @@
 //! `sandbox_k8s_executions.updated_at` so a persistently bad row cannot
 //! starve later failed sandboxes.
 //!
-//! Under the same gate, the sweeper retires runtimes that nodes report for
-//! starts the control plane already abandoned. A start that fails reports the
-//! failure and leaves the row `stopped`, but its last pod can keep retrying and
-//! boot later. The node's publication of that running VM records a teardown
-//! request, fenced on the generation and pod UID it reported; this pass hands
-//! each request to [`SubstrateAdapter::retire_execution`] with a
-//! [`RetireFence::AbandonedActivation`], which stops the VM and deletes its pod
-//! while the row stays `stopped`. The request is withdrawn once the node stops
-//! reporting the runtime, and the pass leaves the sandbox alone once a newer
-//! start owns it.
+//! Behind its own gate (`SPACE_ABANDONED_ACTIVATION_CLEANUP_ENABLED`, off by
+//! default, dry-run unless `SPACE_ABANDONED_ACTIVATION_CLEANUP_DRY_RUN=false`),
+//! the sweeper also retires runtimes that nodes report for starts the control
+//! plane already abandoned:
+//!
+//! - A start that fails reports the failure and leaves the row `stopped`, but
+//!   its last pod can keep retrying and boot later.
+//! - When the node publishes that running VM with positive evidence that it
+//!   came up after the row went `stopped`, the publication records a teardown
+//!   request, fenced on the generation and pod UID the node reported.
+//! - This pass reads recently re-asserted requests and hands each to
+//!   [`SubstrateAdapter::retire_execution`] with a
+//!   [`RetireFence::AbandonedActivation`]. The substrate re-proves the fence,
+//!   stops the VM through its pod, then deletes the pod, while the row stays
+//!   `stopped`.
+//! - The request is withdrawn once the node stops reporting the runtime. A
+//!   newer start owning the sandbox, a lifecycle that moved on, or a runtime
+//!   the stop cannot reach is a defer that changes nothing.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -137,13 +145,15 @@ use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
 };
 use pplx_space_metrics::cluster_reconciler::{
-    self as metrics, AgedTransientOutcome, CleanupOutcome, CommandReadyOutcome,
-    FailedCleanupOutcome, Loop, OutcomeEvent, UnrestorableOutcome, WakeLifecycle,
+    self as metrics, AbandonedActivationOutcome, AgedTransientOutcome, CleanupOutcome,
+    CommandReadyOutcome, FailedCleanupOutcome, Loop, OutcomeEvent, UnrestorableOutcome,
+    WakeLifecycle,
 };
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
 use crate::env_config;
+use pplx_space_common_svc::types::SANDBOX_ABANDONED_ACTIVATION_REASON;
 
 pub mod classify;
 pub mod probe;
@@ -312,9 +322,6 @@ enum CleanupPass {
     /// Retire retried against an authoritative `failed` row that still has an
     /// active execution.
     FailedCleanup,
-    /// Retire of a runtime its node still reports for a start the control
-    /// plane abandoned, behind an authoritative `stopped` row.
-    AbandonedActivation,
 }
 
 impl CleanupPass {
@@ -323,7 +330,6 @@ impl CleanupPass {
             Self::RevertToSuspended | Self::TransientAgeOut => "transient_lifecycle_sweep",
             Self::CommandReadyReap => "command_ready_pending_sweep",
             Self::FailedCleanup => "failed_sandbox_active_execution_cleanup",
-            Self::AbandonedActivation => ABANDONED_ACTIVATION_CLEANUP_OPERATION,
         }
     }
 
@@ -342,10 +348,6 @@ impl CleanupPass {
                 "cleanup deferred; the next pass re-reads the execution and fences on \
                  whatever is current"
             }
-            Self::AbandonedActivation => {
-                "row stays stopped; the runtime is retried while its node keeps reporting \
-                 it, and left alone once a newer start owns the sandbox"
-            }
         }
     }
 
@@ -355,9 +357,6 @@ impl CleanupPass {
                 report.cleanup_pod_identity_deferred += 1;
             }
             Self::FailedCleanup => report.failed_cleanup_pod_identity_deferred += 1,
-            Self::AbandonedActivation => {
-                report.abandoned_activation_pod_identity_deferred += 1;
-            }
         }
     }
 }
@@ -387,7 +386,7 @@ fn note_cleanup_pod_identity_deferral(
         .trigger(SandboxEventTrigger::System)
         .with_from_state(from_state)
         .result(mismatch.as_str());
-    if let RetireFence::Pod(fence) | RetireFence::AbandonedActivation(fence) = fence {
+    if let RetireFence::Pod(fence) = fence {
         details = details.pod_name(fence.pod_name.as_str());
         if let Some(pod_uid) = fence.pod_uid.as_ref() {
             details = details.pod_uid(pod_uid.as_str());
@@ -458,8 +457,6 @@ fn emit_failed_cleanup_event(
 
 /// The operation label of the abandoned-activation teardown pass.
 const ABANDONED_ACTIVATION_CLEANUP_OPERATION: &str = "abandoned_activation_cleanup";
-/// Why the abandoned-activation pass retires a runtime behind a `stopped` row.
-const ABANDONED_ACTIVATION_REASON: &str = "abandoned_activation";
 
 fn emit_abandoned_activation_cleanup_event(
     candidate: &AbandonedActivationCandidate,
@@ -468,15 +465,15 @@ fn emit_abandoned_activation_cleanup_event(
     error: Option<String>,
 ) {
     let mut details = SandboxEventDetails::default()
-        .reason(ABANDONED_ACTIVATION_REASON)
+        .reason(SANDBOX_ABANDONED_ACTIVATION_REASON)
         .operation(ABANDONED_ACTIVATION_CLEANUP_OPERATION)
         .trigger(SandboxEventTrigger::System)
         .lifecycle_state(SandboxLifecycle::Stopped.as_str())
         .execution_generation(candidate.execution_generation.to_string())
         .source_node_id(candidate.node_id.to_string());
     if let RetireFence::AbandonedActivation(fence) = &candidate.pod_fence {
-        details = details.pod_name(fence.pod_name.as_str());
-        if let Some(pod_uid) = fence.pod_uid.as_ref() {
+        details = details.pod_name(fence.pod.pod_name.as_str());
+        if let Some(pod_uid) = fence.pod.pod_uid.as_ref() {
             details = details.pod_uid(pod_uid.as_str());
         }
     }
@@ -633,6 +630,10 @@ pub(crate) const DEFAULT_TICK: Duration = Duration::from_secs(60);
 /// the worst on-call escalations.
 pub(crate) const DEFAULT_AGE_SECS: u64 = 600;
 pub(crate) const DEFAULT_FAILED_CLEANUP_BATCH_SIZE: i64 = 100;
+/// Requests the abandoned-activation pass reads per tick. Each is a late
+/// boot behind a `stopped` row, which is rare; the bound only keeps one tick
+/// from fanning out unboundedly if a fault ever produces many.
+pub(crate) const ABANDONED_ACTIVATION_BATCH_SIZE: i64 = 50;
 /// Bounded per-node `SandboxState` probe deadline. The probe is a read-only
 /// metadata RPC against the node-api (which answers from the on-node sbx-mgr
 /// without touching the guest), so this only needs to exceed connect jitter.
@@ -695,12 +696,20 @@ pub struct ReconcilerConfig {
     /// sweep and the failed-cleanup probe gate.
     pub probe_timeout: Duration,
     /// When true, retry cleanup for authoritative `failed` k8s sandboxes
-    /// that still have an active `sandbox_k8s_executions` row, and retire
-    /// runtimes nodes report for abandoned activations behind `stopped` rows.
-    /// This is intentionally independent from `enabled`: operators can run
-    /// only these cleanups without enabling transient lifecycle age-out.
+    /// that still have an active `sandbox_k8s_executions` row. This is
+    /// intentionally independent from `enabled`: operators can run only
+    /// failed cleanup without enabling transient lifecycle age-out.
     pub failed_cleanup_enabled: bool,
     pub failed_cleanup_batch_size: i64,
+    /// When true, act on the teardown requests node publications record for
+    /// runtimes that booted behind `stopped` rows after their start was
+    /// abandoned. Default `false`: it ships off everywhere and is enabled per
+    /// environment, independently of `failed_cleanup_enabled`.
+    pub abandoned_activation_cleanup_enabled: bool,
+    /// When true (the default), the abandoned-activation pass lists and
+    /// reports would-retire candidates but never stops a runtime or deletes a
+    /// pod.
+    pub abandoned_activation_cleanup_dry_run: bool,
     /// When true, probe-and-resolve preserved `started` +
     /// `command_ready_pending` rows older than
     /// [`Self::command_ready_pending_age`]. Independent of `enabled` so an
@@ -766,6 +775,8 @@ impl Default for ReconcilerConfig {
             probe_timeout: DEFAULT_SWEEP_PROBE_TIMEOUT,
             failed_cleanup_enabled: true,
             failed_cleanup_batch_size: DEFAULT_FAILED_CLEANUP_BATCH_SIZE,
+            abandoned_activation_cleanup_enabled: false,
+            abandoned_activation_cleanup_dry_run: true,
             command_ready_pending_enabled: false,
             command_ready_pending_age: PositiveDuration::new_panic(Duration::from_secs(
                 DEFAULT_COMMAND_READY_PENDING_AGE_SECS,
@@ -822,6 +833,16 @@ impl ReconcilerConfig {
                 "SPACE_FAILED_SANDBOX_CLEANUP_ENABLED",
             ),
             failed_cleanup_batch_size: default.failed_cleanup_batch_size,
+            abandoned_activation_cleanup_enabled: env_config::truthy_default(
+                "SPACE_ABANDONED_ACTIVATION_CLEANUP_ENABLED",
+                default.abandoned_activation_cleanup_enabled,
+            ),
+            // Only an explicit false goes live; anything else, including a
+            // misspelling, keeps the pass dry.
+            abandoned_activation_cleanup_dry_run: env_config::truthy_default(
+                "SPACE_ABANDONED_ACTIVATION_CLEANUP_DRY_RUN",
+                default.abandoned_activation_cleanup_dry_run,
+            ),
             command_ready_pending_enabled: false,
             command_ready_pending_age: default.command_ready_pending_age,
             command_ready_pending_probe_timeout: default.command_ready_pending_probe_timeout,
@@ -1282,10 +1303,13 @@ pub struct TickReport {
     pub failed_cleanup_repair_failures: usize,
     /// Abandoned activations whose runtime was stopped and pod deleted.
     pub abandoned_activation_retired: usize,
+    /// Abandoned activations the dry-run pass would have retired.
+    pub abandoned_activation_would_retire: usize,
     pub abandoned_activation_failures: usize,
-    /// Abandoned-activation retires the substrate refused on pod identity:
-    /// a newer start owns the sandbox, or the reported pod was replaced.
-    pub abandoned_activation_pod_identity_deferred: usize,
+    /// Abandoned-activation retires the substrate deferred: the row moved on,
+    /// a newer start owns the sandbox, the reported pod was replaced, or no
+    /// reachable runtime was left to stop.
+    pub abandoned_activation_deferred: usize,
     pub command_ready_healed: usize,
     pub command_ready_reaped: usize,
     pub command_ready_deferred: usize,
@@ -1314,6 +1338,8 @@ impl<S: SweepSink> Reconciler<S> {
         }
         if self.config.failed_cleanup_enabled {
             self.cleanup_failed_active_executions(&mut report).await;
+        }
+        if self.config.abandoned_activation_cleanup_enabled {
             self.retire_abandoned_activations(&mut report).await;
         }
         if self.config.command_ready_pending_enabled {
@@ -2618,12 +2644,23 @@ impl<S: SweepSink> Reconciler<S> {
     /// Retire runtimes that nodes report for starts the control plane already
     /// abandoned. The row stays `stopped` throughout: the start was reported to
     /// its client as failed, so its late runtime is retired, never adopted.
-    /// No probe gate: the evidence is the node's own report of a live runtime,
-    /// and the substrate re-proves the pod identity before acting.
+    /// No probe gate: the evidence is the node's own recent report of a live
+    /// runtime, and the substrate re-proves the fence immediately before it
+    /// stops anything.
+    ///
+    /// Dry-run reports each would-retire candidate (metric and log, `mode`
+    /// `dry_run`) and changes nothing. Live mode emits the cleanup event only
+    /// for a runtime it actually stopped and whose pod it deleted; a refused
+    /// fence or an error is a `sweep_deferred`.
     async fn retire_abandoned_activations(&self, report: &mut TickReport) {
+        let mode = if self.config.abandoned_activation_cleanup_dry_run {
+            metrics::Mode::DryRun
+        } else {
+            metrics::Mode::Live
+        };
         let candidates = match self
             .sink
-            .list_abandoned_activations(self.config.failed_cleanup_batch_size)
+            .list_abandoned_activations(ABANDONED_ACTIVATION_BATCH_SIZE)
             .await
         {
             Ok(candidates) => candidates,
@@ -2637,58 +2674,76 @@ impl<S: SweepSink> Reconciler<S> {
         };
         for candidate in candidates {
             let sandbox_id = candidate.sandbox_id;
-            emit_abandoned_activation_cleanup_event(
-                &candidate,
-                SandboxEventType::CleanupStarted,
-                None,
-                None,
-            );
+            if mode == metrics::Mode::DryRun {
+                OutcomeEvent::abandoned_activation_cleanup(
+                    AbandonedActivationOutcome::Retired,
+                    mode,
+                )
+                .sandbox_id(sandbox_id)
+                .generation(candidate.execution_generation)
+                .node(candidate.node_id.to_string())
+                .reason(SANDBOX_ABANDONED_ACTIVATION_REASON)
+                .detail("dry run: runtime left running")
+                .info();
+                report.abandoned_activation_would_retire += 1;
+                continue;
+            }
             match self
                 .sink
                 .retire_abandoned_activation(sandbox_id, candidate.pod_fence.clone())
                 .await
             {
                 Ok(RetireExecutionOutcome::Retired) => {
-                    OutcomeEvent::substrate_cleanup(
-                        CleanupOutcome::Completed,
-                        SandboxLifecycle::Stopped.as_str(),
+                    OutcomeEvent::abandoned_activation_cleanup(
+                        AbandonedActivationOutcome::Retired,
+                        mode,
                     )
                     .sandbox_id(sandbox_id)
-                    .reason(ABANDONED_ACTIVATION_REASON)
+                    .generation(candidate.execution_generation)
+                    .node(candidate.node_id.to_string())
+                    .reason(SANDBOX_ABANDONED_ACTIVATION_REASON)
                     .info();
                     report.abandoned_activation_retired += 1;
                     emit_abandoned_activation_cleanup_event(
                         &candidate,
                         SandboxEventType::CleanupCompleted,
-                        Some("ok"),
+                        Some("runtime_stopped_and_pod_deleted"),
                         None,
                     );
                 }
                 Ok(RetireExecutionOutcome::PodIdentityChanged { mismatch, .. }) => {
-                    note_cleanup_pod_identity_deferral(
-                        sandbox_id,
-                        CleanupPass::AbandonedActivation,
-                        SandboxLifecycle::Stopped.as_str(),
-                        &candidate.pod_fence,
-                        mismatch,
-                        report,
+                    OutcomeEvent::abandoned_activation_cleanup(
+                        AbandonedActivationOutcome::Deferred,
+                        mode,
+                    )
+                    .sandbox_id(sandbox_id)
+                    .generation(candidate.execution_generation)
+                    .reason(mismatch.as_str())
+                    .info();
+                    report.abandoned_activation_deferred += 1;
+                    emit_abandoned_activation_cleanup_event(
+                        &candidate,
+                        SandboxEventType::SweepDeferred,
+                        Some(mismatch.as_str()),
+                        None,
                     );
                 }
                 Err(error) => {
-                    OutcomeEvent::substrate_cleanup(
-                        CleanupOutcome::Error,
-                        SandboxLifecycle::Stopped.as_str(),
+                    OutcomeEvent::abandoned_activation_cleanup(
+                        AbandonedActivationOutcome::Error,
+                        mode,
                     )
                     .sandbox_id(sandbox_id)
-                    .reason(ABANDONED_ACTIVATION_REASON)
+                    .generation(candidate.execution_generation)
+                    .reason(SANDBOX_ABANDONED_ACTIVATION_REASON)
                     .error(&error)
-                    .detail("runtime left running; retried while its node keeps reporting it")
+                    .detail("runtime left as it is; retried while the node keeps re-asserting it")
                     .warn();
                     report.abandoned_activation_failures += 1;
                     emit_abandoned_activation_cleanup_event(
                         &candidate,
-                        SandboxEventType::CleanupFailed,
-                        Some("failed"),
+                        SandboxEventType::SweepDeferred,
+                        Some("error"),
                         Some(error),
                     );
                 }
@@ -2705,11 +2760,16 @@ pub async fn run<S: SweepSink>(
     sink: S,
     shutdown_token: CancellationToken,
 ) {
-    if !config.enabled && !config.failed_cleanup_enabled && !config.command_ready_pending_enabled {
+    if !config.enabled
+        && !config.failed_cleanup_enabled
+        && !config.abandoned_activation_cleanup_enabled
+        && !config.command_ready_pending_enabled
+    {
         tracing::info!(
             "transient_lifecycle_sweeper disabled \
              (SPACE_TRANSIENT_LIFECYCLE_SWEEPER_ENABLED, \
-              SPACE_FAILED_SANDBOX_CLEANUP_ENABLED, and \
+              SPACE_FAILED_SANDBOX_CLEANUP_ENABLED, \
+              SPACE_ABANDONED_ACTIVATION_CLEANUP_ENABLED, and \
               the fixed-disabled command-ready-pending reaper are all false); waiting for shutdown"
         );
         shutdown_token.cancelled().await;
@@ -2723,6 +2783,8 @@ pub async fn run<S: SweepSink>(
         probe_timeout_secs = config.probe_timeout.as_secs(),
         failed_cleanup_enabled = config.failed_cleanup_enabled,
         failed_cleanup_batch_size = config.failed_cleanup_batch_size,
+        abandoned_activation_cleanup_enabled = config.abandoned_activation_cleanup_enabled,
+        abandoned_activation_cleanup_dry_run = config.abandoned_activation_cleanup_dry_run,
         command_ready_pending_enabled = config.command_ready_pending_enabled,
         command_ready_pending_age_secs = config.command_ready_pending_age.get().as_secs(),
         command_ready_pending_probe_timeout_secs =

@@ -91,7 +91,7 @@ use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use pplx_space_api::controllers::substrate::{
-    CommandReadyProbe, ObservedPodIdentity, PodIdentityFence,
+    AbandonedActivationFence, CommandReadyProbe, ObservedPodIdentity, PodIdentityFence,
 };
 use pplx_space_common_core::types::{
     PodName, PodResourceVersion, PodUid, PositiveDuration, SandboxId, SandboxLifecycle,
@@ -874,6 +874,8 @@ fn config_with_all_overrides(age: PositiveDuration) -> ReconcilerConfig {
         probe_timeout: DEFAULT_SWEEP_PROBE_TIMEOUT,
         failed_cleanup_enabled: false,
         failed_cleanup_batch_size: DEFAULT_FAILED_CLEANUP_BATCH_SIZE,
+        abandoned_activation_cleanup_enabled: false,
+        abandoned_activation_cleanup_dry_run: true,
         command_ready_pending_enabled: false,
         command_ready_pending_age: age,
         command_ready_pending_probe_timeout: DEFAULT_COMMAND_READY_PENDING_PROBE_TIMEOUT,
@@ -2497,18 +2499,29 @@ fn abandoned_activation_candidate(sandbox_id: SandboxId) -> AbandonedActivationC
         sandbox_id,
         node_id: pplx_space_common_core::types::NodeId::new(),
         execution_generation: 7,
-        pod_fence: RetireFence::AbandonedActivation(
+        pod_fence: RetireFence::AbandonedActivation(AbandonedActivationFence::behind_stopped_row(
             PodIdentityFence::new(PodName::parse(pod_name).unwrap())
                 .with_generation(7)
                 .with_pod_uid(PodUid::parse("uid-late").unwrap()),
-        ),
+        )),
+    }
+}
+
+fn live_abandoned_activation_config() -> ReconcilerConfig {
+    ReconcilerConfig {
+        enabled: false,
+        failed_cleanup_enabled: false,
+        abandoned_activation_cleanup_enabled: true,
+        abandoned_activation_cleanup_dry_run: false,
+        ..ReconcilerConfig::default()
     }
 }
 
 /// Every runtime a node reports for an abandoned activation is handed to the
 /// substrate under the fence the listing built, and one candidate's outcome
 /// never stops the next: a retire, a refused fence, and an error are each
-/// counted for what they are. The pass runs without the transient age-out.
+/// counted for what they are. The pass runs on its own gate, without the
+/// transient age-out or failed-sandbox cleanup.
 #[tokio::test(flavor = "current_thread")]
 async fn f5_abandoned_activation_pass_retires_each_reported_runtime_under_its_fence() {
     let sink = FakeSink::new();
@@ -2523,19 +2536,12 @@ async fn f5_abandoned_activation_pass_retires_each_reported_runtime_under_its_fe
     sink.enqueue_abandoned_activations(candidates.clone());
     sink.fail_abandoned_activation_retire(failing);
     sink.set_cleanup_pod_identity_changed(superseded, PodFenceMismatch::ExecutionSuperseded);
-    let reconciler = Reconciler::new(
-        ReconcilerConfig {
-            enabled: false,
-            failed_cleanup_enabled: true,
-            ..ReconcilerConfig::default()
-        },
-        sink,
-    );
+    let reconciler = Reconciler::new(live_abandoned_activation_config(), sink);
 
     let report = reconciler.tick().await;
 
     assert_eq!(report.abandoned_activation_retired, 1);
-    assert_eq!(report.abandoned_activation_pod_identity_deferred, 1);
+    assert_eq!(report.abandoned_activation_deferred, 1);
     assert_eq!(report.abandoned_activation_failures, 1);
     assert_eq!(
         reconciler.sink.abandoned_activation_retires(),
@@ -2557,6 +2563,30 @@ async fn f6_abandoned_activation_pass_is_off_by_default() {
 
     let report = reconciler.tick().await;
 
+    assert_eq!(report.abandoned_activation_retired, 0);
+    assert!(reconciler.sink.abandoned_activation_retires().is_empty());
+}
+
+/// Dry-run lists the requests and reports each would-retire candidate, but
+/// never hands one to the substrate.
+#[tokio::test(flavor = "current_thread")]
+async fn f7_abandoned_activation_dry_run_reports_without_retiring() {
+    let sink = FakeSink::new();
+    sink.enqueue_abandoned_activations(vec![
+        abandoned_activation_candidate(SandboxId::new()),
+        abandoned_activation_candidate(SandboxId::new()),
+    ]);
+    let reconciler = Reconciler::new(
+        ReconcilerConfig {
+            abandoned_activation_cleanup_dry_run: true,
+            ..live_abandoned_activation_config()
+        },
+        sink,
+    );
+
+    let report = reconciler.tick().await;
+
+    assert_eq!(report.abandoned_activation_would_retire, 2);
     assert_eq!(report.abandoned_activation_retired, 0);
     assert!(reconciler.sink.abandoned_activation_retires().is_empty());
 }
@@ -2670,11 +2700,25 @@ mod postgres_backed {
 
     use pplx_space_test_env::TestResult;
 
+    /// One row of the listing table: the row behind a request, and whether
+    /// the listing still offers that request to the pass.
+    struct ListingCase {
+        case: &'static str,
+        lifecycle: SandboxLifecycle,
+        execution_active: bool,
+        attempt_held: bool,
+        newer_generation_active: bool,
+        stopped_after_execution: bool,
+        request_age_secs: i64,
+        listed: bool,
+    }
+
     /// The teardown requests a node publication records are what this listing
     /// reads back, re-checked against the row: a request is listed only while
-    /// the row is still `stopped`, no start holds the reported generation, and
-    /// no newer generation is active. A malformed element under the same key
-    /// cannot fail the listing for everyone else.
+    /// it was re-asserted recently, the row is still `stopped`, no start holds
+    /// the reported generation, no newer generation is active, and an active
+    /// execution was created after the row went `stopped`. A malformed element
+    /// under the same key cannot fail the listing for everyone else.
     #[tokio::test(flavor = "current_thread")]
     async fn abandoned_activation_listing_rechecks_the_row_behind_each_request() -> TestResult {
         let Some(db) = try_pg_test_db().await? else {
@@ -2695,41 +2739,66 @@ mod postgres_backed {
         .execute(&db.pool)
         .await?;
 
+        let base = ListingCase {
+            case: "retired attempt",
+            lifecycle: SandboxLifecycle::Stopped,
+            execution_active: false,
+            attempt_held: false,
+            newer_generation_active: false,
+            stopped_after_execution: false,
+            request_age_secs: 0,
+            listed: true,
+        };
+        let cases = [
+            ListingCase { ..base },
+            ListingCase {
+                case: "released attempt",
+                execution_active: true,
+                ..base
+            },
+            ListingCase {
+                case: "row started since",
+                lifecycle: SandboxLifecycle::Started,
+                listed: false,
+                ..base
+            },
+            ListingCase {
+                case: "start holds the attempt",
+                execution_active: true,
+                attempt_held: true,
+                listed: false,
+                ..base
+            },
+            ListingCase {
+                case: "newer generation active",
+                newer_generation_active: true,
+                listed: false,
+                ..base
+            },
+            ListingCase {
+                case: "stopped in place since",
+                execution_active: true,
+                stopped_after_execution: true,
+                listed: false,
+                ..base
+            },
+            ListingCase {
+                case: "request not re-asserted",
+                request_age_secs: 3600,
+                listed: false,
+                ..base
+            },
+        ];
         let mut expected_listed = Vec::new();
-        for (case, lifecycle, attempt_held, newer_generation_active, listed) in [
-            (
-                "retired attempt",
-                SandboxLifecycle::Stopped,
-                false,
-                false,
-                true,
-            ),
-            (
-                "row started since",
-                SandboxLifecycle::Started,
-                false,
-                false,
-                false,
-            ),
-            (
-                "start holds the attempt",
-                SandboxLifecycle::Stopped,
-                true,
-                false,
-                false,
-            ),
-            (
-                "newer generation active",
-                SandboxLifecycle::Stopped,
-                false,
-                true,
-                false,
-            ),
-        ] {
+        for case in &cases {
             let sandbox_id = SandboxId::new();
             let attempt_id = Uuid::now_v7();
             insert_sandbox_with_lifecycle_and_managed_by(
-                &db.pool, sandbox_id, lifecycle, 60, "k8s",
+                &db.pool,
+                sandbox_id,
+                case.lifecycle,
+                60,
+                "k8s",
             )
             .await?;
             sqlx::query(pplx_space_common_core::sql!(
@@ -2739,15 +2808,25 @@ mod postgres_backed {
                      activation_attempt_target_state, route_activation_id
                  )
                  VALUES ($1, 7, $2, 'sandboxes', 'uid-7', 'running', $3, $4,
-                         NOW() + INTERVAL '5 minutes', 'started', $4)"
+                         NOW() + INTERVAL '5 minutes', 'started', $5)"
             ))
             .bind(sandbox_id)
             .bind(format!("space-sbx-{}-g7", sandbox_id.as_uuid().simple()))
-            .bind(attempt_held)
+            .bind(case.execution_active)
+            .bind(case.attempt_held.then_some(attempt_id))
             .bind(attempt_id)
             .execute(&db.pool)
             .await?;
-            if newer_generation_active {
+            if case.stopped_after_execution {
+                // A STOP left this execution in place after it was created.
+                sqlx::query(pplx_space_common_core::sql!(
+                    "UPDATE sandboxes SET lifecycle_changed_at = NOW() WHERE id = $1"
+                ))
+                .bind(sandbox_id)
+                .execute(&db.pool)
+                .await?;
+            }
+            if case.newer_generation_active {
                 sqlx::query(pplx_space_common_core::sql!(
                     "INSERT INTO sandbox_k8s_executions (
                          sandbox_id, generation, pod_name, pod_namespace, state, active
@@ -2766,16 +2845,17 @@ mod postgres_backed {
                  VALUES ($1, $2, $3, jsonb_build_object(
                      $4::TEXT,
                      jsonb_build_object('execution_generation', 7, 'pod_uid', 'uid-7')
-                 ), NOW(), NOW())"
+                 ), NOW() - make_interval(secs => $5::BIGINT), NOW())"
             ))
             .bind(node_id)
             .bind(pplx_space_common_svc::types::FACET_SANDBOX_DESIRED_STATE)
             .bind(sandbox_id.to_string())
             .bind(pplx_space_common_svc::types::SANDBOX_ABANDONED_ACTIVATION_KEY)
+            .bind(case.request_age_secs)
             .execute(&db.pool)
             .await?;
-            if listed {
-                expected_listed.push((case, sandbox_id, attempt_id));
+            if case.listed {
+                expected_listed.push((case.case, sandbox_id));
             }
         }
 
@@ -2787,7 +2867,7 @@ mod postgres_backed {
             .fetch_all(&db.pool)
             .await?;
 
-        let listed = rows
+        let mut listed = rows
             .iter()
             .map(|row| {
                 (
@@ -2795,22 +2875,22 @@ mod postgres_backed {
                     row.node_id,
                     row.generation,
                     row.observed_pod_uid.as_str(),
-                    row.activation_attempt_id.map(|id| id.as_uuid()),
                 )
             })
             .collect::<Vec<_>>();
+        listed.sort();
+        let mut expected = expected_listed
+            .iter()
+            .map(|(_, sandbox_id)| (*sandbox_id, node_id, 7, "uid-7"))
+            .collect::<Vec<_>>();
+        expected.sort();
         assert_eq!(
             listed,
+            expected,
+            "only {:?} are still abandoned activations",
             expected_listed
                 .iter()
-                .map(|(_, sandbox_id, attempt_id)| {
-                    (*sandbox_id, node_id, 7, "uid-7", Some(*attempt_id))
-                })
-                .collect::<Vec<_>>(),
-            "only {:?} is still an abandoned activation",
-            expected_listed
-                .iter()
-                .map(|(case, ..)| *case)
+                .map(|(case, _)| *case)
                 .collect::<Vec<_>>()
         );
         Ok(())

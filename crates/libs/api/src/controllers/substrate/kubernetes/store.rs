@@ -39,7 +39,8 @@ use uuid::Uuid;
 use crate::{controllers::sandbox::fetch_sandbox as fetch_api_sandbox, models::Sandbox};
 
 use crate::controllers::substrate::{
-    DbContext, PublishedLocalArtifact, SubstrateError, reject_deleting_current_local_artifact,
+    DbContext, PodFenceMismatch, PublishedLocalArtifact, SubstrateError,
+    reject_deleting_current_local_artifact,
 };
 
 #[derive(Clone)]
@@ -5021,6 +5022,41 @@ impl K8sStore {
             );
         }
         Ok(true)
+    }
+
+    /// Release an abandoned activation's tracking after its runtime was
+    /// stopped and its pod deleted: retire exactly the execution the fence
+    /// verified and unplace the sandbox, only while the row still reads
+    /// `expected_lifecycle` under its lock. Nothing else in this transaction
+    /// may move the row: a start that converged since owns it, and an
+    /// unguarded placement clear is how a torn-down sandbox comes back.
+    pub(super) async fn forget_abandoned_activation_tracking(
+        &self,
+        sandbox_id: SandboxId,
+        identity: &ExecutionIdentity,
+        expected_lifecycle: SandboxLifecycle,
+    ) -> Result<Result<(), PodFenceMismatch>, SubstrateError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .db_context("failed to start abandoned activation cleanup transaction")?;
+        let lifecycle = Self::lock_sandbox_execution_lifecycle_in(&mut tx, sandbox_id).await?;
+        if lifecycle != Some(expected_lifecycle) {
+            return Ok(Err(PodFenceMismatch::LifecycleChanged));
+        }
+        if !self
+            .finish_fenced_execution_in(&mut tx, sandbox_id, identity, "forgotten")
+            .await?
+        {
+            return Ok(Err(PodFenceMismatch::ExecutionSuperseded));
+        }
+        self.clear_pod_tracking_in(&mut tx, sandbox_id, PlacementClock::Preserve)
+            .await?;
+        tx.commit()
+            .await
+            .db_context("failed to commit abandoned activation cleanup transaction")?;
+        Ok(Ok(()))
     }
 
     pub(super) async fn converge_failed_recovery_after_pod_absence_if_generation(
