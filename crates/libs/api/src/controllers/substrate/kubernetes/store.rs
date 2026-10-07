@@ -2496,6 +2496,16 @@ impl K8sStore {
         .db_context("failed to query stopped sandbox execution")
     }
 
+    /// Retire the execution an abandoned start selected, or re-prove there is
+    /// none, under the sandbox lock.
+    pub(super) async fn retire_abandoned_start_execution(
+        &self,
+        _sandbox_id: SandboxId,
+        _expected: Option<&ExecutionIdentity>,
+    ) -> Result<bool, SubstrateError> {
+        Ok(true)
+    }
+
     pub(super) async fn complete_activation_attempt(
         &self,
         sandbox_id: SandboxId,

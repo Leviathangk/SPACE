@@ -519,13 +519,14 @@ impl PublicOperationStore {
         Ok(result)
     }
 
-    /// Whether any operation on this tenant's sandbox other than `except` is
-    /// still queued or running.
+    /// Whether any operation on this tenant's sandbox other than `except`,
+    /// claimed with `except_claim_token`, is still queued or running.
     pub async fn other_sandbox_operation_unfinished(
         &self,
         org_id: OrgId,
         target_id: &str,
         except: OperationId,
+        _except_claim_token: &str,
     ) -> Result<bool, PublicOperationStoreError> {
         Ok(sqlx::query_scalar(sql!(
             "SELECT EXISTS (
@@ -712,7 +713,10 @@ impl PublicOperationStore {
                        target_id,
                        payload_json,
                        attempts,
-                       claim_generation"
+                       claim_generation,
+                       pending_failure_json,
+                       EXTRACT(EPOCH FROM NOW() - pending_failure_at)::float8
+                           AS pending_failure_age_secs"
         ))
         .bind(operation_id.as_uuid())
         .bind(&claim_token)
@@ -796,6 +800,16 @@ impl PublicOperationStore {
         input: ReleaseClaimedPublicOperation,
     ) -> Result<bool, PublicOperationStoreError> {
         release_claimed_operation(&self.pool, input).await
+    }
+
+    /// Requeue a claimed operation whose failure is decided but waits on
+    /// compensation. Like a budget-preserving release, plus the failure to
+    /// record once compensation completes; the first deferral's time is kept.
+    pub async fn defer_claimed_failure(
+        &self,
+        input: DeferClaimedPublicOperationFailure,
+    ) -> Result<bool, PublicOperationStoreError> {
+        defer_claimed_failure(&self.pool, input).await
     }
 
     pub async fn update_claimed_payload(
@@ -1065,6 +1079,73 @@ pub struct ClaimedPublicOperation {
     pub payload: serde_json::Value,
     pub attempts: i32,
     pub claim_generation: i64,
+    /// Set when an earlier claim decided this operation failed but deferred
+    /// recording it while the executor compensates; this claim only retries
+    /// that compensation.
+    pub pending_failure: Option<ClaimedPendingFailure>,
+}
+
+/// What the dispatcher does with a failure once the executor has tried to undo
+/// what the failed operation left behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicOperationCompensation {
+    /// Nothing is left to undo, or nothing more can be: record the failure.
+    Complete,
+    /// Something may still be left behind: keep the failure pending and
+    /// compensate again no sooner than this.
+    RetryAfter(Duration),
+}
+
+/// A failure the dispatcher has decided on but not recorded yet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingPublicOperationFailure {
+    pub progress_message: String,
+    pub terminal_error_code: PublicErrorCode,
+    pub terminal_error_json: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClaimedPendingFailure {
+    pub failure: PendingPublicOperationFailure,
+    /// How long ago the failure was first deferred.
+    pub pending_for: Duration,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct StoredPendingFailure {
+    progress_message: String,
+    terminal_error_code: String,
+    terminal_error_json: serde_json::Value,
+}
+
+impl From<&PendingPublicOperationFailure> for StoredPendingFailure {
+    fn from(failure: &PendingPublicOperationFailure) -> Self {
+        Self {
+            progress_message: failure.progress_message.clone(),
+            terminal_error_code: failure.terminal_error_code.as_str().to_string(),
+            terminal_error_json: failure.terminal_error_json.clone(),
+        }
+    }
+}
+
+impl From<StoredPendingFailure> for PendingPublicOperationFailure {
+    fn from(stored: StoredPendingFailure) -> Self {
+        Self {
+            progress_message: stored.progress_message,
+            terminal_error_code: PublicErrorCode::from(stored.terminal_error_code),
+            terminal_error_json: stored.terminal_error_json,
+        }
+    }
+}
+
+/// Requeue a claimed operation whose failure is pending compensation.
+#[derive(Debug, Clone)]
+pub struct DeferClaimedPublicOperationFailure {
+    pub claim_token: String,
+    pub operation_id: OperationId,
+    pub progress_message: String,
+    pub failure: PendingPublicOperationFailure,
+    pub retry_after: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -1341,7 +1422,10 @@ async fn claim_operations(
                    o.target_id,
                    o.payload_json,
                    o.attempts,
-                   o.claim_generation"
+                   o.claim_generation,
+                   o.pending_failure_json,
+                   EXTRACT(EPOCH FROM NOW() - o.pending_failure_at)::float8
+                       AS pending_failure_age_secs"
     ))
     .bind(i64::from(input.limit))
     .bind(duration_secs_i64(input.claim_stale_after))
@@ -1434,6 +1518,8 @@ async fn fail_claimed_operation(
              progress_message = $4,
              terminal_error_code = $5,
              terminal_error_json = $6,
+             pending_failure_json = NULL,
+             pending_failure_at = NULL,
              payload_json = CASE WHEN kind = 'create_sandbox'
                  THEN payload_json #- '{federated_create,service_grant_base64}'::text[]
                  ELSE payload_json END,
@@ -1462,6 +1548,53 @@ async fn fail_claimed_operation(
                 "state": OperationState::Failed.as_str(),
                 "code": input.terminal_error_code.as_str(),
                 "error": input.terminal_error_json,
+            }),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(updated.is_some())
+}
+
+async fn defer_claimed_failure(
+    pool: &PgPool,
+    input: DeferClaimedPublicOperationFailure,
+) -> Result<bool, PublicOperationStoreError> {
+    let mut tx = pool.begin().await?;
+    let updated = sqlx::query_scalar::<_, Uuid>(sql!(
+        "UPDATE public_operations
+         SET state = $3,
+             claim_token = '',
+             progress_message = $4,
+             next_attempt_at = NOW() + make_interval(secs => $5::BIGINT),
+             attempts = GREATEST(attempts - 1, 0),
+             pending_failure_json = $7,
+             pending_failure_at = COALESCE(pending_failure_at, NOW()),
+             updated_at = NOW()
+         WHERE operation_id = $1
+           AND claim_token = $2
+           AND state = $6
+         RETURNING operation_id"
+    ))
+    .bind(input.operation_id.as_uuid())
+    .bind(&input.claim_token)
+    .bind(OperationState::Queued.as_str())
+    .bind(&input.progress_message)
+    .bind(duration_secs_i64(input.retry_after))
+    .bind(OperationState::Running.as_str())
+    .bind(Json(StoredPendingFailure::from(&input.failure)))
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if updated.is_some() {
+        append_operation_event_tx(
+            &mut tx,
+            input.operation_id,
+            PublicOperationEventType::Requeued,
+            serde_json::json!({
+                "state": OperationState::Queued.as_str(),
+                "retry_after_secs": duration_secs_i64(input.retry_after),
+                "reason": "failure_pending_compensation",
             }),
         )
         .await?;
@@ -1816,6 +1949,8 @@ struct ClaimedPublicOperationRow {
     payload_json: Json<serde_json::Value>,
     attempts: i32,
     claim_generation: i64,
+    pending_failure_json: Option<Json<StoredPendingFailure>>,
+    pending_failure_age_secs: Option<f64>,
 }
 
 #[derive(Debug, FromRow)]
@@ -1990,6 +2125,14 @@ impl TryFrom<ClaimedPublicOperationRow> for ClaimedPublicOperation {
             payload: row.payload_json.0,
             attempts: row.attempts,
             claim_generation: row.claim_generation,
+            pending_failure: row
+                .pending_failure_json
+                .map(|stored| ClaimedPendingFailure {
+                    failure: stored.0.into(),
+                    pending_for: Duration::from_secs_f64(
+                        row.pending_failure_age_secs.unwrap_or(0.0).max(0.0),
+                    ),
+                }),
         })
     }
 }

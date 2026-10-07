@@ -294,8 +294,8 @@ fn delete_operation_input(org_id: OrgId, target_id: &str) -> CreatePublicOperati
 }
 
 #[tokio::test]
-async fn other_unfinished_sandbox_operation_ignores_itself_finished_and_other_tenants() -> TestResult
-{
+async fn other_unfinished_sandbox_operation_counts_runtime_owners_and_its_reclaimed_self()
+-> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
@@ -325,33 +325,42 @@ async fn other_unfinished_sandbox_operation_ignores_itself_finished_and_other_te
             }
         }
     };
+    let set_claim = |operation_id: OperationId, state: &'static str, claim_token: &'static str| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query(sql!(
+                "UPDATE public_operations SET state = $2, claim_token = $3
+                  WHERE operation_id = $1"
+            ))
+            .bind(operation_id.as_uuid())
+            .bind(state)
+            .bind(claim_token)
+            .execute(&pool)
+            .await
+        }
+    };
     let exhausted = create(org_id, OperationKind::StartSandbox).await?;
+    set_claim(exhausted, "running", "claim-a").await?;
     create(other_org_id, OperationKind::StartSandbox).await?;
+    create(org_id, OperationKind::UpdateSandbox).await?;
+    create(org_id, OperationKind::PauseSandbox).await?;
+    let unfinished =
+        || store.other_sandbox_operation_unfinished(org_id, &target_id, exhausted, "claim-a");
 
     assert!(
-        !store
-            .other_sandbox_operation_unfinished(org_id, &target_id, exhausted)
-            .await?,
-        "an operation does not wait on itself, nor on another tenant's"
+        !unfinished().await?,
+        "not itself under its own claim, another tenant's, or one that cannot reuse the runtime"
     );
 
     let newer = create(org_id, OperationKind::StartSandbox).await?;
-    assert!(
-        store
-            .other_sandbox_operation_unfinished(org_id, &target_id, exhausted)
-            .await?
-    );
+    assert!(unfinished().await?);
+    set_claim(newer, "failed", "").await?;
+    assert!(!unfinished().await?);
 
-    sqlx::query(sql!(
-        "UPDATE public_operations SET state = 'failed' WHERE operation_id = $1"
-    ))
-    .bind(newer.as_uuid())
-    .execute(&db.pool)
-    .await?;
+    set_claim(exhausted, "running", "claim-b").await?;
     assert!(
-        !store
-            .other_sandbox_operation_unfinished(org_id, &target_id, exhausted)
-            .await?
+        unfinished().await?,
+        "its own operation, re-claimed by another dispatcher, may be starting again"
     );
     Ok(())
 }

@@ -75,3 +75,20 @@ pub fn stale_claim(api_product: &str, kind: &str) {
         &[tag("api_product", api_product), tag("kind", kind)],
     );
 }
+
+/// One attempt to undo what a failed operation left behind before its failure
+/// is recorded. `outcome` is the executor's verdict (for a sandbox start:
+/// `retired`, `nothing_to_retire`, `running_pod_left`, a `deferred_*` reason,
+/// or an error class), or `abandoned` when the dispatcher records the failure
+/// because compensation did not complete within its bound.
+pub fn compensated(api_product: &str, kind: &str, outcome: &str) {
+    counter(
+        "operations.compensated",
+        1,
+        &[
+            tag("api_product", api_product),
+            tag("kind", kind),
+            tag("outcome", outcome),
+        ],
+    );
+}

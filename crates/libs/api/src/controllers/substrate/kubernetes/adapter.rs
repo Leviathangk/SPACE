@@ -2713,7 +2713,9 @@ impl SubstrateAdapter for KubernetesSubstrate {
             // joined start is exactly what this must never do.
             Some(row) if row.activation_lease_live => {
                 return Ok(AbandonedStartRetirement::Deferred(
-                    AbandonedStartDeferral::ActivationLeaseHeld,
+                    AbandonedStartDeferral::ActivationLeaseHeld {
+                        remaining: Duration::ZERO,
+                    },
                 ));
             }
             Some(row) => {
@@ -2766,11 +2768,9 @@ impl SubstrateAdapter for KubernetesSubstrate {
             .await?
         {
             RetireExecutionOutcome::Retired => Ok(AbandonedStartRetirement::Retired),
-            RetireExecutionOutcome::PodIdentityChanged { mismatch, .. } => {
-                Ok(AbandonedStartRetirement::Deferred(
-                    AbandonedStartDeferral::PodIdentityChanged(mismatch),
-                ))
-            }
+            RetireExecutionOutcome::PodIdentityChanged { .. } => Ok(
+                AbandonedStartRetirement::Deferred(AbandonedStartDeferral::PodIdentityChanged),
+            ),
         }
     }
 

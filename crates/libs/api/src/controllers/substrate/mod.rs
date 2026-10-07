@@ -1181,10 +1181,14 @@ pub enum AbandonedStartRetirement {
     /// is not `stopped`, its active execution is the one the stop left, or
     /// there is no runtime object to collect.
     NothingToRetire,
-    /// The abandoned start's execution was retired and its pod deleted, or
-    /// pods recorded only on inactive execution rows were collected.
+    /// The abandoned start's execution was retired, its pods deleted, or both.
     Retired,
-    /// Another activation may own the execution, so it was left alone.
+    /// A pod the abandoned start left has booted (Running, or holding an IP),
+    /// so it was left alone: deleting it would kill a VM on the stopped
+    /// sandbox's disk with no in-VM stop. Retrying cannot change that.
+    RunningPodLeft,
+    /// Another activation may own the execution, or it changed underneath
+    /// this call; nothing was torn down, and a later attempt may succeed.
     Deferred(AbandonedStartDeferral),
 }
 
@@ -1193,10 +1197,11 @@ pub enum AbandonedStartRetirement {
 pub enum AbandonedStartDeferral {
     /// The execution holds a live activation lease. It may be the abandoned
     /// start's own lease or a newer start that joined or replaced it; the
-    /// lease alone cannot tell them apart.
-    ActivationLeaseHeld,
-    /// The execution changed between selection and teardown.
-    PodIdentityChanged(PodFenceMismatch),
+    /// lease alone cannot tell them apart. It expires after `remaining`.
+    ActivationLeaseHeld { remaining: Duration },
+    /// The execution or one of its pods changed between selection and
+    /// teardown.
+    PodIdentityChanged,
 }
 
 impl AbandonedStartRetirement {
@@ -1204,10 +1209,11 @@ impl AbandonedStartRetirement {
         match self {
             Self::NothingToRetire => "nothing_to_retire",
             Self::Retired => "retired",
-            Self::Deferred(AbandonedStartDeferral::ActivationLeaseHeld) => {
+            Self::RunningPodLeft => "running_pod_left",
+            Self::Deferred(AbandonedStartDeferral::ActivationLeaseHeld { .. }) => {
                 "deferred_activation_lease_held"
             }
-            Self::Deferred(AbandonedStartDeferral::PodIdentityChanged(_)) => {
+            Self::Deferred(AbandonedStartDeferral::PodIdentityChanged) => {
                 "deferred_pod_identity_changed"
             }
         }
@@ -2260,16 +2266,20 @@ pub trait SubstrateAdapter: Send + Sync {
     ///
     /// A start materializes a runtime before it can tell whether the sandbox
     /// will boot, and each failed attempt deliberately leaves that runtime for
-    /// the next attempt to reuse. Once the caller has stopped retrying, nothing
-    /// else reuses it, and a runtime left on a `stopped` sandbox can still boot
-    /// a VM the control plane reports as stopped. The caller must have proven
-    /// that no other operation is driving this sandbox.
+    /// the next attempt to reuse. Once the start has failed terminally, for
+    /// any reason, nothing reuses it, and a runtime left on a `stopped`
+    /// sandbox can still boot a VM the control plane reports as stopped. The
+    /// caller must have proven that no other operation is driving this
+    /// sandbox.
     ///
-    /// Only an execution created after the sandbox's current stop is in scope,
-    /// never the one the stop itself left, and the teardown is fenced on the
-    /// identity read here, so a newer start that claims the execution first
-    /// makes this defer rather than tear it down. A substrate with no runtime
-    /// object that outlives a failed start has nothing to retire.
+    /// Only what a start created after the sandbox's current stop is in
+    /// scope, never the execution the stop itself left, and nothing happens
+    /// unless the sandbox is still `stopped`. The execution is retired by a
+    /// guarded write on the identity read here before any pod is deleted, so
+    /// a start that claims it first makes this defer and a start that comes
+    /// later cannot adopt it. No VM is ever stopped here: a booted pod is
+    /// left alone and reported. A substrate with no runtime object that
+    /// outlives a failed start has nothing to retire.
     async fn retire_abandoned_start(
         &self,
         _sandbox_id: SandboxId,

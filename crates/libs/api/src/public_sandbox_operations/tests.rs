@@ -27,6 +27,7 @@ fn claimed_create_operation() -> ClaimedPublicOperation {
         payload: serde_json::json!({}),
         attempts: 1,
         claim_generation: 1,
+        pending_failure: None,
     }
 }
 
@@ -54,6 +55,7 @@ fn claimed_create_operation_for(
         .into_json(),
         attempts: 1,
         claim_generation: 1,
+        pending_failure: None,
     }
 }
 
@@ -628,6 +630,7 @@ async fn create_executor_retries_unpinned_transient_substrate_failure() {
         .into_json(),
         attempts: 1,
         claim_generation: 1,
+        pending_failure: None,
     };
     let controller =
         SandboxController::new(crate::controllers::substrate::Substrate::Direct(Box::new(
@@ -1081,4 +1084,400 @@ async fn admitted_create_re_execution_after_success_does_not_create_again() -> T
         "re-execution must not start another execution"
     );
     Ok(())
+}
+
+/// The executor half of compensating a failed start: which operations it
+/// defers to, what it validates before touching the substrate, and what it
+/// reports for each outcome.
+#[cfg(feature = "kubernetes")]
+mod start_compensation {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use k8s_openapi::api::core::v1::Pod;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    use super::*;
+    use crate::controllers::substrate::kubernetes::tests::{
+        FakePodDelete, StartAttemptLease, abandoned_start_kubernetes_client, deactivate_execution,
+        insert_start_attempt_execution, insert_stopped_sandbox_after_stop,
+        substrate_with_store_client_proxy_port_and_pod,
+    };
+    use crate::public_operations::{CreatePublicOperation, CreatePublicOperationResult};
+
+    /// The org the Kubernetes test sandbox rows belong to.
+    const SANDBOX_ORG: Uuid = Uuid::from_u128(1);
+
+    type CapturedDeletes = Arc<Mutex<Vec<(String, serde_json::Value)>>>;
+
+    /// `(event_type, result)` of every `space.sandbox` event on this thread.
+    #[derive(Clone, Default)]
+    struct EventCapture(Arc<Mutex<Vec<(String, String)>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = pplx_space_observability::test_capture::RecordingVisitor::default();
+            event.record(&mut visitor);
+            let fields = visitor.into_fields();
+            let field = |name| pplx_space_observability::test_capture::field_value(&fields, name);
+            if field("event_stream") == Some("space.sandbox")
+                && let Some(event_type) = field("event_type")
+            {
+                self.0.lock().unwrap().push((
+                    event_type.to_string(),
+                    field("result").unwrap_or_default().to_string(),
+                ));
+            }
+        }
+    }
+
+    struct Subject {
+        executor: SandboxLifecycleOperationExecutor,
+        deletes: CapturedDeletes,
+    }
+
+    /// A stopped sandbox whose start attempt left generation 2 active with a
+    /// pod that never booted, behind an executor on the real Kubernetes
+    /// substrate.
+    async fn abandoned_start(
+        pool: &PgPool,
+        sandbox_id: SandboxId,
+        failing_gets: Vec<String>,
+    ) -> Result<(Subject, Pod), Box<dyn std::error::Error + Send + Sync>> {
+        insert_stopped_sandbox_after_stop(pool, sandbox_id).await?;
+        let pod = insert_start_attempt_execution(pool, sandbox_id, 2, StartAttemptLease::Released)
+            .await?;
+        let deletes: CapturedDeletes = Arc::default();
+        let substrate = crate::controllers::substrate::Substrate::Kubernetes(Box::new(
+            substrate_with_store_client_proxy_port_and_pod(
+                pool.clone(),
+                abandoned_start_kubernetes_client(
+                    vec![pod.clone()],
+                    Arc::clone(&deletes),
+                    FakePodDelete::Accept,
+                    failing_gets,
+                ),
+                0,
+                Some(pod.clone()),
+            ),
+        ));
+        Ok((
+            Subject {
+                executor: SandboxLifecycleOperationExecutor::new(
+                    pool.clone(),
+                    SandboxController::new(substrate),
+                ),
+                deletes,
+            },
+            pod,
+        ))
+    }
+
+    fn claimed_start(sandbox_id: SandboxId, org_id: OrgId) -> ClaimedPublicOperation {
+        let public_sandbox_id = PublicSandboxId::from(sandbox_id);
+        ClaimedPublicOperation {
+            id: OperationId::new(),
+            org_id,
+            actor_user_id: None,
+            api_product: ApiProduct::Native,
+            kind: OperationKind::StartSandbox,
+            target_type: Some(OperationTargetType::Sandbox),
+            target_id: Some(public_sandbox_id.to_string()),
+            payload: SandboxLifecycleOperationPayload {
+                sandbox_id: public_sandbox_id,
+                action: SandboxLifecycleAction::Start,
+                rollback: None,
+            }
+            .into_json(),
+            attempts: 16,
+            claim_generation: 1,
+            pending_failure: None,
+        }
+    }
+
+    async fn queue_operation(
+        pool: &PgPool,
+        sandbox_id: SandboxId,
+        kind: OperationKind,
+    ) -> Result<OperationId, Box<dyn std::error::Error + Send + Sync>> {
+        let target_id = PublicSandboxId::from(sandbox_id).to_string();
+        match crate::public_operations::PublicOperationStore::new(pool.clone())
+            .create_operation(CreatePublicOperation {
+                org_id: OrgId::from_uuid(SANDBOX_ORG),
+                actor_user_id: None,
+                api_product: ApiProduct::Native,
+                kind,
+                target_type: Some(OperationTargetType::Sandbox),
+                target_id: Some(&target_id),
+                payload_json: serde_json::json!({}),
+                idempotency: None,
+            })
+            .await?
+        {
+            CreatePublicOperationResult::Created(id) => Ok(id),
+            other => Err(format!("operation was not created: {other:?}").into()),
+        }
+    }
+
+    async fn active_generations(pool: &PgPool, sandbox_id: SandboxId) -> Vec<i64> {
+        sqlx::query_scalar(sql!(
+            "SELECT generation FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND active"
+        ))
+        .bind(sandbox_id)
+        .fetch_all(pool)
+        .await
+        .expect("active executions are queryable")
+    }
+
+    /// Run one compensation, returning what it told the dispatcher plus the
+    /// sandbox events and `operations.compensated` outcomes it emitted.
+    async fn compensate(
+        subject: &Subject,
+        claim_token: &str,
+        operation: &ClaimedPublicOperation,
+    ) -> (
+        PublicOperationCompensation,
+        Vec<(String, String)>,
+        Vec<String>,
+    ) {
+        let events = EventCapture::default();
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(events.clone()));
+        let metrics = pplx_space_metrics::test_capture::capture_counters_guard();
+        let disposition = subject
+            .executor
+            .compensate_failed_start(claim_token, operation)
+            .await;
+        let outcomes = metrics
+            .finish()
+            .into_iter()
+            .filter(|counter| counter.name == "operations.compensated")
+            .flat_map(|counter| counter.tags)
+            .filter_map(|tag| tag.strip_prefix("outcome:").map(str::to_string))
+            .collect();
+        let events = events.0.lock().unwrap().clone();
+        (disposition, events, outcomes)
+    }
+
+    /// Another operation that can materialize, adopt, or tear down this
+    /// sandbox's runtime may be about to reuse the very pod compensation
+    /// would delete, so compensation waits for it, visibly, without touching
+    /// the substrate.
+    #[tokio::test(flavor = "current_thread")]
+    async fn defers_to_another_operation_that_can_reuse_the_runtime() -> TestResult {
+        let db = pg_test_db().await?;
+        for kind in [
+            OperationKind::StartSandbox,
+            OperationKind::WakeSandbox,
+            OperationKind::RestoreSandbox,
+            OperationKind::StopSandbox,
+            OperationKind::DeleteSandbox,
+        ] {
+            let sandbox_id = SandboxId::new();
+            let (subject, _) = abandoned_start(&db.pool, sandbox_id, Vec::new()).await?;
+            queue_operation(&db.pool, sandbox_id, kind).await?;
+
+            let (disposition, events, outcomes) = compensate(
+                &subject,
+                "claim",
+                &claimed_start(sandbox_id, OrgId::from_uuid(SANDBOX_ORG)),
+            )
+            .await;
+
+            assert!(
+                matches!(disposition, PublicOperationCompensation::RetryAfter(_)),
+                "{kind}: {disposition:?}"
+            );
+            assert!(subject.deletes.lock().unwrap().is_empty(), "{kind}");
+            assert_eq!(active_generations(&db.pool, sandbox_id).await, vec![2]);
+            assert_eq!(
+                events,
+                vec![(
+                    "sweep_deferred".to_string(),
+                    "deferred_other_operation_in_flight".to_string()
+                )],
+                "{kind}"
+            );
+            assert_eq!(outcomes, vec!["deferred_other_operation_in_flight"]);
+        }
+        Ok(())
+    }
+
+    /// An operation that neither runs nor reuses the runtime does not hold
+    /// compensation back.
+    #[tokio::test(flavor = "current_thread")]
+    async fn proceeds_past_operations_that_cannot_reuse_the_runtime() -> TestResult {
+        let db = pg_test_db().await?;
+        let sandbox_id = SandboxId::new();
+        let (subject, pod) = abandoned_start(&db.pool, sandbox_id, Vec::new()).await?;
+        queue_operation(&db.pool, sandbox_id, OperationKind::UpdateSandbox).await?;
+        queue_operation(&db.pool, sandbox_id, OperationKind::EnableSandboxSnapshots).await?;
+
+        let (disposition, events, outcomes) = compensate(
+            &subject,
+            "claim",
+            &claimed_start(sandbox_id, OrgId::from_uuid(SANDBOX_ORG)),
+        )
+        .await;
+
+        assert_eq!(disposition, PublicOperationCompensation::Complete);
+        assert!(
+            subject
+                .deletes
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(name, _)| Some(name.as_str()) == pod.metadata.name.as_deref())
+        );
+        assert!(active_generations(&db.pool, sandbox_id).await.is_empty());
+        assert_eq!(
+            events,
+            vec![("cleanup_completed".to_string(), "retired".to_string())]
+        );
+        assert_eq!(outcomes, vec!["retired"]);
+        Ok(())
+    }
+
+    /// If this operation's claim went stale and another dispatcher re-claimed
+    /// it, that dispatcher may be running a fresh start attempt on the same
+    /// generation. The stale holder sees its own operation under another
+    /// claim and defers.
+    #[tokio::test(flavor = "current_thread")]
+    async fn defers_to_its_own_operation_reclaimed_by_another_dispatcher() -> TestResult {
+        let db = pg_test_db().await?;
+        let sandbox_id = SandboxId::new();
+        let (subject, _) = abandoned_start(&db.pool, sandbox_id, Vec::new()).await?;
+        let operation_id =
+            queue_operation(&db.pool, sandbox_id, OperationKind::StartSandbox).await?;
+        sqlx::query(sql!(
+            "UPDATE public_operations
+                SET state = 'running', claim_token = 'fresh-claim'
+              WHERE operation_id = $1"
+        ))
+        .bind(operation_id.as_uuid())
+        .execute(&db.pool)
+        .await?;
+        let mut operation = claimed_start(sandbox_id, OrgId::from_uuid(SANDBOX_ORG));
+        operation.id = operation_id;
+
+        let (stale, _, _) = compensate(&subject, "stale-claim", &operation).await;
+        assert!(matches!(stale, PublicOperationCompensation::RetryAfter(_)));
+        assert!(subject.deletes.lock().unwrap().is_empty());
+
+        let (current, _, _) = compensate(&subject, "fresh-claim", &operation).await;
+        assert_eq!(current, PublicOperationCompensation::Complete);
+        assert!(active_generations(&db.pool, sandbox_id).await.is_empty());
+        Ok(())
+    }
+
+    /// An operation that does not describe a start of a sandbox it may act
+    /// on reaches nothing: retrying cannot make it valid, so compensation
+    /// completes without calling the substrate.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejects_an_invalid_operation_before_the_substrate() -> TestResult {
+        let db = pg_test_db().await?;
+        let sandbox_id = SandboxId::new();
+        let (subject, _) = abandoned_start(&db.pool, sandbox_id, Vec::new()).await?;
+        let org_id = OrgId::from_uuid(SANDBOX_ORG);
+        let mut wrong_action = claimed_start(sandbox_id, org_id);
+        wrong_action.payload["action"] = serde_json::json!("stop");
+        let mut wrong_target = claimed_start(sandbox_id, org_id);
+        wrong_target.target_id = Some(PublicSandboxId::from(SandboxId::new()).to_string());
+        let mut malformed = claimed_start(sandbox_id, org_id);
+        malformed.payload = serde_json::json!({"sandbox_id": 7});
+        let other_tenant = claimed_start(sandbox_id, OrgId::new());
+
+        for operation in [wrong_action, wrong_target, malformed, other_tenant] {
+            let (disposition, _, outcomes) = compensate(&subject, "claim", &operation).await;
+            assert_eq!(disposition, PublicOperationCompensation::Complete);
+            assert_eq!(outcomes, vec!["invalid_operation"]);
+        }
+        assert!(subject.deletes.lock().unwrap().is_empty());
+        assert_eq!(active_generations(&db.pool, sandbox_id).await, vec![2]);
+        Ok(())
+    }
+
+    /// A transient failure (here the apiserver answering 500 to the pod
+    /// read) is retried, and reported each time so a stuck leftover shows up.
+    #[tokio::test(flavor = "current_thread")]
+    async fn retries_a_transient_substrate_error() -> TestResult {
+        let db = pg_test_db().await?;
+        let sandbox_id = SandboxId::new();
+        let pod_name = format!("space-sbx-{}-g2", sandbox_id.as_uuid().simple());
+        let (subject, _) = abandoned_start(&db.pool, sandbox_id, vec![pod_name]).await?;
+
+        let (disposition, events, outcomes) = compensate(
+            &subject,
+            "claim",
+            &claimed_start(sandbox_id, OrgId::from_uuid(SANDBOX_ORG)),
+        )
+        .await;
+
+        assert!(matches!(
+            disposition,
+            PublicOperationCompensation::RetryAfter(_)
+        ));
+        assert_eq!(
+            events,
+            vec![("cleanup_failed".to_string(), "error".to_string())]
+        );
+        assert_eq!(outcomes, vec!["error"]);
+        assert_eq!(active_generations(&db.pool, sandbox_id).await, vec![2]);
+        Ok(())
+    }
+
+    /// A pod that already booted is left alone and reported loudly; retrying
+    /// cannot change that, so the failure is recorded.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reports_a_booted_pod_it_must_leave() -> TestResult {
+        let db = pg_test_db().await?;
+        let sandbox_id = SandboxId::new();
+        insert_stopped_sandbox_after_stop(&db.pool, sandbox_id).await?;
+        let pod = crate::controllers::substrate::kubernetes::tests::booted(
+            insert_start_attempt_execution(&db.pool, sandbox_id, 2, StartAttemptLease::Released)
+                .await?,
+        );
+        deactivate_execution(&db.pool, sandbox_id, 2).await?;
+        let deletes: CapturedDeletes = Arc::default();
+        let subject = Subject {
+            executor: SandboxLifecycleOperationExecutor::new(
+                db.pool.clone(),
+                SandboxController::new(crate::controllers::substrate::Substrate::Kubernetes(
+                    Box::new(substrate_with_store_client_proxy_port_and_pod(
+                        db.pool.clone(),
+                        abandoned_start_kubernetes_client(
+                            vec![pod.clone()],
+                            Arc::clone(&deletes),
+                            FakePodDelete::Accept,
+                            Vec::new(),
+                        ),
+                        0,
+                        Some(pod),
+                    )),
+                )),
+            ),
+            deletes,
+        };
+
+        let (disposition, events, outcomes) = compensate(
+            &subject,
+            "claim",
+            &claimed_start(sandbox_id, OrgId::from_uuid(SANDBOX_ORG)),
+        )
+        .await;
+
+        assert_eq!(disposition, PublicOperationCompensation::Complete);
+        assert!(subject.deletes.lock().unwrap().is_empty());
+        assert_eq!(
+            events,
+            vec![("cleanup_failed".to_string(), "running_pod_left".to_string())]
+        );
+        assert_eq!(outcomes, vec!["running_pod_left"]);
+        let _ = Duration::ZERO;
+        Ok(())
+    }
 }

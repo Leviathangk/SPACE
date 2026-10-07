@@ -11,11 +11,13 @@ use super::support::*;
 use super::*;
 
 pub(crate) use kubernetes_tests::{
-    existing_then_created_running_pod_kubernetes_client,
-    insert_ready_full_snapshot_relative_to_lifecycle, mock_kubernetes_client,
-    running_pod_kubernetes_client, running_pod_kubernetes_client_with_create_barrier,
-    substrate_with_inventory_caches_and_pool, substrate_with_store,
-    substrate_with_store_and_client, substrate_with_store_client_proxy_port_and_pod,
+    FakePodDelete, StartAttemptLease, abandoned_start_kubernetes_client, booted,
+    deactivate_execution, existing_then_created_running_pod_kubernetes_client,
+    insert_ready_full_snapshot_relative_to_lifecycle, insert_start_attempt_execution,
+    insert_stopped_sandbox_after_stop, mock_kubernetes_client, running_pod_kubernetes_client,
+    running_pod_kubernetes_client_with_create_barrier, substrate_with_inventory_caches_and_pool,
+    substrate_with_store, substrate_with_store_and_client,
+    substrate_with_store_client_proxy_port_and_pod,
 };
 
 mod kubernetes_tests {
@@ -14414,18 +14416,25 @@ mod kubernetes_tests {
     }
 
     /// A `stopped` sandbox whose stop retired generation 1 a minute ago, as
-    /// every start attempt since then found it.
-    async fn insert_stopped_sandbox_after_stop(
+    /// every start attempt since then found it. The rollback of a failed cold
+    /// activation leaves the sandbox unplaced but keeps the node its stopped
+    /// disk lives on as `target_node_id`, and the attempt's pod set
+    /// `active_node_id`.
+    pub(crate) async fn insert_stopped_sandbox_after_stop(
         pool: &PgPool,
         sandbox_id: SandboxId,
     ) -> Result<(), BoxError> {
         insert_test_sandbox_row(pool, sandbox_id, "stopped").await?;
         sqlx::query(sql!(
             "UPDATE sandboxes
-                SET lifecycle_changed_at = NOW() - INTERVAL '1 minute'
+                SET lifecycle_changed_at = NOW() - INTERVAL '1 minute',
+                    target_node_id = $2,
+                    active_node_id = $3
               WHERE id = $1"
         ))
         .bind(sandbox_id)
+        .bind(ABANDONED_START_SOURCE_NODE)
+        .bind(ABANDONED_START_ATTEMPT_NODE)
         .execute(pool)
         .await?;
         insert_k8s_execution(
@@ -14449,33 +14458,49 @@ mod kubernetes_tests {
         Ok(())
     }
 
+    const ABANDONED_START_SOURCE_NODE: Uuid = Uuid::from_u128(0x0a);
+    const ABANDONED_START_ATTEMPT_NODE: Uuid = Uuid::from_u128(0x0b);
+
+    /// How the start attempt's activation lease looks when compensation runs.
+    #[derive(Clone, Copy)]
+    pub(crate) enum StartAttemptLease {
+        Released,
+        Live,
+        Expired,
+    }
+
     /// An execution a start created after the stop, with a scheduled pod
     /// that never got an IP: kubelet is still retrying its sandbox creation.
-    async fn insert_start_attempt_execution(
+    pub(crate) async fn insert_start_attempt_execution(
         pool: &PgPool,
         sandbox_id: SandboxId,
         generation: i64,
-        live_lease: bool,
+        lease: StartAttemptLease,
     ) -> Result<Pod, BoxError> {
         let pod_name = format!("space-sbx-{}-g{generation}", sandbox_id.as_uuid().simple());
         let pod_uid = format!("uid-start-g{generation}");
         let attempt_id = SandboxActivationAttemptId::new();
+        let lease_expires_in_secs: Option<i64> = match lease {
+            StartAttemptLease::Released => None,
+            StartAttemptLease::Live => Some(300),
+            StartAttemptLease::Expired => Some(-30),
+        };
         sqlx::query(sql!(
             "INSERT INTO sandbox_k8s_executions
                  (sandbox_id, generation, pod_name, pod_namespace, pod_uid, state, active,
                   route_activation_id, activation_attempt_id, activation_attempt_expires_at,
                   activation_attempt_target_state)
              VALUES ($1, $2, $3, 'space', $4, 'created', TRUE, $5,
-                     CASE WHEN $6 THEN $5 END,
-                     CASE WHEN $6 THEN NOW() + INTERVAL '5 minutes' END,
-                     CASE WHEN $6 THEN 'started' END)"
+                     CASE WHEN $6::BIGINT IS NOT NULL THEN $5 END,
+                     NOW() + make_interval(secs => $6::BIGINT),
+                     CASE WHEN $6::BIGINT IS NOT NULL THEN 'started' END)"
         ))
         .bind(sandbox_id)
         .bind(generation)
         .bind(&pod_name)
         .bind(&pod_uid)
         .bind(attempt_id)
-        .bind(live_lease)
+        .bind(lease_expires_in_secs)
         .execute(pool)
         .await?;
         Ok(Pod {
@@ -14486,12 +14511,169 @@ mod kubernetes_tests {
                 resource_version: Some("17".to_string()),
                 ..Default::default()
             },
-            status: Some(PodStatus {
+            status: Some(K8sPodStatus {
                 phase: Some("Pending".to_string()),
                 ..Default::default()
             }),
             ..Default::default()
         })
+    }
+
+    pub(crate) fn booted(mut pod: Pod) -> Pod {
+        pod.status = Some(K8sPodStatus {
+            phase: Some("Running".to_string()),
+            pod_ip: Some("127.0.0.1".to_string()),
+            ..Default::default()
+        });
+        pod
+    }
+
+    pub(crate) async fn deactivate_execution(
+        pool: &PgPool,
+        sandbox_id: SandboxId,
+        generation: i64,
+    ) -> Result<(), BoxError> {
+        sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions SET active = FALSE, state = 'replaced'
+              WHERE sandbox_id = $1 AND generation = $2"
+        ))
+        .bind(sandbox_id)
+        .bind(generation)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// What the fake apiserver answers to a pod `DELETE`.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum FakePodDelete {
+        Accept,
+        /// The preconditions no longer match: the pod changed since it was read.
+        Conflict,
+    }
+
+    /// A kube client that answers pod GETs from `pods` (404 for any other
+    /// name), records every pod DELETE with its body, and answers it as
+    /// `delete` says. A GET to a name in `failing_gets` answers 500.
+    pub(crate) fn abandoned_start_kubernetes_client(
+        pods: Vec<Pod>,
+        captured_deletes: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+        delete: FakePodDelete,
+        failing_gets: Vec<String>,
+    ) -> Client {
+        let pods = Arc::new(pods);
+        let failing_gets = Arc::new(failing_gets);
+        let service = tower::service_fn(move |req: Request<Body>| {
+            let captured_deletes = Arc::clone(&captured_deletes);
+            let pods = Arc::clone(&pods);
+            let failing_gets = Arc::clone(&failing_gets);
+            async move {
+                let method = req.method().clone();
+                let path = req.uri().path().to_string();
+                let status_body = |status: StatusCode, reason: &str| {
+                    serde_json::json!({
+                        "kind": "Status",
+                        "apiVersion": "v1",
+                        "status": if status.is_success() { "Success" } else { "Failure" },
+                        "reason": reason,
+                        "code": status.as_u16(),
+                    })
+                };
+                let respond = |status: StatusCode, body: serde_json::Value| {
+                    Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&body)?))
+                        .map_err(BoxError::from)
+                };
+                let Some(pod_name) = path
+                    .strip_prefix("/api/v1/namespaces/space/pods/")
+                    .map(str::to_string)
+                else {
+                    return respond(
+                        StatusCode::BAD_REQUEST,
+                        status_body(StatusCode::BAD_REQUEST, "BadRequest"),
+                    );
+                };
+                if method == Method::GET {
+                    if failing_gets.contains(&pod_name) {
+                        return respond(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            status_body(StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
+                        );
+                    }
+                    return match pods
+                        .iter()
+                        .find(|pod| pod.metadata.name.as_deref() == Some(pod_name.as_str()))
+                    {
+                        Some(pod) => respond(StatusCode::OK, serde_json::to_value(pod)?),
+                        None => respond(
+                            StatusCode::NOT_FOUND,
+                            status_body(StatusCode::NOT_FOUND, "NotFound"),
+                        ),
+                    };
+                }
+                if method == Method::DELETE {
+                    let body = req.into_body().collect().await?.to_bytes();
+                    let options: serde_json::Value = if body.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::from_slice(&body)?
+                    };
+                    captured_deletes
+                        .lock()
+                        .expect("capture mutex poisoned")
+                        .push((pod_name, options));
+                    return match delete {
+                        FakePodDelete::Accept => {
+                            respond(StatusCode::OK, status_body(StatusCode::OK, ""))
+                        }
+                        FakePodDelete::Conflict => respond(
+                            StatusCode::CONFLICT,
+                            status_body(StatusCode::CONFLICT, "Conflict"),
+                        ),
+                    };
+                }
+                respond(
+                    StatusCode::BAD_REQUEST,
+                    status_body(StatusCode::BAD_REQUEST, "BadRequest"),
+                )
+            }
+        });
+        ClientBuilder::new(service, "space").build()
+    }
+
+    fn abandoned_start_subject(
+        pool: &PgPool,
+        pods: Vec<Pod>,
+        delete: FakePodDelete,
+    ) -> (
+        KubernetesSubstrate,
+        Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    ) {
+        let captured_deletes = Arc::new(Mutex::new(Vec::new()));
+        let cached = pods.first().cloned();
+        let substrate = substrate_with_store_client_proxy_port_and_pod(
+            pool.clone(),
+            abandoned_start_kubernetes_client(
+                pods,
+                Arc::clone(&captured_deletes),
+                delete,
+                Vec::new(),
+            ),
+            DEFAULT_SANDBOX_PROXY_PORT,
+            cached,
+        );
+        (substrate, captured_deletes)
+    }
+
+    fn deleted_pod_names(captured: &Arc<Mutex<Vec<(String, serde_json::Value)>>>) -> Vec<String> {
+        captured
+            .lock()
+            .expect("capture mutex poisoned")
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     async fn sandbox_lifecycle(pool: &PgPool, sandbox_id: SandboxId) -> String {
@@ -14502,24 +14684,34 @@ mod kubernetes_tests {
             .expect("sandbox lifecycle must be queryable")
     }
 
+    async fn sandbox_node_ids(
+        pool: &PgPool,
+        sandbox_id: SandboxId,
+    ) -> (Option<Uuid>, Option<Uuid>) {
+        sqlx::query_as(sql!(
+            "SELECT target_node_id, active_node_id FROM sandboxes WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(pool)
+        .await
+        .expect("sandbox placement must be queryable")
+    }
+
     /// The pod an exhausted start left is deleted under the identity of the
     /// attempt that made it, and its execution is retired, so the `stopped`
     /// sandbox has no runtime left to boot behind the control plane's back.
+    /// The node holding the stopped disk stays the restart target.
     #[tokio::test(flavor = "current_thread")]
     async fn abandoned_start_retires_the_failed_attempts_pod() -> Result<(), BoxError> {
         let db = pplx_space_db_test_fixtures::pg_test_db().await?;
         let pool = db.pool.clone();
         let sandbox_id = SandboxId::new();
         insert_stopped_sandbox_after_stop(&pool, sandbox_id).await?;
-        let pod = insert_start_attempt_execution(&pool, sandbox_id, 2, false).await?;
+        let pod = insert_start_attempt_execution(&pool, sandbox_id, 2, StartAttemptLease::Released)
+            .await?;
         let pod_name = pod.metadata.name.clone().expect("pod has a name");
-        let captured_deletes = Arc::new(Mutex::new(Vec::new()));
-        let substrate = substrate_with_store_client_proxy_port_and_pod(
-            pool.clone(),
-            delete_capturing_kubernetes_client(Arc::clone(&captured_deletes), Some(pod.clone())),
-            DEFAULT_SANDBOX_PROXY_PORT,
-            Some(pod),
-        );
+        let (substrate, captured_deletes) =
+            abandoned_start_subject(&pool, vec![pod], FakePodDelete::Accept);
 
         let outcome = substrate.retire_abandoned_start(sandbox_id).await?;
 
@@ -14540,6 +14732,39 @@ mod kubernetes_tests {
                 .is_empty()
         );
         assert_eq!(sandbox_lifecycle(&pool, sandbox_id).await, "stopped");
+        assert_eq!(
+            sandbox_node_ids(&pool, sandbox_id).await,
+            (Some(ABANDONED_START_SOURCE_NODE), None),
+            "the attempt's node is forgotten; the stopped disk's node is kept"
+        );
+        Ok(())
+    }
+
+    /// An attempt whose lease ran out still names that attempt on the row.
+    /// It no longer protects anything, and the retire fences on it, so a
+    /// start that replaces it in the meantime still makes the retire refuse.
+    #[tokio::test(flavor = "current_thread")]
+    async fn abandoned_start_retires_through_an_expired_activation_attempt() -> Result<(), BoxError>
+    {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        insert_stopped_sandbox_after_stop(&pool, sandbox_id).await?;
+        let pod = insert_start_attempt_execution(&pool, sandbox_id, 2, StartAttemptLease::Expired)
+            .await?;
+        let pod_name = pod.metadata.name.clone().expect("pod has a name");
+        let (substrate, captured_deletes) =
+            abandoned_start_subject(&pool, vec![pod], FakePodDelete::Accept);
+
+        let outcome = substrate.retire_abandoned_start(sandbox_id).await?;
+
+        assert_eq!(outcome, AbandonedStartRetirement::Retired);
+        assert!(deleted_pod_names(&captured_deletes).contains(&pod_name));
+        assert!(
+            active_execution_generations(&pool, sandbox_id)
+                .await
+                .is_empty()
+        );
         Ok(())
     }
 
@@ -14552,35 +14777,25 @@ mod kubernetes_tests {
         let pool = db.pool.clone();
         let sandbox_id = SandboxId::new();
         insert_stopped_sandbox_after_stop(&pool, sandbox_id).await?;
-        insert_start_attempt_execution(&pool, sandbox_id, 2, false).await?;
-        sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions SET active = FALSE
-              WHERE sandbox_id = $1 AND generation = 2"
-        ))
-        .bind(sandbox_id)
-        .execute(&pool)
-        .await?;
-        let newer = insert_start_attempt_execution(&pool, sandbox_id, 3, true).await?;
-        let captured_deletes = Arc::new(Mutex::new(Vec::new()));
-        let substrate = substrate_with_store_client_proxy_port_and_pod(
-            pool.clone(),
-            delete_capturing_kubernetes_client(Arc::clone(&captured_deletes), Some(newer.clone())),
-            DEFAULT_SANDBOX_PROXY_PORT,
-            Some(newer),
-        );
+        let abandoned =
+            insert_start_attempt_execution(&pool, sandbox_id, 2, StartAttemptLease::Released)
+                .await?;
+        deactivate_execution(&pool, sandbox_id, 2).await?;
+        let newer =
+            insert_start_attempt_execution(&pool, sandbox_id, 3, StartAttemptLease::Live).await?;
+        let (substrate, captured_deletes) =
+            abandoned_start_subject(&pool, vec![newer, abandoned], FakePodDelete::Accept);
 
         let outcome = substrate.retire_abandoned_start(sandbox_id).await?;
 
-        assert_eq!(
-            outcome,
-            AbandonedStartRetirement::Deferred(AbandonedStartDeferral::ActivationLeaseHeld)
-        );
-        assert!(
-            captured_deletes
-                .lock()
-                .expect("capture mutex poisoned")
-                .is_empty()
-        );
+        let AbandonedStartRetirement::Deferred(AbandonedStartDeferral::ActivationLeaseHeld {
+            remaining,
+        }) = outcome
+        else {
+            panic!("expected a lease deferral, got {outcome:?}");
+        };
+        assert!(remaining > Duration::from_secs(200), "{remaining:?}");
+        assert!(deleted_pod_names(&captured_deletes).is_empty());
         assert_eq!(
             active_execution_generations(&pool, sandbox_id).await,
             vec![3]
@@ -14604,23 +14819,13 @@ mod kubernetes_tests {
         .bind(sandbox_id)
         .execute(&pool)
         .await?;
-        let captured_deletes = Arc::new(Mutex::new(Vec::new()));
-        let substrate = substrate_with_store_client_proxy_port_and_pod(
-            pool.clone(),
-            delete_capturing_kubernetes_client(Arc::clone(&captured_deletes), None),
-            DEFAULT_SANDBOX_PROXY_PORT,
-            None,
-        );
+        let (substrate, captured_deletes) =
+            abandoned_start_subject(&pool, Vec::new(), FakePodDelete::Accept);
 
         let outcome = substrate.retire_abandoned_start(sandbox_id).await?;
 
         assert_eq!(outcome, AbandonedStartRetirement::NothingToRetire);
-        assert!(
-            captured_deletes
-                .lock()
-                .expect("capture mutex poisoned")
-                .is_empty()
-        );
+        assert!(deleted_pod_names(&captured_deletes).is_empty());
         assert_eq!(
             active_execution_generations(&pool, sandbox_id).await,
             vec![1]
@@ -14640,35 +14845,169 @@ mod kubernetes_tests {
         let pool = db.pool.clone();
         let sandbox_id = SandboxId::new();
         insert_stopped_sandbox_after_stop(&pool, sandbox_id).await?;
-        let pod = insert_start_attempt_execution(&pool, sandbox_id, 2, true).await?;
+        let pod =
+            insert_start_attempt_execution(&pool, sandbox_id, 2, StartAttemptLease::Live).await?;
         let pod_name = pod.metadata.name.clone().expect("pod has a name");
-        sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions SET active = FALSE
-              WHERE sandbox_id = $1 AND generation = 2"
-        ))
-        .bind(sandbox_id)
-        .execute(&pool)
-        .await?;
-        let captured_deletes = Arc::new(Mutex::new(Vec::new()));
-        let substrate = substrate_with_store_client_proxy_port_and_pod(
-            pool.clone(),
-            delete_capturing_kubernetes_client(Arc::clone(&captured_deletes), Some(pod.clone())),
-            DEFAULT_SANDBOX_PROXY_PORT,
-            Some(pod),
-        );
+        deactivate_execution(&pool, sandbox_id, 2).await?;
+        let (substrate, captured_deletes) =
+            abandoned_start_subject(&pool, vec![pod], FakePodDelete::Accept);
 
         let outcome = substrate.retire_abandoned_start(sandbox_id).await?;
 
         assert_eq!(outcome, AbandonedStartRetirement::Retired);
-        assert!(
-            captured_deletes
-                .lock()
-                .expect("capture mutex poisoned")
-                .iter()
-                .any(|(name, _)| *name == pod_name),
-            "the leftover pod is deleted"
+        let deletes = captured_deletes
+            .lock()
+            .expect("capture mutex poisoned")
+            .clone();
+        let (_, options) = deletes
+            .iter()
+            .find(|(name, _)| *name == pod_name)
+            .expect("the leftover pod is deleted");
+        assert_eq!(
+            options["preconditions"]["uid"], "uid-start-g2",
+            "deleted only as the object that was read"
         );
         assert_eq!(sandbox_lifecycle(&pool, sandbox_id).await, "stopped");
+        assert_eq!(
+            sandbox_node_ids(&pool, sandbox_id).await.0,
+            Some(ABANDONED_START_SOURCE_NODE)
+        );
+        Ok(())
+    }
+
+    /// A pod that booted is a VM running on the stopped sandbox's disk.
+    /// Deleting it would kill that VM with no in-VM stop, so it is left alone
+    /// and reported, and no stop is attempted either: a newer start could
+    /// adopt the same generation between any check and that stop.
+    #[tokio::test(flavor = "current_thread")]
+    async fn abandoned_start_leaves_a_booted_pod_on_the_active_execution() -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        insert_stopped_sandbox_after_stop(&pool, sandbox_id).await?;
+        let pod = booted(
+            insert_start_attempt_execution(&pool, sandbox_id, 2, StartAttemptLease::Released)
+                .await?,
+        );
+        // Any in-VM stop would have to dial this pod; nothing listens there.
+        let (substrate, captured_deletes) =
+            abandoned_start_subject(&pool, vec![pod], FakePodDelete::Accept);
+
+        let outcome = substrate.retire_abandoned_start(sandbox_id).await?;
+
+        assert_eq!(outcome, AbandonedStartRetirement::RunningPodLeft);
+        assert!(deleted_pod_names(&captured_deletes).is_empty());
+        assert_eq!(
+            active_execution_generations(&pool, sandbox_id).await,
+            vec![2]
+        );
+        Ok(())
+    }
+
+    /// The same holds for a booted pod recorded only on an inactive row: the
+    /// pods that did not boot are still collected around it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn abandoned_start_never_deletes_a_booted_pod_on_an_inactive_execution()
+    -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        insert_stopped_sandbox_after_stop(&pool, sandbox_id).await?;
+        let pending =
+            insert_start_attempt_execution(&pool, sandbox_id, 2, StartAttemptLease::Released)
+                .await?;
+        let running = booted(
+            insert_start_attempt_execution(&pool, sandbox_id, 3, StartAttemptLease::Released)
+                .await?,
+        );
+        let pending_name = pending.metadata.name.clone().expect("pod has a name");
+        deactivate_execution(&pool, sandbox_id, 2).await?;
+        deactivate_execution(&pool, sandbox_id, 3).await?;
+        let (substrate, captured_deletes) =
+            abandoned_start_subject(&pool, vec![running, pending], FakePodDelete::Accept);
+
+        let outcome = substrate.retire_abandoned_start(sandbox_id).await?;
+
+        assert_eq!(outcome, AbandonedStartRetirement::RunningPodLeft);
+        assert_eq!(deleted_pod_names(&captured_deletes), vec![pending_name]);
+        Ok(())
+    }
+
+    /// The pod's UID and resourceVersion ride on its delete. A 409 means it
+    /// changed after it was read (a Pending pod coming up is the canonical
+    /// case), so the retire defers instead of deleting what it did not see.
+    #[tokio::test(flavor = "current_thread")]
+    async fn abandoned_start_defers_when_a_pod_changes_before_its_delete() -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        insert_stopped_sandbox_after_stop(&pool, sandbox_id).await?;
+        let pod = insert_start_attempt_execution(&pool, sandbox_id, 2, StartAttemptLease::Released)
+            .await?;
+        deactivate_execution(&pool, sandbox_id, 2).await?;
+        let (substrate, _captured_deletes) =
+            abandoned_start_subject(&pool, vec![pod], FakePodDelete::Conflict);
+
+        let outcome = substrate.retire_abandoned_start(sandbox_id).await?;
+
+        assert_eq!(
+            outcome,
+            AbandonedStartRetirement::Deferred(AbandonedStartDeferral::PodIdentityChanged)
+        );
+        Ok(())
+    }
+
+    /// The retire's database half re-proves, under the sandbox lock, both
+    /// that the sandbox is still `stopped` and what it expects to retire. A
+    /// successor that appeared since the selection, or a lifecycle change,
+    /// makes it refuse and leaves the row exactly as it was.
+    #[tokio::test(flavor = "current_thread")]
+    async fn abandoned_start_retire_reproves_its_selection_under_the_lock() -> Result<(), BoxError>
+    {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        insert_stopped_sandbox_after_stop(&pool, sandbox_id).await?;
+        insert_start_attempt_execution(&pool, sandbox_id, 2, StartAttemptLease::Released).await?;
+        let (substrate, _) = abandoned_start_subject(&pool, Vec::new(), FakePodDelete::Accept);
+
+        // Selected with no active execution; a successor exists by now.
+        assert!(
+            !substrate
+                .store
+                .retire_abandoned_start_execution(sandbox_id, None)
+                .await?
+        );
+        assert_eq!(
+            active_execution_generations(&pool, sandbox_id).await,
+            vec![2]
+        );
+        assert_eq!(
+            sandbox_node_ids(&pool, sandbox_id).await,
+            (
+                Some(ABANDONED_START_SOURCE_NODE),
+                Some(ABANDONED_START_ATTEMPT_NODE)
+            )
+        );
+
+        deactivate_execution(&pool, sandbox_id, 2).await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET lifecycle = 'starting' WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .execute(&pool)
+        .await?;
+        assert!(
+            !substrate
+                .store
+                .retire_abandoned_start_execution(sandbox_id, None)
+                .await?,
+            "a sandbox that left `stopped` belongs to whatever moved it"
+        );
+        assert_eq!(
+            sandbox_node_ids(&pool, sandbox_id).await.1,
+            Some(ABANDONED_START_ATTEMPT_NODE)
+        );
         Ok(())
     }
 

@@ -7,8 +7,8 @@ use pplx_space_api::controllers::substrate::Substrate;
 use pplx_space_api::fork_operation_executor::ForkSandboxOperationExecutor;
 use pplx_space_api::public_operations::{
     ApiProduct, ClaimPublicOperations, ClaimedPublicOperation, CompleteClaimedPublicOperation,
-    FailClaimedPublicOperation, PublicOperationClaim, PublicOperationRequeueReason,
-    PublicOperationStore, ReleaseClaimedPublicOperation,
+    FailClaimedPublicOperation, PublicOperationClaim, PublicOperationCompensation,
+    PublicOperationRequeueReason, PublicOperationStore, ReleaseClaimedPublicOperation,
 };
 use pplx_space_api::public_sandbox_operations::{
     CreateSandboxOperationExecutor, PublicOperationExecutionResult,
@@ -160,14 +160,15 @@ pub trait PublicOperationExecutor: Send + Sync + 'static {
         operation: ClaimedPublicOperation,
     ) -> OperationExecutionResult;
 
-    /// Undo what the operation's retried attempts left behind, once the
-    /// dispatcher has stopped retrying it.
-    ///
-    /// Called once, after the last attempt asked for another retry and the
-    /// retry budget is exhausted, while the claim is still held and before the
-    /// failure is recorded. A failure here is the executor's to report: the
-    /// operation fails either way, because the budget is spent.
-    async fn compensate_exhausted(&self, _operation: &ClaimedPublicOperation) {}
+    /// Undo what the operation's attempts left behind, once the dispatcher
+    /// has decided the operation failed.
+    async fn compensate_failure(
+        &self,
+        _claim_token: &str,
+        _operation: &ClaimedPublicOperation,
+    ) -> PublicOperationCompensation {
+        PublicOperationCompensation::Complete
+    }
 }
 
 #[derive(Clone)]
@@ -326,13 +327,19 @@ impl PublicOperationExecutor for NativePublicOperationExecutor {
         }
     }
 
-    async fn compensate_exhausted(&self, operation: &ClaimedPublicOperation) {
+    async fn compensate_failure(
+        &self,
+        claim_token: &str,
+        operation: &ClaimedPublicOperation,
+    ) -> PublicOperationCompensation {
         // A start is the operation whose attempts each leave a runtime for
         // the next one to reuse; once none is coming, that runtime is orphaned.
         if operation.kind == OperationKind::StartSandbox {
             self.sandbox_lifecycle
-                .compensate_exhausted_start(operation)
-                .await;
+                .compensate_failed_start(claim_token, operation)
+                .await
+        } else {
+            PublicOperationCompensation::Complete
         }
     }
 }
@@ -722,7 +729,7 @@ where
                     &claim_token,
                     &operation,
                     config.claim_stale_after,
-                    executor.compensate_exhausted(&operation),
+                    executor.compensate_failure(&claim_token, &operation),
                 )
                 .await?
                 .is_none()

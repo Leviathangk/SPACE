@@ -28,7 +28,9 @@ use crate::models::{
     SandboxNetworkPolicyPatch as ControllerSandboxNetworkPolicyPatch,
     UpdateSandboxRequest as ControllerUpdateSandboxRequest, User,
 };
-use crate::public_operations::{ApiProduct, ClaimedPublicOperation, PublicOperationRequeueReason};
+use crate::public_operations::{
+    ApiProduct, ClaimedPublicOperation, PublicOperationCompensation, PublicOperationRequeueReason,
+};
 use crate::public_sandbox_projection::public_lifecycle_state as project_public_lifecycle_state;
 
 const CREATE_RETRY_AFTER: Duration = Duration::from_secs(5);
@@ -480,34 +482,36 @@ impl SandboxLifecycleOperationExecutor {
         }
     }
 
-    /// Retire what a `start` left behind once the dispatcher has stopped
-    /// retrying it: without this, the last attempt's runtime outlives the
-    /// failed operation on a sandbox the control plane reports as stopped.
-    ///
-    /// Best-effort, because the operation fails either way; every outcome is
-    /// logged here. Any other unfinished operation on the sandbox may be a
-    /// newer start about to reuse that runtime, so this defers to it, and the
-    /// substrate fences the teardown against a start that claims the runtime
-    /// after this check.
-    pub async fn compensate_exhausted_start(&self, operation: &ClaimedPublicOperation) {
-        match self.compensate_exhausted_start_inner(operation).await {
+    /// Retire what a `start` left behind once the dispatcher has decided it
+    /// failed.
+    pub async fn compensate_failed_start(
+        &self,
+        claim_token: &str,
+        operation: &ClaimedPublicOperation,
+    ) -> PublicOperationCompensation {
+        match self
+            .compensate_failed_start_inner(claim_token, operation)
+            .await
+        {
             Ok(outcome) => tracing::info!(
                 operation_id = %operation.id,
                 target_id = operation.target_id.as_deref().unwrap_or_default(),
                 outcome = outcome.as_str(),
-                "compensated exhausted sandbox start"
+                "compensated failed sandbox start"
             ),
             Err(error) => tracing::warn!(
                 operation_id = %operation.id,
                 target_id = operation.target_id.as_deref().unwrap_or_default(),
                 error = %error,
-                "failed to compensate exhausted sandbox start; its runtime may remain"
+                "failed to compensate failed sandbox start; its runtime may remain"
             ),
         }
+        PublicOperationCompensation::Complete
     }
 
-    async fn compensate_exhausted_start_inner(
+    async fn compensate_failed_start_inner(
         &self,
+        claim_token: &str,
         operation: &ClaimedPublicOperation,
     ) -> Result<ExhaustedStartCompensation, SandboxLifecycleExecutionError> {
         let payload = validated_lifecycle_payload(operation)?;
@@ -527,6 +531,7 @@ impl SandboxLifecycleOperationExecutor {
                 operation.org_id,
                 &payload.sandbox_id.to_string(),
                 operation.id,
+                claim_token,
             )
             .await
             .map_err(SandboxLifecycleExecutionError::OperationStore)?

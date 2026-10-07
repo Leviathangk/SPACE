@@ -153,7 +153,7 @@ async fn retry_exhaustion_compensates_once_before_recording_failure() -> TestRes
         "sbx_start_exhausts",
     )
     .await?;
-    let executor = CompensationRecordingExecutor::new(db.pool.clone());
+    let executor = CompensationRecordingExecutor::new(db.pool.clone(), Attempt::Retry);
     let config = ReconcilerConfig {
         max_retry_attempts: 2,
         ..single_claim_config()
@@ -181,6 +181,276 @@ async fn retry_exhaustion_compensates_once_before_recording_failure() -> TestRes
     let after = tick(&config, &store, &executor).await?;
     assert_eq!(after.claimed, 0);
     assert_eq!(executor.compensated_states().len(), 1);
+    Ok(())
+}
+
+/// An attempt that fails outright — a 409 from the controller, a
+/// non-retryable 5xx — leaves the same runtime behind as one that ran out of
+/// retries, so it is compensated the same way before its failure is recorded.
+#[tokio::test]
+async fn terminal_failure_compensates_before_recording_failure() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = seed_org(&db.pool).await?;
+    let store = PublicOperationStore::new(db.pool.clone());
+    let operation_id = create_queued_operation(
+        &store,
+        OrgId::from_uuid(org_id),
+        ApiProduct::Native,
+        OperationKind::StartSandbox,
+        "sbx_start_conflicts",
+    )
+    .await?;
+    let executor = CompensationRecordingExecutor::new(db.pool.clone(), Attempt::Fail);
+
+    let report = tick(&single_claim_config(), &store, &executor).await?;
+
+    assert_eq!(report.failed, 1);
+    assert_eq!(
+        executor.compensated_states(),
+        vec![OperationState::Running.as_str().to_string()]
+    );
+    let operation = store
+        .fetch_operation(OrgId::from_uuid(org_id), operation_id)
+        .await?
+        .expect("operation remains visible");
+    assert_eq!(operation.state, OperationState::Failed);
+    assert_eq!(
+        operation.terminal_error_code,
+        Some(PublicErrorCode::Conflict)
+    );
+    Ok(())
+}
+
+/// Requeues that keep the retry budget are not failures, so nothing is
+/// abandoned and nothing is compensated, however many times they repeat.
+#[tokio::test]
+async fn budget_preserving_requeues_never_compensate() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = seed_org(&db.pool).await?;
+    let store = PublicOperationStore::new(db.pool.clone());
+    for attempt in [Attempt::Backpressure, Attempt::WorkflowProgress] {
+        let operation_id = create_queued_operation(
+            &store,
+            OrgId::from_uuid(org_id),
+            ApiProduct::Native,
+            OperationKind::StartSandbox,
+            "sbx_start_waits",
+        )
+        .await?;
+        let executor = CompensationRecordingExecutor::new(db.pool.clone(), attempt);
+        for _ in 0..3 {
+            make_due(&db.pool, operation_id).await?;
+            let report = tick(&single_claim_config(), &store, &executor).await?;
+            assert_eq!(report.retried, 1);
+        }
+        assert_eq!(executor.executions(), 3);
+        assert!(executor.compensated_states().is_empty());
+        assert_eq!(
+            operation_state(&db.pool, operation_id).await?,
+            OperationState::Queued.as_str()
+        );
+        sqlx::query(sql!(
+            "UPDATE public_operations SET state = 'failed' WHERE operation_id = $1"
+        ))
+        .bind(operation_id.as_uuid())
+        .execute(&db.pool)
+        .await?;
+    }
+    Ok(())
+}
+
+/// A compensation that outlives its claim belongs to whichever dispatcher
+/// re-claimed the operation; this one must not record the failure over it.
+#[tokio::test]
+async fn losing_the_claim_during_compensation_records_no_failure() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = seed_org(&db.pool).await?;
+    let store = PublicOperationStore::new(db.pool.clone());
+    let operation_id = create_queued_operation(
+        &store,
+        OrgId::from_uuid(org_id),
+        ApiProduct::Native,
+        OperationKind::StartSandbox,
+        "sbx_start_claim_lost",
+    )
+    .await?;
+    let executor =
+        CompensationRecordingExecutor::new(db.pool.clone(), Attempt::Fail).blocking_compensation();
+    let started = Arc::clone(&executor.compensation_started);
+    let config = ReconcilerConfig {
+        claim_stale_after: Duration::from_millis(300),
+        ..single_claim_config()
+    };
+    let tick_task = tokio::spawn({
+        let store = store.clone();
+        let executor = executor.clone();
+        async move { tick(&config, &store, &executor).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .map_err(|_| "the failed attempt was never compensated")?;
+    sqlx::query(sql!(
+        "UPDATE public_operations SET claim_token = 'another-dispatcher' WHERE operation_id = $1"
+    ))
+    .bind(operation_id.as_uuid())
+    .execute(&db.pool)
+    .await?;
+
+    let report = tokio::time::timeout(Duration::from_secs(5), tick_task).await???;
+
+    assert_eq!(report.failed, 0);
+    let (state, claim_token): (String, String) = sqlx::query_as(sql!(
+        "SELECT state, claim_token FROM public_operations WHERE operation_id = $1"
+    ))
+    .bind(operation_id.as_uuid())
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(state, OperationState::Running.as_str());
+    assert_eq!(claim_token, "another-dispatcher");
+    Ok(())
+}
+
+/// A compensation that cannot finish yet keeps the failure pending instead of
+/// dropping it: the operation is requeued without spending its budget, the
+/// next claim retries only the compensation, and once that completes the
+/// original failure is what gets recorded.
+#[tokio::test]
+async fn deferred_compensation_is_retried_before_the_failure_is_recorded() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = seed_org(&db.pool).await?;
+    let store = PublicOperationStore::new(db.pool.clone());
+    let operation_id = create_queued_operation(
+        &store,
+        OrgId::from_uuid(org_id),
+        ApiProduct::Native,
+        OperationKind::StartSandbox,
+        "sbx_start_compensation_deferred",
+    )
+    .await?;
+    let executor = CompensationRecordingExecutor::new(db.pool.clone(), Attempt::Fail)
+        .with_compensations([PublicOperationCompensation::RetryAfter(
+            Duration::from_secs(1),
+        )]);
+    let config = single_claim_config();
+
+    let deferred = tick(&config, &store, &executor).await?;
+
+    assert_eq!(deferred.failed, 0);
+    assert_eq!(deferred.retried, 1);
+    let (state, attempts, terminal_error_code, pending): (
+        String,
+        i32,
+        Option<String>,
+        Option<serde_json::Value>,
+    ) = sqlx::query_as(sql!(
+        "SELECT state, attempts, terminal_error_code, pending_failure_json
+           FROM public_operations WHERE operation_id = $1"
+    ))
+    .bind(operation_id.as_uuid())
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(state, OperationState::Queued.as_str());
+    assert_eq!(
+        attempts, 0,
+        "waiting on compensation spends no retry budget"
+    );
+    assert_eq!(terminal_error_code, None);
+    assert!(pending.is_some());
+
+    make_due(&db.pool, operation_id).await?;
+    let completed = tick(&config, &store, &executor).await?;
+
+    assert_eq!(completed.failed, 1);
+    assert_eq!(
+        executor.executions(),
+        1,
+        "the failed start is not attempted again"
+    );
+    assert_eq!(executor.compensated_states().len(), 2);
+    let operation = store
+        .fetch_operation(OrgId::from_uuid(org_id), operation_id)
+        .await?
+        .expect("operation remains visible");
+    assert_eq!(operation.state, OperationState::Failed);
+    assert_eq!(
+        operation.terminal_error_code,
+        Some(PublicErrorCode::Conflict)
+    );
+    assert_eq!(operation.progress_message, "sandbox start conflicted");
+    Ok(())
+}
+
+/// A compensation that never completes cannot hold the failure back forever:
+/// past its bound the failure is recorded anyway, marked and counted as
+/// abandoned so whatever it could not undo is visible.
+#[tokio::test]
+async fn compensation_pending_past_its_bound_records_the_failure() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = seed_org(&db.pool).await?;
+    let store = PublicOperationStore::new(db.pool.clone());
+    let operation_id = create_queued_operation(
+        &store,
+        OrgId::from_uuid(org_id),
+        ApiProduct::Native,
+        OperationKind::StartSandbox,
+        "sbx_start_compensation_stuck",
+    )
+    .await?;
+    let executor = CompensationRecordingExecutor::new(db.pool.clone(), Attempt::Fail)
+        .with_compensations([
+            PublicOperationCompensation::RetryAfter(Duration::from_secs(1)),
+            PublicOperationCompensation::RetryAfter(Duration::from_secs(1)),
+        ]);
+    let config = single_claim_config();
+    tick(&config, &store, &executor).await?;
+    sqlx::query(sql!(
+        "UPDATE public_operations
+            SET pending_failure_at = NOW() - INTERVAL '31 minutes',
+                next_attempt_at = NOW()
+          WHERE operation_id = $1"
+    ))
+    .bind(operation_id.as_uuid())
+    .execute(&db.pool)
+    .await?;
+
+    let metrics = pplx_space_metrics::test_capture::capture_counters_guard();
+    let report = tick(&config, &store, &executor).await?;
+    let counters = metrics.finish();
+
+    assert_eq!(report.failed, 1);
+    let operation = store
+        .fetch_operation(OrgId::from_uuid(org_id), operation_id)
+        .await?
+        .expect("operation remains visible");
+    assert_eq!(operation.state, OperationState::Failed);
+    assert_eq!(
+        operation.terminal_error_code,
+        Some(PublicErrorCode::Conflict)
+    );
+    let terminal_error: serde_json::Value = sqlx::query_scalar(sql!(
+        "SELECT terminal_error_json FROM public_operations WHERE operation_id = $1"
+    ))
+    .bind(operation_id.as_uuid())
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(terminal_error["compensation"], "abandoned");
+    assert!(
+        counters
+            .iter()
+            .any(|counter| counter.name == "operations.compensated"
+                && counter.tags.iter().any(|tag| tag == "outcome:abandoned")),
+        "{counters:?}"
+    );
     Ok(())
 }
 
@@ -685,6 +955,7 @@ async fn native_executor_requeues_create_when_cluster_admission_rejects() -> Tes
         .into_json(),
         attempts: 1,
         claim_generation: 1,
+        pending_failure: None,
     };
     let substrate = Substrate::Direct(Box::new(
         pplx_space_api::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
@@ -836,6 +1107,7 @@ async fn native_executor_persists_exemptions_on_policy_update_and_template_reset
                 .into_json(),
                 attempts: 1,
                 claim_generation: 1,
+                pending_failure: None,
             };
             let mut first_generation = None;
             for _ in 0..2 {
@@ -1194,20 +1466,61 @@ impl PublicOperationExecutor for AlwaysRetryExecutor {
     }
 }
 
-/// Always asks for a transient retry, and records the operation's persisted
-/// state each time the dispatcher asks it to compensate.
+/// What each attempt of [`CompensationRecordingExecutor`] reports.
+#[derive(Clone, Copy)]
+enum Attempt {
+    Retry,
+    Fail,
+    Backpressure,
+    WorkflowProgress,
+}
+
+/// Reports a fixed attempt outcome, and records the operation's persisted
+/// state each time the dispatcher asks it to compensate. Compensations answer
+/// from a script, then `Complete`.
 #[derive(Clone)]
 struct CompensationRecordingExecutor {
     pool: PgPool,
+    attempt: Attempt,
+    executions: Arc<std::sync::atomic::AtomicUsize>,
     compensated_states: Arc<Mutex<Vec<String>>>,
+    compensations: Arc<Mutex<std::collections::VecDeque<PublicOperationCompensation>>>,
+    block_compensation: bool,
+    compensation_started: Arc<Notify>,
 }
 
 impl CompensationRecordingExecutor {
-    fn new(pool: PgPool) -> Self {
+    fn new(pool: PgPool, attempt: Attempt) -> Self {
         Self {
             pool,
-            compensated_states: Arc::new(Mutex::new(Vec::new())),
+            attempt,
+            executions: Arc::default(),
+            compensated_states: Arc::default(),
+            compensations: Arc::default(),
+            block_compensation: false,
+            compensation_started: Arc::default(),
         }
+    }
+
+    fn with_compensations(
+        self,
+        compensations: impl IntoIterator<Item = PublicOperationCompensation>,
+    ) -> Self {
+        *self
+            .compensations
+            .lock()
+            .expect("compensation script lock is available") = compensations.into_iter().collect();
+        self
+    }
+
+    /// Never finish compensating, after announcing it started.
+    fn blocking_compensation(mut self) -> Self {
+        self.block_compensation = true;
+        self
+    }
+
+    fn executions(&self) -> usize {
+        self.executions.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn compensated_states(&self) -> Vec<String> {
@@ -1229,10 +1542,37 @@ impl PublicOperationExecutor for CompensationRecordingExecutor {
         claim_token: &str,
         operation: ClaimedPublicOperation,
     ) -> OperationExecutionResult {
-        AlwaysRetryExecutor.execute(claim_token, operation).await
+        self.executions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match self.attempt {
+            Attempt::Retry => AlwaysRetryExecutor.execute(claim_token, operation).await,
+            Attempt::Backpressure => {
+                AlwaysBackpressureExecutor
+                    .execute(claim_token, operation)
+                    .await
+            }
+            Attempt::WorkflowProgress => {
+                AlwaysWorkflowProgressExecutor
+                    .execute(claim_token, operation)
+                    .await
+            }
+            Attempt::Fail => OperationExecutionResult {
+                state: OperationState::Failed,
+                progress_message: "sandbox start conflicted".to_string(),
+                result_json: None,
+                terminal_error_code: Some(PublicErrorCode::Conflict),
+                terminal_error_json: Some(serde_json::json!({"reason": "conflict"})),
+                retry_after: None,
+                requeue_reason: PublicOperationRequeueReason::TransientFailure,
+            },
+        }
     }
 
-    async fn compensate_exhausted(&self, operation: &ClaimedPublicOperation) {
+    async fn compensate_failure(
+        &self,
+        _claim_token: &str,
+        operation: &ClaimedPublicOperation,
+    ) -> PublicOperationCompensation {
         let state = operation_state(&self.pool, operation.id)
             .await
             .expect("operation state query succeeds");
@@ -1240,6 +1580,15 @@ impl PublicOperationExecutor for CompensationRecordingExecutor {
             .lock()
             .expect("compensation record lock is available")
             .push(state);
+        if self.block_compensation {
+            self.compensation_started.notify_one();
+            std::future::pending::<()>().await;
+        }
+        self.compensations
+            .lock()
+            .expect("compensation script lock is available")
+            .pop_front()
+            .unwrap_or(PublicOperationCompensation::Complete)
     }
 }
 
