@@ -5108,10 +5108,13 @@ fn pod_has_booted(pod: &Pod) -> bool {
 }
 
 impl KubernetesSubstrate {
-    /// Delete the pods that executions created since the sandbox's current
-    /// stop left on inactive rows, the only record of them once their
-    /// execution is retired. No successor can own one: a successor's pod is
-    /// on the active row, and a pod name is unique to its generation.
+    /// Delete the pods left on the sandbox's inactive execution rows, the
+    /// only record of them once their execution is retired. No successor can
+    /// own one: a successor's pod is on the active row, and a pod name is
+    /// unique to its generation. Every inactive row is swept, not only those
+    /// newer than the current stop: the node's rollback of each failed cold
+    /// activation re-publishes `stopped`, moving `lifecycle_changed_at` past
+    /// the very execution it retired.
     ///
     /// Each pod is read live and deleted only as the object read, under its
     /// UID and resourceVersion, so a pod that comes up in between is not
@@ -5122,11 +5125,7 @@ impl KubernetesSubstrate {
         sandbox_id: SandboxId,
     ) -> Result<AbandonedStartPods, SubstrateError> {
         let mut found = AbandonedStartPods::NoneLeft;
-        for pod_name in self
-            .store
-            .post_stop_inactive_execution_pod_names(sandbox_id)
-            .await?
-        {
+        for pod_name in self.store.inactive_execution_pod_names(sandbox_id).await? {
             let Some(pod) = fetch_sandbox_pod_uncached(&self.k8s, &pod_name)
                 .await
                 .map_err(|err| SubstrateError::Failed {

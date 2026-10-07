@@ -2272,9 +2272,9 @@ pub trait SubstrateAdapter: Send + Sync {
     /// caller must have proven that no other operation is driving this
     /// sandbox.
     ///
-    /// Only what a start created after the sandbox's current stop is in
-    /// scope, never the execution the stop itself left, and nothing happens
-    /// unless the sandbox is still `stopped`. The execution is retired by a
+    /// The execution the stop itself left is never touched, only one a start
+    /// created after it or pods left on retired executions, and nothing
+    /// happens unless the sandbox is still `stopped`. The execution is retired by a
     /// guarded write on the identity read here before any pod is deleted, so
     /// a start that claims it first makes this defer and a start that comes
     /// later cannot adopt it. No VM is ever stopped here: a booted pod is

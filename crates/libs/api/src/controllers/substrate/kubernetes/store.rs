@@ -2593,28 +2593,6 @@ impl K8sStore {
         Ok(true)
     }
 
-    /// Pod names on inactive executions created since the sandbox's current
-    /// stop, oldest generation first: what start attempts since then left.
-    pub(super) async fn post_stop_inactive_execution_pod_names(
-        &self,
-        sandbox_id: SandboxId,
-    ) -> Result<Vec<String>, SubstrateError> {
-        sqlx::query_scalar(sql!(
-            "SELECT execution.pod_name
-               FROM sandbox_k8s_executions execution
-               JOIN sandboxes sandbox ON sandbox.id = execution.sandbox_id
-              WHERE execution.sandbox_id = $1
-                AND NOT execution.active
-                AND sandbox.lifecycle = 'stopped'
-                AND execution.created_at > sandbox.lifecycle_changed_at
-              ORDER BY execution.generation"
-        ))
-        .bind(sandbox_id)
-        .fetch_all(&self.pool)
-        .await
-        .db_context("failed to query abandoned start pods")
-    }
-
     pub(super) async fn complete_activation_attempt(
         &self,
         sandbox_id: SandboxId,
