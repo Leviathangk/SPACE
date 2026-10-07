@@ -3,6 +3,7 @@ use pplx_space_common_core::{
     types::{CredentialReferenceId, OrgId},
 };
 use pplx_space_credential_injection_core::validation::ValidatedCredentialReference;
+use pplx_space_net_common::NetworkPolicyV1;
 use serde::{Deserialize, Serialize};
 use sqlx::types::Json;
 
@@ -92,6 +93,112 @@ pub async fn lock(
     .bind(organization)
     .bind(ids)
     .fetch_all(executor)
+    .await
+}
+
+/// Share-lock the references a network-policy write binds until the caller's
+/// transaction ends.
+///
+/// Retirement holds the reference row exclusively while it checks
+/// [`attached`], so a concurrent bind either commits first and blocks
+/// retirement, or waits and then binds a retired reference that resolution
+/// never authorizes. Missing and foreign identifiers lock nothing; resolution
+/// already refuses them.
+pub async fn lock_for_binding(
+    executor: impl sqlx::PgExecutor<'_>,
+    policy: &NetworkPolicyV1,
+) -> Result<(), sqlx::Error> {
+    let mut ids: Vec<_> = policy
+        .network_credential_rules
+        .iter()
+        .flat_map(|rule| &rule.credential_header_bindings)
+        .map(|binding| binding.credential_reference_id)
+        .collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    sqlx::query(sql!(
+        "SELECT id FROM credential_references WHERE id = ANY($1) ORDER BY id FOR SHARE"
+    ))
+    .bind(ids)
+    .fetch_all(executor)
+    .await?;
+    Ok(())
+}
+
+/// Share-lock what a sandbox policy write makes effective until the caller's
+/// transaction ends: the override's references or, when the sandbox inherits,
+/// its template row and the references of that row's current policy.
+///
+/// Resolution reads the template row live, even after template deletion, so a
+/// policy resolved before the transaction is not what the sandbox inherits.
+/// The row lock makes a concurrent template policy write or deletion wait for
+/// this sandbox write; a template write that wins instead is read here.
+pub async fn lock_for_sandbox_binding(
+    connection: &mut sqlx::PgConnection,
+    policy_override: Option<&NetworkPolicyV1>,
+    template: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    if let Some(policy) = policy_override {
+        return lock_for_binding(connection, policy).await;
+    }
+    let Some(template) = template else {
+        return Ok(());
+    };
+    let inherited: Option<Json<NetworkPolicyV1>> = sqlx::query_scalar(sql!(
+        "SELECT network_policy_json FROM templates WHERE name = $1 FOR SHARE"
+    ))
+    .bind(template)
+    .fetch_optional(&mut *connection)
+    .await?;
+    match inherited {
+        Some(policy) => lock_for_binding(connection, &policy.0).await,
+        None => Ok(()),
+    }
+}
+
+/// Whether a policy the organization can run still binds its reference.
+///
+/// A sandbox binds through its override, or through its template's policy
+/// when it has none; like resolution, that inheritance survives template
+/// deletion. Deleted sandbox tombstones never run again. A template that is
+/// not deleted and that the organization can use binds its future sandboxes.
+/// Other organizations' policies never resolve the reference.
+pub async fn attached(
+    executor: impl sqlx::PgExecutor<'_>,
+    organization: OrgId,
+    id: CredentialReferenceId,
+) -> Result<bool, sqlx::Error> {
+    // JSONB containment matches any rule with any binding naming the
+    // reference, using resolution's text comparison of the identifier.
+    sqlx::query_scalar(sql!(
+        "WITH binding AS (
+             SELECT jsonb_build_object('network_credential_rules', jsonb_build_array(
+                 jsonb_build_object('credential_header_bindings', jsonb_build_array(
+                     jsonb_build_object('credential_reference_id', $2::uuid::TEXT))))) AS policy
+         )
+         SELECT EXISTS (
+             SELECT 1
+             FROM sandboxes s
+             LEFT JOIN templates t ON t.name = s.template_id
+             CROSS JOIN binding
+             WHERE s.org_id = $1 AND s.lifecycle <> 'deleted'
+               AND COALESCE(s.network_policy_override_json, t.network_policy_json)
+                   @> binding.policy
+         ) OR EXISTS (
+             SELECT 1
+             FROM templates t
+             CROSS JOIN binding
+             WHERE t.desired_state <> 'deleted'
+               AND (t.visibility = 'generic' OR t.org_id = $1)
+               AND t.network_policy_json @> binding.policy
+         )"
+    ))
+    .bind(organization)
+    .bind(id)
+    .fetch_one(executor)
     .await
 }
 

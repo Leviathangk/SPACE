@@ -10,6 +10,8 @@ use pplx_space_public_api::credential_references as wire;
 pub(crate) enum ReferenceError {
     #[error("credential reference not found")]
     NotFound,
+    #[error("credential reference remains attached to a network policy")]
+    Attached,
     #[error("request_id was already used with a different request")]
     IdempotencyConflict,
     #[error(transparent)]
@@ -75,6 +77,11 @@ pub(crate) async fn retire(
         .pop()
         .ok_or(ReferenceError::NotFound)?;
     if reference.state == ReferenceState::Active {
+        // The exclusive lock waited for in-flight binds, so this statement
+        // sees every binding a gateway could have hydrated.
+        if store::attached(&mut *tx, organization, id).await? {
+            return Err(ReferenceError::Attached);
+        }
         store::retire(&mut *tx, organization, id).await?;
     }
     tx.commit().await?;
