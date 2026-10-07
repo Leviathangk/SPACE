@@ -525,8 +525,10 @@ impl PublicOperationStore {
     ///
     /// `except` under any *other* claim counts: a claim that went stale was
     /// re-claimed by another dispatcher, which may be running a new attempt
-    /// of this very operation. See [`RUNTIME_OWNING_SANDBOX_OPERATION_KINDS`]
-    /// for which kinds count.
+    /// of this very operation. An operation whose failure is already pending
+    /// compensation does not: it will never run another attempt, and two
+    /// failed starts counting each other would wait on each other forever.
+    /// See [`RUNTIME_OWNING_SANDBOX_OPERATION_KINDS`] for which kinds count.
     pub async fn other_sandbox_operation_unfinished(
         &self,
         org_id: OrgId,
@@ -547,6 +549,7 @@ impl PublicOperationStore {
                    AND target_id = $2
                    AND kind = ANY($5)
                    AND state IN ('queued', 'running')
+                   AND pending_failure_json IS NULL
                    AND NOT (operation_id = $3 AND claim_token = $4)
             )"
         ))
