@@ -14875,6 +14875,39 @@ mod kubernetes_tests {
         Ok(())
     }
 
+    /// The node's rollback re-publishes `stopped`, which moves
+    /// `lifecycle_changed_at` past the execution it just retired. That
+    /// execution was still a start attempt's, and its pod is still the
+    /// leftover to collect: whether an inactive row's pod may go cannot hinge
+    /// on when the lifecycle last changed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn abandoned_start_collects_a_leftover_after_the_rollback_republishes_stopped()
+    -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        insert_stopped_sandbox_after_stop(&pool, sandbox_id).await?;
+        let pod =
+            insert_start_attempt_execution(&pool, sandbox_id, 17, StartAttemptLease::Live).await?;
+        let pod_name = pod.metadata.name.clone().expect("pod has a name");
+        deactivate_execution(&pool, sandbox_id, 17).await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET lifecycle_changed_at = NOW() + INTERVAL '1 second'
+              WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .execute(&pool)
+        .await?;
+        let (substrate, captured_deletes) =
+            abandoned_start_subject(&pool, vec![pod], FakePodDelete::Accept);
+
+        let outcome = substrate.retire_abandoned_start(sandbox_id).await?;
+
+        assert_eq!(outcome, AbandonedStartRetirement::Retired);
+        assert!(deleted_pod_names(&captured_deletes).contains(&pod_name));
+        Ok(())
+    }
+
     /// A pod that booted is a VM running on the stopped sandbox's disk.
     /// Deleting it would kill that VM with no in-VM stop, so it is left alone
     /// and reported, and no stop is attempted either: a newer start could
