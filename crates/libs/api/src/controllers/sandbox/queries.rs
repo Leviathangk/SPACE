@@ -1418,6 +1418,7 @@ impl SandboxController {
         })?;
         credential_references::lock_for_sandbox_binding(
             &mut tx,
+            create_owner.org_id,
             network_policy_override.as_ref(),
             Some(template),
         )
@@ -2832,6 +2833,7 @@ async fn insert_pooled_sandbox(
         })?;
     credential_references::lock_for_sandbox_binding(
         tx,
+        create_owner.org_id,
         input.network_policy_override,
         Some(input.template),
     )

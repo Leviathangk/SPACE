@@ -398,6 +398,7 @@ impl SandboxController {
         })?;
         credential_references::lock_for_sandbox_binding(
             &mut tx,
+            sandbox.org_id,
             policy_override.as_ref(),
             sandbox.template_id.as_deref(),
         )

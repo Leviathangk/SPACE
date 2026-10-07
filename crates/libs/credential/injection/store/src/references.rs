@@ -102,10 +102,19 @@ pub async fn lock(
 /// Retirement holds the reference row exclusively while it checks
 /// [`attached`], so a concurrent bind either commits first and blocks
 /// retirement, or waits and then binds a retired reference that resolution
-/// never authorizes. Missing and foreign identifiers lock nothing; resolution
-/// already refuses them.
+/// never authorizes. Templates can serve multiple organizations, so all
+/// existing references are locked. Sandbox writes use
+/// [`lock_for_sandbox_binding`] to lock only their organization's references.
 pub async fn lock_for_binding(
     executor: impl sqlx::PgExecutor<'_>,
+    policy: &NetworkPolicyV1,
+) -> Result<(), sqlx::Error> {
+    lock_policy_references(executor, None, policy).await
+}
+
+async fn lock_policy_references(
+    executor: impl sqlx::PgExecutor<'_>,
+    organization: Option<OrgId>,
     policy: &NetworkPolicyV1,
 ) -> Result<(), sqlx::Error> {
     let mut ids: Vec<_> = policy
@@ -120,9 +129,12 @@ pub async fn lock_for_binding(
     ids.sort_unstable();
     ids.dedup();
     sqlx::query(sql!(
-        "SELECT id FROM credential_references WHERE id = ANY($1) ORDER BY id FOR SHARE"
+        "SELECT id FROM credential_references
+         WHERE id = ANY($1) AND ($2::uuid IS NULL OR org_id = $2)
+         ORDER BY id FOR SHARE"
     ))
     .bind(ids)
+    .bind(organization)
     .fetch_all(executor)
     .await?;
     Ok(())
@@ -131,6 +143,8 @@ pub async fn lock_for_binding(
 /// Share-lock what a sandbox policy write makes effective until the caller's
 /// transaction ends: the override's references or, when the sandbox inherits,
 /// its template row and the references of that row's current policy.
+/// Missing and foreign references cannot resolve for the sandbox and are not
+/// locked, so one organization's writes cannot lock another's credentials.
 ///
 /// Resolution reads the template row live, even after template deletion, so a
 /// policy resolved before the transaction is not what the sandbox inherits.
@@ -138,11 +152,12 @@ pub async fn lock_for_binding(
 /// this sandbox write; a template write that wins instead is read here.
 pub async fn lock_for_sandbox_binding(
     connection: &mut sqlx::PgConnection,
+    organization: OrgId,
     policy_override: Option<&NetworkPolicyV1>,
     template: Option<&str>,
 ) -> Result<(), sqlx::Error> {
     if let Some(policy) = policy_override {
-        return lock_for_binding(connection, policy).await;
+        return lock_policy_references(connection, Some(organization), policy).await;
     }
     let Some(template) = template else {
         return Ok(());
@@ -154,7 +169,7 @@ pub async fn lock_for_sandbox_binding(
     .fetch_optional(&mut *connection)
     .await?;
     match inherited {
-        Some(policy) => lock_for_binding(connection, &policy.0).await,
+        Some(policy) => lock_policy_references(connection, Some(organization), &policy.0).await,
         None => Ok(()),
     }
 }

@@ -77,8 +77,9 @@ pub(crate) async fn retire(
         .pop()
         .ok_or(ReferenceError::NotFound)?;
     if reference.state == ReferenceState::Active {
-        // The exclusive lock waited for in-flight binds, so this statement
-        // sees every binding a gateway could have hydrated.
+        // After waiting for in-flight binds, this fresh statement sees their
+        // committed policies. Detachment still needs worker reconciliation;
+        // this check does not revoke material already held by a gateway.
         if store::attached(&mut *tx, organization, id).await? {
             return Err(ReferenceError::Attached);
         }

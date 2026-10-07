@@ -285,11 +285,16 @@ async fn update_metadata_replaces_the_whole_document() -> TestResult {
     Ok(())
 }
 
-/// A policy write that binds a credential reference serializes with that
-/// reference's retirement. Otherwise retirement could check attachment, a bind
-/// could commit and hydrate a gateway, and retirement could then report success.
+/// A policy write serializes with retirement of its own organization's
+/// reference. A foreign reference cannot resolve and must not couple the two
+/// organizations' writes.
+#[rstest::rstest]
+#[case::owned(true)]
+#[case::foreign(false)]
 #[tokio::test(flavor = "multi_thread")]
-async fn binding_a_credential_reference_waits_for_its_retirement() -> TestResult {
+async fn sandbox_binding_waits_only_for_owned_reference_retirement(
+    #[case] owned: bool,
+) -> TestResult {
     // The held retirement, the bind, and the lock probe each need a connection.
     let db = pg_test_db_with_max_connections(4).await?;
     let actor = insert_actor(&db.pool).await?;
@@ -301,7 +306,11 @@ async fn binding_a_credential_reference_waits_for_its_retirement() -> TestResult
                  '{\"secret_arn\": \"arn:aws:secretsmanager:us-west-2:123456789012:secret:example-AbCdEf\"}')"
     ))
     .bind(reference)
-    .bind(actor.org_id)
+    .bind(if owned {
+        actor.org_id
+    } else {
+        OrgId::from_uuid(pplx_space_db_test_fixtures::SEED_ORG_ID)
+    })
     .execute(&db.pool)
     .await?;
     let policy: pplx_space_net_common::NetworkPolicyV1 =
@@ -327,7 +336,7 @@ async fn binding_a_credential_reference_waits_for_its_retirement() -> TestResult
     .bind(reference)
     .fetch_one(&mut *retirement)
     .await?;
-    let bind = tokio::spawn({
+    let mut bind = tokio::spawn({
         let pool = db.pool.clone();
         let controller = direct_sandbox_controller(&db.pool);
         async move {
@@ -341,6 +350,13 @@ async fn binding_a_credential_reference_waits_for_its_retirement() -> TestResult
                 .await
         }
     });
+    if !owned {
+        // Foreign references cannot resolve for this sandbox and must not
+        // couple its policy writes to another organization's retirement.
+        tokio::time::timeout(std::time::Duration::from_secs(5), &mut bind).await???;
+        retirement.rollback().await?;
+        return Ok(());
+    }
     wait_for_lock_waiter(&db.pool).await?;
     assert!(!bind.is_finished(), "the bind must wait for the retirement");
     sqlx::query(sql!(
@@ -359,10 +375,14 @@ async fn binding_a_credential_reference_waits_for_its_retirement() -> TestResult
 /// Inheriting a template default makes the template's *current* policy
 /// effective, not the one in the caller's sandbox snapshot. A binding added
 /// after the snapshot (and kept through template deletion, which resolution
-/// still inherits) must still serialize with that reference's retirement.
+/// still inherits) must still serialize with an owned reference's retirement.
+#[rstest::rstest]
+#[case::owned(true)]
+#[case::foreign(false)]
 #[tokio::test(flavor = "multi_thread")]
-async fn inheriting_a_template_binding_waits_for_retirement_despite_a_stale_snapshot() -> TestResult
-{
+async fn inheriting_a_stale_template_serializes_only_owned_reference_retirement(
+    #[case] owned: bool,
+) -> TestResult {
     let db = pg_test_db_with_max_connections(4).await?;
     let actor = insert_actor(&db.pool).await?;
     let reference = uuid::Uuid::now_v7();
@@ -372,7 +392,11 @@ async fn inheriting_a_template_binding_waits_for_retirement_despite_a_stale_snap
                  '{\"secret_arn\": \"arn:aws:secretsmanager:us-west-2:123456789012:secret:example-AbCdEf\"}')"
     ))
     .bind(reference)
-    .bind(actor.org_id)
+    .bind(if owned {
+        actor.org_id
+    } else {
+        OrgId::from_uuid(pplx_space_db_test_fixtures::SEED_ORG_ID)
+    })
     .execute(&db.pool)
     .await?;
     sqlx::query(sql!(
@@ -435,7 +459,7 @@ async fn inheriting_a_template_binding_waits_for_retirement_despite_a_stale_snap
         .await?,
         "the override hides the deleted template's binding, so retirement would proceed"
     );
-    let inherit = tokio::spawn({
+    let mut inherit = tokio::spawn({
         let pool = db.pool.clone();
         let controller = direct_sandbox_controller(&db.pool);
         async move {
@@ -449,6 +473,11 @@ async fn inheriting_a_template_binding_waits_for_retirement_despite_a_stale_snap
                 .await
         }
     });
+    if !owned {
+        tokio::time::timeout(std::time::Duration::from_secs(5), &mut inherit).await???;
+        retirement.rollback().await?;
+        return Ok(());
+    }
     wait_for_lock_waiter(&db.pool).await?;
     assert!(
         !inherit.is_finished(),
