@@ -19,12 +19,14 @@ pub enum Service {
     ClusterApi,
     NodeApi,
     BuildManager,
+    IngressActivation,
 }
 impl Service {
     fn name_env(self) -> &'static str {
         match self {
             Self::ClusterApi => "SPACE_CLUSTER_API_TLS_SERVER_NAME",
             Self::NodeApi => "SPACE_NODE_API_TLS_SERVER_NAME",
+            Self::IngressActivation => "SPACE_INGRESS_ACTIVATION_TLS_SERVER_NAME",
             Self::BuildManager => "SPACE_BUILD_MANAGER_TLS_SERVER_NAME",
         }
     }
