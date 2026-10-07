@@ -7,6 +7,9 @@ use axum::http::StatusCode;
 use pplx_space_common_core::types::{
     NodeId, NodePoolName, SandboxId, SandboxLifecycle, SandboxLifecycleParseError,
 };
+use pplx_space_events::{
+    SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
+};
 use pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_public_api::{
     OperationKind, OperationState, PublicErrorCode, PublicOperationResult, PublicSandboxId,
@@ -22,6 +25,7 @@ use crate::controllers::ControllerError;
 use crate::controllers::sandbox::FederatedSandboxCreateContext;
 use crate::controllers::sandbox::lifecycle::SandboxAction;
 use crate::controllers::sandbox::{SandboxController, fetch_sandbox};
+use crate::controllers::substrate::AbandonedStartRetirement;
 use crate::models::{
     CreateSandboxRequest as ControllerCreateSandboxRequest, SandboxMetadata,
     SandboxMetadataValue as ControllerSandboxMetadataValue,
@@ -483,44 +487,54 @@ impl SandboxLifecycleOperationExecutor {
     }
 
     /// Retire what a `start` left behind once the dispatcher has decided it
-    /// failed.
+    /// failed: without this, the last attempt's runtime outlives the failed
+    /// operation on a sandbox the control plane reports as stopped.
+    ///
+    /// Any other unfinished operation that can reuse that runtime may be a
+    /// newer start about to adopt it, so this defers to it; the substrate
+    /// fences the teardown against a start that claims the runtime after
+    /// this check. Every outcome other than a clean retirement is counted
+    /// and recorded on the sandbox's event stream, and any outcome a later
+    /// attempt could improve on asks the dispatcher to retry.
     pub async fn compensate_failed_start(
         &self,
         claim_token: &str,
         operation: &ClaimedPublicOperation,
     ) -> PublicOperationCompensation {
-        match self
-            .compensate_failed_start_inner(claim_token, operation)
-            .await
-        {
-            Ok(outcome) => tracing::info!(
-                operation_id = %operation.id,
-                target_id = operation.target_id.as_deref().unwrap_or_default(),
-                outcome = outcome.as_str(),
-                "compensated failed sandbox start"
-            ),
-            Err(error) => tracing::warn!(
-                operation_id = %operation.id,
-                target_id = operation.target_id.as_deref().unwrap_or_default(),
-                error = %error,
-                "failed to compensate failed sandbox start; its runtime may remain"
-            ),
-        }
-        PublicOperationCompensation::Complete
+        let report = match validated_lifecycle_payload(operation).and_then(|payload| {
+            if payload.action == SandboxLifecycleAction::Start {
+                Ok(payload)
+            } else {
+                Err(SandboxLifecycleExecutionError::UnsupportedAction(
+                    payload.action,
+                ))
+            }
+        }) {
+            Err(error) => StartCompensationReport::invalid(error),
+            Ok(payload) => {
+                let sandbox_id = SandboxId::from(payload.sandbox_id);
+                match self
+                    .compensate_failed_start_inner(claim_token, operation, sandbox_id)
+                    .await
+                {
+                    Ok(outcome) => StartCompensationReport::from_outcome(sandbox_id, outcome),
+                    Err(error @ SandboxLifecycleExecutionError::TargetOrgMismatch) => {
+                        StartCompensationReport::invalid(error)
+                    }
+                    Err(error) => StartCompensationReport::transient(sandbox_id, error),
+                }
+            }
+        };
+        report.emit(operation)
     }
 
     async fn compensate_failed_start_inner(
         &self,
         claim_token: &str,
         operation: &ClaimedPublicOperation,
+        sandbox_id: SandboxId,
     ) -> Result<ExhaustedStartCompensation, SandboxLifecycleExecutionError> {
-        let payload = validated_lifecycle_payload(operation)?;
-        if payload.action != SandboxLifecycleAction::Start {
-            return Err(SandboxLifecycleExecutionError::UnsupportedAction(
-                payload.action,
-            ));
-        }
-        let Some(sandbox) = fetch_sandbox(&self.pool, payload.sandbox_id.into()).await? else {
+        let Some(sandbox) = fetch_sandbox(&self.pool, sandbox_id).await? else {
             return Ok(ExhaustedStartCompensation::SandboxMissing);
         };
         if sandbox.org_id != operation.org_id {
@@ -529,7 +543,7 @@ impl SandboxLifecycleOperationExecutor {
         if crate::public_operations::PublicOperationStore::new(self.pool.clone())
             .other_sandbox_operation_unfinished(
                 operation.org_id,
-                &payload.sandbox_id.to_string(),
+                &PublicSandboxId::from(sandbox_id).to_string(),
                 operation.id,
                 claim_token,
             )
@@ -539,9 +553,7 @@ impl SandboxLifecycleOperationExecutor {
             return Ok(ExhaustedStartCompensation::OtherOperationInFlight);
         }
         Ok(ExhaustedStartCompensation::Substrate(
-            self.controller
-                .retire_abandoned_start(payload.sandbox_id.into())
-                .await?,
+            self.controller.retire_abandoned_start(sandbox_id).await?,
         ))
     }
 
@@ -695,16 +707,146 @@ fn validated_lifecycle_payload(
 enum ExhaustedStartCompensation {
     SandboxMissing,
     OtherOperationInFlight,
-    Substrate(crate::controllers::substrate::AbandonedStartRetirement),
+    Substrate(AbandonedStartRetirement),
 }
 
-impl ExhaustedStartCompensation {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::SandboxMissing => "sandbox_missing",
-            Self::OtherOperationInFlight => "deferred_other_operation_in_flight",
-            Self::Substrate(outcome) => outcome.as_str(),
+/// Waiting on another runtime owner: long enough not to spin while it runs.
+const START_COMPENSATION_OTHER_OPERATION_RETRY: Duration = Duration::from_secs(15);
+/// A changed execution or pod is re-read on the next attempt.
+const START_COMPENSATION_CHANGED_RETRY: Duration = Duration::from_secs(5);
+/// A database, apiserver, or worker error.
+const START_COMPENSATION_ERROR_RETRY: Duration = Duration::from_secs(10);
+
+/// What one start compensation found, how it is reported, and what the
+/// dispatcher should do next.
+struct StartCompensationReport {
+    sandbox_id: Option<SandboxId>,
+    outcome: &'static str,
+    disposition: PublicOperationCompensation,
+    event: Option<SandboxEventType>,
+    error: Option<String>,
+}
+
+impl StartCompensationReport {
+    /// The operation does not describe a start of a sandbox it may act on.
+    /// Retrying cannot change that, and there is no sandbox to report on.
+    fn invalid(error: SandboxLifecycleExecutionError) -> Self {
+        Self {
+            sandbox_id: None,
+            outcome: "invalid_operation",
+            disposition: PublicOperationCompensation::Complete,
+            event: None,
+            error: Some(error.to_string()),
         }
+    }
+
+    fn transient(sandbox_id: SandboxId, error: SandboxLifecycleExecutionError) -> Self {
+        Self {
+            sandbox_id: Some(sandbox_id),
+            outcome: "error",
+            disposition: PublicOperationCompensation::RetryAfter(START_COMPENSATION_ERROR_RETRY),
+            event: Some(SandboxEventType::CleanupFailed),
+            error: Some(error.to_string()),
+        }
+    }
+
+    fn from_outcome(sandbox_id: SandboxId, outcome: ExhaustedStartCompensation) -> Self {
+        use crate::controllers::substrate::AbandonedStartDeferral as Deferral;
+        use AbandonedStartRetirement as Retirement;
+        let (label, disposition, event) = match outcome {
+            ExhaustedStartCompensation::SandboxMissing => (
+                "sandbox_missing",
+                PublicOperationCompensation::Complete,
+                None,
+            ),
+            ExhaustedStartCompensation::OtherOperationInFlight => (
+                "deferred_other_operation_in_flight",
+                PublicOperationCompensation::RetryAfter(START_COMPENSATION_OTHER_OPERATION_RETRY),
+                Some(SandboxEventType::SweepDeferred),
+            ),
+            ExhaustedStartCompensation::Substrate(retirement) => {
+                let (disposition, event) = match retirement {
+                    Retirement::NothingToRetire => (PublicOperationCompensation::Complete, None),
+                    Retirement::Retired => (
+                        PublicOperationCompensation::Complete,
+                        Some(SandboxEventType::CleanupCompleted),
+                    ),
+                    // Left alone on purpose and never deletable from here, so
+                    // retrying would only repeat this report.
+                    Retirement::RunningPodLeft => (
+                        PublicOperationCompensation::Complete,
+                        Some(SandboxEventType::CleanupFailed),
+                    ),
+                    Retirement::Deferred(Deferral::ActivationLeaseHeld { remaining }) => (
+                        PublicOperationCompensation::RetryAfter(
+                            remaining.max(START_COMPENSATION_CHANGED_RETRY),
+                        ),
+                        Some(SandboxEventType::SweepDeferred),
+                    ),
+                    Retirement::Deferred(Deferral::PodIdentityChanged) => (
+                        PublicOperationCompensation::RetryAfter(START_COMPENSATION_CHANGED_RETRY),
+                        Some(SandboxEventType::SweepDeferred),
+                    ),
+                };
+                (retirement.as_str(), disposition, event)
+            }
+        };
+        Self {
+            sandbox_id: Some(sandbox_id),
+            outcome: label,
+            disposition,
+            event,
+            error: None,
+        }
+    }
+
+    fn emit(self, operation: &ClaimedPublicOperation) -> PublicOperationCompensation {
+        pplx_space_metrics::operations::compensated(
+            operation.api_product.as_str(),
+            operation.kind.as_str(),
+            self.outcome,
+        );
+        if let (Some(sandbox_id), Some(event_type)) = (self.sandbox_id, self.event) {
+            let mut details = SandboxEventDetails::default()
+                .reason("abandoned_start")
+                .operation("start")
+                .trigger(SandboxEventTrigger::System)
+                .result(self.outcome);
+            if let Some(error) = &self.error {
+                details = details.error(error.clone());
+            }
+            SandboxEvent::new(
+                sandbox_id,
+                event_type,
+                SandboxEventSource::ClusterController,
+            )
+            .emit_with(details);
+        }
+        let target_id = operation.target_id.as_deref().unwrap_or_default();
+        match self.disposition {
+            PublicOperationCompensation::Complete
+                if self.error.is_none() && self.event != Some(SandboxEventType::CleanupFailed) =>
+            {
+                tracing::info!(
+                    operation_id = %operation.id,
+                    target_id,
+                    outcome = self.outcome,
+                    "compensated failed sandbox start"
+                );
+            }
+            disposition => tracing::warn!(
+                operation_id = %operation.id,
+                target_id,
+                outcome = self.outcome,
+                error = self.error.as_deref().unwrap_or_default(),
+                retry_after_secs = match disposition {
+                    PublicOperationCompensation::Complete => None,
+                    PublicOperationCompensation::RetryAfter(after) => Some(after.as_secs()),
+                },
+                "failed sandbox start left something behind that was not retired"
+            ),
+        }
+        self.disposition
     }
 }
 

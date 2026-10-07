@@ -274,7 +274,15 @@ pub(super) struct StoppedSandboxExecutionRow {
     pub(super) execution: ActiveExecutionStatusRow,
     /// The stop left this execution; no start has created one since.
     pub(super) predates_stop: bool,
-    pub(super) activation_lease_live: bool,
+    activation_lease_remaining_secs: f64,
+}
+
+impl StoppedSandboxExecutionRow {
+    /// How long the execution's activation lease still holds; zero when no
+    /// attempt owns it or its lease has run out.
+    pub(super) fn activation_lease_remaining(&self) -> Duration {
+        Duration::from_secs_f64(self.activation_lease_remaining_secs.max(0.0))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2480,11 +2488,12 @@ impl K8sStore {
                     e.activation_attempt_id,
                     e.route_activation_id,
                     e.created_at <= s.lifecycle_changed_at AS predates_stop,
-                    COALESCE(
-                        e.activation_attempt_id IS NOT NULL
-                            AND e.activation_attempt_expires_at > NOW(),
-                        FALSE
-                    ) AS activation_lease_live
+                    CASE WHEN e.activation_attempt_id IS NULL THEN 0.0
+                         ELSE COALESCE(GREATEST(
+                             EXTRACT(EPOCH FROM (e.activation_attempt_expires_at - NOW())),
+                             0.0
+                         ), 0.0)
+                    END::float8 AS activation_lease_remaining_secs
              FROM sandbox_k8s_executions e
              JOIN sandboxes s ON s.id = e.sandbox_id
              WHERE e.sandbox_id = $1 AND e.active AND s.lifecycle = 'stopped'"
@@ -2497,13 +2506,113 @@ impl K8sStore {
     }
 
     /// Retire the execution an abandoned start selected, or re-prove there is
-    /// none, under the sandbox lock.
+    /// none, and forget where it ran, all under the sandbox lock.
+    ///
+    /// The lock is the one every activation takes to assign an attempt or
+    /// create an execution, so this cannot interleave with either. It
+    /// refuses (`false`, nothing written) unless the sandbox is still
+    /// `stopped` and, with `expected`, that exact execution is still active,
+    /// was created after the current stop, and no attempt holds a live lease
+    /// on it; without `expected`, unless no execution is active.
+    ///
+    /// Only the attempt's placement is forgotten. `target_node_id` is the
+    /// node holding the stopped disk, which a failed cold activation's
+    /// rollback keeps and the next start restarts from.
     pub(super) async fn retire_abandoned_start_execution(
         &self,
-        _sandbox_id: SandboxId,
-        _expected: Option<&ExecutionIdentity>,
+        sandbox_id: SandboxId,
+        expected: Option<&ExecutionIdentity>,
     ) -> Result<bool, SubstrateError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .db_context("failed to start abandoned start retirement transaction")?;
+        if Self::lock_sandbox_execution_lifecycle_in(&mut tx, sandbox_id).await?
+            != Some(SandboxLifecycle::Stopped)
+        {
+            return Ok(false);
+        }
+        match expected {
+            Some(identity) => {
+                let claimable: bool = sqlx::query_scalar(sql!(
+                    "SELECT EXISTS (
+                        SELECT 1
+                          FROM sandbox_k8s_executions execution
+                          JOIN sandboxes sandbox ON sandbox.id = execution.sandbox_id
+                         WHERE execution.sandbox_id = $1
+                           AND execution.active
+                           AND execution.created_at > sandbox.lifecycle_changed_at
+                           AND NOT COALESCE(
+                               execution.activation_attempt_id IS NOT NULL
+                                   AND execution.activation_attempt_expires_at > NOW(),
+                               FALSE
+                           )
+                    )"
+                ))
+                .bind(sandbox_id)
+                .fetch_one(&mut *tx)
+                .await
+                .db_context("failed to re-check abandoned start execution")?;
+                if !claimable
+                    || !self
+                        .finish_fenced_execution_in(&mut tx, sandbox_id, identity, "forgotten")
+                        .await?
+                {
+                    return Ok(false);
+                }
+            }
+            None => {
+                let active_exists: bool = sqlx::query_scalar(sql!(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND active
+                     )"
+                ))
+                .bind(sandbox_id)
+                .fetch_one(&mut *tx)
+                .await
+                .db_context("failed to re-check abandoned start execution absence")?;
+                if active_exists {
+                    return Ok(false);
+                }
+            }
+        }
+        sqlx::query(sql!(
+            "UPDATE sandboxes
+                SET placement = 'unplaced',
+                    active_node_id = NULL
+              WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .execute(&mut *tx)
+        .await
+        .db_context("failed to forget abandoned start placement")?;
+        tx.commit()
+            .await
+            .db_context("failed to commit abandoned start retirement")?;
         Ok(true)
+    }
+
+    /// Pod names on inactive executions created since the sandbox's current
+    /// stop, oldest generation first: what start attempts since then left.
+    pub(super) async fn post_stop_inactive_execution_pod_names(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<Vec<String>, SubstrateError> {
+        sqlx::query_scalar(sql!(
+            "SELECT execution.pod_name
+               FROM sandbox_k8s_executions execution
+               JOIN sandboxes sandbox ON sandbox.id = execution.sandbox_id
+              WHERE execution.sandbox_id = $1
+                AND NOT execution.active
+                AND sandbox.lifecycle = 'stopped'
+                AND execution.created_at > sandbox.lifecycle_changed_at
+              ORDER BY execution.generation"
+        ))
+        .bind(sandbox_id)
+        .fetch_all(&self.pool)
+        .await
+        .db_context("failed to query abandoned start pods")
     }
 
     pub(super) async fn complete_activation_attempt(

@@ -519,15 +519,25 @@ impl PublicOperationStore {
         Ok(result)
     }
 
-    /// Whether any operation on this tenant's sandbox other than `except`,
-    /// claimed with `except_claim_token`, is still queued or running.
+    /// Whether an operation that can own or reuse this tenant's sandbox
+    /// runtime is still queued or running, other than `except` under the
+    /// claim `except_claim_token`.
+    ///
+    /// `except` under any *other* claim counts: a claim that went stale was
+    /// re-claimed by another dispatcher, which may be running a new attempt
+    /// of this very operation. See [`RUNTIME_OWNING_SANDBOX_OPERATION_KINDS`]
+    /// for which kinds count.
     pub async fn other_sandbox_operation_unfinished(
         &self,
         org_id: OrgId,
         target_id: &str,
         except: OperationId,
-        _except_claim_token: &str,
+        except_claim_token: &str,
     ) -> Result<bool, PublicOperationStoreError> {
+        let kinds = RUNTIME_OWNING_SANDBOX_OPERATION_KINDS
+            .iter()
+            .map(|kind| kind.as_str().to_string())
+            .collect::<Vec<_>>();
         Ok(sqlx::query_scalar(sql!(
             "SELECT EXISTS (
                 SELECT 1
@@ -535,13 +545,16 @@ impl PublicOperationStore {
                  WHERE org_id = $1
                    AND target_type = 'sandbox'
                    AND target_id = $2
-                   AND operation_id <> $3
+                   AND kind = ANY($5)
                    AND state IN ('queued', 'running')
+                   AND NOT (operation_id = $3 AND claim_token = $4)
             )"
         ))
         .bind(org_id)
         .bind(target_id)
         .bind(except.as_uuid())
+        .bind(except_claim_token)
+        .bind(&kinds)
         .fetch_one(&self.pool)
         .await?)
     }
@@ -1044,6 +1057,32 @@ pub enum CreateClaimedPublicOperationResult {
     AdmissionDenied,
 }
 
+/// Sandbox operations whose execution can materialize, adopt, or tear down
+/// the sandbox's runtime, and so may be about to use a pod that a failed
+/// start left behind:
+///
+/// - start, wake, restore, resume, and rollback (which can restart the
+///   sandbox) all reach a recovering activation path that creates or adopts
+///   the execution's pod;
+/// - stop and kill go through the recovering runtime client, which can
+///   materialize a pod for the call;
+/// - delete owns the runtime's teardown.
+///
+/// Everything else either dials only a pod that already has an IP (pause,
+/// suspend, checkpoint, a fork reading its source), which a failed start's
+/// compensation never deletes, or never touches the runtime (updates and
+/// snapshot policy).
+pub const RUNTIME_OWNING_SANDBOX_OPERATION_KINDS: &[OperationKind] = &[
+    OperationKind::StartSandbox,
+    OperationKind::WakeSandbox,
+    OperationKind::RestoreSandbox,
+    OperationKind::ResumeSandbox,
+    OperationKind::RollbackSandbox,
+    OperationKind::StopSandbox,
+    OperationKind::KillSandbox,
+    OperationKind::DeleteSandbox,
+];
+
 #[derive(Debug, Clone)]
 pub struct ClaimPublicOperations<'a> {
     pub limit: u32,
@@ -1082,7 +1121,7 @@ pub struct ClaimedPublicOperation {
     /// Set when an earlier claim decided this operation failed but deferred
     /// recording it while the executor compensates; this claim only retries
     /// that compensation.
-    pub pending_failure: Option<ClaimedPendingFailure>,
+    pub pending_failure: Option<Box<ClaimedPendingFailure>>,
 }
 
 /// What the dispatcher does with a failure once the executor has tried to undo
@@ -2125,14 +2164,14 @@ impl TryFrom<ClaimedPublicOperationRow> for ClaimedPublicOperation {
             payload: row.payload_json.0,
             attempts: row.attempts,
             claim_generation: row.claim_generation,
-            pending_failure: row
-                .pending_failure_json
-                .map(|stored| ClaimedPendingFailure {
+            pending_failure: row.pending_failure_json.map(|stored| {
+                Box::new(ClaimedPendingFailure {
                     failure: stored.0.into(),
                     pending_for: Duration::from_secs_f64(
                         row.pending_failure_age_secs.unwrap_or(0.0).max(0.0),
                     ),
-                }),
+                })
+            }),
         })
     }
 }

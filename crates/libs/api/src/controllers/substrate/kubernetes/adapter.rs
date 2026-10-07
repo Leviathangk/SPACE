@@ -2692,86 +2692,105 @@ impl SubstrateAdapter for KubernetesSubstrate {
             }
             Err(err) => return Err(err),
         }
-        let fence = match self
+        // The database half goes first and closes the race with a newer
+        // start: it retires the selected execution (or re-proves there is
+        // none) under the same sandbox lock every activation takes to claim
+        // or create one. A start that claimed it first makes this refuse; a
+        // start that comes later finds no active execution and creates a
+        // new generation, so nothing can adopt a pod deleted below.
+        let retired_execution = match self
             .store
             .stopped_sandbox_active_execution(sandbox_id)
             .await?
         {
             // No active execution: a failed cold activation's rollback
             // receipt retires the attempt's execution but not its pod, so
-            // that pod is recorded only on an inactive row, which nothing else
-            // collects. Pods on inactive rows cannot be a successor's, and the
-            // absence is re-proven under the sandbox lock before any tracking
-            // is cleared, so a start that creates an execution meanwhile keeps
-            // both.
-            None => RetireFence::NoExecution,
+            // that pod is recorded only on an inactive row, which nothing
+            // else collects.
+            None => {
+                if !self
+                    .store
+                    .retire_abandoned_start_execution(sandbox_id, None)
+                    .await?
+                {
+                    return Ok(AbandonedStartRetirement::Deferred(
+                        AbandonedStartDeferral::PodIdentityChanged,
+                    ));
+                }
+                false
+            }
             Some(row) if row.predates_stop => {
                 return Ok(AbandonedStartRetirement::NothingToRetire);
             }
             // Its own attempt's lease, or a newer start that joined or
             // replaced it: the lease cannot say which, and tearing down a
             // joined start is exactly what this must never do.
-            Some(row) if row.activation_lease_live => {
+            Some(row) if row.activation_lease_remaining() > Duration::ZERO => {
                 return Ok(AbandonedStartRetirement::Deferred(
                     AbandonedStartDeferral::ActivationLeaseHeld {
-                        remaining: Duration::ZERO,
+                        remaining: row.activation_lease_remaining(),
                     },
                 ));
             }
             Some(row) => {
                 let execution = row.execution;
-                let pod_name =
-                    PodName::parse(&execution.pod_name).map_err(|err| SubstrateError::Failed {
-                        message: format!("invalid abandoned start pod name: {err}"),
-                    })?;
-                let live_pod = fetch_sandbox_pod_uncached(&self.k8s, pod_name.as_str())
+                // A booted pod would need an in-VM stop before it could go,
+                // and nothing here can keep a newer start from adopting this
+                // generation between any check and that stop. So it is left
+                // running, with its execution, and reported.
+                let live_pod = fetch_sandbox_pod_uncached(&self.k8s, &execution.pod_name)
                     .await
                     .map_err(|err| SubstrateError::Failed {
                         message: format!("failed to read abandoned start pod: {err}"),
                     })?;
-                // Fenced on everything this read saw: the generation, the
-                // attempt (none live), what the row records, and the live
-                // object's UID and resourceVersion. A start that claims the
-                // execution or replaces its pod before the delete makes the
-                // teardown refuse.
-                let mut fence = PodIdentityFence::new(pod_name)
-                    .with_generation(execution.generation)
-                    .with_recorded(RecordedExecution::Read {
+                if live_pod.as_ref().is_some_and(pod_has_booted) {
+                    tracing::warn!(
+                        sandbox_id = %sandbox_id,
+                        generation = execution.generation,
+                        pod_name = %execution.pod_name,
+                        "abandoned start's pod has booted on a stopped sandbox; leaving it running"
+                    );
+                    return Ok(AbandonedStartRetirement::RunningPodLeft);
+                }
+                let pod_name =
+                    PodName::parse(&execution.pod_name).map_err(|err| SubstrateError::Failed {
+                        message: format!("invalid abandoned start pod name: {err}"),
+                    })?;
+                let identity = ExecutionIdentity {
+                    pod_name,
+                    generation: Some(execution.generation),
+                    activation_attempt_id: execution.activation_attempt_id,
+                    recorded: RecordedExecution::Read {
                         pod_uid: execution.pod_uid.clone(),
                         route_activation_id: execution.route_activation_id,
-                    });
-                if let Some(attempt_id) = execution.activation_attempt_id {
-                    fence = fence.with_activation_attempt(attempt_id);
-                }
-                if let Some(pod_uid) = live_pod
-                    .as_ref()
-                    .and_then(|pod| pod.metadata.uid.as_deref())
-                    .and_then(|uid| PodUid::parse(uid).ok())
+                    },
+                    // The guarded write binds what the row recorded, not the
+                    // live object; each pod delete below carries the live
+                    // object's identity instead.
+                    pod: ObservedPod::Unobserved,
+                };
+                if !self
+                    .store
+                    .retire_abandoned_start_execution(sandbox_id, Some(&identity))
+                    .await?
                 {
-                    fence = fence.with_pod_uid(pod_uid);
-                    if let Some(resource_version) = live_pod
-                        .as_ref()
-                        .and_then(|pod| pod.metadata.resource_version.as_deref())
-                        .and_then(|version| PodResourceVersion::parse(version).ok())
-                    {
-                        fence = fence.with_resource_version(resource_version);
-                    }
+                    return Ok(AbandonedStartRetirement::Deferred(
+                        AbandonedStartDeferral::PodIdentityChanged,
+                    ));
                 }
-                RetireFence::Pod(fence)
+                true
             }
         };
-        // Retire, not delete: a pod that did boot holds the only copy of what
-        // the guest wrote since the stop, so it is stopped and backed up like
-        // any other retire before its pod goes.
-        match self
-            .teardown_execution(sandbox_id, ExecutionTeardown::Retire, &fence)
-            .await?
-        {
-            RetireExecutionOutcome::Retired => Ok(AbandonedStartRetirement::Retired),
-            RetireExecutionOutcome::PodIdentityChanged { .. } => Ok(
-                AbandonedStartRetirement::Deferred(AbandonedStartDeferral::PodIdentityChanged),
-            ),
-        }
+        let collected = self.collect_abandoned_start_pods(sandbox_id).await?;
+        Ok(match collected {
+            AbandonedStartPods::RunningLeft => AbandonedStartRetirement::RunningPodLeft,
+            AbandonedStartPods::Changed => {
+                AbandonedStartRetirement::Deferred(AbandonedStartDeferral::PodIdentityChanged)
+            }
+            AbandonedStartPods::Deleted => AbandonedStartRetirement::Retired,
+            AbandonedStartPods::NoneLeft if retired_execution => AbandonedStartRetirement::Retired,
+            AbandonedStartPods::NoneLeft => AbandonedStartRetirement::NothingToRetire,
+        })
     }
 
     async fn delete_observed_execution(
@@ -2884,8 +2903,10 @@ impl SubstrateAdapter for KubernetesSubstrate {
         // restore pod — swept by neither the orphaned-sandbox nor the
         // transient-lifecycle sweeper — stranding the pod and making retries see
         // a dormant sandbox. Non-restore starts (e.g. `stopped`) keep the inline
-        // path below; they never claim `restoring`, so there's no orphan to
-        // guard against.
+        // path below; they never claim `restoring`. They can still leave their
+        // attempt's pod behind, deliberately, for the next attempt to reuse;
+        // once the start has failed for good, the operation dispatcher's
+        // compensation (`retire_abandoned_start`) collects it.
         if matches!(
             normalize_lifecycle(&sandbox.lifecycle).as_str(),
             "suspended" | "restoring"
@@ -5060,3 +5081,114 @@ impl SubstrateAdapter for KubernetesSubstrate {
 
 #[cfg(test)]
 mod tests;
+
+/// What [`KubernetesSubstrate::collect_abandoned_start_pods`] found, most
+/// significant first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbandonedStartPods {
+    /// A pod had booted and was left alone.
+    RunningLeft,
+    /// A pod changed between its read and its delete, and was not deleted.
+    Changed,
+    Deleted,
+    NoneLeft,
+}
+
+/// A booted pod is a VM on the stopped sandbox's disk: Running, or already
+/// holding the IP its sandbox gets once the node has started it.
+fn pod_has_booted(pod: &Pod) -> bool {
+    pod.status
+        .as_ref()
+        .and_then(|status| status.phase.as_deref())
+        == Some("Running")
+        || assigned_pod_ip(pod.status.as_ref())
+            .ok()
+            .flatten()
+            .is_some()
+}
+
+impl KubernetesSubstrate {
+    /// Delete the pods that executions created since the sandbox's current
+    /// stop left on inactive rows, the only record of them once their
+    /// execution is retired. No successor can own one: a successor's pod is
+    /// on the active row, and a pod name is unique to its generation.
+    ///
+    /// Each pod is read live and deleted only as the object read, under its
+    /// UID and resourceVersion, so a pod that comes up in between is not
+    /// deleted. A booted pod is never deleted: it would need an in-VM stop
+    /// first, and an inactive row has no fence to stop it under.
+    async fn collect_abandoned_start_pods(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<AbandonedStartPods, SubstrateError> {
+        let mut found = AbandonedStartPods::NoneLeft;
+        for pod_name in self
+            .store
+            .post_stop_inactive_execution_pod_names(sandbox_id)
+            .await?
+        {
+            let Some(pod) = fetch_sandbox_pod_uncached(&self.k8s, &pod_name)
+                .await
+                .map_err(|err| SubstrateError::Failed {
+                    message: format!("failed to read abandoned start pod {pod_name}: {err}"),
+                })?
+            else {
+                continue;
+            };
+            if pod.metadata.deletion_timestamp.is_some() {
+                continue;
+            }
+            if pod_has_booted(&pod) {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    pod_name = %pod_name,
+                    "pod left by an abandoned start has booted on a stopped sandbox; leaving it running"
+                );
+                found = AbandonedStartPods::RunningLeft;
+                continue;
+            }
+            let (Ok(name), Some(pod_uid)) = (
+                PodName::parse(&pod_name),
+                pod.metadata
+                    .uid
+                    .as_deref()
+                    .and_then(|uid| PodUid::parse(uid).ok()),
+            ) else {
+                // Nothing to precondition the delete on.
+                if found != AbandonedStartPods::RunningLeft {
+                    found = AbandonedStartPods::Changed;
+                }
+                continue;
+            };
+            let resource_version = pod
+                .metadata
+                .resource_version
+                .as_deref()
+                .and_then(|version| PodResourceVersion::parse(version).ok());
+            match delete_sandbox_pod_fenced(&self.k8s, &name, &pod_uid, resource_version.as_ref())
+                .await
+                .map_err(|err| SubstrateError::Failed {
+                    message: format!("failed to delete abandoned start pod {pod_name}: {err}"),
+                })? {
+                FencedPodDeleteOutcome::Deleted => {
+                    tracing::info!(
+                        sandbox_id = %sandbox_id,
+                        pod_name = %pod_name,
+                        pod_uid = %pod_uid,
+                        "deleted pod left by an abandoned start"
+                    );
+                    if found == AbandonedStartPods::NoneLeft {
+                        found = AbandonedStartPods::Deleted;
+                    }
+                }
+                FencedPodDeleteOutcome::NotFound => {}
+                FencedPodDeleteOutcome::PreconditionFailed => {
+                    if found != AbandonedStartPods::RunningLeft {
+                        found = AbandonedStartPods::Changed;
+                    }
+                }
+            }
+        }
+        Ok(found)
+    }
+}

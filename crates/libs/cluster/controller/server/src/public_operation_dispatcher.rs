@@ -7,8 +7,9 @@ use pplx_space_api::controllers::substrate::Substrate;
 use pplx_space_api::fork_operation_executor::ForkSandboxOperationExecutor;
 use pplx_space_api::public_operations::{
     ApiProduct, ClaimPublicOperations, ClaimedPublicOperation, CompleteClaimedPublicOperation,
-    FailClaimedPublicOperation, PublicOperationClaim, PublicOperationCompensation,
-    PublicOperationRequeueReason, PublicOperationStore, ReleaseClaimedPublicOperation,
+    DeferClaimedPublicOperationFailure, FailClaimedPublicOperation, PendingPublicOperationFailure,
+    PublicOperationClaim, PublicOperationCompensation, PublicOperationRequeueReason,
+    PublicOperationStore, ReleaseClaimedPublicOperation,
 };
 use pplx_space_api::public_sandbox_operations::{
     CreateSandboxOperationExecutor, PublicOperationExecutionResult,
@@ -161,7 +162,16 @@ pub trait PublicOperationExecutor: Send + Sync + 'static {
     ) -> OperationExecutionResult;
 
     /// Undo what the operation's attempts left behind, once the dispatcher
-    /// has decided the operation failed.
+    /// has decided the operation failed: the executor reported a terminal
+    /// failure, the operation exceeded its deadline, or its retry budget is
+    /// exhausted.
+    ///
+    /// Called while the claim is held and before the failure is recorded.
+    /// `RetryAfter` keeps the failure pending: the operation is requeued
+    /// without spending its retry budget, and later claims call only this,
+    /// with the same failure, until it answers `Complete` or the pending
+    /// failure ages out. `claim_token` is this claim's, so an executor can
+    /// tell its own operation from a re-claimed copy of it.
     async fn compensate_failure(
         &self,
         _claim_token: &str,
@@ -558,6 +568,20 @@ where
     let kind = operation.kind;
     let attempts = operation.attempts;
     pplx_space_metrics::operations::claimed(api_product_label, kind.as_str());
+    // An earlier claim decided this operation failed; only its compensation
+    // is left, and the attempt that failed is not run again.
+    if let Some(pending) = operation.pending_failure.clone() {
+        return finish_failure(
+            &store,
+            &executor,
+            claim_token,
+            config,
+            &operation,
+            pending.failure,
+            pending.pending_for,
+        )
+        .await;
+    }
     let execution_claim_token = claim_token.clone();
     let Some(result) = while_renewing_claim(
         &store,
@@ -571,7 +595,7 @@ where
         return Ok(TickReport::default());
     };
     let mut report = TickReport::default();
-    let updated = match result.state {
+    let failure = match result.state {
         OperationState::Succeeded => {
             let updated = store
                 .complete_claimed_operation(CompleteClaimedPublicOperation {
@@ -588,40 +612,20 @@ where
                     kind.as_str(),
                     OperationState::Succeeded.as_str(),
                 );
+            } else {
+                note_stale_claim(&mut report, &operation);
             }
-            updated
+            return Ok(report);
         }
-        OperationState::Failed => {
-            let terminal_error_code = result
+        OperationState::Failed => PendingPublicOperationFailure {
+            progress_message: result.progress_message,
+            terminal_error_code: result
                 .terminal_error_code
-                .unwrap_or(PublicErrorCode::Internal);
-            let terminal_error_label = terminal_error_code.as_str().to_string();
-            let updated = store
-                .fail_claimed_operation(FailClaimedPublicOperation {
-                    claim_token,
-                    operation_id,
-                    progress_message: result.progress_message,
-                    terminal_error_code,
-                    terminal_error_json: result
-                        .terminal_error_json
-                        .unwrap_or_else(|| serde_json::json!({})),
-                })
-                .await?;
-            if updated {
-                report.failed += 1;
-                pplx_space_metrics::operations::failed(
-                    api_product_label,
-                    kind.as_str(),
-                    &terminal_error_label,
-                );
-                pplx_space_metrics::operations::completed(
-                    api_product_label,
-                    kind.as_str(),
-                    OperationState::Failed.as_str(),
-                );
-            }
-            updated
-        }
+                .unwrap_or(PublicErrorCode::Internal),
+            terminal_error_json: result
+                .terminal_error_json
+                .unwrap_or_else(|| serde_json::json!({})),
+        },
         // Executors only produce the known states; an `Other` here would be a
         // programming error, and releasing the claim is the safe reading.
         OperationState::Queued
@@ -673,108 +677,55 @@ where
                 let max_age_seconds = deadline
                     .expect("deadline is configured when it is exceeded")
                     .as_secs();
-                let terminal_error_code = PublicErrorCode::OperationFailed;
-                let updated = store
-                    .fail_claimed_operation(FailClaimedPublicOperation {
-                        claim_token,
-                        operation_id,
-                        progress_message: m1_deadline_message(max_age_seconds),
-                        terminal_error_code: terminal_error_code.clone(),
-                        terminal_error_json: serde_json::json!({
-                            "operation_id": operation_id.to_string(),
-                            "kind": kind.as_str(),
-                            "reason": "operation_deadline_exceeded",
-                            "max_age_seconds": max_age_seconds,
-                            "last_requeue_reason": last_requeue_reason,
-                            "last_progress_message": last_progress_message,
-                            "attempts": attempts,
-                        }),
-                    })
-                    .await?;
-                if updated {
-                    report.failed += 1;
-                    pplx_space_metrics::operations::failed(
-                        api_product_label,
-                        kind.as_str(),
-                        terminal_error_code.as_str(),
-                    );
-                    pplx_space_metrics::operations::completed(
-                        api_product_label,
-                        kind.as_str(),
-                        OperationState::Failed.as_str(),
-                    );
-                    pplx_space_metrics::operations::deadline_exceeded(
-                        api_product_label,
-                        kind.as_str(),
-                        last_requeue_reason,
-                    );
-                    tracing::warn!(
-                        operation_id = %operation_id,
-                        api_product = api_product_label,
-                        kind = kind.as_str(),
-                        last_requeue_reason,
-                        max_age_seconds,
-                        attempts,
-                        "public operation exceeded the M1 terminalization deadline"
-                    );
+                pplx_space_metrics::operations::deadline_exceeded(
+                    api_product_label,
+                    kind.as_str(),
+                    last_requeue_reason,
+                );
+                tracing::warn!(
+                    operation_id = %operation_id,
+                    api_product = api_product_label,
+                    kind = kind.as_str(),
+                    last_requeue_reason,
+                    max_age_seconds,
+                    attempts,
+                    "public operation exceeded the M1 terminalization deadline"
+                );
+                PendingPublicOperationFailure {
+                    progress_message: m1_deadline_message(max_age_seconds),
+                    terminal_error_code: PublicErrorCode::OperationFailed,
+                    terminal_error_json: serde_json::json!({
+                        "operation_id": operation_id.to_string(),
+                        "kind": kind.as_str(),
+                        "reason": "operation_deadline_exceeded",
+                        "max_age_seconds": max_age_seconds,
+                        "last_requeue_reason": last_requeue_reason,
+                        "last_progress_message": last_progress_message,
+                        "attempts": attempts,
+                    }),
                 }
-                updated
             } else if !preserve_retry_budget
                 && retry_budget_exhausted(attempts, config.max_retry_attempts)
             {
-                // Before the failure is recorded, so a crash here re-claims
-                // the operation and compensates again rather than never.
-                if while_renewing_claim(
-                    &store,
-                    &claim_token,
-                    &operation,
-                    config.claim_stale_after,
-                    executor.compensate_failure(&claim_token, &operation),
-                )
-                .await?
-                .is_none()
-                {
-                    return Ok(TickReport::default());
-                }
-                let terminal_error_code = result
-                    .terminal_error_code
-                    .unwrap_or(PublicErrorCode::Internal);
-                let terminal_error_json = result.terminal_error_json.unwrap_or_else(|| {
-                    serde_json::json!({
-                        "operation_id": operation_id.to_string(),
-                        "kind": kind.as_str(),
-                        "reason": "retry_attempts_exhausted",
-                        "retry_reason": retry_reason,
-                        "attempts": attempts,
+                PendingPublicOperationFailure {
+                    progress_message: format!(
+                        "retry attempts exhausted after {attempts} attempt(s): \
+                         {progress_message}"
+                    ),
+                    terminal_error_code: result
+                        .terminal_error_code
+                        .unwrap_or(PublicErrorCode::Internal),
+                    terminal_error_json: result.terminal_error_json.unwrap_or_else(|| {
+                        serde_json::json!({
+                            "operation_id": operation_id.to_string(),
+                            "kind": kind.as_str(),
+                            "reason": "retry_attempts_exhausted",
+                            "retry_reason": retry_reason,
+                            "attempts": attempts,
                             "max_retry_attempts": config.max_retry_attempts.max(1),
-                    })
-                });
-                let updated = store
-                    .fail_claimed_operation(FailClaimedPublicOperation {
-                        claim_token,
-                        operation_id,
-                        progress_message: format!(
-                            "retry attempts exhausted after {attempts} attempt(s): \
-                             {progress_message}"
-                        ),
-                        terminal_error_code: terminal_error_code.clone(),
-                        terminal_error_json,
-                    })
-                    .await?;
-                if updated {
-                    report.failed += 1;
-                    pplx_space_metrics::operations::failed(
-                        api_product_label,
-                        kind.as_str(),
-                        terminal_error_code.as_str(),
-                    );
-                    pplx_space_metrics::operations::completed(
-                        api_product_label,
-                        kind.as_str(),
-                        OperationState::Failed.as_str(),
-                    );
+                        })
+                    }),
                 }
-                updated
             } else {
                 let updated = store
                     .release_claimed_operation(ReleaseClaimedPublicOperation {
@@ -797,22 +748,171 @@ where
                         kind.as_str(),
                         retry_reason,
                     );
+                } else {
+                    note_stale_claim(&mut report, &operation);
                 }
-                updated
+                return Ok(report);
             }
         }
     };
+    finish_failure(
+        &store,
+        &executor,
+        claim_token,
+        config,
+        &operation,
+        failure,
+        Duration::ZERO,
+    )
+    .await
+}
 
-    if !updated {
-        report.stale_claims += 1;
-        pplx_space_metrics::operations::stale_claim(api_product_label, kind.as_str());
-        tracing::warn!(
-            operation_id = %operation_id,
-            "public operation claim was lost before completion update"
+/// How long a failure may wait on its compensation before it is recorded
+/// anyway, counted from when it was first deferred. Long enough to outlive
+/// an activation lease (five minutes) several times over and ride out a
+/// transient outage; short enough that a client still learns the outcome.
+const COMPENSATION_MAX_AGE: Duration = Duration::from_secs(30 * 60);
+/// Retries of a pending compensation back off to at most this interval.
+const COMPENSATION_MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Record a decided failure once the executor has compensated for it, or
+/// keep it pending while the executor reports that something may still be
+/// left behind.
+///
+/// Compensation runs under claim renewal and before anything is recorded,
+/// so a crash re-claims the operation and compensates again rather than
+/// never. A failure that is kept pending requeues the operation without
+/// spending its retry budget; the next claim runs only the compensation. Past
+/// [`COMPENSATION_MAX_AGE`] the failure is recorded anyway and marked, so a
+/// compensation that never completes cannot hold the outcome back forever.
+async fn finish_failure<E>(
+    store: &PublicOperationStore,
+    executor: &E,
+    claim_token: String,
+    config: OperationExecutionConfig,
+    operation: &ClaimedPublicOperation,
+    failure: PendingPublicOperationFailure,
+    pending_for: Duration,
+) -> Result<TickReport, pplx_space_api::public_operations::PublicOperationStoreError>
+where
+    E: PublicOperationExecutor,
+{
+    let api_product_label = operation.api_product.as_str();
+    let kind = operation.kind;
+    let mut report = TickReport::default();
+    let Some(compensation) = while_renewing_claim(
+        store,
+        &claim_token,
+        operation,
+        config.claim_stale_after,
+        executor.compensate_failure(&claim_token, operation),
+    )
+    .await?
+    else {
+        return Ok(report);
+    };
+    let failure = match compensation {
+        PublicOperationCompensation::Complete => failure,
+        PublicOperationCompensation::RetryAfter(suggested)
+            if pending_for < COMPENSATION_MAX_AGE =>
+        {
+            let retry_after = suggested
+                .max((pending_for / 4).min(COMPENSATION_MAX_BACKOFF))
+                .max(Duration::from_secs(1));
+            let updated = store
+                .defer_claimed_failure(DeferClaimedPublicOperationFailure {
+                    claim_token,
+                    operation_id: operation.id,
+                    progress_message: format!(
+                        "{}; cleaning up what the operation left behind before \
+                         reporting the failure",
+                        failure.progress_message
+                    ),
+                    failure,
+                    retry_after,
+                })
+                .await?;
+            if updated {
+                report.retried += 1;
+                pplx_space_metrics::operations::requeued(
+                    api_product_label,
+                    kind.as_str(),
+                    "failure_pending_compensation",
+                );
+            } else {
+                note_stale_claim(&mut report, operation);
+            }
+            return Ok(report);
+        }
+        PublicOperationCompensation::RetryAfter(_) => {
+            pplx_space_metrics::operations::compensated(
+                api_product_label,
+                kind.as_str(),
+                "abandoned",
+            );
+            tracing::warn!(
+                operation_id = %operation.id,
+                api_product = api_product_label,
+                kind = kind.as_str(),
+                pending_secs = pending_for.as_secs(),
+                "recording a failure whose compensation did not complete; \
+                 what the operation left behind may remain"
+            );
+            abandoned_compensation(failure)
+        }
+    };
+    let terminal_error_label = failure.terminal_error_code.as_str().to_string();
+    let updated = store
+        .fail_claimed_operation(FailClaimedPublicOperation {
+            claim_token,
+            operation_id: operation.id,
+            progress_message: failure.progress_message,
+            terminal_error_code: failure.terminal_error_code,
+            terminal_error_json: failure.terminal_error_json,
+        })
+        .await?;
+    if updated {
+        report.failed += 1;
+        pplx_space_metrics::operations::failed(
+            api_product_label,
+            kind.as_str(),
+            &terminal_error_label,
         );
+        pplx_space_metrics::operations::completed(
+            api_product_label,
+            kind.as_str(),
+            OperationState::Failed.as_str(),
+        );
+    } else {
+        note_stale_claim(&mut report, operation);
     }
-
     Ok(report)
+}
+
+/// Mark a failure recorded without its compensation completing.
+fn abandoned_compensation(
+    mut failure: PendingPublicOperationFailure,
+) -> PendingPublicOperationFailure {
+    failure.terminal_error_json = match failure.terminal_error_json {
+        serde_json::Value::Object(mut error) => {
+            error.insert("compensation".to_string(), "abandoned".into());
+            serde_json::Value::Object(error)
+        }
+        error => serde_json::json!({"error": error, "compensation": "abandoned"}),
+    };
+    failure
+}
+
+fn note_stale_claim(report: &mut TickReport, operation: &ClaimedPublicOperation) {
+    report.stale_claims += 1;
+    pplx_space_metrics::operations::stale_claim(
+        operation.api_product.as_str(),
+        operation.kind.as_str(),
+    );
+    tracing::warn!(
+        operation_id = %operation.id,
+        "public operation claim was lost before completion update"
+    );
 }
 
 /// Drive `work` while keeping the operation's claim fresh. `None` when the

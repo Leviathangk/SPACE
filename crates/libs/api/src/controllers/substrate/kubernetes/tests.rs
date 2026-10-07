@@ -14557,7 +14557,7 @@ mod kubernetes_tests {
     /// `delete` says. A GET to a name in `failing_gets` answers 500.
     pub(crate) fn abandoned_start_kubernetes_client(
         pods: Vec<Pod>,
-        captured_deletes: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+        captured_deletes: CapturedPodDeletes,
         delete: FakePodDelete,
         failing_gets: Vec<String>,
     ) -> Client {
@@ -14643,14 +14643,14 @@ mod kubernetes_tests {
         ClientBuilder::new(service, "space").build()
     }
 
+    /// Every pod `DELETE` a fake apiserver received, with its body.
+    pub(crate) type CapturedPodDeletes = Arc<Mutex<Vec<(String, serde_json::Value)>>>;
+
     fn abandoned_start_subject(
         pool: &PgPool,
         pods: Vec<Pod>,
         delete: FakePodDelete,
-    ) -> (
-        KubernetesSubstrate,
-        Arc<Mutex<Vec<(String, serde_json::Value)>>>,
-    ) {
+    ) -> (KubernetesSubstrate, CapturedPodDeletes) {
         let captured_deletes = Arc::new(Mutex::new(Vec::new()));
         let cached = pods.first().cloned();
         let substrate = substrate_with_store_client_proxy_port_and_pod(
@@ -14667,7 +14667,7 @@ mod kubernetes_tests {
         (substrate, captured_deletes)
     }
 
-    fn deleted_pod_names(captured: &Arc<Mutex<Vec<(String, serde_json::Value)>>>) -> Vec<String> {
+    fn deleted_pod_names(captured: &CapturedPodDeletes) -> Vec<String> {
         captured
             .lock()
             .expect("capture mutex poisoned")
