@@ -248,10 +248,9 @@ fn resolve_node_id(path: &Path) -> Result<(String, String), NodeIdError> {
 
 /// Serve the cluster control-plane gRPC API until `shutdown_token` is
 /// cancelled, then drain in-flight requests and return.
-pub async fn run_with_ingress_activation(
+pub async fn run(
     config: InternalApiRunConfig,
     shutdown_token: CancellationToken,
-    factory: &dyn crate::ingress_activation::IngressActivationFactory,
 ) -> Result<(), RunInternalApiError> {
     let route_ed25519_authority = Some(std::sync::Arc::new(
         pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Authority::load_required_from_env()
@@ -314,7 +313,6 @@ pub async fn run_with_ingress_activation(
     // the signal wiring; this is the token it handed over.
     let shutdown_signal = shutdown_token.clone();
     let shutdown = async move { shutdown_signal.cancelled().await };
-    let activation_tasks = tokio_util::task::TaskTracker::new();
 
     let reflection = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(
@@ -323,15 +321,11 @@ pub async fn run_with_ingress_activation(
         .build_v1()?;
     let (_, health_service) = pplx_space_common_svc::grpc_health_service();
 
-    let activation = factory
-        .build(
-            pool.clone(),
-            route_ed25519_authority.clone(),
-            activation_tasks.clone(),
-            shutdown_token.clone(),
-        )
-        .await
-        .map_err(RunInternalApiError::ClusterApiService)?;
+    let activation = std::sync::Arc::new(
+        pplx_space_node_api_client::activation::RemoteIngressActivation::from_env()
+            .await
+            .map_err(RunInternalApiError::ClusterApiService)?,
+    );
     let mut svc = ClusterApiService::from_env_with_security_state(
         pool,
         route_ed25519_authority,
@@ -369,22 +363,6 @@ pub async fn run_with_ingress_activation(
         .await;
 
     shutdown_token.cancel();
-    activation_tasks.close();
-    // The short ingress wait must not cancel accepted restore ownership. Allow
-    // its existing node-RPC budget to drain even after the server stops serving.
-    // Deployment termination grace can cut this short; lease recovery remains
-    // authoritative after process exit.
-    if tokio::time::timeout(
-        pplx_space_common_core::restore_ownership::NODE_RPC_TIMEOUT,
-        activation_tasks.wait(),
-    )
-    .await
-    .is_err()
-    {
-        tracing::warn!(
-            "ingress activation shutdown budget exhausted; remaining ownership will recover through existing leases"
-        );
-    }
     serve_result?;
     Ok(())
 }
