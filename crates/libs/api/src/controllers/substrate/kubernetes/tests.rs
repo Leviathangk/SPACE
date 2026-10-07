@@ -14916,13 +14916,13 @@ mod kubernetes_tests {
         let pending =
             insert_start_attempt_execution(&pool, sandbox_id, 2, StartAttemptLease::Released)
                 .await?;
+        deactivate_execution(&pool, sandbox_id, 2).await?;
         let running = booted(
             insert_start_attempt_execution(&pool, sandbox_id, 3, StartAttemptLease::Released)
                 .await?,
         );
-        let pending_name = pending.metadata.name.clone().expect("pod has a name");
-        deactivate_execution(&pool, sandbox_id, 2).await?;
         deactivate_execution(&pool, sandbox_id, 3).await?;
+        let pending_name = pending.metadata.name.clone().expect("pod has a name");
         let (substrate, captured_deletes) =
             abandoned_start_subject(&pool, vec![running, pending], FakePodDelete::Accept);
 
