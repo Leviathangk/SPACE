@@ -241,6 +241,7 @@ enum FakePodCleanupResult {
 struct FakePodCleaner {
     result: FakePodCleanupResult,
     per_pod: BTreeMap<String, K8sBlockingDeleteOutcome>,
+    tracked: Vec<String>,
     calls: Mutex<Vec<String>>,
 }
 
@@ -249,6 +250,7 @@ impl FakePodCleaner {
         Self {
             result: FakePodCleanupResult::Outcome(outcome),
             per_pod: BTreeMap::new(),
+            tracked: Vec::new(),
             calls: Mutex::new(Vec::new()),
         }
     }
@@ -257,8 +259,16 @@ impl FakePodCleaner {
         Self {
             result: FakePodCleanupResult::DeleteTimeout,
             per_pod: BTreeMap::new(),
+            tracked: Vec::new(),
             calls: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Report `pod_names` as every pod the sandbox's executions record, the
+    /// answer the Kubernetes store gives for the rows the test seeds.
+    fn tracking(mut self, pod_names: &[String]) -> Self {
+        self.tracked = pod_names.to_vec();
+        self
     }
 
     /// Answer `pod_name` with `outcome` instead of the default result.
@@ -292,10 +302,24 @@ impl ProjectionPodCleaner for LifecycleRacePodCleaner {
         .expect("test lifecycle race update should succeed");
         Ok(K8sBlockingDeleteOutcome::Deleted)
     }
+
+    async fn tracked_pod_names(
+        &self,
+        _sandbox_id: SandboxId,
+    ) -> Result<Vec<String>, SubstrateError> {
+        Ok(Vec::new())
+    }
 }
 
 #[async_trait::async_trait]
 impl ProjectionPodCleaner for FakePodCleaner {
+    async fn tracked_pod_names(
+        &self,
+        _sandbox_id: SandboxId,
+    ) -> Result<Vec<String>, SubstrateError> {
+        Ok(self.tracked.clone())
+    }
+
     async fn delete_projection_pod(
         &self,
         name: &str,
@@ -1848,6 +1872,7 @@ async fn legacy_deleting_confirms_every_tracked_pod_before_finalizing() -> TestR
 
     let stuck = Arc::new(
         FakePodCleaner::new(K8sBlockingDeleteOutcome::NotFound)
+            .tracking(&tracked)
             .with_outcome_for(&tracked[2], K8sBlockingDeleteOutcome::TimedOut),
     );
     let sink = SubstrateActionSink::new_with_pod_cleaner(db.pool.clone(), stuck.clone());
@@ -1873,7 +1898,8 @@ async fn legacy_deleting_confirms_every_tracked_pod_before_finalizing() -> TestR
         "the rows naming the leftover pod survive the deferral"
     );
 
-    let cleaner = Arc::new(FakePodCleaner::new(K8sBlockingDeleteOutcome::Deleted));
+    let cleaner =
+        Arc::new(FakePodCleaner::new(K8sBlockingDeleteOutcome::Deleted).tracking(&tracked));
     let sink = SubstrateActionSink::new_with_pod_cleaner(db.pool.clone(), cleaner.clone());
     let outcome = sink
         .classify_orphan(sandbox_id, ClassifyGuard::LegacyDeleting { pod_name: None })

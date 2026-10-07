@@ -53,6 +53,7 @@ use uuid::Uuid;
 
 use pplx_space_api::reconcile_queue::ReconcileElementRef;
 
+use pplx_space_api::controllers::substrate::SubstrateError;
 use pplx_space_api::controllers::substrate::kubernetes::{
     K8sBlockingDeleteError, K8sBlockingDeleteOutcome, KubernetesSubstrate,
 };
@@ -1062,6 +1063,10 @@ trait ProjectionPodCleaner: Send + Sync {
         &self,
         name: &str,
     ) -> Result<K8sBlockingDeleteOutcome, K8sBlockingDeleteError>;
+
+    /// Every pod name the sandbox's executions record, active or not.
+    async fn tracked_pod_names(&self, sandbox_id: SandboxId)
+    -> Result<Vec<String>, SubstrateError>;
 }
 
 #[async_trait::async_trait]
@@ -1071,6 +1076,13 @@ impl ProjectionPodCleaner for KubernetesSubstrate {
         name: &str,
     ) -> Result<K8sBlockingDeleteOutcome, K8sBlockingDeleteError> {
         self.delete_sandbox_pod_for_projection_cleanup(name).await
+    }
+
+    async fn tracked_pod_names(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<Vec<String>, SubstrateError> {
+        self.tracked_execution_pod_names(sandbox_id).await
     }
 }
 
@@ -1357,7 +1369,7 @@ impl SubstrateActionSink {
         };
         let pod_names = match guard {
             ClassifyGuard::LegacyDeleting { .. } => {
-                match tracked_execution_pod_names(&self.pool, sandbox_id).await {
+                match pod_cleaner.tracked_pod_names(sandbox_id).await {
                     Ok(pod_names) => pod_names,
                     Err(err) => {
                         tracing::warn!(
@@ -1820,22 +1832,6 @@ impl SubstrateActionSink {
     ) -> Result<Vec<OrphanCandidateRow>, sqlx::Error> {
         list_candidates_after(&self.pool, after_sandbox_id, upper_bound, limit).await
     }
-}
-
-/// Every pod the sandbox's executions name, active or not, oldest first.
-async fn tracked_execution_pod_names(
-    pool: &PgPool,
-    sandbox_id: SandboxId,
-) -> Result<Vec<String>, sqlx::Error> {
-    sqlx::query_scalar(sql!(
-        "SELECT pod_name
-           FROM sandbox_k8s_executions
-          WHERE sandbox_id = $1
-          ORDER BY generation"
-    ))
-    .bind(sandbox_id)
-    .fetch_all(pool)
-    .await
 }
 
 async fn list_candidates_after(

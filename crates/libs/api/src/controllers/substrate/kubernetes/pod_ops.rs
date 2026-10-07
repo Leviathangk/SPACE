@@ -1069,6 +1069,15 @@ impl KubernetesSubstrate {
         .await
     }
 
+    /// Every pod name the sandbox's executions record, active or not: what a
+    /// delete has to see gone before the row that names them can go.
+    pub async fn tracked_execution_pod_names(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<Vec<String>, SubstrateError> {
+        self.store.tracked_execution_pod_names(sandbox_id).await
+    }
+
     /// Delete a terminal pod that is only being kept as stale projection
     /// carrier state, then wait until absence is observed.
     pub async fn delete_sandbox_pod_for_projection_cleanup(

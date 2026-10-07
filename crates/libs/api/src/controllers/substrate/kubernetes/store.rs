@@ -1191,9 +1191,9 @@ impl K8sStore {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Vec<String>, SubstrateError> {
-        sqlx::query_scalar::<_, String>(
-            "SELECT pod_name FROM sandbox_k8s_executions WHERE sandbox_id = $1",
-        )
+        sqlx::query_scalar::<_, String>(sql!(
+            "SELECT pod_name FROM sandbox_k8s_executions WHERE sandbox_id = $1"
+        ))
         .bind(sandbox_id.as_uuid())
         .fetch_all(&self.pool)
         .await
