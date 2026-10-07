@@ -228,12 +228,16 @@ fn evacuation_guards(lifecycle: SandboxLifecycle) -> String {
 /// the sandbox desired-state facet, `$2` = the abandoned-activation key, `$3` =
 /// `managed_by`, `$4` = batch limit.
 ///
-/// Requests are node-scoped facet observations. The query walks nodes and,
-/// per node, reads every sandbox desired-state observation through the
-/// `(node_id, facet)` primary-key prefix, filtering on the request key. That
-/// is every desired-state row in the table, though never another facet's.
-/// The element is cast only after the `CASE` proves it is a UUID, so an
-/// unrelated element can never fail the whole listing.
+/// Requests are node-scoped facet observations. Each tick reads every sandbox
+/// desired-state observation and filters on the request key. Postgres reaches
+/// them through an index led by `facet`, so another facet's rows are never
+/// read, and the join to `nodes` only resolves each row's node. Desired-state
+/// rows exist only for sandboxes a node has made an observation about
+/// (failure episode, quarantine recovery, local suspend handoff, apply
+/// failure, or one of these requests), not one per sandbox, though a row whose
+/// payload was emptied stays until its sandbox is gone. The element is cast
+/// only after the `CASE` proves it is a UUID, so an unrelated element can never
+/// fail the whole listing.
 ///
 /// Only a request its node re-asserted within the last five minutes is
 /// listed. Nodes republish every minute, so a request outlives the reports
