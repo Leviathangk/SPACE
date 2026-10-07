@@ -224,12 +224,11 @@ Explicit destination denies and platform guardrails take precedence. Exemptions
 grant no egress permission and bypass HTTP inspection and credential injection.
 Other destinations retain the policy's interception mode.
 
-The API's configured Falcon destination composition always adds its exact
-destinations to the allow list. It also adds them to the exemption list when
-`SPACE_FALCON_TLS_INTERCEPTION_EXEMPTIONS_ENABLED=true`. This API startup setting
-accepts `true` or `false` and defaults to `false` when unset. DNS resolver
-allowances are not exempted. Policies are persisted at create time; existing
-sandboxes need recreation or an explicit policy update to acquire exemptions.
+The API's [optional network policy overlay](network-policy-overlay.md) adds
+operator-configured egress allowances and TLS exemptions independently on opted-in
+federated creates. DNS resolver allowances are not automatically exempted.
+Policies are persisted at create time; existing sandboxes need recreation or an
+explicit policy update to acquire exemptions.
 An established exempt flow retains its verified hostname binding for its lifetime,
 so DNS expiry or cache eviction does not disconnect it on an unrelated policy
 update. Each update still rechecks current egress permissions and exemptions;
@@ -238,28 +237,23 @@ New connections require fresh DNS evidence.
 
 Roll out in two phases:
 
-1. Leave the activation setting unset or `false` while upgrading every policy
-   reader, including all API replicas, the internal API, and the credential
-   manager, and every running worker gateway. Falcon composition continues adding
-   allowances without adding exemptions. Empty
-   exemption lists are omitted from JSON and preserve existing policy hashes.
-   An old internal API rejects an entire node policy batch when any requested
-   policy contains the new field; the credential manager also reads stored
-   policies when authorizing credential resolution.
-2. Once all readers and running gateways are compatible, set the activation
-   setting to `true` and roll the API. After activation completes, recreate
-   affected sandboxes or explicitly update their policies. Creates reaching a
-   replica that has not activated yet retain the previous behavior.
+1. Keep all automatic exemption lists empty while upgrading every policy reader,
+   including all API replicas, the internal API, and the credential manager,
+   and every running worker gateway. Empty exemption lists are omitted from JSON
+   and preserve existing policy hashes. An old internal API rejects an entire
+   node policy batch when any requested policy contains the new field; the
+   credential manager also reads stored policies during credential resolution.
+2. Once all readers and running gateways are compatible, configure exemption
+   lists and roll every writer, including the APIs and cluster controller. Then
+   recreate affected sandboxes or explicitly update their policies.
 
-API replicas both read and write policies; enabling composition during a mixed
-old/new API rollout is unsafe. Older JSON readers reject the new field, while
-older protobuf readers cannot enforce it. The activation setting gates automatic
-Falcon composition only. Native sandbox and template policy writers must also
-wait until all readers and gateways are compatible before submitting nonempty
-exemptions.
+API replicas both read and write policies. Older JSON readers reject nonempty
+exemption lists, while older protobuf readers cannot enforce them. Native sandbox
+and template policy writers must also wait until all readers and gateways are
+compatible before submitting nonempty exemptions.
 
-Before downgrading, set activation to `false`, finish rolling all API replicas,
-and stop direct exemption writes. The setting does not strip existing exemptions.
+Before downgrading, empty automatic exemption lists, finish rolling all writers,
+and stop direct exemption writes. This does not strip existing exemptions.
 Use compatible binaries to remove exemptions from all stored policies, including
 template defaults (or retire their resources), before reverting any reader.
 Then roll back API writers before workers and other readers. Removing an exemption

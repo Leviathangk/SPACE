@@ -14,7 +14,6 @@ pub mod client_concurrency;
 pub mod cluster_admission;
 pub mod controllers;
 pub mod e2b;
-pub(crate) mod falcon_egress;
 pub mod federated_identity;
 pub mod fork_operation_executor;
 mod fork_operation_store;
@@ -22,6 +21,7 @@ pub mod fork_operations;
 pub(crate) mod limiter_liveness;
 pub mod middleware;
 pub mod models;
+pub(crate) mod network_policy_overlay;
 // Resolving a node-group candidate set produces a `NodeGroupPlacement`, which
 // lives behind common-core's `kubernetes` feature.
 mod credential_injection;

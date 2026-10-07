@@ -23,26 +23,8 @@ pub(super) struct CreateSandboxTranslation {
     pub(super) template_id: String,
 }
 
-pub(super) const ECW_FALCON_HEADER: &str = "x-space-falcon";
+pub(super) use crate::network_policy_overlay::ecw_network_policy_overlay_requested;
 const TLS_INTERCEPTION_METADATA_KEY: &str = "network.tls_interception";
-
-pub(super) fn falcon_us2_egress_requested(headers: &HeaderMap, federated: bool) -> bool {
-    let Some(value) = headers.get(ECW_FALCON_HEADER) else {
-        return false;
-    };
-    if federated
-        && value
-            .to_str()
-            .is_ok_and(|value| value.trim().eq_ignore_ascii_case("us2"))
-    {
-        return true;
-    }
-    tracing::warn!("Falcon create admission falling back to Noop: invalid request");
-    pplx_space_metrics::sandbox::admission::falcon_create(
-        pplx_space_metrics::sandbox::admission::FalconCreateOutcome::InvalidRequest,
-    );
-    false
-}
 
 pub(super) fn translate_create_request(
     req: CreateSandboxRequestE2b,

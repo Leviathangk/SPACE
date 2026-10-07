@@ -3028,7 +3028,7 @@ async fn postgres_strict_pool_placement_refusal_is_a_conflict_not_unavailable() 
 }
 
 #[tokio::test]
-async fn unconfigured_falcon_create_continues_to_database_access() -> TestResult {
+async fn unconfigured_network_policy_overlay_create_continues_to_database_access() -> TestResult {
     let pool = sqlx::postgres::PgPoolOptions::new()
         .acquire_timeout(std::time::Duration::from_millis(50))
         .connect_lazy("postgresql://postgres:postgres@127.0.0.1:1/unused")?;
@@ -3053,7 +3053,8 @@ async fn unconfigured_falcon_create_continues_to_database_access() -> TestResult
             &actor,
             &pooled_create_request("unconfigured-egress", None),
             SandboxApiMetricIdentity::native("create"),
-            FederatedSandboxCreateContext::new(Some(&owner), Some(&grant)).with_falcon_us2_egress(),
+            FederatedSandboxCreateContext::new(Some(&owner), Some(&grant))
+                .with_network_policy_overlay(),
         )
         .await
         .unwrap_err();

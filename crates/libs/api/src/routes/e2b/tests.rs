@@ -4795,27 +4795,6 @@ fn ecw_request_logs(events: &[CapturedEvent]) -> Vec<&[(String, String)]> {
         .collect()
 }
 
-mod ecw_falcon_header {
-    use axum::http::{HeaderMap, HeaderValue};
-
-    use super::super::translate::{ECW_FALCON_HEADER, falcon_us2_egress_requested};
-
-    #[test]
-    fn accepts_only_federated_us2_requests() {
-        let mut headers = HeaderMap::new();
-        assert!(!falcon_us2_egress_requested(&headers, true));
-
-        headers.insert(ECW_FALCON_HEADER, HeaderValue::from_static("us2"));
-        assert!(falcon_us2_egress_requested(&headers, true));
-        assert!(!falcon_us2_egress_requested(&headers, false));
-
-        headers.insert(ECW_FALCON_HEADER, HeaderValue::from_static("other"));
-        assert!(!falcon_us2_egress_requested(&headers, true));
-        headers.insert(ECW_FALCON_HEADER, HeaderValue::from_bytes(&[0xff]).unwrap());
-        assert!(!falcon_us2_egress_requested(&headers, true));
-    }
-}
-
 fn test_ecw_host_config() -> EcwHostConfig {
     EcwHostConfig::from_env_value(Some(
         r#"[

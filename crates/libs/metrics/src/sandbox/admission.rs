@@ -291,3 +291,36 @@ pub fn falcon_create(outcome: FalconCreateOutcome) {
         ],
     );
 }
+
+metric_vocabulary! {
+    /// Result of the optional network policy overlay on a sandbox create.
+    NetworkPolicyOverlayOutcome {
+        Ready => "ready",
+        InvalidRequest => "invalid_request",
+        Unconfigured => "unconfigured",
+    }
+}
+
+pub fn network_policy_overlay_create(outcome: NetworkPolicyOverlayOutcome) {
+    // Preserve existing admission dashboards while operators migrate metric names.
+    falcon_create(match outcome {
+        NetworkPolicyOverlayOutcome::Ready => FalconCreateOutcome::Ready,
+        NetworkPolicyOverlayOutcome::InvalidRequest => FalconCreateOutcome::InvalidRequest,
+        NetworkPolicyOverlayOutcome::Unconfigured => FalconCreateOutcome::Unconfigured,
+    });
+    counter(
+        "space.sandbox.network_policy_overlay_create_admission",
+        1,
+        &[
+            tag(
+                "outcome",
+                if outcome == NetworkPolicyOverlayOutcome::Ready {
+                    "ok"
+                } else {
+                    "failed"
+                },
+            ),
+            tag("reason", outcome),
+        ],
+    );
+}
