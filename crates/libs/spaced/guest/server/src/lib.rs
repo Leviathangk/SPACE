@@ -239,7 +239,7 @@ pub(crate) fn refused(status: Status) -> Status {
 // and long enough for a restarting guest to come back.
 const REFUSAL_RETRY_AFTER: Duration = Duration::from_secs(1);
 
-fn native_vsock_available() -> bool {
+pub(crate) fn native_vsock_available() -> bool {
     cfg!(target_os = "linux") && std::path::Path::new("/dev/vsock").exists()
 }
 
@@ -363,8 +363,8 @@ struct SpacedGuestServiceInner {
     /// host-side reconcilers can detect guest restarts (which drop the
     /// in-memory authorized port set) and re-apply port bridges.
     service_generation: String,
-    /// Guest cgroup split that places spawned workloads in a capped
-    /// `workloads/` leaf, away from the supervisor. `None` outside a real
+    /// Guest cgroup split that places spawned workloads in the workloads
+    /// unit's leaf, with the rest of user work and away from the supervisor. `None` outside a real
     /// Firecracker guest or when cgroup setup degraded to the shared layout.
     guest_cgroups: Option<Arc<cgroup::GuestCgroups>>,
 }
@@ -389,8 +389,13 @@ impl SpacedGuestService {
         // guest vsock transport device. Setup relocates this process and
         // rewrites cgroup limits, so it must never run against a host's
         // cgroups; with no `/dev/vsock` (any non-guest environment) it no-ops.
+        // `run()` has normally done it already, before any large allocation
+        // and before telemetry; its report is logged here, where telemetry is
+        // up.
         let guest_cgroups = if native_vsock_available() {
-            cgroup::GuestCgroups::initialize().map(Arc::new)
+            let cgroups = cgroup::GuestCgroups::initialize_for_process();
+            cgroup::GuestCgroups::report_process_setup();
+            cgroups
         } else {
             None
         };
