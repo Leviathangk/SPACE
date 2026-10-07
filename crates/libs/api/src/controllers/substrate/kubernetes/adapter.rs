@@ -1633,6 +1633,12 @@ impl KubernetesSubstrate {
 
     /// Idempotent best-effort delete of each tracked pod name. An already-gone
     /// pod is the expected case, not a failure.
+    ///
+    /// The delete is graceful on purpose. An accepted DELETE hands teardown to
+    /// kubelet, which stops a pod that never got past `ContainerCreating`
+    /// within its grace period. A pod that stays terminating is one whose
+    /// node-side teardown is stuck, and a force delete would only drop the API
+    /// object, the last visible sign of it, while the VM keeps running.
     async fn delete_tracked_pods(&self, pod_names: Vec<String>) -> Result<(), SubstrateError> {
         for pod_name in pod_names {
             if let Err(err) = delete_sandbox_pod(&self.k8s, &pod_name).await

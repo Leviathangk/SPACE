@@ -10667,7 +10667,7 @@ mod kubernetes_tests {
     /// The control-plane half of the same failure. Finalizing the row would
     /// cascade the execution rows away, and with them the only record of the
     /// pods this delete could not confirm — the restore-pod GC skips
-    /// non-restore pods, and nothing else looks for a pod without a row. So
+    /// non-restore pods, and the stuck-`ContainerCreating` GC ships disabled. So
     /// the delete must fail, and the row must stay claimed for deletion with
     /// its executions, for the delete retry or the orphaned-sandbox
     /// reconciler to finish. Restoring the pre-delete `stopped` would be no
