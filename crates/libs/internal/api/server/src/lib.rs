@@ -320,6 +320,10 @@ pub struct ClusterApiService {
     /// than a `static` so each instance — and each test fixture — owns its own.
     /// See `template_visibility_cache`.
     template_visibility_cache: template_visibility_cache::TemplateVisibilityCache,
+    /// What node publications do beyond projecting state. Defaults off;
+    /// [`ClusterApiService::from_env_with_security_state`] reads it from the
+    /// environment.
+    sandbox_publication_policy: SandboxPublicationPolicy,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -513,6 +517,7 @@ impl ClusterApiService {
             template_releases_store,
             route_ed25519_authority,
             ecw_credential_keyring,
+            sandbox_publication_policy: SandboxPublicationPolicy::default(),
         }
     }
 
@@ -525,6 +530,13 @@ impl ClusterApiService {
     #[must_use]
     pub fn with_visibility_pool(mut self, visibility_pool: sqlx::PgPool) -> Self {
         self.visibility_pool = visibility_pool;
+        self
+    }
+
+    /// Replace the node-publication policy, for tests that exercise it
+    /// through the service.
+    pub fn with_sandbox_publication_policy(mut self, policy: SandboxPublicationPolicy) -> Self {
+        self.sandbox_publication_policy = policy;
         self
     }
 
@@ -563,6 +575,7 @@ impl ClusterApiService {
         service.trusted_template_storage =
             trusted_storage::TrustedTemplateStorageBuckets::from_env()
                 .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        service.sandbox_publication_policy = SandboxPublicationPolicy::from_env();
         Ok(service)
     }
 

@@ -67,7 +67,8 @@ impl ClusterApiService {
             .node_status
             .map(published_node_status_db)
             .transpose()?;
-        // Per-row validation and telemetry live in `publish_sandbox_states`.
+        // Per-row validation and telemetry live in
+        // `publish_sandbox_states_with_policy`.
         // Pruning reuses only identities that can name a central row.
         let mut sandbox_inventory_prunable = sandbox_inventory_complete;
         let present_sandbox_ids = request
@@ -107,8 +108,13 @@ impl ClusterApiService {
 
         let templates_accepted =
             publish_template_states(&mut tx, origin.id, origin.role, &request.templates).await?;
-        let sandbox_publication =
-            publish_sandbox_states(&mut tx, origin.id, &request.sandboxes).await?;
+        let sandbox_publication = publish_sandbox_states_with_policy(
+            &mut tx,
+            origin.id,
+            &request.sandboxes,
+            self.sandbox_publication_policy,
+        )
+        .await?;
         if let Some(execution_inventory) = request.execution_inventory.as_ref() {
             publish_execution_inventory(&mut tx, origin.id, execution_inventory).await?;
         }

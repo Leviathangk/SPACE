@@ -153,7 +153,10 @@ use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
 use crate::env_config;
-use pplx_space_common_svc::types::SANDBOX_ABANDONED_ACTIVATION_REASON;
+use pplx_space_common_svc::types::{
+    SANDBOX_ABANDONED_ACTIVATION_CLEANUP_ENABLED_ENV, SANDBOX_ABANDONED_ACTIVATION_REASON,
+    abandoned_activation_cleanup_enabled,
+};
 
 pub mod classify;
 pub mod probe;
@@ -704,7 +707,9 @@ pub struct ReconcilerConfig {
     /// When true, act on the teardown requests node publications record for
     /// runtimes that booted behind `stopped` rows after their start was
     /// abandoned. Default `false`: it ships off everywhere and is enabled per
-    /// environment, independently of `failed_cleanup_enabled`.
+    /// environment, independently of `failed_cleanup_enabled`. The internal
+    /// API reads the same switch and records requests only while it is on, so
+    /// both processes must be given the same value.
     pub abandoned_activation_cleanup_enabled: bool,
     /// When true (the default), the abandoned-activation pass lists and
     /// reports would-retire candidates but never stops a runtime or deletes a
@@ -833,9 +838,12 @@ impl ReconcilerConfig {
                 "SPACE_FAILED_SANDBOX_CLEANUP_ENABLED",
             ),
             failed_cleanup_batch_size: default.failed_cleanup_batch_size,
-            abandoned_activation_cleanup_enabled: env_config::truthy_default(
-                "SPACE_ABANDONED_ACTIVATION_CLEANUP_ENABLED",
-                default.abandoned_activation_cleanup_enabled,
+            // Shared with the internal API, which records the requests this
+            // pass acts on only while the same switch is on.
+            abandoned_activation_cleanup_enabled: abandoned_activation_cleanup_enabled(
+                std::env::var(SANDBOX_ABANDONED_ACTIVATION_CLEANUP_ENABLED_ENV)
+                    .ok()
+                    .as_deref(),
             ),
             // Only an explicit false goes live; anything else, including a
             // misspelling, keeps the pass dry.

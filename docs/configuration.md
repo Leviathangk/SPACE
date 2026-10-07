@@ -29,8 +29,8 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_FAILED_RESTORABLE_REPAIR_ENABLED` | on | Reverts failed restorable sandboxes. |
 | `SPACE_STARTED_SANDBOX_REPAIR_ENABLED` | on | |
 | `SPACE_FAILED_SANDBOX_CLEANUP_ENABLED` | on | Part of the transient lifecycle sweeper. |
-| `SPACE_ABANDONED_ACTIVATION_CLEANUP_ENABLED` | off | Part of the transient lifecycle sweeper. Retires a VM that boots behind a `stopped` row after its start was abandoned. Runs dry unless `SPACE_ABANDONED_ACTIVATION_CLEANUP_DRY_RUN` is `false`. |
-| `SPACE_ABANDONED_ACTIVATION_CLEANUP_DRY_RUN` | true | Only an explicit `false` lets the pass stop VMs and delete pods; dry-run logs and meters would-retire candidates. |
+| `SPACE_ABANDONED_ACTIVATION_CLEANUP_ENABLED` | off | Retires a VM that boots behind a `stopped` row after its start was abandoned. Set it on **both** the internal API, which then detects such VMs in node publications and records teardown requests, and the cluster controller, whose transient lifecycle sweeper acts on them. Off, publications skip detection entirely; requests recorded earlier are left in place and ignored. The sweeper runs dry unless `SPACE_ABANDONED_ACTIVATION_CLEANUP_DRY_RUN` is `false`. |
+| `SPACE_ABANDONED_ACTIVATION_CLEANUP_DRY_RUN` | true | Cluster controller. Only an explicit `false` lets the sweeper stop VMs and delete pods; dry-run logs and meters would-retire candidates. |
 | `SPACE_INTERNAL_API_DELETED_PARTITION_ENABLED` | on | |
 | `SPACE_INTERNAL_API_DELETED_SUPPRESS_ABSOLUTE` | 500 | |
 | `SPACE_KUBE_NODE_SYNC_ENABLED` | on | |

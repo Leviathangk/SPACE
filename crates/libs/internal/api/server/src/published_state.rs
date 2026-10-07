@@ -27,9 +27,10 @@ use pplx_space_common_svc::{
     types::{
         FACET_NETWORK_POLICY, FACET_SANDBOX_DESIRED_STATE, FACET_TEMPLATE_BASE_SNAPSHOT_POLICY,
         FACET_TEMPLATE_DESIRED_STATE, NetworkPolicyTarget, ReconcileReason,
-        SANDBOX_ABANDONED_ACTIVATION_REASON, SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY,
-        SANDBOX_FAILURE_EPISODE_KEY, SANDBOX_FAILURE_EXECUTION_GENERATION_KEY,
-        SANDBOX_FAILURE_POD_UID_KEY, SANDBOX_LOCAL_SUSPEND_KEY,
+        SANDBOX_ABANDONED_ACTIVATION_CLEANUP_ENABLED_ENV, SANDBOX_ABANDONED_ACTIVATION_REASON,
+        SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY, SANDBOX_FAILURE_EPISODE_KEY,
+        SANDBOX_FAILURE_EXECUTION_GENERATION_KEY, SANDBOX_FAILURE_POD_UID_KEY,
+        SANDBOX_LOCAL_SUSPEND_KEY, abandoned_activation_cleanup_enabled,
     },
 };
 use pplx_space_events::{
@@ -1743,10 +1744,32 @@ fn failure_episode_input(
 pub struct SandboxPublicationPolicy {
     /// Detect runtimes that booted behind `stopped` rows after their start was
     /// abandoned, and record generation-fenced teardown requests for them.
+    ///
+    /// Off, a publication runs neither the detection query nor the read or
+    /// write of the node's teardown requests. Requests recorded while it was
+    /// on are left as they are: nothing withdraws them, and nothing acts on
+    /// them either, because the sweep takes only requests re-asserted within
+    /// its freshness window and only a detection-enabled publication
+    /// re-asserts one.
     pub abandoned_activation_detection: bool,
 }
 
-/// [`publish_sandbox_states_with_policy`] under the default policy.
+impl SandboxPublicationPolicy {
+    /// Read from [`SANDBOX_ABANDONED_ACTIVATION_CLEANUP_ENABLED_ENV`], the
+    /// switch the cluster-controller sweep reads too.
+    pub fn from_env() -> Self {
+        Self {
+            abandoned_activation_detection: abandoned_activation_cleanup_enabled(
+                std::env::var(SANDBOX_ABANDONED_ACTIVATION_CLEANUP_ENABLED_ENV)
+                    .ok()
+                    .as_deref(),
+            ),
+        }
+    }
+}
+
+/// [`publish_sandbox_states_with_policy`] under the default policy, which
+/// leaves abandoned-activation detection off.
 pub async fn publish_sandbox_states(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
@@ -1760,7 +1783,7 @@ pub async fn publish_sandbox_states_with_policy(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
     states: &[PublishedSandboxState],
-    _policy: SandboxPublicationPolicy,
+    policy: SandboxPublicationPolicy,
 ) -> Result<SandboxPublicationOutcome, Status> {
     let mut states_by_id = BTreeMap::new();
     for state in states {
@@ -2969,26 +2992,28 @@ pub async fn publish_sandbox_states_with_policy(
     // `stopped`, and the runtime is handed to teardown fenced on the exact
     // generation and pod the node reported. Runs after receipt consumption, so
     // an attempt that still owns its runtime has already converged.
-    let abandoned_runtimes = sandbox_quarantine_store::select_abandoned_activation_runtimes(
-        conn,
-        node_id,
-        rows_json.clone(),
-    )
-    .await?;
-    let newly_requested = sandbox_quarantine_store::reconcile_abandoned_activation_requests(
-        conn,
-        node_id,
-        &reported_runtime_ids,
-        &abandoned_runtimes,
-    )
-    .await?;
-    post_commit_events.extend(newly_requested.into_iter().map(|runtime| {
-        PostCommitSandboxEvent::AbandonedActivationTeardownRequested {
-            sandbox_id: runtime.sandbox_id,
-            execution_generation: runtime.execution_generation,
-            pod_uid: runtime.pod_uid,
-        }
-    }));
+    if policy.abandoned_activation_detection {
+        let abandoned_runtimes = sandbox_quarantine_store::select_abandoned_activation_runtimes(
+            conn,
+            node_id,
+            rows_json.clone(),
+        )
+        .await?;
+        let newly_requested = sandbox_quarantine_store::reconcile_abandoned_activation_requests(
+            conn,
+            node_id,
+            &reported_runtime_ids,
+            &abandoned_runtimes,
+        )
+        .await?;
+        post_commit_events.extend(newly_requested.into_iter().map(|runtime| {
+            PostCommitSandboxEvent::AbandonedActivationTeardownRequested {
+                sandbox_id: runtime.sandbox_id,
+                execution_generation: runtime.execution_generation,
+                pod_uid: runtime.pod_uid,
+            }
+        }));
+    }
 
     let suspended_projection =
         project_node_published_suspended_sandboxes(conn, node_id, rows_json.clone()).await?;

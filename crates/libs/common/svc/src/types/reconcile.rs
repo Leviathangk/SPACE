@@ -27,6 +27,20 @@ pub const SANDBOX_ABANDONED_ACTIVATION_KEY: &str = "abandoned_activation";
 /// The event and metric `reason` for every step of an abandoned activation's
 /// teardown, from the publication that requests it to the retire that runs it.
 pub const SANDBOX_ABANDONED_ACTIVATION_REASON: &str = "abandoned_activation";
+/// One switch for abandoned-activation teardown in every process that takes
+/// part: the internal API records teardown requests from node publications
+/// only while it is on, and the cluster-controller sweep acts on them only
+/// while it is on. Off by default; read with
+/// [`abandoned_activation_cleanup_enabled`] everywhere so the processes agree
+/// on what a value means.
+pub const SANDBOX_ABANDONED_ACTIVATION_CLEANUP_ENABLED_ENV: &str =
+    "SPACE_ABANDONED_ACTIVATION_CLEANUP_ENABLED";
+
+/// Interpret [`SANDBOX_ABANDONED_ACTIVATION_CLEANUP_ENABLED_ENV`]: on only for
+/// an explicit truthy value, off when unset or unrecognized.
+pub fn abandoned_activation_cleanup_enabled(raw: Option<&str>) -> bool {
+    pplx_space_common_core::env::env_flag(raw, false)
+}
 
 pub const NETWORK_POLICY_TARGET_TEMPLATE_PREFIX: &str = "template:";
 pub const NETWORK_POLICY_TARGET_SANDBOX_PREFIX: &str = "sandbox:";
