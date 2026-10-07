@@ -436,5 +436,9 @@ fn every_program_a_seed_unit_runs_is_carried_in_the_bundle() {
             "{key}={program} is not carried in the OCI guest bundle"
         );
     }
-    assert!(programs.iter().any(|program| program == "/usr/local/bin/spaced-svc"));
+    assert!(
+        programs
+            .iter()
+            .any(|program| program == "/usr/local/bin/spaced-svc")
+    );
 }

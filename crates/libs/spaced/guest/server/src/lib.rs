@@ -193,6 +193,8 @@ mod guest_path;
 mod idempotency;
 mod identity;
 mod local_admission;
+#[cfg(target_os = "linux")]
+mod memlock;
 mod meta;
 mod networking;
 mod port_forward;
@@ -383,6 +385,8 @@ impl SpacedGuestService {
         let guest_cgroups = if native_vsock_available() {
             let cgroups = cgroup::GuestCgroups::initialize_for_process();
             cgroup::GuestCgroups::report_process_setup();
+            #[cfg(target_os = "linux")]
+            memlock::report();
             cgroups
         } else {
             None

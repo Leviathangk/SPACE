@@ -34,7 +34,9 @@
 //!     outside the cap, is not an OOM candidate and does no reclaim on its
 //!     behalf. Either kind of user work can use the whole envelope.
 //!     `supervisor/memory.min` keeps spaced's pages resident under the
-//!     pressure that remains.
+//!     pressure that remains, as far as its ancestors' floors allow. Without
+//!     swap only file pages are reclaimed, and spaced's text is locked
+//!     (`crate::memlock`).
 //!   - I/O: `supervisor/io.weight` dominates, so spaced's own disk I/O (reading
 //!     `/proc`, fs metadata, writing logs) is serviced ahead of a workload
 //!     saturating the device, rather than queuing behind it. This is the one
