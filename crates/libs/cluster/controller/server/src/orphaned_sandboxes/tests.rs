@@ -240,6 +240,7 @@ enum FakePodCleanupResult {
 
 struct FakePodCleaner {
     result: FakePodCleanupResult,
+    per_pod: BTreeMap<String, K8sBlockingDeleteOutcome>,
     calls: Mutex<Vec<String>>,
 }
 
@@ -247,6 +248,7 @@ impl FakePodCleaner {
     fn new(outcome: K8sBlockingDeleteOutcome) -> Self {
         Self {
             result: FakePodCleanupResult::Outcome(outcome),
+            per_pod: BTreeMap::new(),
             calls: Mutex::new(Vec::new()),
         }
     }
@@ -254,8 +256,15 @@ impl FakePodCleaner {
     fn timeout() -> Self {
         Self {
             result: FakePodCleanupResult::DeleteTimeout,
+            per_pod: BTreeMap::new(),
             calls: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Answer `pod_name` with `outcome` instead of the default result.
+    fn with_outcome_for(mut self, pod_name: &str, outcome: K8sBlockingDeleteOutcome) -> Self {
+        self.per_pod.insert(pod_name.to_string(), outcome);
+        self
     }
 
     fn calls(&self) -> Vec<String> {
@@ -292,6 +301,9 @@ impl ProjectionPodCleaner for FakePodCleaner {
         name: &str,
     ) -> Result<K8sBlockingDeleteOutcome, K8sBlockingDeleteError> {
         self.calls.lock().unwrap().push(name.to_string());
+        if let Some(outcome) = self.per_pod.get(name) {
+            return Ok(*outcome);
+        }
         match self.result {
             FakePodCleanupResult::Outcome(outcome) => Ok(outcome),
             FakePodCleanupResult::DeleteTimeout => Err(K8sBlockingDeleteError::DeleteTimeout {
@@ -1791,6 +1803,94 @@ async fn classify_legacy_deleting_finalizes_delete() -> TestResult {
             from_lifecycle: SandboxLifecycle::Deleting,
             reason: OrphanDeleteReason::ExplicitDeleting,
         }
+    );
+    let sandbox_count: i64 =
+        sqlx::query_scalar(sql!("SELECT COUNT(*)::BIGINT FROM sandboxes WHERE id = $1"))
+            .bind(sandbox_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(sandbox_count, 0);
+    Ok(())
+}
+
+/// The shape a delete leaves in `deleting` when its teardown could not be
+/// confirmed, as in the Kind reproduction: no active execution, inactive
+/// generations g1..g3, and a leftover pod. The candidate scan joins only the
+/// active execution, so the guard names no pod, and finalizing then cascades
+/// away every row that names the leftover. The `deleting` path must delete and
+/// confirm every tracked generation's pod first, and defer while any one of
+/// them is unconfirmed.
+#[tokio::test(flavor = "current_thread")]
+async fn legacy_deleting_confirms_every_tracked_pod_before_finalizing() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let sandbox_id = SandboxId::new();
+    insert_legacy_deleting_sandbox(&db.pool, sandbox_id).await?;
+    let mut tracked = Vec::new();
+    for generation in 1..=3_i64 {
+        let pod_name = format!("space-sbx-{}-g{generation}", sandbox_id.as_uuid().simple());
+        sqlx::query(sql!(
+            "INSERT INTO sandbox_k8s_executions
+                (sandbox_id, generation, pod_name, pod_namespace, pod_uid,
+                 state, active, created_at)
+             VALUES ($1, $2, $3, 'sandboxes', $4, 'replaced', FALSE,
+                     NOW() - INTERVAL '1 hour')"
+        ))
+        .bind(sandbox_id)
+        .bind(generation)
+        .bind(&pod_name)
+        .bind(format!("uid-g{generation}"))
+        .execute(&db.pool)
+        .await?;
+        tracked.push(pod_name);
+    }
+
+    let stuck = Arc::new(
+        FakePodCleaner::new(K8sBlockingDeleteOutcome::NotFound)
+            .with_outcome_for(&tracked[2], K8sBlockingDeleteOutcome::TimedOut),
+    );
+    let sink = SubstrateActionSink::new_with_pod_cleaner(db.pool.clone(), stuck.clone());
+    let outcome = sink
+        .classify_orphan(sandbox_id, ClassifyGuard::LegacyDeleting { pod_name: None })
+        .await?;
+
+    assert_eq!(
+        outcome,
+        ClassifyOutcome::Deferred {
+            from_lifecycle: SandboxLifecycle::Deleting,
+            reason: OrphanDeferReason::PodCleanupUnconfirmed,
+        }
+    );
+    let executions: i64 = sqlx::query_scalar(sql!(
+        "SELECT COUNT(*)::BIGINT FROM sandbox_k8s_executions WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        executions, 3,
+        "the rows naming the leftover pod survive the deferral"
+    );
+
+    let cleaner = Arc::new(FakePodCleaner::new(K8sBlockingDeleteOutcome::Deleted));
+    let sink = SubstrateActionSink::new_with_pod_cleaner(db.pool.clone(), cleaner.clone());
+    let outcome = sink
+        .classify_orphan(sandbox_id, ClassifyGuard::LegacyDeleting { pod_name: None })
+        .await?;
+
+    assert_eq!(
+        outcome,
+        ClassifyOutcome::Deleted {
+            from_lifecycle: SandboxLifecycle::Deleting,
+            reason: OrphanDeleteReason::ExplicitDeleting,
+        }
+    );
+    let mut calls = cleaner.calls();
+    calls.sort();
+    assert_eq!(
+        calls, tracked,
+        "every generation's pod is confirmed gone first"
     );
     let sandbox_count: i64 =
         sqlx::query_scalar(sql!("SELECT COUNT(*)::BIGINT FROM sandboxes WHERE id = $1"))

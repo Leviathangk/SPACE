@@ -809,6 +809,14 @@ async fn insert_failed_terminal_sandbox(
     pool: &PgPool,
     sandbox_id: SandboxId,
 ) -> TestResult<Organization> {
+    insert_unplaced_sandbox_with_lifecycle(pool, sandbox_id, "failed").await
+}
+
+async fn insert_unplaced_sandbox_with_lifecycle(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    lifecycle: &str,
+) -> TestResult<Organization> {
     let org_id = SEED_ORG_ID;
     let user_id = SEED_USER_ID;
 
@@ -817,11 +825,12 @@ async fn insert_failed_terminal_sandbox(
              id, user_id, org_id, managed_by, lifecycle, placement, template_id,
              network_policy_generation
          )
-         VALUES ($1, $2, $3, 'space', 'failed', 'unplaced', 'seed', 1)",
+         VALUES ($1, $2, $3, 'space', $4, 'unplaced', 'seed', 1)",
     )
     .bind(sandbox_id)
     .bind(user_id)
     .bind(org_id)
+    .bind(lifecycle)
     .execute(pool)
     .await?;
 
@@ -4578,6 +4587,86 @@ fn metadata_uses_sandbox_metadata() {
     );
     assert_eq!(metadata.get("priority").map(String::as_str), Some("3"));
     assert_eq!(metadata.get("debug").map(String::as_str), Some("true"));
+}
+
+/// A sandbox whose delete could not confirm its teardown stays in `deleting`
+/// while its delete operation re-drives the teardown. An E2B kill is
+/// synchronous, so to an ECW caller that sandbox is gone: absent from the
+/// list, a 404 on detail like a deleted sandbox, and a kill that answers 204
+/// rather than timing out while the re-drive continues behind it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_sandbox_kept_in_deleting_is_gone_to_ecw() -> TestResult {
+    let db = pg_test_db().await?;
+    let deleting_id = SandboxId::new();
+    let running_id = SandboxId::new();
+    let org = insert_unplaced_sandbox_with_lifecycle(&db.pool, deleting_id, "deleting").await?;
+    insert_unplaced_sandbox_with_lifecycle(&db.pool, running_id, "started").await?;
+    let state = AppState::from_pool(db.pool.clone()).await?;
+    let app = e2b_api_routes()
+        .layer(Extension(AuthOrg(org)))
+        .layer(Extension(test_ecw_host_config()))
+        .with_state(state);
+
+    let list = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/sandboxes")
+                .header(header::HOST, TEST_ECW_API_HOST)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(list.status(), StatusCode::OK);
+    let listed: serde_json::Value =
+        serde_json::from_slice(&to_bytes(list.into_body(), usize::MAX).await?)?;
+    let listed_ids: Vec<&str> = listed
+        .as_array()
+        .expect("list body is an array")
+        .iter()
+        .filter_map(|item| item.get("sandboxID").and_then(serde_json::Value::as_str))
+        .collect();
+    assert!(
+        listed_ids.contains(&running_id.to_string().as_str()),
+        "{listed}"
+    );
+    assert!(
+        !listed_ids.contains(&deleting_id.to_string().as_str()),
+        "a deleting sandbox must not be listed: {listed}"
+    );
+
+    let detail = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/sandboxes/{deleting_id}"))
+                .header(header::HOST, TEST_ECW_API_HOST)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(detail.status(), StatusCode::NOT_FOUND);
+
+    let kill = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/sandboxes/{deleting_id}"))
+                .header(header::HOST, TEST_ECW_API_HOST)
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(kill.status(), StatusCode::NO_CONTENT);
+    let delete_operations: Vec<String> =
+        sqlx::query_scalar("SELECT state FROM public_operations WHERE target_id = $1")
+            .bind(pplx_space_public_api::PublicSandboxId::from(deleting_id).to_string())
+            .fetch_all(&db.pool)
+            .await?;
+    assert_eq!(
+        delete_operations,
+        vec!["queued".to_string()],
+        "the kill leaves its delete operation queued to re-drive the teardown"
+    );
+    Ok(())
 }
 
 #[tokio::test(flavor = "current_thread")]

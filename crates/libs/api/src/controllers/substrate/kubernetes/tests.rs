@@ -10690,9 +10690,15 @@ mod kubernetes_tests {
             .delete_control_plane(&pool, sandbox_id, Some(&sandbox))
             .await;
 
+        let error = result.expect_err("an unconfirmed teardown must not report success");
+        assert_eq!(
+            error.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the delete is retryable, not an internal failure: {error}"
+        );
         assert!(
-            result.is_err(),
-            "an unconfirmed teardown must not report success"
+            error.retry_after_header().is_some(),
+            "and carries a retry hint for whoever re-drives it: {error}"
         );
         assert_eq!(captured_delete_names(&captured_deletes), tracked);
         let lifecycle: Option<String> =
@@ -10706,6 +10712,164 @@ mod kubernetes_tests {
             2,
             "the rows naming both pods survive for the retry"
         );
+        Ok(())
+    }
+
+    /// A pod bound to an admin-terminated node has no runtime a delete can
+    /// reach: recording its placement hits the node tombstone, which refuses
+    /// to re-create the node row (`NodeTombstoned`, a terminal 409). Like an
+    /// unschedulable pod's `Unavailable`, that must read as "no live runtime"
+    /// for a delete, which deletes the pod and completes, rather than a
+    /// failure that holds the row in `deleting` for a node that will never
+    /// answer.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delete_on_an_admin_terminated_node_skips_the_runtime_and_deletes_its_pod()
+    -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        let pod_name = format!("space-sbx-{}-g1", sandbox_id.as_uuid().simple());
+        let node_name = format!("terminated-worker-{}", sandbox_id.as_uuid().simple());
+        insert_test_sandbox_row(&pool, sandbox_id, "deleting").await?;
+        insert_k8s_execution(&pool, sandbox_id, 1, &pod_name, "uid-g1", None, true).await?;
+        sqlx::query(sql!(
+            "INSERT INTO node_k8s_tombstones (node_id, k8s_node_name, role, reason)
+             VALUES ($1, $2, 'worker', 'admin-terminate')"
+        ))
+        .bind(pplx_space_common_svc::types::k8s::space_k8s_node_id(
+            &node_name, "worker",
+        ))
+        .bind(&node_name)
+        .execute(&pool)
+        .await?;
+        let pod = pending_sandbox_pod(&pod_name, "uid-g1", Some(&node_name), None);
+        let captured_deletes = Arc::new(Mutex::new(Vec::new()));
+        let substrate = substrate_with_store_client_proxy_port_pod_and_nodes(
+            pool.clone(),
+            delete_capturing_kubernetes_client(Arc::clone(&captured_deletes), Some(pod.clone())),
+            DEFAULT_SANDBOX_PROXY_PORT,
+            Some(pod),
+            vec![k8s_node_with_internal_ip(&node_name, "10.4.0.9")],
+        );
+
+        substrate.delete_execution(sandbox_id).await?;
+
+        assert_eq!(captured_delete_names(&captured_deletes), vec![pod_name]);
+        Ok(())
+    }
+
+    /// The Kind reproduction's shape, end to end through the delete operation:
+    /// a `stopped` sandbox whose failed start left inactive generations g1..g3
+    /// and a pod the apiserver refuses to delete. Each attempt keeps the row in
+    /// `deleting`, and the operation must be re-queued without spending the
+    /// retry budget, with a backoff that grows to a cap — the budget is ~16
+    /// short attempts, and with the orphaned-sandbox reconciler in dry-run
+    /// nothing else would ever finish the row. Once the fault clears, the next
+    /// attempt deletes every generation's pod and finalizes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delete_operation_is_redriven_until_its_teardown_completes() -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        insert_test_sandbox_row(&pool, sandbox_id, "stopped").await?;
+        let mut tracked = Vec::new();
+        for generation in 1..=3 {
+            let pod_name = format!("space-sbx-{}-g{generation}", sandbox_id.as_uuid().simple());
+            insert_k8s_execution(
+                &pool,
+                sandbox_id,
+                generation,
+                &pod_name,
+                &format!("uid-g{generation}"),
+                None,
+                false,
+            )
+            .await?;
+            tracked.push(pod_name);
+        }
+        let refuse_deletes = Arc::new(AtomicBool::new(true));
+        let captured_deletes = Arc::new(Mutex::new(Vec::new()));
+        let substrate = substrate_with_store_client_proxy_port_and_pod(
+            pool.clone(),
+            delete_capturing_kubernetes_client_with_fault(
+                Arc::clone(&captured_deletes),
+                None,
+                Arc::clone(&refuse_deletes),
+            ),
+            DEFAULT_SANDBOX_PROXY_PORT,
+            None,
+        );
+        let executor = crate::public_sandbox_operations::SandboxLifecycleOperationExecutor::new(
+            pool.clone(),
+            SandboxController::new(Substrate::Kubernetes(Box::new(substrate))),
+        );
+        let public_sandbox_id = pplx_space_public_api::PublicSandboxId::from(sandbox_id);
+        let operation = |claim_generation| crate::public_operations::ClaimedPublicOperation {
+            id: pplx_space_public_api::OperationId::new(),
+            org_id: OrgId::from_uuid(uuid::Uuid::from_u128(1)),
+            actor_user_id: None,
+            api_product: crate::public_operations::ApiProduct::Native,
+            kind: pplx_space_public_api::OperationKind::DeleteSandbox,
+            target_type: Some(pplx_space_public_api::OperationTargetType::Sandbox),
+            target_id: Some(public_sandbox_id.to_string()),
+            payload: crate::public_sandbox_operations::SandboxLifecycleOperationPayload {
+                sandbox_id: public_sandbox_id,
+                action: pplx_space_public_api::SandboxLifecycleAction::Delete,
+                rollback: None,
+            }
+            .into_json(),
+            attempts: 1,
+            claim_generation,
+        };
+
+        let first = executor.execute(&operation(1)).await;
+
+        assert_eq!(
+            first.state,
+            pplx_space_public_api::OperationState::Queued,
+            "{first:?}"
+        );
+        assert!(
+            first.requeue_reason.preserves_retry_budget(),
+            "an unconfirmed teardown is re-driven, not spent against the retry budget: {first:?}"
+        );
+        let lifecycle: String =
+            sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
+                .bind(sandbox_id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(lifecycle, "deleting");
+        assert_eq!(execution_rows(&pool, sandbox_id).await?, 3);
+
+        let later = executor.execute(&operation(4)).await;
+        let late = executor.execute(&operation(40)).await;
+        assert!(
+            later.retry_after > first.retry_after,
+            "the re-drive backs off: {first:?} then {later:?}"
+        );
+        assert!(
+            late.retry_after
+                .is_some_and(|delay| delay <= Duration::from_secs(300)),
+            "and the backoff is capped: {late:?}"
+        );
+        assert!(captured_delete_names(&captured_deletes).is_empty());
+
+        refuse_deletes.store(false, Ordering::SeqCst);
+        let done = executor.execute(&operation(41)).await;
+
+        assert_eq!(
+            done.state,
+            pplx_space_public_api::OperationState::Succeeded,
+            "{done:?}"
+        );
+        assert_eq!(captured_delete_names(&captured_deletes), tracked);
+        let remaining: bool = sqlx::query_scalar(sql!(
+            "SELECT EXISTS (SELECT 1 FROM sandboxes WHERE id = $1)"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(&pool)
+        .await?;
+        assert!(!remaining, "the confirmed teardown finalizes the row");
         Ok(())
     }
 
@@ -13132,10 +13296,26 @@ mod kubernetes_tests {
         captured_deletes: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
         live_pod: Option<Pod>,
     ) -> Client {
+        delete_capturing_kubernetes_client_with_fault(
+            captured_deletes,
+            live_pod,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    /// [`delete_capturing_kubernetes_client`] whose pod DELETEs fail with a
+    /// retryable server error while `refuse_deletes` is set. A refused DELETE
+    /// is not captured, so the capture lists only deletes the apiserver took.
+    fn delete_capturing_kubernetes_client_with_fault(
+        captured_deletes: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+        live_pod: Option<Pod>,
+        refuse_deletes: Arc<AtomicBool>,
+    ) -> Client {
         let live_pod = Arc::new(live_pod);
         let service = tower::service_fn(move |req: Request<Body>| {
             let captured_deletes = Arc::clone(&captured_deletes);
             let live_pod = Arc::clone(&live_pod);
+            let refuse_deletes = Arc::clone(&refuse_deletes);
             async move {
                 let method = req.method().clone();
                 let path = req.uri().path().to_string();
@@ -13159,6 +13339,24 @@ mod kubernetes_tests {
                     return Ok::<_, BoxError>(
                         Response::builder()
                             .status(status)
+                            .header("content-type", "application/json")
+                            .body(Body::from(serde_json::to_vec(&body)?))?,
+                    );
+                }
+                if method == Method::DELETE
+                    && path.starts_with("/api/v1/namespaces/space/pods/")
+                    && refuse_deletes.load(Ordering::SeqCst)
+                {
+                    let body = serde_json::json!({
+                        "kind": "Status",
+                        "apiVersion": "v1",
+                        "status": "Failure",
+                        "reason": "InternalError",
+                        "code": 500
+                    });
+                    return Ok::<_, BoxError>(
+                        Response::builder()
+                            .status(StatusCode::INTERNAL_SERVER_ERROR)
                             .header("content-type", "application/json")
                             .body(Body::from(serde_json::to_vec(&body)?))?,
                     );
