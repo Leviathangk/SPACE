@@ -511,33 +511,46 @@ async fn activation_admission_bounds_live_waiters_and_rejects_cancelled_ready_wo
 }
 
 #[tokio::test(start_paused = true)]
-async fn blocking_wake_without_client_deadline_has_bounded_passive_wait() {
+async fn blocking_wake_honors_default_and_explicit_passive_wait_budgets() {
     use crate::service::tests::service_tests::insert_test_sandbox;
     use crate::state::SandboxState;
     use pplx_space_common_core::types::SandboxId;
+    use std::time::Duration;
 
-    let conn = crate::db::test_conn();
-    let sandbox_id = SandboxId::new().to_string();
-    insert_test_sandbox(&conn, &sandbox_id, SandboxState::Starting);
-    let manager = SandboxManagerService::new(conn);
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(31),
-        manager.wake_with_start_config(sandbox_id.clone(), None, Default::default(), true, None),
-    )
-    .await
-    .expect("observing another activation must not wait forever without grpc-timeout");
-    assert_eq!(result.unwrap_err().code(), tonic::Code::DeadlineExceeded);
-    assert_eq!(
-        manager.lookup_sandbox(&sandbox_id).unwrap().state,
-        SandboxState::Starting
-    );
-    drop(
-        manager
-            .auto_lifecycle
-            .wake_lock(&sandbox_id)
-            .try_lock()
-            .expect("passive wait timeout must release wake exclusion"),
-    );
+    // Observing somebody else's cold activation needs the same 60-second app
+    // startup allowance plus boot margin. A caller's shorter deadline still wins.
+    for (budget, seconds) in [(None, 90), (Some(Duration::from_secs(7)), 7)] {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &sandbox_id, SandboxState::Starting);
+        let manager = SandboxManagerService::new(conn);
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(seconds + 1),
+            manager.wake_with_start_config(
+                sandbox_id.clone(),
+                budget,
+                Default::default(),
+                true,
+                None,
+            ),
+        )
+        .await
+        .expect("observing another activation must have a bounded wait");
+        assert!(started.elapsed() >= Duration::from_secs(seconds));
+        assert_eq!(result.unwrap_err().code(), tonic::Code::DeadlineExceeded);
+        assert_eq!(
+            manager.lookup_sandbox(&sandbox_id).unwrap().state,
+            SandboxState::Starting
+        );
+        drop(
+            manager
+                .auto_lifecycle
+                .wake_lock(&sandbox_id)
+                .try_lock()
+                .expect("passive wait timeout must release wake exclusion"),
+        );
+    }
 }
 
 #[tokio::test]
