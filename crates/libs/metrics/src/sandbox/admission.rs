@@ -264,30 +264,3 @@ pub fn cluster_eligible_nodes(value: u64) {
         &[tag("bucket", "sandbox_activation")],
     );
 }
-
-metric_vocabulary! {
-    /// Result of the optional Falcon overlay on a sandbox create.
-    FalconCreateOutcome {
-        Ready => "ready",
-        InvalidRequest => "invalid_request",
-        Unconfigured => "unconfigured",
-    }
-}
-
-pub fn falcon_create(outcome: FalconCreateOutcome) {
-    counter(
-        "space.sandbox.falcon_create_admission",
-        1,
-        &[
-            tag(
-                "outcome",
-                if outcome == FalconCreateOutcome::Ready {
-                    "ok"
-                } else {
-                    "failed"
-                },
-            ),
-            tag("reason", outcome),
-        ],
-    );
-}

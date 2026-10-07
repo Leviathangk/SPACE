@@ -28,5 +28,5 @@ Other metadata and create settings retain their existing behavior.
 
 Deploy bridge-capable APIs before enabling callers. Older APIs treat this key
 as ordinary metadata and do not enforce its policy. Requests without the key
-retain the existing E2B translation and legacy opt-in behavior. Callers can later
+retain the existing E2B translation. Callers can later
 switch to native create without changing their policy construction.

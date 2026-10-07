@@ -1023,7 +1023,6 @@ pub enum AdmissionPoolPlan {
 
 #[derive(Clone)]
 pub struct SandboxController {
-    falcon_us2_egress: Option<crate::falcon_egress::FalconUs2Egress>,
     tls_interception_exemptions:
         Option<crate::tls_interception_exemptions::TlsInterceptionExemptions>,
     federated_grant_audience: pplx_space_common_core::types::FederatedGrantAudience,
@@ -1047,8 +1046,6 @@ pub enum SandboxControllerInitError {
         #[from] crate::tls_interception_exemptions::TlsInterceptionExemptionsConfigError,
     ),
     #[error(transparent)]
-    FalconEgress(#[from] crate::falcon_egress::FalconEgressConfigError),
-    #[error(transparent)]
     Substrate(#[from] super::substrate::SubstrateError),
     #[error(transparent)]
     FederatedIdentity(#[from] crate::federated_identity::FederatedIdentityPolicyError),
@@ -1063,14 +1060,6 @@ impl SandboxController {
         self
     }
 
-    pub(crate) fn with_falcon_us2_egress(
-        mut self,
-        egress: Option<crate::falcon_egress::FalconUs2Egress>,
-    ) -> Self {
-        self.falcon_us2_egress = egress;
-        self
-    }
-
     pub fn with_federated_grant_audience(
         mut self,
         audience: pplx_space_common_core::types::FederatedGrantAudience,
@@ -1081,7 +1070,6 @@ impl SandboxController {
 
     pub fn new(substrate: Substrate) -> Self {
         Self {
-            falcon_us2_egress: None,
             tls_interception_exemptions: None,
             federated_grant_audience: crate::federated_identity::FederatedIdentityPolicy::default()
                 .grant_audience,
@@ -1096,7 +1084,6 @@ impl SandboxController {
         cluster_admission: crate::cluster_admission::ClusterSandboxAdmission,
     ) -> Self {
         Self {
-            falcon_us2_egress: None,
             tls_interception_exemptions: None,
             federated_grant_audience: crate::federated_identity::FederatedIdentityPolicy::default()
                 .grant_audience,

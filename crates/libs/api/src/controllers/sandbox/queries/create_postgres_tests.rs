@@ -3027,49 +3027,6 @@ async fn postgres_strict_pool_placement_refusal_is_a_conflict_not_unavailable() 
     Ok(())
 }
 
-#[tokio::test]
-async fn unconfigured_falcon_create_continues_to_database_access() -> TestResult {
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .acquire_timeout(std::time::Duration::from_millis(50))
-        .connect_lazy("postgresql://postgres:postgres@127.0.0.1:1/unused")?;
-    let controller = direct_sandbox_controller(&pool);
-    let owner = test_federated_owner("example-org")?;
-    let grant = test_service_grant()?;
-    let actor = User {
-        id: UserId::new(),
-        email: "actor@example.com".into(),
-        password_hash: "!".into(),
-        display_name: "Test actor".into(),
-        org_id: OrgId::new(),
-        role: crate::user_role::UserRole::Member,
-        owner_source: pplx_space_common_core::types::SandboxOwnerSource::Local,
-        created_at: time::OffsetDateTime::UNIX_EPOCH,
-        updated_at: time::OffsetDateTime::UNIX_EPOCH,
-    };
-
-    let error = controller
-        .create(
-            &pool,
-            &actor,
-            &pooled_create_request("unconfigured-egress", None),
-            SandboxApiMetricIdentity::native("create"),
-            FederatedSandboxCreateContext::new(Some(&owner), Some(&grant)).with_falcon_us2_egress(),
-        )
-        .await
-        .unwrap_err();
-
-    assert_eq!(
-        error.status(),
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR
-    );
-    assert!(
-        error
-            .to_string()
-            .contains("failed to start federated sandbox owner transaction")
-    );
-    Ok(())
-}
-
 /// End to end across both halves: `POST /v1/sandboxes` claims a ready slot at
 /// admission, and the create executor's admitted-claim path adopts exactly
 /// that slot, so the sandbox runs under the ID the 202 returned. The real

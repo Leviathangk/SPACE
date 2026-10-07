@@ -14,7 +14,6 @@ pub mod client_concurrency;
 pub mod cluster_admission;
 pub mod controllers;
 pub mod e2b;
-pub(crate) mod falcon_egress;
 pub mod federated_identity;
 pub mod fork_operation_executor;
 mod fork_operation_store;

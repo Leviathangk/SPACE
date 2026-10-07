@@ -368,7 +368,6 @@ impl From<crate::federated_identity::FederatedOwnerRecord> for SandboxCreateOwne
 pub struct FederatedSandboxCreateContext<'a> {
     owner: Option<&'a crate::federated_identity::FederatedOwner>,
     service_grant: Option<&'a crate::federated_identity::FederatedServiceGrant>,
-    falcon_us2_egress: bool,
 }
 
 impl<'a> FederatedSandboxCreateContext<'a> {
@@ -379,13 +378,7 @@ impl<'a> FederatedSandboxCreateContext<'a> {
         Self {
             owner,
             service_grant,
-            falcon_us2_egress: false,
         }
-    }
-
-    pub fn with_falcon_us2_egress(mut self) -> Self {
-        self.falcon_us2_egress = true;
-        self
     }
 }
 
@@ -844,12 +837,10 @@ fn pool_attempt_resources(pool_shape: Option<PooledExecutionPoolShape>) -> Sandb
 impl SandboxController {
     pub async fn from_env(pool: &PgPool) -> Result<Self, SandboxControllerInitError> {
         let policy = crate::federated_identity::FederatedIdentityPolicy::from_env()?;
-        let falcon_us2_egress = crate::falcon_egress::FalconUs2Egress::from_env()?;
         let tls_interception_exemptions =
             crate::tls_interception_exemptions::TlsInterceptionExemptions::from_env()?;
         Ok(Self::new(Substrate::from_env(pool).await?)
             .with_federated_grant_audience(policy.grant_audience)
-            .with_falcon_us2_egress(falcon_us2_egress)
             .with_tls_interception_exemptions(tls_interception_exemptions))
     }
 
@@ -1118,10 +1109,7 @@ impl SandboxController {
             restore_operation_id,
             restore_lease_seconds,
         } = mode;
-        let falcon_us2_egress = crate::falcon_egress::for_create(
-            federated.falcon_us2_egress,
-            self.falcon_us2_egress.as_ref(),
-        );
+
         if restore_from.is_some() && req.node_pool.is_some() {
             return Err(ControllerError::bad_request(
                 "node-pool placement is not supported for fork disk restores",
@@ -1165,20 +1153,9 @@ impl SandboxController {
         };
         let auto_lifecycle = effective_create_auto_lifecycle(req, &resolved_template)?;
         let template_network_policy = resolved_template.default_network_policy;
-        let network_policy_override = if let Some(egress) = falcon_us2_egress {
-            Some(
-                egress.compose(
-                    req.network_policy
-                        .as_ref()
-                        .unwrap_or(&template_network_policy),
-                ),
-            )
-        } else {
-            req.network_policy.clone()
-        };
         let network_policy_override = crate::tls_interception_exemptions::compose(
             self.tls_interception_exemptions.as_ref(),
-            network_policy_override,
+            req.network_policy.clone(),
             Some(&template_network_policy),
         );
         // A sandbox override takes precedence over the resolved template default.

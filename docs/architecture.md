@@ -230,42 +230,24 @@ Explicit destination denies and platform guardrails take precedence. Exemptions
 grant no egress permission and bypass HTTP inspection and credential injection.
 Other destinations retain the policy's interception mode.
 
-The API's configured Falcon destination composition always adds its exact
-destinations to the allow list. It also adds them to the exemption list when
-`SPACE_FALCON_TLS_INTERCEPTION_EXEMPTIONS_ENABLED=true`. This API startup setting
-accepts `true` or `false` and defaults to `false` when unset. DNS resolver
-allowances are not exempted. Policies are persisted at create time; existing
-sandboxes need recreation or an explicit policy update to acquire exemptions.
+Clients construct complete policies, including feature-specific permissions and
+exemptions. Native create accepts `network_policy`; ECW accepts the same document
+through its [full-policy bridge](ecw-network-policy.md). Policies are persisted at
+create time; existing sandboxes need recreation or an explicit policy update to
+acquire exemptions.
 An established exempt flow retains its verified hostname binding for its lifetime,
 so DNS expiry or cache eviction does not disconnect it on an unrelated policy
 update. Each update still rechecks current egress permissions and exemptions;
 removing an exemption closes the flow when the updated policy requires interception.
 New connections require fresh DNS evidence.
 
-Roll out in two phases:
+Before writing nonempty exemptions, upgrade every policy reader and running
+worker gateway, including APIs, the internal API, and the credential manager.
+Older readers may reject policies or be unable to enforce exemptions. API
+replicas both read and write policies, so enabling writers during a mixed
+reader rollout is unsafe. Empty exemption lists preserve existing policy hashes.
 
-1. Leave the activation setting unset or `false` while upgrading every policy
-   reader, including all API replicas, the internal API, and the credential
-   manager, and every running worker gateway. Falcon composition continues adding
-   allowances without adding exemptions. Empty
-   exemption lists are omitted from JSON and preserve existing policy hashes.
-   An old internal API rejects an entire node policy batch when any requested
-   policy contains the new field; the credential manager also reads stored
-   policies when authorizing credential resolution.
-2. Once all readers and running gateways are compatible, set the activation
-   setting to `true` and roll the API. After activation completes, recreate
-   affected sandboxes or explicitly update their policies. Creates reaching a
-   replica that has not activated yet retain the previous behavior.
-
-API replicas both read and write policies; enabling composition during a mixed
-old/new API rollout is unsafe. Older JSON readers reject the new field, while
-older protobuf readers cannot enforce it. The activation setting gates automatic
-Falcon composition only. Native sandbox and template policy writers must also
-wait until all readers and gateways are compatible before submitting nonempty
-exemptions.
-
-Before downgrading, set activation to `false`, finish rolling all API replicas,
-and stop direct exemption writes. The setting does not strip existing exemptions.
+Before downgrading, stop all direct and deployment-configured exemption writes.
 Use compatible binaries to remove exemptions from all stored policies, including
 template defaults (or retire their resources), before reverting any reader.
 Then roll back API writers before workers and other readers. Removing an exemption

@@ -163,10 +163,8 @@ release = "questing"
     assert!(message.contains("missing field"));
 }
 
-/// The shared seed pins the BPF guest kernel, so the Falcon sensor can attach
-/// CO-RE instead of falling back to Reduced Functionality Mode. Pinning it here
-/// rather than in a Falcon-specific seed keeps one lineage, which is the agreed
-/// architecture, and makes staging a hard prerequisite: a node without this
+/// The shared seed pins a BPF-capable guest kernel for tracing workloads.
+/// Keeping one lineage makes staging a hard prerequisite: a node without this
 /// exact kernel in its runtime inventory cannot cold-boot anything built from
 /// this seed. Every cluster's worker and builder values must carry the matching
 /// `additionalGuestKernel` entry before this pin changes.
