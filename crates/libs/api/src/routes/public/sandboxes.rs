@@ -97,7 +97,13 @@ pub async fn create_sandbox(
         actor.id,
         &idempotency_key,
         request,
-        federated_create,
+        NativeCreateAdmission {
+            network_policy_overlay: crate::network_policy_overlay::network_policy_overlay_requested(
+                &headers,
+                federated_create.is_some(),
+            ),
+            federated_create,
+        },
         pool_claims,
     )
     .await?;
@@ -136,6 +142,12 @@ fn native_create_pool_claim_gate(
     )
 }
 
+#[derive(Default)]
+pub(crate) struct NativeCreateAdmission {
+    federated_create: Option<crate::fork_operations::ForkFederatedCreateContext>,
+    network_policy_overlay: bool,
+}
+
 /// Record a native create.
 ///
 /// `pool_claims` is `None` when admission-time pool claiming is off, which
@@ -152,10 +164,24 @@ pub(crate) async fn create_native_sandbox_operation(
     actor_user_id: UserId,
     idempotency_key: &IdempotencyKey,
     request: CreateSandboxRequest,
-    federated_create: Option<crate::fork_operations::ForkFederatedCreateContext>,
+    admission: NativeCreateAdmission,
     pool_claims: Option<&SandboxController>,
 ) -> Result<SandboxOperationResponse, PublicApiError> {
+    let NativeCreateAdmission {
+        federated_create,
+        network_policy_overlay,
+    } = admission;
     let (request, fingerprint) = prepare_native_create_request(request)?;
+    // Keep Noop fingerprints compatible with existing operations. A changed
+    // admission intent must conflict, never replay a differently admitted create.
+    let fingerprint = if network_policy_overlay {
+        RequestFingerprint::parse(hex::encode(Sha256::digest(
+            format!("network-policy-overlay:{}", fingerprint.as_str()).as_bytes(),
+        )))
+        .map_err(|_| PublicApiError::internal())?
+    } else {
+        fingerprint
+    };
     let plan = match pool_claims {
         None => NativeCreatePoolPlan::Unclaimed(AdmissionClaimOutcome::Disabled),
         Some(controller) => {
@@ -202,6 +228,7 @@ pub(crate) async fn create_native_sandbox_operation(
                     request: request.clone(),
                     // Placement is operator-only (admin surface); the public API never pins.
                     node_pool: None,
+                    network_policy_overlay,
                     federated_create: federated_create.clone(),
                     pool_claim: pool_claim.map(|claim| claim.claim.into()),
                 }

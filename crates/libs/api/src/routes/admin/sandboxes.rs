@@ -343,6 +343,7 @@ async fn create_sandbox_for_org(
         sandbox_id,
         request: request.sandbox,
         node_pool: request.node_pool,
+        network_policy_overlay: false,
         federated_create: None,
         pool_claim: None,
     }

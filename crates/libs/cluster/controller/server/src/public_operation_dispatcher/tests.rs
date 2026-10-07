@@ -635,6 +635,7 @@ async fn native_executor_requeues_create_when_cluster_admission_rejects() -> Tes
             sandbox_id,
             request: public_create_request(),
             node_pool: None,
+            network_policy_overlay: false,
         }
         .into_json(),
         attempts: 1,

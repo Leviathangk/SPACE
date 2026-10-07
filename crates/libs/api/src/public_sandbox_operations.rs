@@ -38,6 +38,10 @@ const CREATE_RETRY_AFTER: Duration = Duration::from_secs(5);
 pub struct CreateSandboxOperationPayload {
     pub sandbox_id: PublicSandboxId,
     pub request: pplx_space_public_api::CreateSandboxRequest,
+    /// Trusted per-create intent. Roll out every executor before producers:
+    /// old executors reject this field; Noop payloads retain their old shape.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub network_policy_overlay: bool,
     /// Operator-only isolation node pool pin, carried from the admin create
     /// surface. Absent (`None`) on every public/E2B create.
     ///
@@ -335,6 +339,9 @@ impl CreateSandboxOperationExecutor {
         let payload: CreateSandboxOperationPayload =
             serde_json::from_value(operation.payload.clone())
                 .map_err(CreateSandboxExecutionError::InvalidPayload)?;
+        if payload.network_policy_overlay && payload.federated_create.is_none() {
+            return Err(CreateSandboxExecutionError::MissingOverlayOwner);
+        }
         let target_id = operation
             .target_id
             .as_deref()
@@ -411,10 +418,13 @@ impl CreateSandboxOperationExecutor {
         }
         let planned_sandbox_id = SandboxId::from(payload.sandbox_id);
         let controller_request = controller_create_request(payload.request, payload.node_pool);
-        let federated_context = FederatedSandboxCreateContext::new(
+        let mut federated_context = FederatedSandboxCreateContext::new(
             federated.as_ref().map(|(owner, _)| owner),
             federated.as_ref().map(|(_, grant)| grant),
         );
+        if payload.network_policy_overlay {
+            federated_context = federated_context.with_network_policy_overlay();
+        }
         let response = match payload.pool_claim {
             None => {
                 self.controller
@@ -962,6 +972,8 @@ impl SandboxLifecycleExecutionError {
 
 #[derive(Debug, thiserror::Error)]
 enum CreateSandboxExecutionError {
+    #[error("Network policy overlay admission requires a federated owner and service grant")]
+    MissingOverlayOwner,
     #[error("invalid create_sandbox operation payload: {0}")]
     InvalidPayload(#[source] serde_json::Error),
     #[error("invalid federated create context")]
@@ -996,7 +1008,8 @@ enum CreateSandboxExecutionError {
 impl CreateSandboxExecutionError {
     fn into_result(self, operation: &ClaimedPublicOperation) -> PublicOperationExecutionResult {
         match self {
-            Self::InvalidPayload(_)
+            Self::MissingOverlayOwner
+            | Self::InvalidPayload(_)
             | Self::InvalidFederatedContext(_)
             | Self::MissingTargetId
             | Self::TargetMismatch { .. }

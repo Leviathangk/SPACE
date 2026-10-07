@@ -2,11 +2,11 @@
 
 [Documentation](../README.md)
 
-The ECW create header `X-Space-Network-Policy-Overlay: true` selects a single
+The native and ECW create header `X-Space-Network-Policy-Overlay: true` selects a single
 operator-configured network policy overlay. Only authenticated federated creates
 can select it. Creates without the header retain their normal policy.
 
-Set `SPACE_NETWORK_POLICY_OVERLAY` on each API process to a JSON object:
+Set `SPACE_NETWORK_POLICY_OVERLAY` on each API and cluster-controller process to a JSON object:
 
 ```json
 {
@@ -51,6 +51,14 @@ running worker gateway. Follow the [TLS exemption rollout and rollback
 steps](architecture.md#tls-interception-exemptions). The deployment-wide
 `SPACE_TLS_INTERCEPTION_EXEMPTIONS` setting remains independent: unlike this
 overlay, it does not require per-create opt-in.
+
+Native creates persist opt-in intent in the queued operation and include it in
+idempotency matching. Repeating a key with changed opt-in intent conflicts;
+renewing a service grant preserves the original intent. Deploy every cluster
+controller before APIs that emit selected overlays: old executors reject the new
+payload field. Operations without opt-in retain their existing serialized shape.
+Configure the same overlay on every API and cluster controller before enabling
+callers. Pending creates use the executor's configuration when executed.
 
 ## Migrating existing deployments
 

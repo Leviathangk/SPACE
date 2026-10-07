@@ -306,15 +306,21 @@ async fn deleted_sandbox_replay_is_authorized_by_its_retained_operation() -> Tes
 #[tokio::test]
 async fn native_create_requires_grant_before_enqueue() -> TestDbResult<()> {
     let fixture = fixture().await?;
-    let (status, _) = send(
-        &fixture.app,
-        Method::POST,
-        "/v1/sandboxes",
-        owner_headers(ORG, "101"),
-        json!({"template":"seed:latest"}),
-    )
-    .await?;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    for overlay in [false, true] {
+        let mut headers = owner_headers(ORG, "101");
+        if overlay {
+            headers.insert("x-space-network-policy-overlay", "true".parse()?);
+        }
+        let (status, _) = send(
+            &fixture.app,
+            Method::POST,
+            "/v1/sandboxes",
+            headers,
+            json!({"template":"seed:latest"}),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
     let count: i64 = sqlx::query_scalar(sql!("SELECT COUNT(*) FROM public_operations"))
         .fetch_one(&fixture.db.pool)
         .await?;
@@ -425,15 +431,25 @@ async fn native_resources_and_capability_minting_deny_other_subjects() -> TestDb
 #[tokio::test]
 async fn legacy_native_stays_local_and_has_no_asserted_owner_bridge() -> TestDbResult<()> {
     let fixture = fixture().await?;
+    let mut headers = HeaderMap::new();
+    headers.insert("x-space-network-policy-overlay", "true".parse()?);
     let (status, local) = send(
         &fixture.app,
         Method::POST,
         "/v1/sandboxes",
-        HeaderMap::new(),
+        headers,
         json!({"template":"seed:latest"}),
     )
     .await?;
     assert_eq!(status, StatusCode::ACCEPTED, "{local}");
+    let operation_id: OperationId = local["operation_id"].as_str().unwrap().parse()?;
+    let payload: sqlx::types::Json<Value> = sqlx::query_scalar(sql!(
+        "SELECT payload_json FROM public_operations WHERE operation_id = $1"
+    ))
+    .bind(operation_id.as_uuid())
+    .fetch_one(&fixture.db.pool)
+    .await?;
+    assert!(payload.0.get("network_policy_overlay").is_none());
     let sandbox = seed_target(&fixture, &local).await?;
     let path = format!("/v1/sandboxes/{sandbox}");
     let (status, _) = send(
@@ -672,5 +688,82 @@ async fn queued_native_create_grant_renewal_is_monotone_and_terminal_payload_is_
         stored.0.pointer("/federated_create/subject_id"),
         Some(&json!("101"))
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_overlay_admission_survives_replay_and_rejects_changed_intent() -> TestDbResult<()> {
+    let fixture = fixture().await?;
+    let mut headers = grant_headers(owner_headers(ORG, "101"));
+    headers.insert("x-space-network-policy-overlay", "true".parse()?);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    headers.insert(
+        FEDERATED_SERVICE_GRANT_ISSUED_AT_HEADER,
+        (now - 60).to_string().parse()?,
+    );
+    let request = json!({"template":"seed:latest"});
+    let (status, created) = send(
+        &fixture.app,
+        Method::POST,
+        "/v1/sandboxes",
+        headers.clone(),
+        request.clone(),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::ACCEPTED, "{created}");
+    let operation_id: OperationId = created["operation_id"].as_str().unwrap().parse()?;
+    let stored: sqlx::types::Json<Value> = sqlx::query_scalar(sql!(
+        "SELECT payload_json FROM public_operations WHERE operation_id = $1"
+    ))
+    .bind(operation_id.as_uuid())
+    .fetch_one(&fixture.db.pool)
+    .await?;
+    assert_eq!(stored.0["network_policy_overlay"], json!(true));
+    // Renewing the grant must retain the same admission intent.
+    headers.insert(
+        FEDERATED_SERVICE_GRANT_ISSUED_AT_HEADER,
+        now.to_string().parse()?,
+    );
+    headers.insert(
+        FEDERATED_SERVICE_GRANT_HEADER,
+        "renewed-synthetic-grant".parse()?,
+    );
+    headers.insert(
+        FEDERATED_SERVICE_GRANT_EXPIRES_AT_HEADER,
+        (time::OffsetDateTime::now_utc().unix_timestamp() + 7200)
+            .to_string()
+            .parse()?,
+    );
+    let (status, replay) = send(
+        &fixture.app,
+        Method::POST,
+        "/v1/sandboxes",
+        headers.clone(),
+        request.clone(),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::ACCEPTED, "{replay}");
+    assert_eq!(created, replay);
+    let renewed: sqlx::types::Json<Value> = sqlx::query_scalar(sql!(
+        "SELECT payload_json FROM public_operations WHERE operation_id = $1"
+    ))
+    .bind(operation_id.as_uuid())
+    .fetch_one(&fixture.db.pool)
+    .await?;
+    let renewed: crate::public_sandbox_operations::CreateSandboxOperationPayload =
+        serde_json::from_value(renewed.0)?;
+    assert!(renewed.network_policy_overlay);
+    let (_, grant) = renewed.federated_create.unwrap().restore()?;
+    assert_eq!(grant.as_bytes(), b"renewed-synthetic-grant");
+    headers.remove("x-space-network-policy-overlay");
+    let (status, _) = send(
+        &fixture.app,
+        Method::POST,
+        "/v1/sandboxes",
+        headers,
+        request,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::CONFLICT);
     Ok(())
 }

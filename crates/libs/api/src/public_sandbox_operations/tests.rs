@@ -48,6 +48,7 @@ fn claimed_create_operation_for(
             sandbox_id: public_sandbox_id,
             request: public_create_request(),
             node_pool: None,
+            network_policy_overlay: false,
             federated_create: None,
             pool_claim: None,
         }
@@ -65,7 +66,7 @@ fn direct_sandbox_controller(pool: &PgPool) -> SandboxController {
 
 #[cfg(feature = "kubernetes")]
 #[tokio::test(flavor = "current_thread")]
-async fn native_create_executor_persists_exemptions_without_changing_egress() -> TestResult {
+async fn native_create_executor_persists_admission_policy_and_replays() -> TestResult {
     use std::sync::{Arc, Mutex};
 
     use crate::controllers::substrate::kubernetes::tests::{
@@ -82,9 +83,25 @@ async fn native_create_executor_persists_exemptions_without_changing_egress() ->
         return Ok(());
     }
     let db = pg_test_db().await?;
-    let org_id = seed_org(&db.pool).await?;
-    let user_id = seed_user(&db.pool, org_id).await?;
-    let policy: NetworkPolicyV1 = serde_json::from_value(serde_json::json!({
+    let owner = crate::federated_identity::FederatedOwner {
+        issuer: UpstreamIssuer::parse("example-issuer")?,
+        org_id: UpstreamOrgId::parse("admission-org")?,
+        subject_id: UpstreamSubjectId::parse("admission-subject")?,
+    };
+    let effective_owner = crate::federated_identity::materialize_owner(&db.pool, &owner).await?;
+    let org_id = effective_owner.org_id;
+    let user_id = effective_owner.user_id;
+    let grant = crate::federated_identity::FederatedServiceGrant::new(
+        b"synthetic-admission-grant".to_vec(),
+        time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+    )?;
+    let network_policy_overlay = crate::network_policy_overlay::NetworkPolicyOverlay::from_config(
+        r#"{
+            "egress_allowances":[{"domain":"sensor.example.test"},{"domain":"blocked.example.test"}],
+            "tls_interception_exemptions":[{"domain":"sensor.example.test"},{"domain":"blocked.example.test"}]
+        }"#,
+    )?;
+    let mut policy: NetworkPolicyV1 = serde_json::from_value(serde_json::json!({
         "egress": {
             "default_action": "deny",
             "allow": [{"domain": "allowed.example.test"}],
@@ -121,7 +138,27 @@ async fn native_create_executor_persists_exemptions_without_changing_egress() ->
     let captured_pods = Arc::new(Mutex::new(Vec::new()));
     // Native create probes the pod's TCP listener even with command readiness disabled.
     let pod_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    for configured in [false, true] {
+    for (configured, overlay, tls) in [
+        (false, false, false),
+        (false, false, true),
+        (false, true, false),
+        (false, true, true),
+        (true, false, false),
+        (true, false, true),
+        (true, true, false),
+        (true, true, true),
+    ] {
+        policy.tls_interception = if tls {
+            pplx_space_net_common::TlsInterception::On
+        } else {
+            pplx_space_net_common::TlsInterception::Off
+        };
+        sqlx::query(sql!(
+            "UPDATE templates SET network_policy_json = $1 WHERE name = 'seed'"
+        ))
+        .bind(serde_json::to_value(&policy)?)
+        .execute(&db.pool)
+        .await?;
         let substrate = crate::controllers::substrate::Substrate::Kubernetes(Box::new(
             substrate_with_store_client_proxy_port_and_pod(
                 db.pool.clone(),
@@ -131,7 +168,8 @@ async fn native_create_executor_persists_exemptions_without_changing_egress() ->
             ),
         ));
         let controller = SandboxController::new(substrate)
-            .with_tls_interception_exemptions(configured.then(|| exemptions.clone()));
+            .with_tls_interception_exemptions(configured.then(|| exemptions.clone()))
+            .with_network_policy_overlay(Some(network_policy_overlay.clone()));
         let executor = CreateSandboxOperationExecutor::new(db.pool.clone(), controller);
         for inherit_template in [false, true] {
             let sandbox_id = SandboxId::new();
@@ -142,7 +180,12 @@ async fn native_create_executor_persists_exemptions_without_changing_egress() ->
                 sandbox_id: sandbox_id.into(),
                 request,
                 node_pool: None,
-                federated_create: None,
+                network_policy_overlay: overlay,
+                federated_create: Some(
+                    crate::fork_operations::ForkFederatedCreateContext::from_request(
+                        &owner, &grant,
+                    ),
+                ),
                 pool_claim: None,
             }
             .into_json();
@@ -155,20 +198,43 @@ async fn native_create_executor_persists_exemptions_without_changing_egress() ->
             .bind(sandbox_id)
             .fetch_one(&db.pool)
             .await?;
-            assert_eq!(persisted.is_some(), configured || !inherit_template);
+            assert_eq!(
+                persisted.is_some(),
+                (configured && tls) || overlay || !inherit_template
+            );
             let effective = persisted.as_ref().map(|value| &value.0).unwrap_or(&policy);
-            let mut expected = policy.clone();
-            if configured {
-                expected.tls_interception_exemptions = serde_json::from_value(serde_json::json!([
-                    {"wildcard_domain": "*.relay.example.test"}
-                ]))?;
+            // Differential oracle: native must select the same overlay as ECW.
+            let mut expected = if overlay {
+                network_policy_overlay.compose(&policy)
+            } else {
+                policy.clone()
+            };
+            if configured && tls {
+                expected
+                    .tls_interception_exemptions
+                    .extend(serde_json::from_value::<
+                        Vec<pplx_space_net_common::EgressDestinationV1>,
+                    >(serde_json::json!([
+                        {"wildcard_domain": "*.relay.example.test"}
+                    ]))?);
             }
             assert_eq!(effective, &expected);
+            assert_eq!(effective.egress.deny, policy.egress.deny);
+            assert_eq!(effective.tls_interception, policy.tls_interception);
+            let replay = Box::pin(executor.execute(&operation)).await;
+            assert_eq!(replay.state, OperationState::Succeeded, "{replay:?}");
+            let replay_policy: Option<sqlx::types::Json<NetworkPolicyV1>> = sqlx::query_scalar(
+                sql!("SELECT network_policy_override_json FROM sandboxes WHERE id = $1"),
+            )
+            .bind(sandbox_id)
+            .fetch_one(&db.pool)
+            .await?;
+            assert_eq!(replay_policy, persisted);
         }
     }
     assert_eq!(
         captured_pods.lock().expect("capture mutex poisoned").len(),
-        4
+        16
     );
     Ok(())
 }
@@ -349,6 +415,7 @@ async fn existing_row_create_persists_the_renewed_grant() -> TestResult {
             sandbox_id: PublicSandboxId::from(sandbox_id),
             request: public_create_request(),
             node_pool: None,
+            network_policy_overlay: false,
             federated_create: Some(
                 crate::fork_operations::ForkFederatedCreateContext::from_request(&owner, &renewed),
             ),
@@ -622,6 +689,7 @@ async fn create_executor_retries_unpinned_transient_substrate_failure() {
             sandbox_id,
             request: public_create_request(),
             node_pool: None,
+            network_policy_overlay: false,
             federated_create: None,
             pool_claim: None,
         }
@@ -708,6 +776,7 @@ fn create_operation_payload_is_wire_compatible_with_old_shape() {
         sandbox_id: PublicSandboxId::new(),
         request: public_create_request(),
         node_pool: None,
+        network_policy_overlay: false,
         federated_create: None,
         pool_claim: None,
     };
@@ -717,9 +786,15 @@ fn create_operation_payload_is_wire_compatible_with_old_shape() {
         "unpinned payload must omit node_pool: {value}"
     );
 
+    assert!(value.get("network_policy_overlay").is_none());
     // An old-shape payload (no key) deserializes via serde(default).
     let roundtrip: CreateSandboxOperationPayload = serde_json::from_value(value).unwrap();
     assert_eq!(roundtrip.node_pool, None);
+    assert!(!roundtrip.network_policy_overlay);
+    let mut selected = serde_json::to_value(&roundtrip).unwrap();
+    selected["network_policy_overlay"] = serde_json::json!(true);
+    let admitted: CreateSandboxOperationPayload = serde_json::from_value(selected).unwrap();
+    assert!(admitted.network_policy_overlay);
 
     // A pin adds the key (rejected by an old deny_unknown_fields executor —
     // the consumer-first rollout precondition).
@@ -727,6 +802,7 @@ fn create_operation_payload_is_wire_compatible_with_old_shape() {
         sandbox_id: PublicSandboxId::new(),
         request: public_create_request(),
         node_pool: Some(NodePoolName::parse("isolated-test-pool").unwrap()),
+        network_policy_overlay: false,
         federated_create: None,
         pool_claim: None,
     };
@@ -983,6 +1059,7 @@ fn create_operation_payload_pool_claim_is_optional_on_the_wire() {
         sandbox_id: PublicSandboxId::new(),
         request: public_create_request(),
         node_pool: None,
+        network_policy_overlay: false,
         federated_create: None,
         pool_claim: None,
     };
