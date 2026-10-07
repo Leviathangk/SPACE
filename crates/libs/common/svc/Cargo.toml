@@ -36,7 +36,7 @@ http = { workspace = true }
 http-body = { workspace = true }
 jiff = { workspace = true }
 k8s-openapi = { workspace = true, features = ["v1_32"], optional = true }
-kube = { workspace = true, default-features = false, features = ["client", "config", "rustls-tls"], optional = true }
+kube = { workspace = true, default-features = false, features = ["client", "config", "runtime", "rustls-tls"], optional = true }
 libc = { workspace = true }
 log = { workspace = true }
 nix = { workspace = true, features = ["fs", "user"] }
