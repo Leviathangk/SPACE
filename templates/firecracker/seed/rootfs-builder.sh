@@ -472,16 +472,20 @@ cat > /etc/systemd/system/space.target <<'SPACETARGET'
 Description=SPACE Sandbox Target
 DefaultDependencies=no
 Requires=local-fs.target spaced.service space-user-sessions.service
-Wants=ssh.socket
+Wants=ssh.socket space-runtime.service
 After=local-fs.target spaced.service space-user-sessions.service
 Conflicts=shutdown.target
-Before=shutdown.target
+Before=shutdown.target space-runtime.service
 AllowIsolate=yes
 
 [Install]
 Alias=default.target
 SPACETARGET
 systemctl set-default space.target 2>/dev/null || true
+
+# The guest binary owns the fixed native startup unit; templates carry only
+# validated declarations. Boot ordering leaves the agent available for debugging.
+/usr/local/bin/spaced-svc --runtime-unit > /etc/systemd/system/space-runtime.service
 
 # spaced guest daemon — runs as root, listens on /run/spaced.sock for
 # CLI and agent processes (user UID 2000), and vsock for host communication.

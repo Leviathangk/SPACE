@@ -198,6 +198,7 @@ mod memlock;
 mod meta;
 mod networking;
 mod port_forward;
+pub mod template_runtime;
 #[cfg(test)]
 mod transport;
 
@@ -356,6 +357,7 @@ struct SpacedGuestServiceInner {
     ready: watch::Sender<bool>,
     ready_events: watch::Sender<u64>,
     process_env: RwLock<EnvMap>,
+    runtime_boot_ready: std::sync::atomic::AtomicBool,
     processes: ProcessRegistry,
     idempotency: IdempotencyStore,
     filesystem: filesystem::FilesystemRouter,
@@ -424,6 +426,7 @@ impl SpacedGuestService {
                 ready,
                 ready_events,
                 process_env: RwLock::new(EnvMap::empty()),
+                runtime_boot_ready: std::sync::atomic::AtomicBool::new(false),
                 processes: ProcessRegistry::new(process::ProcessOutputBudget::for_guest_memory(
                     meta::guest_mem_total_bytes(),
                 )),
