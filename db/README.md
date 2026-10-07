@@ -42,6 +42,17 @@ Generate the version prefix with:
 date -u +%Y%m%d%H%M%S
 ```
 
+## Migration runners
+
+Each database's `up` command runs its embedded SQLx migrations. Applied files
+must retain their exact checksums unless an equivalent revision is explicitly
+registered as described below. There are no automatic history repairs.
+
+SQLite consumers of the common jobs schema run the shared catalog first, using
+`_space_common_schema_migrations`, then the service catalog using
+`_sqlx_migrations`. Both existing histories are validated before either catalog
+can apply SQL. Existing history rows and migration versions are preserved.
+
 ## Equivalent historical revisions
 
 A reviewed edit that preserves executable SQL (for example, removing a private
