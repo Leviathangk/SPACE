@@ -283,6 +283,7 @@ fn booted_runtime_state(
     };
     state.execution_generation = Some(execution_generation);
     state.pod_uid = Some(format!("pod-uid-{execution_generation}"));
+    state.state_changed_at = Some(timestamp(time::OffsetDateTime::now_utc().unix_timestamp()));
     state.activation_attempt_id = activation_attempt_id.map(|id| id.to_string());
     state
 }
@@ -4056,16 +4057,52 @@ async fn activation_completion_receipt_cannot_overwrite_a_newer_suspend_claim() 
     Ok(())
 }
 
-/// How a start abandoned the attempt whose pod later booted anyway.
+/// The shape of a sandbox whose node reports a running VM behind a `stopped`
+/// row, and whether that runtime belongs to a start the control plane gave up
+/// on.
 #[derive(Clone, Copy, Debug)]
-enum AbandonedAttempt {
+enum LateRuntime {
     /// The node rolled the failed activation back, retiring its execution and
     /// unplacing the row; kubelet then retried the same pod until it booted.
     RolledBack,
-    /// The start released its attempt without converging the lifecycle.
-    Released,
-    /// The attempt's lease expired before the runtime published.
+    /// A start created the execution after the stop, then released its
+    /// attempt without converging the lifecycle; the pod booted later.
+    ReleasedByStart,
+    /// The start's attempt lease expired before the runtime published.
     Expired,
+    /// An ordinary STOP stopped the VM in place, leaving its execution active
+    /// with no attempt, and the node's report was collected before the stop.
+    /// Nothing about this sandbox was abandoned.
+    StoppedInPlace,
+    /// A rolled-back start whose report names no pod, so teardown has nothing
+    /// to fence on.
+    MissingPodUid,
+}
+
+impl LateRuntime {
+    fn abandoned(self) -> bool {
+        match self {
+            Self::RolledBack | Self::ReleasedByStart | Self::Expired => true,
+            Self::StoppedInPlace | Self::MissingPodUid => false,
+        }
+    }
+}
+
+async fn abandoned_activation_observed_at(
+    pool: &PgPool,
+    node_id: NodeId,
+    sandbox_id: SandboxId,
+) -> TestResult<time::OffsetDateTime> {
+    Ok(sqlx::query_scalar(sql!(
+        "SELECT observed_at
+           FROM node_facet_observed_status
+          WHERE node_id = $1 AND facet = $2 AND element = $3"
+    ))
+    .bind(node_id)
+    .bind(FACET_SANDBOX_DESIRED_STATE)
+    .bind(sandbox_id.to_string())
+    .fetch_one(pool)
+    .await?)
 }
 
 /// A start that failed told its client so and left the row `stopped`. When the
@@ -4075,35 +4112,72 @@ enum AbandonedAttempt {
 /// reporting it.
 #[tokio::test(flavor = "current_thread")]
 async fn late_runtime_behind_a_stopped_row_is_handed_to_teardown_without_promotion() -> TestResult {
+    publish_late_runtimes(&[
+        LateRuntime::RolledBack,
+        LateRuntime::ReleasedByStart,
+        LateRuntime::Expired,
+    ])
+    .await
+}
+
+/// Teardown needs positive evidence that the runtime came up after the row
+/// went `stopped`, and a pod to fence on. A stopped-in-place sandbox looks the
+/// same as an abandoned start apart from when its execution was created and
+/// when its runtime last changed, and must never be torn down; neither may a
+/// runtime whose report names no pod.
+#[tokio::test(flavor = "current_thread")]
+async fn late_runtime_without_proof_of_abandonment_is_never_torn_down() -> TestResult {
+    publish_late_runtimes(&[LateRuntime::StoppedInPlace, LateRuntime::MissingPodUid]).await
+}
+
+async fn publish_late_runtimes(shapes: &[LateRuntime]) -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
     let node_id = NodeId::new();
     insert_ready_worker_node(&db.pool, node_id).await?;
-    for abandoned in [
-        AbandonedAttempt::RolledBack,
-        AbandonedAttempt::Released,
-        AbandonedAttempt::Expired,
-    ] {
+    for &shape in shapes {
         let sandbox_id = SandboxId::new();
         let attempt_id = Uuid::now_v7();
-        insert_active_sandbox(&db.pool, sandbox_id, node_id, "stopped").await?;
-        insert_k8s_execution(&db.pool, sandbox_id, 7, "creating", None).await?;
-        sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions
-                SET activation_attempt_id = $2,
-                    route_activation_id = $2,
-                    activation_attempt_expires_at = NOW() + INTERVAL '5 minutes',
-                    activation_attempt_target_state = 'started'
-              WHERE sandbox_id = $1 AND generation = 7"
-        ))
-        .bind(sandbox_id)
-        .bind(attempt_id)
-        .execute(&db.pool)
-        .await?;
+        if matches!(shape, LateRuntime::StoppedInPlace) {
+            // The execution and its VM predate the STOP that left the row
+            // `stopped`.
+            insert_active_sandbox(&db.pool, sandbox_id, node_id, "started").await?;
+            insert_k8s_execution(&db.pool, sandbox_id, 7, "running", Some("100.64.0.7")).await?;
+            sqlx::query(sql!(
+                "UPDATE sandboxes SET lifecycle = 'stopped' WHERE id = $1"
+            ))
+            .bind(sandbox_id)
+            .execute(&db.pool)
+            .await?;
+        } else {
+            // The row went `stopped` before the start that created the
+            // execution.
+            insert_active_sandbox(&db.pool, sandbox_id, node_id, "stopped").await?;
+            sqlx::query(sql!(
+                "UPDATE sandboxes SET lifecycle_changed_at = NOW() - INTERVAL '10 minutes'
+                  WHERE id = $1"
+            ))
+            .bind(sandbox_id)
+            .execute(&db.pool)
+            .await?;
+            insert_k8s_execution(&db.pool, sandbox_id, 7, "creating", None).await?;
+            sqlx::query(sql!(
+                "UPDATE sandbox_k8s_executions
+                    SET activation_attempt_id = $2,
+                        route_activation_id = $2,
+                        activation_attempt_expires_at = NOW() + INTERVAL '5 minutes',
+                        activation_attempt_target_state = 'started'
+                  WHERE sandbox_id = $1 AND generation = 7"
+            ))
+            .bind(sandbox_id)
+            .bind(attempt_id)
+            .execute(&db.pool)
+            .await?;
+        }
         let mut conn = db.pool.acquire().await?;
-        let late_runtime = match abandoned {
-            AbandonedAttempt::RolledBack => {
+        let late_runtime = match shape {
+            LateRuntime::RolledBack | LateRuntime::MissingPodUid => {
                 let rollback = activation_rollback_state(
                     sandbox_id,
                     Uuid::now_v7(),
@@ -4113,9 +4187,13 @@ async fn late_runtime_behind_a_stopped_row_is_handed_to_teardown_without_promoti
                     SandboxQuarantineReasonCode::ColdActivationInterrupted,
                 );
                 publish_sandbox_states(&mut conn, node_id, &[rollback]).await?;
-                booted_runtime_state(sandbox_id, 7, Some(attempt_id))
+                let mut state = booted_runtime_state(sandbox_id, 7, Some(attempt_id));
+                if matches!(shape, LateRuntime::MissingPodUid) {
+                    state.pod_uid = None;
+                }
+                state
             }
-            AbandonedAttempt::Released => {
+            LateRuntime::ReleasedByStart => {
                 sqlx::query(sql!(
                     "UPDATE sandbox_k8s_executions
                         SET state = 'running',
@@ -4130,7 +4208,7 @@ async fn late_runtime_behind_a_stopped_row_is_handed_to_teardown_without_promoti
                 .await?;
                 booted_runtime_state(sandbox_id, 7, None)
             }
-            AbandonedAttempt::Expired => {
+            LateRuntime::Expired => {
                 sqlx::query(sql!(
                     "UPDATE sandbox_k8s_executions
                         SET state = 'created',
@@ -4142,31 +4220,65 @@ async fn late_runtime_behind_a_stopped_row_is_handed_to_teardown_without_promoti
                 .await?;
                 booted_runtime_state(sandbox_id, 7, Some(attempt_id))
             }
+            LateRuntime::StoppedInPlace => {
+                // Collected while the sandbox was still `started`, applied
+                // after the STOP.
+                let mut state = booted_runtime_state(sandbox_id, 7, None);
+                state.state_changed_at = Some(timestamp(
+                    time::OffsetDateTime::now_utc().unix_timestamp() - 3600,
+                ));
+                state
+            }
         };
 
         publish_sandbox_states(&mut conn, node_id, std::slice::from_ref(&late_runtime)).await?;
         assert_eq!(
             sandbox_lifecycle(&db.pool, sandbox_id).await?,
             "stopped",
-            "{abandoned:?}: a start the API reported as failed must not be adopted"
+            "{shape:?}: a `stopped` row is never promoted by a runtime no attempt owns"
         );
+        if !shape.abandoned() {
+            assert_eq!(
+                abandoned_activation_observation(&db.pool, node_id, sandbox_id).await?,
+                None,
+                "{shape:?}: nothing proves this runtime was abandoned, so it is not torn down"
+            );
+            continue;
+        }
         assert_eq!(
             abandoned_activation_observation(&db.pool, node_id, sandbox_id).await?,
             Some(serde_json::json!({
                 "execution_generation": 7,
                 "pod_uid": "pod-uid-7",
             })),
-            "{abandoned:?}: the runtime is handed to teardown fenced on its generation and pod"
+            "{shape:?}: the runtime is handed to teardown fenced on its generation and pod"
         );
 
-        // A republished report keeps the same request; one the node no longer
-        // backs with a running VM withdraws it.
+        // A republished report keeps the request and refreshes when it was
+        // last asserted, so teardown acts only on a runtime the node still
+        // reports; one the node no longer backs with a running VM withdraws
+        // it.
+        sqlx::query(sql!(
+            "UPDATE node_facet_observed_status
+                SET observed_at = NOW() - INTERVAL '1 hour'
+              WHERE node_id = $1 AND facet = $2 AND element = $3"
+        ))
+        .bind(node_id)
+        .bind(FACET_SANDBOX_DESIRED_STATE)
+        .bind(sandbox_id.to_string())
+        .execute(&db.pool)
+        .await?;
         publish_sandbox_states(&mut conn, node_id, std::slice::from_ref(&late_runtime)).await?;
         assert!(
             abandoned_activation_observation(&db.pool, node_id, sandbox_id)
                 .await?
                 .is_some(),
-            "{abandoned:?}"
+            "{shape:?}"
+        );
+        assert!(
+            abandoned_activation_observed_at(&db.pool, node_id, sandbox_id).await?
+                > time::OffsetDateTime::now_utc() - time::Duration::minutes(1),
+            "{shape:?}: a re-asserted request is fresh again"
         );
         publish_sandbox_states(
             &mut conn,
@@ -4177,7 +4289,7 @@ async fn late_runtime_behind_a_stopped_row_is_handed_to_teardown_without_promoti
         assert_eq!(
             abandoned_activation_observation(&db.pool, node_id, sandbox_id).await?,
             None,
-            "{abandoned:?}: a runtime the node no longer reports needs no teardown"
+            "{shape:?}: a runtime the node no longer reports needs no teardown"
         );
         assert_eq!(sandbox_lifecycle(&db.pool, sandbox_id).await?, "stopped");
     }

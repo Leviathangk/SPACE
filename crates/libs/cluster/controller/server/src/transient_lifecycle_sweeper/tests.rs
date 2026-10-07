@@ -2546,6 +2546,21 @@ async fn f5_abandoned_activation_pass_retires_each_reported_runtime_under_its_fe
     );
 }
 
+/// Retiring node-reported runtimes behind `stopped` rows ships off: the default
+/// configuration, which runs failed-sandbox cleanup everywhere, neither lists
+/// nor retires abandoned activations.
+#[tokio::test(flavor = "current_thread")]
+async fn f6_abandoned_activation_pass_is_off_by_default() {
+    let sink = FakeSink::new();
+    sink.enqueue_abandoned_activations(vec![abandoned_activation_candidate(SandboxId::new())]);
+    let reconciler = Reconciler::new(ReconcilerConfig::default(), sink);
+
+    let report = reconciler.tick().await;
+
+    assert_eq!(report.abandoned_activation_retired, 0);
+    assert!(reconciler.sink.abandoned_activation_retires().is_empty());
+}
+
 /// A lost fence must stop the reap before its CAS, not after. That CAS flips
 /// the row to `failed`, and the transition's trigger clears
 /// `command_ready_pending` — so running it and only then refusing the teardown

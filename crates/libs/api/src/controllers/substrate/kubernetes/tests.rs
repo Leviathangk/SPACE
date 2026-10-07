@@ -14422,11 +14422,168 @@ mod kubernetes_tests {
         }
     }
 
+    /// Where the execution of an abandoned activation stands when the sweep
+    /// acts on the node's report of its running VM.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum AbandonedExecution {
+        /// The node's activation rollback retired it; nothing tracks its pod.
+        Retired,
+        /// Still active, its start's attempt lease expired.
+        ActiveAttemptExpired,
+        /// Still active and never got past pod materialization in the
+        /// control plane, though the node booted its VM.
+        ActiveCreating,
+    }
+
+    /// What the apiserver holds at the reported pod's name.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum LivePod {
+        Running { uid: &'static str },
+        Terminating,
+        Absent,
+    }
+
+    struct AbandonedRuntimeSubject {
+        sandbox_id: SandboxId,
+        sim_worker: SimWorkerHarness,
+        captured_deletes: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+        substrate: KubernetesSubstrate,
+        fence: RetireFence,
+    }
+
+    /// The fence the abandoned-activation sweep builds: the generation and pod
+    /// UID the node reported, plus what the execution row recorded about
+    /// itself when the sweep listed it.
+    fn abandoned_activation_fence(
+        pod_name: &str,
+        recorded_pod_uid: &str,
+        route_activation_id: SandboxActivationAttemptId,
+        activation_attempt_id: SandboxActivationAttemptId,
+    ) -> RetireFence {
+        RetireFence::AbandonedActivation(
+            PodIdentityFence::new(PodName::parse(pod_name).expect("pod name"))
+                .with_generation(7)
+                .with_recorded(RecordedExecution::Read {
+                    pod_uid: Some(PodUid::parse(recorded_pod_uid).expect("pod uid")),
+                    route_activation_id: Some(route_activation_id),
+                })
+                .with_activation_attempt(activation_attempt_id)
+                .with_pod_uid(PodUid::parse("uid-late").expect("pod uid")),
+        )
+    }
+
+    /// Seed a sandbox whose node reports the VM of generation 7's pod
+    /// running, and a substrate whose simulated node runs that VM.
+    async fn abandoned_runtime_subject(
+        pool: &PgPool,
+        lifecycle: &str,
+        execution: AbandonedExecution,
+        live_pod: LivePod,
+    ) -> Result<AbandonedRuntimeSubject, BoxError> {
+        let sandbox_id = SandboxId::new();
+        let pod_name = format!("space-sbx-{}-g7", sandbox_id.as_uuid().simple());
+        let route_activation_id = SandboxActivationAttemptId::new();
+        let activation_attempt_id = SandboxActivationAttemptId::new();
+        insert_test_sandbox_row(pool, sandbox_id, lifecycle).await?;
+        insert_k8s_execution(
+            pool,
+            sandbox_id,
+            7,
+            &pod_name,
+            "uid-late",
+            None,
+            execution != AbandonedExecution::Retired,
+        )
+        .await?;
+        sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions
+                SET state = $2,
+                    route_activation_id = $3,
+                    activation_attempt_id = $4,
+                    activation_attempt_expires_at = NOW() - INTERVAL '1 minute',
+                    activation_attempt_target_state = 'started'
+              WHERE sandbox_id = $1 AND generation = 7"
+        ))
+        .bind(sandbox_id)
+        .bind(match execution {
+            AbandonedExecution::Retired => "replaced",
+            AbandonedExecution::ActiveAttemptExpired => "running",
+            AbandonedExecution::ActiveCreating => "creating",
+        })
+        .bind(route_activation_id)
+        .bind(activation_attempt_id)
+        .execute(pool)
+        .await?;
+        let sim_worker = start_sim_worker().await?;
+        sim_worker
+            .state()
+            .ensure_default_running(&sandbox_id.to_string())
+            .await?;
+        let live = match live_pod {
+            LivePod::Running { uid } => Some(running_sandbox_pod(&pod_name, uid)),
+            LivePod::Terminating => {
+                let mut pod = running_sandbox_pod(&pod_name, "uid-late");
+                pod.metadata.deletion_timestamp = Some(serde_json::from_value(serde_json::json!(
+                    "2026-07-24T11:34:00Z"
+                ))?);
+                Some(pod)
+            }
+            LivePod::Absent => None,
+        };
+        let captured_deletes = Arc::new(Mutex::new(Vec::new()));
+        let substrate = substrate_with_store_client_proxy_port_and_pod(
+            pool.clone(),
+            delete_capturing_kubernetes_client(Arc::clone(&captured_deletes), live.clone()),
+            sim_worker.port(),
+            live,
+        );
+        Ok(AbandonedRuntimeSubject {
+            sandbox_id,
+            sim_worker,
+            captured_deletes,
+            substrate,
+            fence: abandoned_activation_fence(
+                &pod_name,
+                "uid-late",
+                route_activation_id,
+                activation_attempt_id,
+            ),
+        })
+    }
+
+    impl AbandonedRuntimeSubject {
+        async fn runtime_status(&self) -> Result<String, BoxError> {
+            Ok(self
+                .sim_worker
+                .state()
+                .get(&self.sandbox_id.to_string())
+                .await?
+                .status)
+        }
+
+        fn deletes(&self) -> Vec<(String, serde_json::Value)> {
+            self.captured_deletes
+                .lock()
+                .expect("capture mutex poisoned")
+                .clone()
+        }
+
+        async fn lifecycle(&self, pool: &PgPool) -> Result<String, BoxError> {
+            Ok(
+                sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
+                    .bind(self.sandbox_id)
+                    .fetch_one(pool)
+                    .await?,
+            )
+        }
+    }
+
     /// The node-reported runtime of a start the control plane abandoned is
-    /// stopped before its pod is deleted, whether or not the generation it
-    /// belongs to is still the active execution. Deleting the pod of a live
-    /// runtime alone hands the VM to the node's durable-suspend teardown, which
-    /// a `stopped` row never asked for.
+    /// stopped before its pod is deleted, whether its generation was retired
+    /// or is still active, and even when the control plane never recorded
+    /// the pod as materialized. Deleting the pod of a live runtime alone hands
+    /// the VM to the node's durable-suspend teardown, which a `stopped` row
+    /// never asked for.
     #[tokio::test(flavor = "current_thread")]
     async fn abandoned_activation_retire_stops_the_runtime_before_deleting_its_pod()
     -> Result<(), BoxError> {
@@ -14435,179 +14592,164 @@ mod kubernetes_tests {
         }
         let db = pplx_space_db_test_fixtures::pg_test_db().await?;
         let pool = db.pool.clone();
-        for generation_still_active in [false, true] {
-            let sandbox_id = SandboxId::new();
-            let pod_name = format!("space-sbx-{}-g7", sandbox_id.as_uuid().simple());
-            insert_test_sandbox_row(&pool, sandbox_id, "stopped").await?;
-            insert_k8s_execution(
+        for execution in [
+            AbandonedExecution::Retired,
+            AbandonedExecution::ActiveAttemptExpired,
+            AbandonedExecution::ActiveCreating,
+        ] {
+            let subject = abandoned_runtime_subject(
                 &pool,
-                sandbox_id,
-                7,
-                &pod_name,
-                "uid-late",
-                None,
-                generation_still_active,
+                "stopped",
+                execution,
+                LivePod::Running { uid: "uid-late" },
             )
             .await?;
-            let sim_worker = start_sim_worker().await?;
-            sim_worker
-                .state()
-                .ensure_default_running(&sandbox_id.to_string())
-                .await?;
-            let live = running_sandbox_pod(&pod_name, "uid-late");
-            let captured_deletes = Arc::new(Mutex::new(Vec::new()));
-            let substrate = substrate_with_store_client_proxy_port_and_pod(
-                pool.clone(),
-                delete_capturing_kubernetes_client(
-                    Arc::clone(&captured_deletes),
-                    Some(live.clone()),
-                ),
-                sim_worker.port(),
-                Some(live),
-            );
 
-            let outcome = substrate
+            let outcome = subject
+                .substrate
                 .retire_execution(RetireExecutionRequest {
-                    sandbox_id,
-                    fence: RetireFence::AbandonedActivation(
-                        PodIdentityFence::new(PodName::parse(&pod_name)?)
-                            .with_generation(7)
-                            .with_pod_uid(PodUid::parse("uid-late")?),
-                    ),
+                    sandbox_id: subject.sandbox_id,
+                    fence: subject.fence.clone(),
                 })
                 .await?;
 
-            assert_eq!(
-                outcome,
-                RetireExecutionOutcome::Retired,
-                "generation still active: {generation_still_active}"
-            );
-            assert_eq!(
-                sim_worker
-                    .state()
-                    .get(&sandbox_id.to_string())
-                    .await?
-                    .status,
-                "stopped",
-                "generation still active: {generation_still_active}"
-            );
-            let deletes = captured_deletes
-                .lock()
-                .expect("capture mutex poisoned")
-                .clone();
-            assert_eq!(deletes.len(), 1);
-            assert_eq!(deletes[0].0, pod_name);
+            assert_eq!(outcome, RetireExecutionOutcome::Retired, "{execution:?}");
+            assert_eq!(subject.runtime_status().await?, "stopped", "{execution:?}");
+            let deletes = subject.deletes();
+            assert_eq!(deletes.len(), 1, "{execution:?}");
             assert_eq!(
                 deletes[0].1.pointer("/preconditions/uid"),
                 Some(&serde_json::json!("uid-late")),
-                "the delete is pinned to the pod the node reported"
+                "{execution:?}: the delete is pinned to the pod the node reported"
             );
             assert!(
-                active_execution_generations(&pool, sandbox_id)
+                active_execution_generations(&pool, subject.sandbox_id)
                     .await
-                    .is_empty()
+                    .is_empty(),
+                "{execution:?}"
             );
-            let lifecycle: String =
-                sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
-                    .bind(sandbox_id)
-                    .fetch_one(&pool)
-                    .await?;
-            assert_eq!(lifecycle, "stopped");
+            assert_eq!(subject.lifecycle(&pool).await?, "stopped", "{execution:?}");
         }
         Ok(())
     }
 
     /// An abandoned-activation retire touches nothing it cannot pin to the
-    /// runtime the node reported: not a newer generation that now owns the
-    /// sandbox, and not a different pod at the reported name.
+    /// runtime the node reported behind a still-`stopped` row: not a newer
+    /// generation that now owns the sandbox, not a different pod at the
+    /// reported name, and not a sandbox a start has since converged to
+    /// `started` under the same identity. Nor does it release a pod it cannot
+    /// stop through: a missing or terminating pod while the node still reports
+    /// a running VM is a defer, never a completed retire.
     #[tokio::test(flavor = "current_thread")]
-    async fn abandoned_activation_retire_refuses_what_the_node_did_not_report()
+    async fn abandoned_activation_retire_refuses_what_it_cannot_prove_or_stop()
     -> Result<(), BoxError> {
         if !crate::test_support::enter_sim_worker_process() {
             return Ok(());
         }
         let db = pplx_space_db_test_fixtures::pg_test_db().await?;
         let pool = db.pool.clone();
-        for (newer_generation_active, live_uid, expected) in [
-            (true, "uid-late", PodFenceMismatch::ExecutionSuperseded),
-            (false, "uid-replacement", PodFenceMismatch::PodUidChanged),
+        for (case, lifecycle, execution, live_pod, newer_generation_active, expected) in [
+            (
+                "newer generation active",
+                "stopped",
+                AbandonedExecution::Retired,
+                LivePod::Running { uid: "uid-late" },
+                true,
+                "execution_superseded",
+            ),
+            (
+                "replaced pod",
+                "stopped",
+                AbandonedExecution::Retired,
+                LivePod::Running {
+                    uid: "uid-replacement",
+                },
+                false,
+                "pod_uid_changed",
+            ),
+            (
+                "row started since, generation retired",
+                "started",
+                AbandonedExecution::Retired,
+                LivePod::Running { uid: "uid-late" },
+                false,
+                "lifecycle_changed",
+            ),
+            (
+                "row started since under the same identity",
+                "started",
+                AbandonedExecution::ActiveAttemptExpired,
+                LivePod::Running { uid: "uid-late" },
+                false,
+                "lifecycle_changed",
+            ),
+            (
+                "pod already gone",
+                "stopped",
+                AbandonedExecution::Retired,
+                LivePod::Absent,
+                false,
+                "runtime_unreachable",
+            ),
+            (
+                "pod terminating",
+                "stopped",
+                AbandonedExecution::Retired,
+                LivePod::Terminating,
+                false,
+                "runtime_unreachable",
+            ),
+            (
+                "tracked pod terminating",
+                "stopped",
+                AbandonedExecution::ActiveAttemptExpired,
+                LivePod::Terminating,
+                false,
+                "runtime_unreachable",
+            ),
         ] {
-            let sandbox_id = SandboxId::new();
-            let pod_name = format!("space-sbx-{}-g7", sandbox_id.as_uuid().simple());
-            insert_test_sandbox_row(&pool, sandbox_id, "stopped").await?;
-            insert_k8s_execution(&pool, sandbox_id, 7, &pod_name, "uid-late", None, false).await?;
+            let subject = abandoned_runtime_subject(&pool, lifecycle, execution, live_pod).await?;
             if newer_generation_active {
                 insert_k8s_execution(
                     &pool,
-                    sandbox_id,
+                    subject.sandbox_id,
                     8,
-                    &format!("space-sbx-{}-g8", sandbox_id.as_uuid().simple()),
+                    &format!("space-sbx-{}-g8", subject.sandbox_id.as_uuid().simple()),
                     "uid-newer",
                     None,
                     true,
                 )
                 .await?;
             }
-            let sim_worker = start_sim_worker().await?;
-            sim_worker
-                .state()
-                .ensure_default_running(&sandbox_id.to_string())
-                .await?;
-            let live = running_sandbox_pod(&pod_name, live_uid);
-            let captured_deletes = Arc::new(Mutex::new(Vec::new()));
-            let substrate = substrate_with_store_client_proxy_port_and_pod(
-                pool.clone(),
-                delete_capturing_kubernetes_client(
-                    Arc::clone(&captured_deletes),
-                    Some(live.clone()),
-                ),
-                sim_worker.port(),
-                Some(live),
-            );
+            let active_before = active_execution_generations(&pool, subject.sandbox_id).await;
 
-            let outcome = substrate
+            let outcome = subject
+                .substrate
                 .retire_execution(RetireExecutionRequest {
-                    sandbox_id,
-                    fence: RetireFence::AbandonedActivation(
-                        PodIdentityFence::new(PodName::parse(&pod_name)?)
-                            .with_generation(7)
-                            .with_pod_uid(PodUid::parse("uid-late")?),
-                    ),
+                    sandbox_id: subject.sandbox_id,
+                    fence: subject.fence.clone(),
                 })
                 .await?;
 
-            assert_eq!(
-                outcome,
-                RetireExecutionOutcome::PodIdentityChanged {
-                    mismatch: expected,
-                    progress: TeardownProgress::NothingMutated,
+            match outcome {
+                RetireExecutionOutcome::PodIdentityChanged { mismatch, progress } => {
+                    assert_eq!(mismatch.as_str(), expected, "{case}");
+                    assert_eq!(progress, TeardownProgress::NothingMutated, "{case}");
                 }
-            );
+                other => panic!("{case}: expected a defer, got {other:?}"),
+            }
             assert_eq!(
-                sim_worker
-                    .state()
-                    .get(&sandbox_id.to_string())
-                    .await?
-                    .status,
+                subject.runtime_status().await?,
                 "running",
-                "{expected}: the runtime is not stopped"
+                "{case}: the runtime is not stopped"
             );
-            assert!(
-                captured_deletes
-                    .lock()
-                    .expect("capture mutex poisoned")
-                    .is_empty(),
-                "{expected}: no pod is deleted"
-            );
-            let expected_active: Vec<i64> = if newer_generation_active {
-                vec![8]
-            } else {
-                Vec::new()
-            };
+            assert!(subject.deletes().is_empty(), "{case}: no pod is deleted");
             assert_eq!(
-                active_execution_generations(&pool, sandbox_id).await,
-                expected_active
+                active_execution_generations(&pool, subject.sandbox_id).await,
+                active_before,
+                "{case}: no execution is retired"
             );
+            assert_eq!(subject.lifecycle(&pool).await?, lifecycle, "{case}");
         }
         Ok(())
     }
