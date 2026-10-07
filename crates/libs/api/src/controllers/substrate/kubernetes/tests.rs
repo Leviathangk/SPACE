@@ -10758,6 +10758,168 @@ mod kubernetes_tests {
         Ok(())
     }
 
+    /// A claimed native delete operation for `sandbox_id`, on its
+    /// `claim_generation`th claim with `attempts` counted against its budget.
+    fn delete_operation(
+        sandbox_id: SandboxId,
+        claim_generation: i64,
+        attempts: i32,
+    ) -> crate::public_operations::ClaimedPublicOperation {
+        let public_sandbox_id = pplx_space_public_api::PublicSandboxId::from(sandbox_id);
+        crate::public_operations::ClaimedPublicOperation {
+            id: pplx_space_public_api::OperationId::new(),
+            org_id: OrgId::from_uuid(uuid::Uuid::from_u128(1)),
+            actor_user_id: None,
+            api_product: crate::public_operations::ApiProduct::Native,
+            kind: pplx_space_public_api::OperationKind::DeleteSandbox,
+            target_type: Some(pplx_space_public_api::OperationTargetType::Sandbox),
+            target_id: Some(public_sandbox_id.to_string()),
+            payload: crate::public_sandbox_operations::SandboxLifecycleOperationPayload {
+                sandbox_id: public_sandbox_id,
+                action: pplx_space_public_api::SandboxLifecycleAction::Delete,
+                rollback: None,
+            }
+            .into_json(),
+            attempts,
+            claim_generation,
+        }
+    }
+
+    /// A delete re-drives with no retry budget and no deadline, so it has to
+    /// say so, without turning into one signal per retry. Each re-drive
+    /// counts `operations.delete_redrive`, tagged with its cause. A
+    /// `delete_redriving` sandbox event, carrying the error and the claim
+    /// generation, fires on the first re-drive and then on every twelfth.
+    ///
+    /// The causes are an unconfirmed teardown, and the catch-all: another
+    /// error that left the row claimed `deleting`. A permanent fault re-drives
+    /// forever through the catch-all, which is why it needs its own tag. The
+    /// catch-all case here is a `deleting` row whose delete is refused by an
+    /// in-flight snapshot upload.
+    ///
+    /// Prior re-drives are `claim_generation - attempts`: every claim counts
+    /// an attempt, and a re-drive gives its attempt back.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_redriving_delete_is_reported_without_an_event_per_retry() -> Result<(), BoxError> {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let unconfirmed = SandboxId::new();
+        insert_test_sandbox_row(&pool, unconfirmed, "stopped").await?;
+        let pod_name = format!("space-sbx-{}-g1", unconfirmed.as_uuid().simple());
+        insert_k8s_execution(&pool, unconfirmed, 1, &pod_name, "uid-g1", None, false).await?;
+        let left_deleting = SandboxId::new();
+        insert_test_sandbox_row(&pool, left_deleting, "deleting").await?;
+        sqlx::query(sql!(
+            "INSERT INTO snapshots (sandbox_id, type, state, org_id)
+             VALUES ($1, 'full', 'creating', '00000000-0000-0000-0000-000000000001')"
+        ))
+        .bind(left_deleting)
+        .execute(&pool)
+        .await?;
+        let substrate = substrate_with_store_client_proxy_port_and_pod(
+            pool.clone(),
+            delete_capturing_kubernetes_client_with_fault(
+                Arc::new(Mutex::new(Vec::new())),
+                None,
+                Arc::new(AtomicBool::new(true)),
+            ),
+            DEFAULT_SANDBOX_PROXY_PORT,
+            None,
+        );
+        let executor = crate::public_sandbox_operations::SandboxLifecycleOperationExecutor::new(
+            pool.clone(),
+            SandboxController::new(Substrate::Kubernetes(Box::new(substrate))),
+        );
+        let event_capture = SandboxEventCapture::default();
+        let event_guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(event_capture.clone()),
+        );
+        let counters = pplx_space_metrics::test_capture::capture_counters_guard();
+
+        // (sandbox, claim generation, attempts): re-drives 0, 1 and 12 of the
+        // unconfirmed teardown, then the catch-all's first.
+        for (sandbox_id, claim_generation, attempts) in [
+            (unconfirmed, 1, 1),
+            (unconfirmed, 2, 1),
+            (unconfirmed, 13, 1),
+            (left_deleting, 3, 3),
+        ] {
+            let result = executor
+                .execute(&delete_operation(sandbox_id, claim_generation, attempts))
+                .await;
+            assert!(
+                result.requeue_reason.preserves_retry_budget(),
+                "{sandbox_id} claim {claim_generation}: {result:?}"
+            );
+        }
+
+        let counted = counters.finish();
+        drop(event_guard);
+        let redriving: Vec<(String, String, String, bool)> = event_capture
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.get("event_type").map(String::as_str) == Some("delete_redriving"))
+            .map(|event| {
+                let field = |name: &str| event.get(name).cloned().unwrap_or_default();
+                (
+                    field("sandbox_id"),
+                    field("claim_generation"),
+                    field("reason"),
+                    !field("error").is_empty(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            redriving,
+            vec![
+                (
+                    unconfirmed.to_string(),
+                    "1".to_string(),
+                    "teardown_unconfirmed".to_string(),
+                    true
+                ),
+                (
+                    unconfirmed.to_string(),
+                    "13".to_string(),
+                    "teardown_unconfirmed".to_string(),
+                    true
+                ),
+                (
+                    left_deleting.to_string(),
+                    "3".to_string(),
+                    "row_left_deleting".to_string(),
+                    true
+                ),
+            ],
+            "an event on the first re-drive and every twelfth, not per retry"
+        );
+        let causes: Vec<String> = counted
+            .iter()
+            .filter(|counter| counter.name == "operations.delete_redrive")
+            .filter_map(|counter| {
+                counter
+                    .tags
+                    .iter()
+                    .find_map(|tag| tag.strip_prefix("cause:").map(str::to_string))
+            })
+            .collect();
+        assert_eq!(
+            causes,
+            [
+                "teardown_unconfirmed",
+                "teardown_unconfirmed",
+                "teardown_unconfirmed",
+                "row_left_deleting"
+            ],
+            "one count per re-drive, tagged with its cause"
+        );
+        Ok(())
+    }
+
     /// The Kind reproduction's shape, end to end through the delete operation:
     /// a `stopped` sandbox whose failed start left inactive generations g1..g3
     /// and a pod the apiserver refuses to delete. Each attempt keeps the row in
@@ -10803,24 +10965,7 @@ mod kubernetes_tests {
             pool.clone(),
             SandboxController::new(Substrate::Kubernetes(Box::new(substrate))),
         );
-        let public_sandbox_id = pplx_space_public_api::PublicSandboxId::from(sandbox_id);
-        let operation = |claim_generation| crate::public_operations::ClaimedPublicOperation {
-            id: pplx_space_public_api::OperationId::new(),
-            org_id: OrgId::from_uuid(uuid::Uuid::from_u128(1)),
-            actor_user_id: None,
-            api_product: crate::public_operations::ApiProduct::Native,
-            kind: pplx_space_public_api::OperationKind::DeleteSandbox,
-            target_type: Some(pplx_space_public_api::OperationTargetType::Sandbox),
-            target_id: Some(public_sandbox_id.to_string()),
-            payload: crate::public_sandbox_operations::SandboxLifecycleOperationPayload {
-                sandbox_id: public_sandbox_id,
-                action: pplx_space_public_api::SandboxLifecycleAction::Delete,
-                rollback: None,
-            }
-            .into_json(),
-            attempts: 1,
-            claim_generation,
-        };
+        let operation = |claim_generation| delete_operation(sandbox_id, claim_generation, 1);
 
         let first = executor.execute(&operation(1)).await;
 
