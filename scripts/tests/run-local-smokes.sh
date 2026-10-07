@@ -3,11 +3,11 @@
 # stack and capture each group's outcome/signature.
 #
 # This does NOT try to make the smokes pass — the point is to run them against a
-# laptop stack (with real SeaweedFS-backed snapshots) and reproduce/record the
+# laptop stack (with real object-store-backed snapshots) and reproduce/record the
 # current failure signatures.
 #
 # What it does:
-#   1. ensures port-forwards to the local space-api and data-plane Services
+#   1. ensures port-forwards to the local space-api, data-plane and object-store Services
 #   2. logs in as the seeded root@local user to mint a session token
 #   3. seeds a local-dev E2B API key into Postgres (idempotent) for the ECW smokes
 #   4. runs the requested smoke groups with local env, teeing logs under a results dir
@@ -20,9 +20,9 @@
 # Usage:
 #   scripts/tests/run-local-smokes.sh [s3-roundtrip|native|ecw-identity|all]
 #
-#   s3-roundtrip drives the real volume-manager → SeaweedFS push/pull (no api needed).
-#   It first ensures the snapshots bucket exists (idempotent), so a SeaweedFS pod
-#   recreation that wiped the emptyDir-backed bucket can't fail the round-trip.
+#   s3-roundtrip drives the real volume-manager → object-store push/pull (no api needed).
+#   It first ensures the snapshots bucket exists (idempotent), so an object-store pod
+#   recreation that wiped the hostPath-backed bucket can't fail the round-trip.
 #
 # Env knobs:
 #   KCTX                 kube context           (default kind-space-local)
@@ -39,8 +39,11 @@
 #   E2B_API_KEY          ECW api key to seed+use (default local_dev_key)
 #   E2B_DOMAIN           ECW host suffix         (default local.e2b.test)
 #   RESULTS_DIR          where logs land         (default /tmp/space-local-smokes)
-#   SNAPSHOT_BUCKET      SeaweedFS bucket to ensure (default snapshots)
-#   SEAWEEDFS_MASTER     master host:port for weed shell (default seaweedfs:9333)
+#   SNAPSHOT_BUCKET      object-store bucket to ensure (default snapshots)
+#   OBJECT_STORE_ENDPOINT  host S3 endpoint for the bucket ensure (default http://127.0.0.1:18333;
+#                        if set explicitly it is trusted as-is, otherwise the
+#                        runner port-forwards $KCTX's svc/object-store to it)
+#   LOCAL_OBJECT_STORE_PORT local port for the object-store forward (default 18333)
 set -Eeuo pipefail
 
 WHICH="${1:-all}"
@@ -52,6 +55,7 @@ NS="${NS:-space}"
 # the smokes against that other cluster's api. 18080 is the runner's own lane.
 LOCAL_API_PORT="${LOCAL_API_PORT:-18080}"
 LOCAL_DATA_PLANE_PORT="${LOCAL_DATA_PLANE_PORT:-18090}"
+LOCAL_OBJECT_STORE_PORT="${LOCAL_OBJECT_STORE_PORT:-18333}"
 # Track whether the caller pinned the api url explicitly. If they did, we trust it
 # and only health-check it; if not, we always stand up our own forward to $KCTX so
 # the smokes can't accidentally talk to a foreign cluster's api.
@@ -71,9 +75,12 @@ PF_PIDS=()
 # any smoke fails so it can be used as a verifier, not just a signature-capture
 # printer.
 FAILURES=0
-# SeaweedFS bucket-ensure knobs (mirror the space-seaweedfs chart defaults).
-SEAWEEDFS_LABEL="${SEAWEEDFS_LABEL:-app.kubernetes.io/name=space-seaweedfs}"
-SEAWEEDFS_MASTER="${SEAWEEDFS_MASTER:-seaweedfs:9333}"
+# Object-store bucket-ensure knobs (mirror the space-object-store chart defaults).
+# Like the api url, an explicit endpoint is trusted; otherwise the runner
+# forwards its own port rather than Tilt's 8333, which may be another cluster's.
+if [[ -n "${OBJECT_STORE_ENDPOINT:-}" ]]; then OBJECT_STORE_ENDPOINT_EXPLICIT=1; else OBJECT_STORE_ENDPOINT_EXPLICIT=0; fi
+OBJECT_STORE_ENDPOINT="${OBJECT_STORE_ENDPOINT:-http://127.0.0.1:${LOCAL_OBJECT_STORE_PORT}}"
+OBJECT_STORE_SECRET="${OBJECT_STORE_SECRET:-space-object-store}"
 SNAPSHOT_BUCKET="${SNAPSHOT_BUCKET:-snapshots}"
 mkdir -p "$RESULTS_DIR"
 
@@ -150,6 +157,25 @@ ensure_data_plane_port_forward() {
   die "space-data-plane did not become reachable at $SPACE_DATA_PLANE_URL (context $KCTX)"
 }
 
+ensure_object_store_port_forward() {
+  if [[ "$OBJECT_STORE_ENDPOINT_EXPLICIT" == "1" ]]; then
+    if curl -fsS -o /dev/null "${OBJECT_STORE_ENDPOINT%/}/healthz" 2>/dev/null; then
+      log "using caller-provided object store at $OBJECT_STORE_ENDPOINT"
+      return
+    fi
+    die "caller-provided OBJECT_STORE_ENDPOINT ($OBJECT_STORE_ENDPOINT) is not reachable"
+  fi
+  log "starting port-forward svc/object-store ${LOCAL_OBJECT_STORE_PORT}:8333 (context $KCTX)"
+  kubectl --context "$KCTX" -n "$NS" port-forward "svc/object-store" "${LOCAL_OBJECT_STORE_PORT}:8333" \
+    >"$RESULTS_DIR/object-store-port-forward.log" 2>&1 &
+  PF_PIDS+=("$!")
+  for _ in $(seq 1 30); do
+    curl -fsS -o /dev/null "${OBJECT_STORE_ENDPOINT%/}/healthz" 2>/dev/null && { log "object store up at $OBJECT_STORE_ENDPOINT"; return; }
+    sleep 1
+  done
+  die "object-store did not become reachable at $OBJECT_STORE_ENDPOINT (context $KCTX)"
+}
+
 login_token() {
   curl -fsS -X POST "${SPACE_API_URL%/}/auth/v1/sessions" \
     -H 'Content-Type: application/json' \
@@ -183,23 +209,41 @@ summarize() {
   fi
 }
 
-# Re-create the snapshots bucket idempotently before the S3 round-trip. SeaweedFS
-# runs on an emptyDir and the bucket is created by a one-shot helm post-install
-# Job, so a SeaweedFS pod recreation wipes the bucket and nothing re-creates it —
-# a fresh round-trip would then fail "bucket not found". `s3.bucket.create` on an
-# existing bucket is a no-op, so this is safe to run every time.
+# Re-create the snapshots bucket idempotently before the S3 round-trip. The
+# object store's bucket-init Job creates the buckets once; with versitygw's
+# POSIX backend they are directories on the infra node's hostPath and survive
+# pod restarts, but a recreated node (or a wiped hostPath) loses them and
+# nothing re-creates them — a fresh round-trip would then fail "bucket not
+# found". Goes through the S3 API on the runner's object-store port-forward with
+# the chart's own credentials, and drops any caller AWS session or profile so
+# they cannot override them; an existing bucket is left alone, so this is safe to
+# run every time.
 ensure_snapshot_bucket() {
-  local pod
-  pod="$(kubectl --context "$KCTX" -n "$NS" get pods -l "$SEAWEEDFS_LABEL" \
-    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-  if [[ -z "$pod" ]]; then
-    log "WARN: no space-seaweedfs pod ($SEAWEEDFS_LABEL); skipping bucket ensure"
+  local key secret
+  if ! command -v aws >/dev/null 2>&1; then
+    log "WARN: aws CLI not found; skipping bucket ensure"
     return
   fi
-  log "ensuring SeaweedFS bucket '$SNAPSHOT_BUCKET' exists"
-  kubectl --context "$KCTX" -n "$NS" exec "$pod" -- sh -c \
-    "echo 's3.bucket.create -name $SNAPSHOT_BUCKET' | weed shell -master='$SEAWEEDFS_MASTER'" \
-    >/dev/null 2>&1 || log "WARN: bucket ensure failed (may already exist); round-trip will report the real error"
+  key="$(kubectl --context "$KCTX" -n "$NS" get secret "$OBJECT_STORE_SECRET" \
+    -o jsonpath='{.data.SPACE_OBJECT_STORE_STATIC_ACCESS_KEY_ID}' 2>/dev/null | base64 -d 2>/dev/null || true)"
+  secret="$(kubectl --context "$KCTX" -n "$NS" get secret "$OBJECT_STORE_SECRET" \
+    -o jsonpath='{.data.SPACE_OBJECT_STORE_STATIC_SECRET_ACCESS_KEY}' 2>/dev/null | base64 -d 2>/dev/null || true)"
+  if [[ -z "$key" || -z "$secret" ]]; then
+    log "WARN: no $OBJECT_STORE_SECRET credentials; skipping bucket ensure"
+    return
+  fi
+  log "ensuring object-store bucket '$SNAPSHOT_BUCKET' exists"
+  local s3=(env -u AWS_SESSION_TOKEN -u AWS_SECURITY_TOKEN -u AWS_PROFILE -u AWS_DEFAULT_PROFILE
+    AWS_CONFIG_FILE=/dev/null AWS_SHARED_CREDENTIALS_FILE=/dev/null
+    AWS_ACCESS_KEY_ID="$key" AWS_SECRET_ACCESS_KEY="$secret" AWS_DEFAULT_REGION=us-east-1
+    aws --no-cli-pager --endpoint-url "$OBJECT_STORE_ENDPOINT" s3api)
+  if "${s3[@]}" head-bucket --bucket "$SNAPSHOT_BUCKET" >/dev/null 2>&1; then
+    log "object-store bucket '$SNAPSHOT_BUCKET' exists"
+  elif "${s3[@]}" create-bucket --bucket "$SNAPSHOT_BUCKET" >/dev/null 2>&1; then
+    log "created object-store bucket '$SNAPSHOT_BUCKET'"
+  else
+    log "WARN: bucket ensure failed; round-trip will report the real error"
+  fi
 }
 
 run_native() {
@@ -253,12 +297,12 @@ run_ecw_identity() {
 }
 
 # Direct check of the real snapshot-storage path: drive the real volume-manager
-# (on the node-stack DaemonSet) to push a payload to SeaweedFS and pull it back,
+# (on the node-stack DaemonSet) to push a payload to the object store and pull it back,
 # asserting the bytes round-trip. This exercises the production object-store S3
-# code against the local SeaweedFS endpoint — independent of the sandbox guest.
+# code against the local object-store endpoint — independent of the sandbox guest.
 run_s3_roundtrip() {
   local code=0 logf="$RESULTS_DIR/s3-roundtrip.log"
-  log "verifying real vol-mgr → SeaweedFS S3 round-trip"
+  log "verifying real vol-mgr → object-store S3 round-trip"
   ensure_snapshot_bucket
   local pod
   pod="$(kubectl --context "$KCTX" -n "$NS" get pods \
@@ -274,7 +318,7 @@ run_s3_roundtrip() {
   # (subject, s3_uri, local_path) — a fixed key would make re-runs return the
   # prior run's object (stale bytes) instead of a fresh round-trip.
   local uniq; uniq="$(date +%s)-$$"
-  local uri="s3://snapshots/local-smoke/rt-$uniq.bin?region=us-east-1&endpoint=http://seaweedfs:8333&path_style=true"
+  local uri="s3://snapshots/local-smoke/rt-$uniq.bin?region=us-east-1&endpoint=http://object-store:8333&path_style=true"
   kubectl --context "$KCTX" -n "$NS" exec "$pod" -- bash -c "
     set -e
     src=/space/cache/rt-$uniq.bin
@@ -286,7 +330,7 @@ run_s3_roundtrip() {
     rm -f \$src \$out
   " >"$logf" 2>&1 || code=$?
   if [[ "$code" == "0" ]]; then
-    printf 'PASS  %-14s real bytes pushed+pulled through SeaweedFS\n' "s3-roundtrip"
+    printf 'PASS  %-14s real bytes pushed+pulled through the object store\n' "s3-roundtrip"
   else
     printf 'FAIL  %-14s exit=%s (log: %s)\n' "s3-roundtrip" "$code" "$logf"
     FAILURES=$((FAILURES + 1))
@@ -296,6 +340,9 @@ run_s3_roundtrip() {
 main() {
   command -v jq >/dev/null 2>&1 || die "jq is required"
 
+  case "$WHICH" in
+    s3-roundtrip|all) ensure_object_store_port_forward ;;
+  esac
   # Only the api-driven smokes need a port-forward + session token + E2B key.
   if [[ "$WHICH" != "s3-roundtrip" ]]; then
     ensure_port_forward

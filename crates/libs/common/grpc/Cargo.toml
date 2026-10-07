@@ -12,12 +12,10 @@ workspace = true
 
 [features]
 default = []
-internal-tls = ["tonic/tls-aws-lc", "tokio/fs", "dep:futures-util", "dep:rustls", "dep:tokio-rustls", "dep:tokio-util"]
+internal-tls = ["tonic/tls-aws-lc", "tokio/fs", "dep:futures-core", "dep:tokio-util"]
 
 [dependencies]
-futures-util = { workspace = true, optional = true }
-rustls = { workspace = true, optional = true, features = ["aws_lc_rs"] }
-tokio-rustls = { workspace = true, optional = true }
+futures-core = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 http = { workspace = true }
 http-body = { workspace = true }
@@ -38,6 +36,7 @@ pplx-space-metrics = { workspace = true }
 pplx-space-observability = { workspace = true }
 
 [dev-dependencies]
+tokio-util = { workspace = true }
 rustls = { workspace = true, features = ["aws_lc_rs"] }
 rcgen = { workspace = true, features = ["aws_lc_rs", "pem"] }
 pplx-space-metrics = { workspace = true, features = ["test-capture"] }

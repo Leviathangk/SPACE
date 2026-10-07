@@ -1,7 +1,7 @@
 # Tiltfile for the local KinD SPACE stack.
 #
 # Brings up the SPACE control plane on a multi-node KinD cluster:
-#   * postgres + SeaweedFS (S3)
+#   * postgres + versitygw object store (S3)
 #   * space-api-server
 #   * space-internal-api
 #   * space-data-plane
@@ -46,6 +46,11 @@
 KIND_CLUSTER = os.getenv("SPACE_KIND_CLUSTER", "space-local")
 NAMESPACE = "space"
 allow_k8s_contexts("kind-" + KIND_CLUSTER)
+
+# A cluster from before the versitygw object store keeps its objects in
+# SeaweedFS; refuse it rather than apply the new charts over it. See "Object
+# store transition" in infra/space/kind/README.md.
+local(["bash", "infra/space/kind/scripts/check-object-store-transition.sh", KIND_CLUSTER], quiet = True)
 
 # The full Kubernetes stack is the development default. The single-worker
 # DirectSubstrate bench is opt-in: set SPACE_LOCAL_MINIMAL=1 and
@@ -187,7 +192,7 @@ rust_runtime_image(
 # same binaries, cargo features, unix identities, nftables policies as the
 # prod EKS worker/builder DaemonSets) plus the kind entrypoint layer. LTO disabled
 # for faster local iteration. Runs as a DaemonSet on the sandbox workers
-# against real Firecracker, wired to SeaweedFS for snapshot artifacts.
+# against real Firecracker, wired to the object store for snapshot artifacts.
 custom_build(
     ref = "space-node-stack:local",
     command = " && ".join([
@@ -215,7 +220,7 @@ custom_build(
 
 # space-seed-publish: carries the locally built production seed template
 # (templates/firecracker/seed builder — vsock spaced, FC-bootable) plus the
-# publisher that uploads it to SeaweedFS and registers the release through
+# publisher that uploads it to the object store and registers the release through
 # the real ClusterApi RPCs. build-seed.sh skips the privileged rootfs build
 # when its inputs (guest binaries, builder script, recipe, pubkey) are
 # unchanged, so watch-mode rebuilds are cheap unless spaced changed.
@@ -488,22 +493,23 @@ if not MINIMAL:
 
 # ── Object store + node stack + seed publish ─────────────────────────────────
 #
-# SeaweedFS (Apache-2.0; replaces MinIO, whose community images went behind a
-# paywall) is a real S3-compatible object store on the infra node. The
-# bucket-init Job creates the `snapshots` + `templates` buckets. It is a
-# public docker.io image the kind nodes pull directly, so no `kind load`
-# step is needed.
-k8s_yaml(helm_release("space", "infra/space/kind/charts/space-seaweedfs"))
+# Versity S3 Gateway (versitygw, Apache-2.0; replaced SeaweedFS, which replaced
+# MinIO) is a real S3-compatible object store on the infra node, serving its
+# POSIX backend from a node-local hostPath. The bucket-init Job creates the
+# `snapshots` + `templates` buckets through the S3 API. Both are public
+# registry images the kind nodes pull directly, so no `kind load` step is
+# needed.
+k8s_yaml(helm_release("space", "infra/space/kind/charts/space-object-store"))
 k8s_resource(
-    "space-seaweedfs",
-    port_forwards = ["8333:8333"],  # S3 API (also browsable filer UI on :8888 in-cluster)
+    "space-object-store",
+    port_forwards = ["8333:8333"],  # S3 API
     labels = ["data"],
     resource_deps = ["label-kind-infra"],
 )
 k8s_resource(
-    "space-seaweedfs-bucket-init",
+    "space-object-store-bucket-init",
     labels = ["data"],
-    resource_deps = ["space-seaweedfs"],
+    resource_deps = ["space-object-store"],
 )
 
 # Redis: shared store for the two API rate limiters (cluster activation
@@ -518,7 +524,7 @@ k8s_resource(
 )
 
 # node-stack: the production worker service set on real Firecracker, on every
-# labeled sandbox worker, wired to SeaweedFS. Needs Postgres up (credmgr
+# labeled sandbox worker, wired to the object store. Needs Postgres up (credmgr
 # authority role), the internal API (node-ctl registration + template pulls),
 # the vendor tree, and the sandbox SSH Secret. The MINIMAL bench opts into
 # the legacy DirectSubstrate SQL registration; the full harness registers
@@ -543,24 +549,24 @@ k8s_resource(
     "space-node-stack",
     labels = ["node-stack"],
     resource_deps = ["label-kind-workers", "space-postgres", "space-internal-api",
-                     "space-seaweedfs-bucket-init", "stage-fc-vendor",
+                     "space-object-store-bucket-init", "stage-fc-vendor",
                      "sandbox-ssh-secret"],
 )
 
-# seed publish: uploads the locally built production seed to SeaweedFS and
+# seed publish: uploads the locally built production seed to the object store and
 # registers the release through the real ClusterApi RPCs. Workers then pull
 # it via template-manager prefetch → volume-manager — the production path.
 k8s_yaml(helm_release("space", "infra/space/kind/charts/space-seed-publish"))
 k8s_resource(
     "space-seed-publish",
     labels = ["bootstrap"],
-    resource_deps = ["space-internal-api", "space-seaweedfs-bucket-init"],
+    resource_deps = ["space-internal-api", "space-object-store-bucket-init"],
 )
 
 # Full-harness builder role: a second render of the node-stack chart targets
 # only the dedicated builder pool. It adds build-manager, exposes the stable
 # space-builder-node-api Service expected by space-api, and publishes recipe
-# outputs to SeaweedFS's templates bucket. MINIMAL remains worker-only.
+# outputs to the object store's templates bucket. MINIMAL remains worker-only.
 if not MINIMAL:
     k8s_yaml(helm(
         "infra/space/kind/charts/space-node-stack",
@@ -573,6 +579,6 @@ if not MINIMAL:
         "space-builder-node-stack",
         labels = ["node-stack"],
         resource_deps = ["space-postgres", "space-internal-api",
-                         "space-seaweedfs-bucket-init", "space-seed-publish",
+                         "space-object-store-bucket-init", "space-seed-publish",
                          "stage-fc-vendor", "sandbox-ssh-secret"],
     )

@@ -11,6 +11,7 @@ The store owns data access for the transactional aggregate formed by:
 - `snapshots`;
 - `snapshot_storage_locations`;
 - `snapshot_storage_location_encrypted_fields`;
+- `snapshot_artifact_digests`;
 - invariants that span those rows and their owning sandbox.
 
 Each snapshot has zero or one storage-location row. Zero is a valid transient
@@ -19,8 +20,8 @@ identifies the single backend route for that snapshot, not one replica in a
 caller-managed set.
 
 Snapshot metadata SQL belongs here as callers are migrated. S3, local disk,
-SeaweedFS, and other byte-storage implementations remain behind their storage
-backend interfaces.
+S3-compatible stores, and other byte-storage implementations remain behind
+their storage backend interfaces.
 
 ## API directive
 

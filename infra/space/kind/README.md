@@ -6,7 +6,7 @@ pause container is hijacked by `containerd-shim-space-v2` into a real
 Firecracker microVM), the production worker service set on every sandbox
 node, a dedicated builder role that runs actual ECW recipes, node registration
 through node-ctl → internal-api, templates distributed through the production
-publish/pull path, and real S3 snapshot transit via in-cluster SeaweedFS. The
+publish/pull path, and real S3 snapshot transit via an in-cluster versitygw object store. The
 remaining deviations from production are listed in "How it differs from
 production" below.
 
@@ -630,7 +630,7 @@ the vsock-listening `spaced-svc` and boots under real Firecracker:
   unchanged.
 - the `space-seed-publish` Job then plays the role the production builder
   plays for distribution: it uploads `metadata.json` + `manifest.json` +
-  `rootfs.ext4` to SeaweedFS under `templates/seed/<content_hash>/` and
+  `rootfs.ext4` to the object store under `templates/seed/<content_hash>/` and
   registers the template + release + `latest` tag + storage location
   through the real `ClusterApi` RPCs on `space-internal-api`.
 - worker template-managers then resolve `seed:latest` via
@@ -651,7 +651,7 @@ kind cluster: space-local (kind-cluster.yaml.tmpl — 6 nodes)
 │   │   ├── space-runtime-supervisor-svc                 (root)
 │   │   ├── space-nodemgr-svc            → Firecracker   (root)
 │   │   ├── space-rtmgr-svc              (read-only list) (space-rtmgr)
-│   │   ├── space-volmgr-svc             → SeaweedFS     (space-sbxmgr)
+│   │   ├── space-volmgr-svc             → object store  (space-sbxmgr)
 │   │   ├── space-credmgr-svc                            (space-sbxmgr)
 │   │   ├── space-tmplmgr-svc                            (space-tmplmgr)
 │   │   ├── space-sbxmgr-svc                             (space-sbxmgr)
@@ -663,7 +663,7 @@ kind cluster: space-local (kind-cluster.yaml.tmpl — 6 nodes)
 │   └── identical to worker, second DaemonSet pod
 ├── worker3 [pool=infra,    space.pplx.net/infra=true]
 │   ├── space-postgres        (StatefulSet)
-│   ├── space-seaweedfs       (S3-compatible object store + bucket-init Job)
+│   ├── space-object-store    (versitygw S3 gateway + bucket-init Job)
 │   ├── space-api             (Deployment; SPACE_K8S_CONTROL_PLANE=true)
 │   ├── space-internal-api    (Deployment; ClusterApi — node registration + template releases)
 │   ├── space-data-plane      (Deployment)
@@ -674,7 +674,7 @@ kind cluster: space-local (kind-cluster.yaml.tmpl — 6 nodes)
 │   └── space-builder-node-stack DaemonSet pod (hostNetwork, label space-builder)
 │       ├── runtime/node/volume/credential/template/sandbox managers
 │       ├── space-nodectl-svc            (builder role → internal-api)
-│       ├── space-buildmgr-svc            (recipe VM + publish → SeaweedFS templates bucket)
+│       ├── space-buildmgr-svc            (recipe VM + publish → object-store templates bucket)
 │       └── space-node-api-svc            (builder role, :9800)
 │           └── Service space-builder-node-api:9800 (stable API dispatch target)
 └── worker5 [pool=builder]
@@ -739,9 +739,9 @@ configuration and the coordinated migration requirements.
 | One DaemonSet per node service, systemd watchdogs via k8s probes | All node services in one `space-node-stack` pod, supervised by the entrypoint (same binaries, identities, sockets) |
 | `/space/cache` is btrfs on instance-store NVMe            | btrfs loopback image, bound from the kind node at `/var/lib/space-cache.img` so it outlives pod restarts like the NVMe does (same code paths, less I/O headroom) |
 | Postgres on RDS, secrets via ExternalSecrets / AWS Secrets Manager | In-cluster `space-postgres` StatefulSet, static Kubernetes Secrets             |
-| S3 for snapshots + template artifacts                     | In-cluster SeaweedFS (real S3 protocol, sigv4, path-style)                    |
+| S3 for snapshots + template artifacts                     | In-cluster versitygw (real S3 protocol, sigv4, path-style)                    |
 | volume-manager credentials via credmgr STS/IRSA           | static `SPACE_OBJECT_STORE_STATIC_*` creds (the documented local escape hatch) |
-| build-manager gets S3 credentials via credential-manager backed by cloud identity | the same directly injected static SeaweedFS credentials; credential-manager's storage exchange endpoint is explicitly disabled |
+| build-manager gets S3 credentials via credential-manager backed by cloud identity | the same directly injected static object-store credentials; credential-manager's storage exchange endpoint is explicitly disabled |
 | `/dev/kvm` access via the AMI's kvm group                 | `chmod 0666 /dev/kvm` at pod start (kind-only; never replicate on a worker)   |
 | Loop devices from the AMI's `max_loop=10000` on a real devtmpfs | 8 nodes inherited in the pod's tmpfs `/dev`; the entrypoint mknods the rest and sets autoclear on the cache device (`scripts/lib/space-loop-devices.sh`) |
 | vhost-vsock jail nodes provided by the AMI                | jail watcher in the entrypoint mknods them as jails appear                    |
@@ -774,7 +774,7 @@ worker cannot disrupt control-plane components:
 | `space-local-control-plane`   | —           | k8s control-plane only                                                                  |
 | `space-local-worker`          | `sandbox`   | Runs space-node-stack DaemonSet + receives SPACE sandbox pods                            |
 | `space-local-worker2`         | `sandbox`   | Same, second worker                                                                      |
-| `space-local-worker3`         | `infra`     | Runs Postgres, SeaweedFS, space-api, internal-api, data-plane, cluster-controller, UI    |
+| `space-local-worker3`         | `infra`     | Runs Postgres, object store, space-api, internal-api, data-plane, cluster-controller, UI    |
 | `space-local-worker4`         | `builder`   | Runs the builder node-stack, including build-manager and builder node-api                 |
 | `space-local-worker5`         | `builder`   | Same, second builder                                                                       |
 
@@ -838,7 +838,7 @@ SPACE_API_URL=http://127.0.0.1:8080 \
   scripts/tests/smoke-spaced-rest.sh
 
 # 4. Forced node drain: the resident is evacuated to the second worker through
-#    a real suspend snapshot in SeaweedFS and its filesystem survives. The
+#    a real suspend snapshot in the object store and its filesystem survives. The
 #    admin endpoint's default is `gentle`, which cordons and waits for
 #    residents to leave instead; this scenario sends `forced`.
 SPACE_SMOKE_BACKEND=kind SPACE_SMOKE_API_SURFACE=ecw \
@@ -850,8 +850,11 @@ SPACE_SMOKE_BACKEND=kind SPACE_SMOKE_API_SURFACE=ecw \
 
 # 6. Explicit AWS Secrets Manager network-credential injection. Before
 #    bootstrap, put short-lived sandbox-account AWS_ACCESS_KEY_ID,
-#    AWS_SECRET_ACCESS_KEY, and AWS_SESSION_TOKEN in private.env. The selected
-#    identity must have secretsmanager:GetSecretValue on the task-owned ARN.
+#    AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, and
+#    SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN in private.env. The selected
+#    identity must be able to sts:AssumeRole and sts:TagSession on that role;
+#    the role reads the task-owned ARN only when the secret's space-org-id tag
+#    equals the smoke organization's ID (docs/configuration.md).
 #    The controlled HTTPS endpoint must return only the lowercase SHA-256 of
 #    the Authorization header it receives.
 SPACE_SMOKE_BACKEND=kind SPACE_SMOKE_API_SURFACE=native \
@@ -915,7 +918,7 @@ under `/run/space-node-stack`; they must not survive a container retry.
   locally built seed → file round-trip → delete).
 - `smoke-spaced-rest.sh` — **PASS** through metadata, identity boundary,
   command SSE, file ops, pause/resume (~1s each), and suspend/restore
-  (~6s round trip incl. the SeaweedFS upload). The trailing immediate
+  (~6s round trip incl. the object-store upload). The trailing immediate
   DELETE can hit a retryable "suspend-snapshot upload in flight" conflict
   when issued within seconds of the lifecycle churn — retry it.
 
@@ -929,13 +932,17 @@ never firing) if reintroduced:
   mount tree doesn't, and FC opens the 0-byte bind target ("Total sum of
   memory regions exceeds largest possible file offset"). The entrypoint
   runs `mount --make-rshared /` to restore host semantics.
-- **SeaweedFS volume sizing**: the default 30 GB pre-allocated volume
-  files exhaust the local disk after the first one, and every subsequent
-  upload gets S3 500 InternalError ("topo failed to pick 1 from 0 node
-  candidates" in the seaweedfs log). The chart pins
-  `-master.volumeSizeLimitMB=1024 -volume.max=48`. The files are sparse, and
-  the larger slot count prevents repeated template and snapshot collections
-  from exhausting the volume registry.
+- **Object store layout**: versitygw's POSIX backend stores each bucket as a
+  directory and each object as a file under the infra node's
+  `/var/lib/space-object-store`, with ETags and user metadata in `user.*`
+  xattrs. kind mounts every node's `/var` as an anonymous Docker volume and
+  no extraMount covers this path, so the data and its xattrs live on the
+  filesystem backing that volume (under Docker's data root), not on the
+  node's overlay root. There are no
+  pre-allocated volumes or volume slots to exhaust (the SeaweedFS chart it
+  replaced needed `-master.volumeSizeLimitMB=1024 -volume.max=48`), but
+  CompleteMultipartUpload assembles the parts with `copy_file_range`, which on
+  ext4 rewrites the object once.
 
 One product-hardening observation stands: after a genuinely failed restore
 attempt, sbxmgr's restore guard only self-heals `Suspended`/`NotFound`
@@ -943,23 +950,53 @@ local states, so a sandbox whose local state reached `failed` wedges
 (every retry FailedPreconditions, DELETE stays blocked on the in-flight
 upload). Only reachable after a real restore failure.
 
-## Real S3 snapshot + template path (SeaweedFS + node-stack)
+## Real S3 snapshot + template path (object store + node-stack)
 
-`space-seaweedfs` runs an S3-compatible object store on the infra node, with
+`space-object-store` runs versitygw, an S3-compatible gateway, on the infra node, with
 a one-shot Job that creates the `snapshots` and `templates` buckets. The S3
 API is port-forwarded to [localhost:8333](http://localhost:8333).
 
-`space-volmgr-svc` performs real S3 transfers to SeaweedFS with static creds
-from the `space-seaweedfs` Secret — both suspend/restore snapshot artifacts
+`space-volmgr-svc` performs real S3 transfers to the object store with static creds
+from the `space-object-store` Secret — both suspend/restore snapshot artifacts
 (`snapshots` bucket) and template pulls (`templates` bucket, populated by the
 `space-seed-publish` Job). See `crates/libs/vol/mgr/server/src/run.rs`.
 
-Verify the round-trips with the SeaweedFS port-forward:
+Verify the round-trips with the object-store port-forward:
 
 ```bash
 aws --endpoint-url http://localhost:8333 s3 ls s3://snapshots/ --recursive
 aws --endpoint-url http://localhost:8333 s3 ls s3://templates/ --recursive
 ```
+
+### Object store transition
+
+The object store was SeaweedFS (`space-seaweedfs` chart, Service
+`seaweedfs:8333`, data in `/var/lib/space-seaweedfs` on the infra node). It
+is now versitygw (`space-object-store` chart, Service `object-store:8333`,
+data in `/var/lib/space-object-store`). The two stores share no data, and the
+database of a SeaweedFS-era cluster records every suspend snapshot and
+published template at `http://seaweedfs:8333`. Applying the new charts to such
+a cluster would leave its restores and template pulls depending on a
+deployment nothing manages any more, and pointing the old Service at the new
+gateway would not help, because the objects are not in it.
+
+An existing cluster is therefore recreated, not migrated. `bootstrap.sh`, the
+smoke suites' `scripts/tests/lib/bootstrap-kind-stack.sh` and the `Tiltfile`
+run `infra/space/kind/scripts/check-object-store-transition.sh` against an
+existing cluster before they apply anything; when it still has resources from
+the `space-seaweedfs` chart, they list those resources and stop without
+changing anything: the two scripts exit with status 1, and Tilt reports a
+Tiltfile load error. Recreating deletes the cluster's sandboxes,
+snapshots and templates, and keeps the containerd image caches:
+
+```bash
+bash infra/space/kind/scripts/teardown.sh
+bash infra/space/kind/scripts/bootstrap.sh   # then `tilt up`, for the Tilt loop
+```
+
+A smoke suite such as `scripts/tests/smoke-kind-e2e.sh` creates the cluster
+itself after the teardown. For a non-default cluster, set `SPACE_KIND_CLUSTER`
+on both commands.
 
 ## Tearing down
 
