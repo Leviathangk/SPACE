@@ -65,4 +65,6 @@ use translate::*;
 use types::*;
 
 #[cfg(test)]
+mod subject_scope_tests;
+#[cfg(test)]
 mod tests;

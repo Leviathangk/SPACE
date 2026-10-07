@@ -150,24 +150,6 @@ pub(super) fn federated_owner_ref(
         .map(|Extension(crate::middleware::auth::AuthFederatedOwner(owner))| owner)
 }
 
-/// Grants bind to a federated owner row; a legacy local sandbox reached through
-/// the bridge has none, so nothing is persisted for it.
-pub(super) fn grant_to_persist<'a>(
-    sandbox_owner_source: pplx_space_common_core::types::SandboxOwnerSource,
-    federated_owner: Option<&'a crate::federated_identity::FederatedOwner>,
-    grant: Option<&'a crate::federated_identity::FederatedServiceGrant>,
-) -> Option<(
-    &'a crate::federated_identity::FederatedOwner,
-    &'a crate::federated_identity::FederatedServiceGrant,
-)> {
-    match sandbox_owner_source {
-        pplx_space_common_core::types::SandboxOwnerSource::FederatedIdentity => {
-            federated_owner.zip(grant)
-        }
-        pplx_space_common_core::types::SandboxOwnerSource::Local => None,
-    }
-}
-
 pub(super) fn request_federated_service_grant(
     headers: &HeaderMap,
     federated_owner: Option<&crate::federated_identity::FederatedOwner>,
@@ -230,11 +212,7 @@ pub(super) async fn persist_request_grant(
     federated_owner: Option<&crate::federated_identity::FederatedOwner>,
     federated_service_grant: Option<&crate::federated_identity::FederatedServiceGrant>,
 ) -> Result<(), crate::controllers::ControllerError> {
-    if let Some((owner, grant)) = grant_to_persist(
-        sandbox.owner_source,
-        federated_owner,
-        federated_service_grant,
-    ) {
+    if let Some((owner, grant)) = federated_owner.zip(federated_service_grant) {
         state
             .sandbox_controller
             .upsert_federated_service_grant(&state.pool, sandbox.id, owner, grant)

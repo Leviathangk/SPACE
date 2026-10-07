@@ -81,38 +81,6 @@ fn federated_owner_without_a_grant_expiry_is_unauthorized() {
     assert_eq!(err.status, StatusCode::UNAUTHORIZED);
 }
 
-/// A legacy local sandbox reached through the federated bridge has no owner row
-/// to bind a grant to, so refresh persists nothing for it.
-#[test]
-fn legacy_local_sandboxes_persist_no_grant() {
-    use pplx_space_common_core::types::SandboxOwnerSource;
-
-    let owner = owner();
-    let grant = request_federated_service_grant(
-        &headers(&[
-            (FEDERATED_SERVICE_GRANT_HEADER, "opaque-grant"),
-            (
-                FEDERATED_SERVICE_GRANT_EXPIRES_AT_HEADER,
-                &GRANT_EXPIRES_AT_UNIX.to_string(),
-            ),
-        ]),
-        Some(&owner),
-    )
-    .unwrap()
-    .unwrap();
-
-    assert!(grant_to_persist(SandboxOwnerSource::Local, Some(&owner), Some(&grant)).is_none());
-    assert!(
-        grant_to_persist(
-            SandboxOwnerSource::FederatedIdentity,
-            Some(&owner),
-            Some(&grant)
-        )
-        .is_some()
-    );
-    assert!(grant_to_persist(SandboxOwnerSource::FederatedIdentity, None, Some(&grant)).is_none());
-}
-
 /// Connect's permissive variant: fully absent grant headers are a no-op even
 /// for a federated owner — connect must not gain a hard header requirement —
 /// while a partial or malformed grant is rejected exactly like refresh.

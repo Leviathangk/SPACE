@@ -1,6 +1,5 @@
 //! Native authorization is applied to the whole mounted resource, before its
 //! handler can read, mutate, mint a data-plane capability, or replay a response.
-//! ECW's legacy-org bridge is intentionally not part of this contract.
 
 use pplx_space_common_core::types::UserId;
 
@@ -10,7 +9,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use pplx_space_common_core::types::{IdempotencyKey, SandboxOwnerSource};
+use pplx_space_common_core::types::IdempotencyKey;
 use pplx_space_public_api::{OperationId, PublicSandboxId};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -92,9 +91,6 @@ async fn authorize_request(state: &AppState, request: Request) -> Result<Request
         let scope = match &owner {
             Some(owner) => SandboxAccessScope::FederatedSubject {
                 owner: owner.clone(),
-                // The scope's legacy bridge is filtered out below, even if a
-                // local row were ever attached to this materialized org.
-                legacy_org_id: org_id,
             },
             None => SandboxAccessScope::LocalOrg { org_id },
         };
@@ -136,9 +132,6 @@ async fn authorize_request(state: &AppState, request: Request) -> Result<Request
             }
             return Err(PublicApiError::not_found("sandbox not found"));
         };
-        if owner.is_some() && sandbox.owner_source != SandboxOwnerSource::FederatedIdentity {
-            return Err(PublicApiError::not_found("sandbox not found"));
-        }
         if let Some(owner) = &owner
             && let Some(grant) = optional_grant(&parts.headers)?
         {

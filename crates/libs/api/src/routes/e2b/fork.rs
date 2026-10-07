@@ -59,35 +59,24 @@ pub(super) async fn fork_sandbox(
     let idempotency_key = parse_idempotency_key(&headers)?;
     let store = PublicOperationStore::new(state.pool.clone());
     let federated_owner = super::lifecycle::federated_owner_ref(&federated);
-    // Malformed federated material is rejected up front even when the source
-    // turns out to be a legacy local row that persists no grant.
+    // Malformed federated material is rejected before replay or source lookup.
     super::lifecycle::request_federated_service_grant(&headers, federated_owner)?;
 
     // Replay before reading the source row. A completed fork remains valid for
     // the operation TTL even if its source sandbox has since been deleted.
     // Federated operations live in the upstream owner's Space organization,
-    // not in the trusted integration API key's organization; a fork of a legacy
-    // local source is recorded under the key's organization instead. Records
-    // are scoped per organization, so one key can exist in both: an exact match
-    // anywhere is the replay, and a mismatch only counts in the namespace this
-    // request is recorded under, which is known once the source's owner is
-    // resolved below.
+    // not in the trusted integration API key's organization, and their
+    // fingerprint carries the subject: an asserted request never replays
+    // another subject's fork or a header-less fork of the key's local rows.
     let replay_org_id = resolve_fork_replay_org_id(&state.pool, org.id, federated_owner).await?;
-    let mut replay_namespaces = Vec::new();
-    if let Some(org_id) = replay_org_id {
-        replay_namespaces.push((org_id, federated_owner.map(|owner| &owner.subject_id)));
-    }
-    if federated_owner.is_some() {
-        replay_namespaces.push((org.id, None));
-    }
-    let mut probes = Vec::with_capacity(replay_namespaces.len());
-    for (replay_org_id, replay_subject) in replay_namespaces {
+    let mut replay_conflict = false;
+    if let Some(replay_org_id) = replay_org_id {
         let observation = observe_fork_operation_idempotency(
             &store,
             replay_org_id,
             source_sandbox_id,
             request,
-            replay_subject,
+            federated_owner.map(|owner| &owner.subject_id),
             &idempotency_key,
         )
         .await
@@ -97,44 +86,33 @@ pub(super) async fn fork_sandbox(
         // idempotency key — the ones whose retry would have found the committed
         // record and returned the deduped answer.
         .map_err(|error| fork_admission_error("observe fork replay", error))?;
-        probes.push((replay_org_id, observation));
-    }
-    let conflicting_namespaces = match resolve_replay_probes(probes) {
-        ReplayProbe::Existing {
-            org_id: replay_org_id,
-            operation_id,
-        } => {
-            let wait_timeout =
-                persisted_fork_wait_timeout(&store, replay_org_id, operation_id).await?;
-            let outcome =
-                wait_for_fork_outcome(store, replay_org_id, operation_id, wait_timeout).await?;
-            return render_fork_outcome(&state.ecw_credential_keyring, outcome);
+        match observation {
+            ObservePublicOperationIdempotency::Existing(operation_id) => {
+                let wait_timeout =
+                    persisted_fork_wait_timeout(&store, replay_org_id, operation_id).await?;
+                let outcome =
+                    wait_for_fork_outcome(store, replay_org_id, operation_id, wait_timeout).await?;
+                return render_fork_outcome(&state.ecw_credential_keyring, outcome);
+            }
+            ObservePublicOperationIdempotency::Conflict { .. } => replay_conflict = true,
+            ObservePublicOperationIdempotency::Missing => {}
         }
-        ReplayProbe::Conflicts(namespaces) => namespaces,
-    };
+    }
 
     let scope = super::ecw_access_scope(&org, &federated);
     let source =
         super::fetch_scoped_sandbox(&state, &scope, &source_sandbox_id.to_string()).await?;
     let operation_actor_user_id =
         fork_execution_actor_id(actor.id, actor.org_id, source.user_id, source.org_id);
-    // A legacy local source keeps local semantics through the bridge: the fork
-    // stays in the key org with no federated owner, grant, or subject.
-    let federated_owner = fork_owner_for_source(federated_owner, source.owner_source);
-    let (request_owner_org_id, federated_service_grant) = match federated_owner {
-        Some(_) => {
-            prepare_fork_owner(
-                &state.pool,
-                org.id,
-                replay_org_id,
-                &headers,
-                federated_owner,
-            )
-            .await?
-        }
-        None => (org.id, None),
-    };
-    if conflicting_namespaces.contains(&request_owner_org_id) {
+    let (request_owner_org_id, federated_service_grant) = prepare_fork_owner(
+        &state.pool,
+        org.id,
+        replay_org_id,
+        &headers,
+        federated_owner,
+    )
+    .await?;
+    if replay_conflict {
         return Err(fork_idempotency_conflict());
     }
     let admission = begin_fork_operation_admission(
@@ -532,48 +510,6 @@ fn fork_idempotency_conflict() -> E2bApiError {
         StatusCode::CONFLICT,
         "Idempotency-Key was already used with a different fork request",
     )
-}
-
-/// Result of probing every organization namespace a replay could live in.
-#[derive(Debug, PartialEq, Eq)]
-enum ReplayProbe {
-    /// An exact match is the replay, whichever namespace recorded it.
-    Existing {
-        org_id: OrgId,
-        operation_id: pplx_space_public_api::OperationId,
-    },
-    /// Namespaces holding this key with a different fingerprint. Only the one
-    /// the request is recorded under makes that a conflict.
-    Conflicts(Vec<OrgId>),
-}
-
-fn resolve_replay_probes(probes: Vec<(OrgId, ObservePublicOperationIdempotency)>) -> ReplayProbe {
-    let mut conflicts = Vec::new();
-    for (org_id, observation) in probes {
-        match observation {
-            ObservePublicOperationIdempotency::Existing(operation_id) => {
-                return ReplayProbe::Existing {
-                    org_id,
-                    operation_id,
-                };
-            }
-            ObservePublicOperationIdempotency::Conflict { .. } => conflicts.push(org_id),
-            ObservePublicOperationIdempotency::Missing => {}
-        }
-    }
-    ReplayProbe::Conflicts(conflicts)
-}
-
-fn fork_owner_for_source(
-    federated_owner: Option<&crate::federated_identity::FederatedOwner>,
-    source_owner_source: pplx_space_common_core::types::SandboxOwnerSource,
-) -> Option<&crate::federated_identity::FederatedOwner> {
-    federated_owner.filter(|_| {
-        matches!(
-            source_owner_source,
-            pplx_space_common_core::types::SandboxOwnerSource::FederatedIdentity
-        )
-    })
 }
 
 fn fork_execution_actor_id(

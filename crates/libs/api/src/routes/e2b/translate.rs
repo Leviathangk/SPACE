@@ -604,7 +604,6 @@ pub(super) fn ecw_access_scope(
         Some(Extension(crate::middleware::auth::AuthFederatedOwner(owner))) => {
             SandboxAccessScope::FederatedSubject {
                 owner: owner.clone(),
-                legacy_org_id: org.id,
             }
         }
         None => SandboxAccessScope::LocalOrg { org_id: org.id },

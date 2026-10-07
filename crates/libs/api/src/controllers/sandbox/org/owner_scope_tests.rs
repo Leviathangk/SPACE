@@ -104,7 +104,6 @@ fn federated_scope(subject_id: &str) -> SandboxAccessScope {
             org_id: UpstreamOrgId::parse(UPSTREAM_ORG_ID).unwrap(),
             subject_id: UpstreamSubjectId::parse(subject_id).unwrap(),
         },
-        legacy_org_id: OrgId::from_uuid(LOCAL_ORG_ID),
     }
 }
 
@@ -142,7 +141,7 @@ async fn insert_local_sandbox_in_other_org(pool: &PgPool) -> TestResult<SandboxI
 }
 
 #[tokio::test]
-async fn scoped_sandbox_resolves_owner_rows_and_key_org_legacy_rows() -> TestResult {
+async fn scoped_sandbox_resolves_only_the_owning_scope() -> TestResult {
     let fixture = scope_fixture().await?;
     let local_id = insert_local_sandbox(&fixture.db.pool).await?;
     let other_org_local_id = insert_local_sandbox_in_other_org(&fixture.db.pool).await?;
@@ -182,21 +181,16 @@ async fn scoped_sandbox_resolves_owner_rows_and_key_org_legacy_rows() -> TestRes
             .await?
             .is_none()
     );
-    // Federated subjects reach the key org's legacy local rows, not other orgs'.
-    assert!(
-        fixture
-            .controller
-            .scoped_sandbox(&fixture.db.pool, federated, local_id)
-            .await?
-            .is_some()
-    );
-    assert!(
-        fixture
-            .controller
-            .scoped_sandbox(&fixture.db.pool, federated, other_org_local_id)
-            .await?
-            .is_none()
-    );
+    // A federated subject reaches no local row, not even in its key's org.
+    for local_row in [local_id, other_org_local_id] {
+        assert!(
+            fixture
+                .controller
+                .scoped_sandbox(&fixture.db.pool, federated, local_row)
+                .await?
+                .is_none()
+        );
+    }
     Ok(())
 }
 
@@ -204,71 +198,43 @@ async fn scoped_sandbox_resolves_owner_rows_and_key_org_legacy_rows() -> TestRes
 async fn scoped_sandbox_page_filters_by_owner() -> TestResult {
     let fixture = scope_fixture().await?;
     let local_id = insert_local_sandbox(&fixture.db.pool).await?;
-    let federated_id = insert_federated_sandbox(&fixture.db.pool, UPSTREAM_SUBJECT_ID).await?;
+    let older_federated_id =
+        insert_federated_sandbox(&fixture.db.pool, UPSTREAM_SUBJECT_ID).await?;
     let other_federated_id = insert_federated_sandbox(&fixture.db.pool, "456").await?;
     let other_org_local_id = insert_local_sandbox_in_other_org(&fixture.db.pool).await?;
+    let federated_id = insert_federated_sandbox(&fixture.db.pool, UPSTREAM_SUBJECT_ID).await?;
 
-    let local_page = fixture
+    let local_ids: Vec<SandboxId> = fixture
         .controller
         .scoped_sandbox_page(&fixture.db.pool, &local_scope(), None, 10, None)
-        .await?;
-    let federated_page = fixture
-        .controller
-        .scoped_sandbox_page(
-            &fixture.db.pool,
-            &federated_scope(UPSTREAM_SUBJECT_ID),
-            None,
-            10,
-            None,
-        )
-        .await?;
-
-    let local_ids: Vec<SandboxId> = local_page.iter().map(|sandbox| sandbox.id).collect();
-    let federated_ids: Vec<SandboxId> = federated_page.iter().map(|sandbox| sandbox.id).collect();
+        .await?
+        .iter()
+        .map(|sandbox| sandbox.id)
+        .collect();
     assert!(local_ids.contains(&local_id));
     assert!(!local_ids.contains(&federated_id));
-    // Own federated rows plus the key org's legacy rows, merged newest-first.
-    assert!(federated_ids.contains(&federated_id));
-    assert!(federated_ids.contains(&local_id));
-    assert!(!federated_ids.contains(&other_federated_id));
-    assert!(!federated_ids.contains(&other_org_local_id));
-    let keys: Vec<_> = federated_page
-        .iter()
-        .map(|sandbox| (sandbox.created_at, sandbox.id))
-        .collect();
-    assert!(keys.windows(2).all(|pair| pair[0] > pair[1]));
+    assert!(!local_ids.contains(&other_org_local_id));
 
-    // The cursor applies to both arms: the newest visible row is the federated
-    // one, and the page after it still reaches the legacy row.
+    // Only the subject's own rows, newest first, across cursor pages.
+    let federated = &federated_scope(UPSTREAM_SUBJECT_ID);
     let first = fixture
         .controller
-        .scoped_sandbox_page(
-            &fixture.db.pool,
-            &federated_scope(UPSTREAM_SUBJECT_ID),
-            None,
-            1,
-            None,
-        )
+        .scoped_sandbox_page(&fixture.db.pool, federated, None, 1, None)
         .await?;
-    assert_eq!(first[0].id, federated_id);
+    let first_ids: Vec<SandboxId> = first.iter().map(|sandbox| sandbox.id).collect();
+    assert_eq!(first_ids, vec![federated_id, older_federated_id]);
     let cursor = SandboxPageCursor {
         created_at: first[0].created_at,
         id: first[0].id,
     };
     let rest: Vec<SandboxId> = fixture
         .controller
-        .scoped_sandbox_page(
-            &fixture.db.pool,
-            &federated_scope(UPSTREAM_SUBJECT_ID),
-            Some(cursor),
-            10,
-            None,
-        )
+        .scoped_sandbox_page(&fixture.db.pool, federated, Some(cursor), 10, None)
         .await?
         .iter()
         .map(|sandbox| sandbox.id)
         .collect();
-    assert!(rest.contains(&local_id));
-    assert!(!rest.contains(&federated_id));
+    assert_eq!(rest, vec![older_federated_id]);
+    assert!(!rest.contains(&other_federated_id));
     Ok(())
 }
