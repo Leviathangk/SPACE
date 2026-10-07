@@ -1738,10 +1738,29 @@ fn failure_episode_input(
 /// Callers that need atomic lifecycle convergence should run this inside a
 /// transaction. Node-published suspended projection uses multiple statements
 /// over one locked candidate set and relies on transaction rollback on error.
+/// What a node publication does beyond projecting node state onto rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SandboxPublicationPolicy {
+    /// Detect runtimes that booted behind `stopped` rows after their start was
+    /// abandoned, and record generation-fenced teardown requests for them.
+    pub abandoned_activation_detection: bool,
+}
+
+/// [`publish_sandbox_states_with_policy`] under the default policy.
 pub async fn publish_sandbox_states(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
     states: &[PublishedSandboxState],
+) -> Result<SandboxPublicationOutcome, Status> {
+    publish_sandbox_states_with_policy(conn, node_id, states, SandboxPublicationPolicy::default())
+        .await
+}
+
+pub async fn publish_sandbox_states_with_policy(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    states: &[PublishedSandboxState],
+    _policy: SandboxPublicationPolicy,
 ) -> Result<SandboxPublicationOutcome, Status> {
     let mut states_by_id = BTreeMap::new();
     for state in states {

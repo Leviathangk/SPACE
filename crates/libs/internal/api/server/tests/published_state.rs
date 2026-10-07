@@ -25,12 +25,12 @@ use pplx_space_db_test_fixtures::{
     try_pg_test_db, try_pg_test_db_with_max_connections,
 };
 use pplx_space_internal_api_server::{
-    ClusterApiService, PostCommitSandboxEvent,
+    ClusterApiService, PostCommitSandboxEvent, SandboxPublicationPolicy,
     proto::{
         GetQuarantineRecoveryPlanRequest, NodeRole as ProtoNodeRole, PublishNodeStateRequest,
         PublishedSandboxState, cluster_api_server::ClusterApi,
     },
-    publish_sandbox_states,
+    publish_sandbox_states, publish_sandbox_states_with_policy,
 };
 use pplx_space_net_common::proto::NetworkPolicySource;
 use pplx_space_test_env::TestResult;
@@ -261,6 +261,24 @@ fn activation_completed_state(
         }),
         ..PublishedSandboxState::default()
     }
+}
+
+/// Publish with abandoned-activation detection on, as a node publication does
+/// when `SPACE_ABANDONED_ACTIVATION_CLEANUP_ENABLED` is set.
+async fn publish_with_detection(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    states: &[PublishedSandboxState],
+) -> Result<pplx_space_internal_api_server::SandboxPublicationOutcome, tonic::Status> {
+    publish_sandbox_states_with_policy(
+        conn,
+        node_id,
+        states,
+        SandboxPublicationPolicy {
+            abandoned_activation_detection: true,
+        },
+    )
+    .await
 }
 
 /// What a node publishes once a pod's VM boots: the runtime's own execution
@@ -3906,7 +3924,7 @@ async fn activation_completion_receipt_converges_and_releases_only_its_attempt()
     receipt.transition_receipt.as_mut().unwrap().reason_code =
         "diagnostic_added_by_newer_worker".to_string();
     let mut conn = db.pool.acquire().await?;
-    publish_sandbox_states(&mut conn, node_id, &[receipt.clone()]).await?;
+    publish_with_detection(&mut conn, node_id, &[receipt.clone()]).await?;
     assert_eq!(sandbox_lifecycle(&db.pool, sandbox_id).await?, "stopped");
     assert_eq!(
         abandoned_activation_observation(&db.pool, node_id, sandbox_id).await?,
@@ -3950,7 +3968,7 @@ async fn activation_completion_receipt_converges_and_releases_only_its_attempt()
     );
     // A legacy route-less resident must retain its operation until the API's
     // post-ack route publication CAS can still match that operation owner.
-    publish_sandbox_states(&mut conn, node_id, &[receipt.clone()]).await?;
+    publish_with_detection(&mut conn, node_id, &[receipt.clone()]).await?;
     let unpublished_owner: Option<Uuid> = sqlx::query_scalar(sql!(
         "SELECT activation_attempt_id FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND generation = 7"
     )).bind(sandbox_id).fetch_one(&db.pool).await?;
@@ -3963,7 +3981,7 @@ async fn activation_completion_receipt_converges_and_releases_only_its_attempt()
     .bind(attempt_a)
     .execute(&db.pool)
     .await?;
-    publish_sandbox_states(&mut conn, node_id, &[receipt.clone()]).await?;
+    publish_with_detection(&mut conn, node_id, &[receipt.clone()]).await?;
     assert_eq!(sandbox_lifecycle(&db.pool, sandbox_id).await?, "started");
     assert_eq!(
         abandoned_activation_observation(&db.pool, node_id, sandbox_id).await?,
@@ -3991,7 +4009,7 @@ async fn activation_completion_receipt_converges_and_releases_only_its_attempt()
     .bind(attempt_b)
     .execute(&db.pool)
     .await?;
-    publish_sandbox_states(&mut conn, node_id, &[receipt]).await?;
+    publish_with_detection(&mut conn, node_id, &[receipt]).await?;
     let current = sqlx::query_scalar::<_, Option<Uuid>>(
         "SELECT activation_attempt_id
            FROM sandbox_k8s_executions
@@ -4209,7 +4227,7 @@ async fn publish_late_runtimes(shapes: &[LateRuntime]) -> TestResult {
                     attempt_id,
                     SandboxQuarantineReasonCode::ColdActivationInterrupted,
                 );
-                publish_sandbox_states(&mut conn, node_id, &[rollback]).await?;
+                publish_with_detection(&mut conn, node_id, &[rollback]).await?;
                 let mut state = booted_runtime_state(sandbox_id, 7, Some(attempt_id));
                 if matches!(shape, LateRuntime::MissingPodUid) {
                     state.pod_uid = None;
@@ -4255,7 +4273,7 @@ async fn publish_late_runtimes(shapes: &[LateRuntime]) -> TestResult {
         };
 
         let outcome =
-            publish_sandbox_states(&mut conn, node_id, std::slice::from_ref(&late_runtime)).await?;
+            publish_with_detection(&mut conn, node_id, std::slice::from_ref(&late_runtime)).await?;
         assert_eq!(
             sandbox_lifecycle(&db.pool, sandbox_id).await?,
             "stopped",
@@ -4302,7 +4320,7 @@ async fn publish_late_runtimes(shapes: &[LateRuntime]) -> TestResult {
         .execute(&db.pool)
         .await?;
         let republished =
-            publish_sandbox_states(&mut conn, node_id, std::slice::from_ref(&late_runtime)).await?;
+            publish_with_detection(&mut conn, node_id, std::slice::from_ref(&late_runtime)).await?;
         assert!(
             teardown_requests(&republished.post_commit_events).is_empty(),
             "{shape:?}: re-asserting an unchanged request is not announced again"
@@ -4318,7 +4336,7 @@ async fn publish_late_runtimes(shapes: &[LateRuntime]) -> TestResult {
                 > time::OffsetDateTime::now_utc() - time::Duration::minutes(1),
             "{shape:?}: a re-asserted request is fresh again"
         );
-        publish_sandbox_states(
+        publish_with_detection(
             &mut conn,
             node_id,
             &[published_sandbox_state(sandbox_id, "stopped")],
@@ -4331,6 +4349,78 @@ async fn publish_late_runtimes(shapes: &[LateRuntime]) -> TestResult {
         );
         assert_eq!(sandbox_lifecycle(&db.pool, sandbox_id).await?, "stopped");
     }
+    Ok(())
+}
+
+/// With abandoned-activation detection off, a node publication does no
+/// detection work: a runtime that would qualify records no request and is not
+/// announced, and a request recorded while detection was on is left exactly as
+/// it was rather than withdrawn. Such a request is inert: the sweep acts only
+/// on requests re-asserted within its freshness window, which only a
+/// detection-enabled publication does.
+#[tokio::test(flavor = "current_thread")]
+async fn publication_with_detection_off_does_no_abandoned_activation_work() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    insert_ready_worker_node(&db.pool, node_id).await?;
+    let late = SandboxId::new();
+    let previously_requested = SandboxId::new();
+    for sandbox_id in [late, previously_requested] {
+        insert_active_sandbox(&db.pool, sandbox_id, node_id, "stopped").await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET lifecycle_changed_at = NOW() - INTERVAL '10 minutes'
+              WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .execute(&db.pool)
+        .await?;
+        insert_k8s_execution(&db.pool, sandbox_id, 7, "running", Some("100.64.0.7")).await?;
+    }
+    let mut conn = db.pool.acquire().await?;
+    publish_with_detection(
+        &mut conn,
+        node_id,
+        &[booted_runtime_state(previously_requested, 7, None)],
+    )
+    .await?;
+    let recorded = abandoned_activation_observation(&db.pool, node_id, previously_requested)
+        .await?
+        .expect("detection-enabled publication records the request");
+    let recorded_at =
+        abandoned_activation_observed_at(&db.pool, node_id, previously_requested).await?;
+
+    let outcome = publish_sandbox_states_with_policy(
+        &mut conn,
+        node_id,
+        &[
+            booted_runtime_state(late, 7, None),
+            published_sandbox_state(previously_requested, "stopped"),
+        ],
+        SandboxPublicationPolicy {
+            abandoned_activation_detection: false,
+        },
+    )
+    .await?;
+
+    assert_eq!(
+        abandoned_activation_observation(&db.pool, node_id, late).await?,
+        None,
+        "no request is recorded while detection is off"
+    );
+    assert!(teardown_requests(&outcome.post_commit_events).is_empty());
+    assert_eq!(
+        abandoned_activation_observation(&db.pool, node_id, previously_requested).await?,
+        Some(recorded),
+        "an existing request is ignored, not withdrawn"
+    );
+    assert_eq!(
+        abandoned_activation_observed_at(&db.pool, node_id, previously_requested).await?,
+        recorded_at,
+        "an ignored request is not re-asserted"
+    );
+    assert_eq!(sandbox_lifecycle(&db.pool, late).await?, "stopped");
     Ok(())
 }
 
@@ -4363,7 +4453,7 @@ async fn late_runtime_of_an_older_generation_leaves_a_newer_activation_untouched
     .execute(&db.pool)
     .await?;
     let mut conn = db.pool.acquire().await?;
-    publish_sandbox_states(
+    publish_with_detection(
         &mut conn,
         node_id,
         &[activation_rollback_state(
@@ -4390,7 +4480,7 @@ async fn late_runtime_of_an_older_generation_leaves_a_newer_activation_untouched
     .execute(&db.pool)
     .await?;
 
-    publish_sandbox_states(
+    publish_with_detection(
         &mut conn,
         node_id,
         &[booted_runtime_state(sandbox_id, 7, Some(abandoned_attempt))],
