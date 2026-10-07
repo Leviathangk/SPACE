@@ -1327,11 +1327,13 @@ impl SandboxController {
         if cluster_delete_must_defer_control_plane(&err) {
             return Err(DeleteTeardownFailure::restore_prior_lifecycle(err));
         }
-        // `NotFound` is the node reporting the sandbox already gone, which is
-        // a confirmation rather than a miss.
-        if !matches!(err, SubstrateError::NotFound { .. })
-            && UnconfirmedTeardown::for_substrate(&self.substrate) == UnconfirmedTeardown::KeepRow
-        {
+        // Every error keeps a Kubernetes row, `NotFound` included. A pod that
+        // is already gone never surfaces here: the teardown counts a 404 on
+        // its pod DELETE as success, and it swallows the in-VM delete RPC's
+        // errors. So no teardown error is evidence that the pods are gone. No
+        // `NotFound` reaches this point today, but a future one would come from
+        // a lookup (a store row, a node mapping), not from the node.
+        if UnconfirmedTeardown::for_substrate(&self.substrate) == UnconfirmedTeardown::KeepRow {
             tracing::warn!(
                 sandbox_id = %id,
                 reason = cluster_delete_miss_reason(&err),
