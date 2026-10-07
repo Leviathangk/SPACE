@@ -90,3 +90,6 @@ k8s:
 serviceAccount:
   name: space-internal-api
 apiReleaseName: space
+
+# Lifecycle API owns activation and the Kubernetes caches.
+activationEndpoint: "http://space-api:9801"

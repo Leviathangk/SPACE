@@ -5838,7 +5838,6 @@ version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
- "pplx-space-api",
  "pplx-space-common-svc",
  "pplx-space-internal-api-server",
  "tikv-jemallocator",
