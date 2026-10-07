@@ -1350,16 +1350,16 @@ impl KubernetesSubstrate {
         // A fenced teardown already has its address, derived from the pod the
         // fence verified. The unfenced path resolves one now: best-effort, and
         // never letting a missing runtime block the teardown. When the tracked
-        // pod has nothing to talk to — no IP yet, or `Pending+Unschedulable` —
-        // `resolve_pod_ip` returns `Unavailable`; treat that as "no live
-        // runtime" and fall through to the pod-delete loop instead of
+        // pod has nothing to talk to — no IP yet, `Pending+Unschedulable`, or
+        // (for a delete) bound to an admin-terminated node — treat that as "no
+        // live runtime" and fall through to the pod-delete loop instead of
         // short-circuiting. Genuine infra faults still propagate, but only
         // after a delete has issued the pod deletes, which need no address.
         let pod_ip = match &fenced {
             Some(fenced) => fenced.runtime_pod_ip,
             None => match self.resolve_pod_ip(sandbox_uuid).await {
                 Ok(pod_ip) => pod_ip,
-                Err(err) if delete_can_skip_runtime_cleanup(&err) => {
+                Err(err) if teardown_can_skip_runtime_cleanup(mode, &err) => {
                     tracing::info!(
                         sandbox_id = %sandbox_id,
                         reason = %err,

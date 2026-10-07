@@ -18,10 +18,10 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tracing::Instrument;
 
-use crate::controllers::ControllerError;
 use crate::controllers::sandbox::FederatedSandboxCreateContext;
 use crate::controllers::sandbox::lifecycle::SandboxAction;
 use crate::controllers::sandbox::{SandboxController, fetch_sandbox};
+use crate::controllers::{ControllerError, ControllerRetryAfterCause};
 use crate::models::{
     CreateSandboxRequest as ControllerCreateSandboxRequest, SandboxMetadata,
     SandboxMetadataValue as ControllerSandboxMetadataValue,
@@ -209,6 +209,36 @@ impl PublicOperationExecutionResult {
         self.requeue_reason = PublicOperationRequeueReason::ActivationBackpressure;
         self
     }
+
+    /// Re-queue a delete whose teardown could not be confirmed, on its
+    /// `claim_generation`th claim. The operation is the only owner of the row
+    /// it kept in `deleting`, so this spends no retry budget and is not ended
+    /// by the native operation deadline; [`teardown_redrive_delay`] bounds how
+    /// often it runs instead.
+    pub(crate) fn teardown_redrive(
+        progress_message: impl Into<String>,
+        claim_generation: i64,
+    ) -> Self {
+        Self {
+            requeue_reason: PublicOperationRequeueReason::TeardownRedrive,
+            ..Self::retry(progress_message, teardown_redrive_delay(claim_generation))
+        }
+    }
+}
+
+/// Delay before the first re-drive of a delete whose teardown could not be
+/// confirmed. Each later claim doubles it, up to
+/// [`TEARDOWN_REDRIVE_MAX_DELAY`].
+pub(crate) const TEARDOWN_REDRIVE_INITIAL_DELAY: Duration = Duration::from_secs(5);
+const TEARDOWN_REDRIVE_MAX_DELAY: Duration = Duration::from_secs(300);
+
+/// Capped exponential backoff keyed on the operation's claim count, which the
+/// store increments on every claim and never rolls back.
+pub(crate) fn teardown_redrive_delay(claim_generation: i64) -> Duration {
+    let doublings = u32::try_from(claim_generation.saturating_sub(1).clamp(0, 16)).unwrap_or(0);
+    TEARDOWN_REDRIVE_INITIAL_DELAY
+        .saturating_mul(1 << doublings)
+        .min(TEARDOWN_REDRIVE_MAX_DELAY)
 }
 
 #[derive(Clone)]
@@ -526,9 +556,27 @@ impl SandboxLifecycleOperationExecutor {
                     "sandbox already deleted",
                 ));
             }
-            self.controller
+            if let Err(error) = self
+                .controller
                 .delete_control_plane(&self.pool, sandbox_uuid.into(), sandbox.as_ref())
-                .await?;
+                .await
+            {
+                // Whatever stopped this attempt, a row it left claimed
+                // `deleting` has no other owner while the orphaned-sandbox
+                // reconciler runs dry, so this operation keeps re-driving it.
+                // The usual way here is an unconfirmed teardown, which says so
+                // itself; a failed compensating write after a deferral is the
+                // rare other one.
+                if error.retry_after_cause() != Some(ControllerRetryAfterCause::TeardownRedrive)
+                    && sandbox_left_deleting(&self.pool, sandbox_uuid.into()).await
+                {
+                    return Ok(PublicOperationExecutionResult::teardown_redrive(
+                        error.to_string(),
+                        operation.claim_generation,
+                    ));
+                }
+                return Err(error.into());
+            }
             return Ok(lifecycle_success_result(
                 payload.sandbox_id,
                 payload.action,
@@ -1036,10 +1084,23 @@ impl CreateSandboxExecutionError {
     }
 }
 
+async fn sandbox_left_deleting(pool: &PgPool, sandbox_id: SandboxId) -> bool {
+    matches!(
+        fetch_sandbox(pool, sandbox_id).await,
+        Ok(Some(sandbox)) if sandbox.lifecycle == SandboxLifecycle::Deleting.as_str()
+    )
+}
+
 fn controller_error_result(
     operation: &ClaimedPublicOperation,
     error: ControllerError,
 ) -> PublicOperationExecutionResult {
+    if error.retry_after_cause() == Some(ControllerRetryAfterCause::TeardownRedrive) {
+        return PublicOperationExecutionResult::teardown_redrive(
+            error.to_string(),
+            operation.claim_generation,
+        );
+    }
     if let Some(retry_after) = error.retry_after_header()
         && error.retry_after_cause()
             == Some(crate::controllers::ControllerRetryAfterCause::PoolSlotRelease)

@@ -1054,6 +1054,10 @@ pub enum PublicOperationRequeueReason {
     TransientFailure,
     WorkflowProgress,
     ActivationBackpressure,
+    /// A delete kept its sandbox row in `deleting` because the runtime
+    /// teardown could not be confirmed. The operation is that row's only
+    /// owner, so it is re-driven until the teardown is confirmed.
+    TeardownRedrive,
 }
 
 impl PublicOperationRequeueReason {
@@ -1062,11 +1066,22 @@ impl PublicOperationRequeueReason {
             Self::TransientFailure => "transient_failure",
             Self::WorkflowProgress => "workflow_progress",
             Self::ActivationBackpressure => "activation_backpressure",
+            Self::TeardownRedrive => "teardown_redrive",
         }
     }
 
     pub const fn preserves_retry_budget(self) -> bool {
-        matches!(self, Self::WorkflowProgress | Self::ActivationBackpressure)
+        matches!(
+            self,
+            Self::WorkflowProgress | Self::ActivationBackpressure | Self::TeardownRedrive
+        )
+    }
+
+    /// Whether the native operation deadline may terminalize this requeue.
+    /// A teardown re-drive may not: failing the operation would leave a row
+    /// claimed `deleting` with nothing left to finish it.
+    pub const fn bounded_by_operation_deadline(self) -> bool {
+        !matches!(self, Self::TeardownRedrive)
     }
 }
 

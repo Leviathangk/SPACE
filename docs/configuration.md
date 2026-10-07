@@ -36,7 +36,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_PUBLIC_OPERATION_DISPATCHER_ENABLED` | on | Without it, create requests are accepted and never complete. |
 | `SPACE_SNAPSHOT_STORAGE_SWEEPER_ENABLED` | on | Does nothing without `SPACE_SNAPSHOT_BUCKET`. |
 | `SPACE_ORPHANED_SANDBOX_RECONCILER_ENABLED` | on | |
-| `SPACE_API_RECONCILER_DRY_RUN` | true | The orphaned-sandbox reconciler classifies and logs only until set to false. |
+| `SPACE_API_RECONCILER_DRY_RUN` | true | The orphaned-sandbox reconciler classifies and logs only until set to false. Rows kept in `deleting` do not depend on it: their delete operation re-drives them. |
 | `SPACE_API_RECONCILER_MAX_CLASSIFICATIONS_PER_MINUTE` | built-in | |
 | `SPACE_API_RECONCILER_MAX_ACTIVE_QUARANTINES`, `SPACE_API_RECONCILER_MAX_NEW_QUARANTINES_PER_SWEEP`, `SPACE_API_RECONCILER_MAX_QUARANTINE_PERCENTAGE` | 50, 20, 25 | Safety ceilings; `0` stops new quarantines. |
 | `SPACE_GONE_NODE_QUEUE_GC_ENABLED` | on | |
@@ -55,7 +55,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_ORPHANED_NODES_ENABLED` | off | Needs AWS. |
 | `SPACE_NODE_DRAIN_ENABLED` | off | |
 | `SPACE_NODE_DRAIN_NODE_CENSUS_RESIDENCY` | off | |
-| `SPACE_NODE_DRAIN_TERMINATION_BLOCKING_GATE` | off | Parks nodes that still hold stopped, created, deleting or quarantined residents in `draining` instead of advancing them to `drained`. |
+| `SPACE_NODE_DRAIN_TERMINATION_BLOCKING_GATE` | off | Parks nodes that still hold stopped, created, deleting or quarantined residents in `draining` instead of advancing them to `drained`. Whatever this is set to, a `deleting` resident holds its node out of `drained → terminating` until its delete completes. A Kubernetes delete that cannot confirm its teardown is re-driven by its operation until it can. |
 | `SPACE_NODE_DRAIN_TERMINATOR_KIND` | `aws` | `aws`, `kube-delete` or `noop`. |
 | `SPACE_DRAINED_NODE_TERMINATOR_ENABLED` | off | |
 | `SPACE_CLUSTER_CONTROLLER_DRAIN_EVACUATION_COHORT_VALUE` | unset | Unset disables the rollout-cohort feature. |

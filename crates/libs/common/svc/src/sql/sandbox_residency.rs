@@ -378,9 +378,14 @@ pub fn non_resident_lifecycle_exclusion(sandbox_alias: &str) -> String {
 /// the point: the drain pipeline services none of them, so "the drain will get
 /// to it" is the wrong answer for every one, and their exits differ.
 ///
-/// - `deleting` — converges on its own. The lifecycle claim is durable delete
-///   intent and its completion removes the row, so the node releases with no
-///   intervention.
+/// - `deleting` — converges only when its delete does. The lifecycle claim is
+///   durable delete intent and its completion removes the row. A Kubernetes
+///   delete that cannot confirm its runtime teardown keeps the row, with
+///   `active_node_id` still set, and its delete operation re-drives the
+///   teardown at a capped backoff until it is confirmed (the orphaned-sandbox
+///   reconciler's `deleting` path is a second owner when it runs live). Until
+///   then the row counts as resident here, so it holds its node out of
+///   `drained → terminating` for as long as the teardown keeps failing.
 /// - `quarantined` — held for as long as the investigation lasts. Recovery is
 ///   driven by the *owning* node republishing state, so evacuating the row would
 ///   destroy its only exit path. Refusing the node **is** the whole preservation

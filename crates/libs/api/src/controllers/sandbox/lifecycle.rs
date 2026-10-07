@@ -91,13 +91,17 @@ pub(crate) struct DeleteTeardownFailure {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeleteTeardownRow {
-    /// The substrate refused before tearing anything down, so the pre-delete
-    /// lifecycle is restored and the caller can retry once the refusal clears.
+    /// Nothing was torn down: the observed-only path failed, or sbx-mgr's
+    /// in-VM delete refused (`SuspendInFlight`, `RetainedFilesystemOnlyCopy`)
+    /// before the pods were touched. The pre-delete lifecycle is restored and
+    /// the caller can retry once the refusal clears.
     RestorePriorLifecycle,
     /// Teardown may have removed part of the runtime and could not confirm
     /// the rest. The row stays `deleting` with its execution rows: they are
-    /// what the delete retry and the orphaned-sandbox reconciler read to find
-    /// the leftovers, and the pre-delete lifecycle would no longer be true.
+    /// what the next attempt reads to find the leftovers, and the pre-delete
+    /// lifecycle would no longer be true. The error carries
+    /// `ControllerRetryAfterCause::TeardownRedrive`, which makes the delete
+    /// operation the row's owner until the teardown is confirmed.
     KeepDeleting,
 }
 
@@ -1336,7 +1340,16 @@ impl SandboxController {
                  the row names pods that may outlive it"
             );
             return Err(DeleteTeardownFailure {
-                error: ControllerError::from(err),
+                error: ControllerError::service_unavailable(format!(
+                    "sandbox runtime teardown could not be confirmed; the delete will be \
+                     retried: {err}"
+                ))
+                .with_retry_after_header(
+                    crate::public_sandbox_operations::TEARDOWN_REDRIVE_INITIAL_DELAY,
+                )
+                .with_retry_after_cause(
+                    crate::controllers::ControllerRetryAfterCause::TeardownRedrive,
+                ),
                 row: DeleteTeardownRow::KeepDeleting,
             });
         }

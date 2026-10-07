@@ -129,7 +129,10 @@ fn classify_fork_attempt(
             PublicOperationRequeueReason::TransientFailure => {
                 pplx_space_metrics::sandbox_fork::ForkRetryKind::TransientFailure
             }
-            PublicOperationRequeueReason::WorkflowProgress => {
+            // A target teardown re-drive is a wait on the target, which the
+            // fork metrics already count as workflow progress.
+            PublicOperationRequeueReason::WorkflowProgress
+            | PublicOperationRequeueReason::TeardownRedrive => {
                 pplx_space_metrics::sandbox_fork::ForkRetryKind::WorkflowProgress
             }
             PublicOperationRequeueReason::ActivationBackpressure => {
@@ -152,7 +155,8 @@ fn classify_fork_attempt(
                 pplx_space_metrics::sandbox_fork::ForkAttemptOutcome::TransientRetry
             }
             PublicOperationRequeueReason::WorkflowProgress
-            | PublicOperationRequeueReason::ActivationBackpressure => {
+            | PublicOperationRequeueReason::ActivationBackpressure
+            | PublicOperationRequeueReason::TeardownRedrive => {
                 pplx_space_metrics::sandbox_fork::ForkAttemptOutcome::WorkflowWait
             }
         },
@@ -243,7 +247,9 @@ impl ForkSandboxOperationExecutor {
                         message,
                         pplx_space_metrics::sandbox_fork::ForkOutcome::DeadlineExceeded,
                     ),
-                    ForkExecutionError::Retry(_) | ForkExecutionError::Wait(_) => unreachable!(),
+                    ForkExecutionError::Retry(_)
+                    | ForkExecutionError::Wait(_)
+                    | ForkExecutionError::TeardownRedrive(_) => unreachable!(),
                 };
                 if let Err(error) = self.cleanup_terminal_targets(operation).await {
                     tracing::warn!(
@@ -251,6 +257,12 @@ impl ForkSandboxOperationExecutor {
                         error = ?error,
                         "terminal fork target cleanup will be retried"
                     );
+                    if let ForkExecutionError::TeardownRedrive(message) = error {
+                        return PublicOperationExecutionResult::teardown_redrive(
+                            message,
+                            operation.claim_generation,
+                        );
+                    }
                     return retry("terminal fork target cleanup is pending");
                 }
                 match self
@@ -297,6 +309,12 @@ impl ForkSandboxOperationExecutor {
             }
             Err(ForkExecutionError::Retry(message)) => retry(message),
             Err(ForkExecutionError::Wait(message)) => wait(message),
+            Err(ForkExecutionError::TeardownRedrive(message)) => {
+                PublicOperationExecutionResult::teardown_redrive(
+                    message,
+                    operation.claim_generation,
+                )
+            }
         }
     }
 
@@ -327,7 +345,7 @@ impl ForkSandboxOperationExecutor {
             self.controller
                 .delete_control_plane(self.store.pool(), target_id, Some(&target))
                 .await
-                .map_err(ForkExecutionError::retry_error)?;
+                .map_err(ForkExecutionError::target_delete_error)?;
         }
         Ok(())
     }
@@ -1228,7 +1246,7 @@ impl ForkSandboxOperationExecutor {
                 .delete(self.store.pool(), target_id, Some(sandbox))
                 .await
                 .map_err(|failure| {
-                    ForkExecutionError::retry_error(ControllerError::from(failure))
+                    ForkExecutionError::target_delete_error(ControllerError::from(failure))
                 })?;
         }
         crate::reconcile_queue::finalize_sandbox_db_delete_user_initiated(
@@ -1781,6 +1799,10 @@ enum ForkExecutionError {
     },
     Retry(String),
     Wait(String),
+    /// A target delete kept its row in `deleting` because the teardown could
+    /// not be confirmed. Re-driven like the sandbox delete operation: without
+    /// spending the retry budget, at a capped backoff.
+    TeardownRedrive(String),
 }
 
 impl From<crate::fork_operation_store::ForkOperationStoreError> for ForkExecutionError {
@@ -1834,6 +1856,16 @@ impl ForkExecutionError {
 
     fn retry_error(error: impl std::fmt::Display) -> Self {
         Self::Retry(error.to_string())
+    }
+
+    fn target_delete_error(error: ControllerError) -> Self {
+        if error.retry_after_cause()
+            == Some(crate::controllers::ControllerRetryAfterCause::TeardownRedrive)
+        {
+            Self::TeardownRedrive(error.to_string())
+        } else {
+            Self::Retry(error.to_string())
+        }
     }
 }
 

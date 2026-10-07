@@ -889,10 +889,15 @@ fn terminal_state(raw: &str) -> Option<TerminalSandboxState> {
     }
 }
 
+/// `None` hides the sandbox from the ECW list and makes its detail a 404.
+///
+/// `deleting` is hidden because an E2B kill is synchronous: once ECW has
+/// answered the kill, the sandbox is gone to the caller, even while a delete
+/// whose teardown could not be confirmed keeps re-driving it behind the row.
 pub(super) fn translate_lifecycle_state(raw: &str) -> Option<SandboxStateE2b> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "paused" | "suspended" => Some(SandboxStateE2b::Paused),
-        "stopped" | "failed" | "quarantined" => None,
+        "stopped" | "failed" | "quarantined" | "deleting" => None,
         _ => Some(SandboxStateE2b::Running),
     }
 }

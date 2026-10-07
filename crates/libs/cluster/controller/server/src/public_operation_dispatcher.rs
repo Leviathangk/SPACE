@@ -647,7 +647,11 @@ where
             } else {
                 "unsupported_executor_state"
             };
-            let deadline = if is_native_m1_terminalized_kind(api_product, kind) {
+            // A teardown re-drive outlives the deadline: it is the only owner of
+            // a row it kept claimed `deleting`.
+            let deadline = if is_native_m1_terminalized_kind(api_product, kind)
+                && requeue_reason.bounded_by_operation_deadline()
+            {
                 config.m1_max_age
             } else {
                 None

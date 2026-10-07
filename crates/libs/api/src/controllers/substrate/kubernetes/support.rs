@@ -881,32 +881,48 @@ pub(super) fn classify_wake_rpc_error(error: &tonic::Status) -> WakeRpcErrorDisp
     WakeRpcErrorDisposition::Fail
 }
 
-/// Decide whether `delete_execution` should skip best-effort in-VM cleanup
-/// (the stop/delete gRPC calls) for a given `resolve_pod_ip` error and proceed
+/// Decide whether a teardown should skip best-effort in-VM cleanup (the
+/// stop/delete gRPC calls) for a given `resolve_pod_ip` error and proceed
 /// straight to deleting the pod object.
 ///
 /// `resolve_pod_ip` surfaces `Unavailable` when the tracked pod has no
 /// reachable runtime to talk to — most importantly a `Pending+Unschedulable`
 /// pod that never got an IP (e.g. a restore pinned to a now-unsuitable source
-/// node via NodeAffinity). The delete path has nothing to say to such a pod,
-/// so it swallows the error and falls through to the unconditional pod-delete
-/// loop. Every other `resolve_pod_ip` error — DB failure, kube-API query
-/// failure, malformed pod IP — is a genuine infra fault that the pod-delete
-/// loop would hit too, so it must propagate.
-pub(super) fn delete_can_skip_runtime_cleanup(err: &SubstrateError) -> bool {
-    matches!(err, SubstrateError::Unavailable { .. })
+/// node via NodeAffinity). There is nothing to say to such a pod, so the error
+/// is swallowed and the teardown falls through to the pod-delete loop.
+///
+/// `NodeTombstoned` means the pod is bound to an admin-terminated node:
+/// recording its placement refused to re-create that node's row. That node
+/// will never answer either, so a *delete* treats it the same way. A retire
+/// does not: it exists to preserve node-local state, and releasing the pods of
+/// a node nobody can reach is the node-drain pipeline's decision, not a
+/// retire's.
+///
+/// Every other `resolve_pod_ip` error — DB failure, kube-API query failure,
+/// malformed pod IP — is a genuine fault and propagates.
+pub(super) fn teardown_can_skip_runtime_cleanup(
+    mode: ExecutionTeardown,
+    err: &SubstrateError,
+) -> bool {
+    match err {
+        SubstrateError::Unavailable { .. } => true,
+        SubstrateError::NodeTombstoned { .. } => mode == ExecutionTeardown::Delete,
+        _ => false,
+    }
 }
 
 /// Whether a delete may still remove the tracked pods after `resolve_pod_ip`
-/// failed with `err`. Deleting a pod needs no address, so it may, except when
-/// the error defers the delete to work that still needs the pod: a suspend
-/// that may yet publish from it, or a node-local copy that may be the only
-/// one. Those deferrals keep the pod and its tracking for that owner.
+/// failed with `err`. Deleting a pod needs no address, so it may, except for
+/// `SuspendInFlight`: a suspend that may yet publish from that pod.
+///
+/// No current delete reaches that exception. `resolve_pod_ip` raises it only
+/// for a `suspending` row, and the user delete (`delete_control_plane`) claims
+/// the row `deleting` before it tears anything down, while the other delete
+/// callers act on `creating`, `failed`, or warm-pool rows. It is kept so a
+/// future caller deleting a `suspending` row cannot remove the pod a
+/// publication still needs.
 pub(super) fn delete_can_remove_pods_after_runtime_lookup_error(err: &SubstrateError) -> bool {
-    !matches!(
-        err,
-        SubstrateError::SuspendInFlight { .. } | SubstrateError::RetainedFilesystemOnlyCopy { .. }
-    )
+    !matches!(err, SubstrateError::SuspendInFlight { .. })
 }
 
 /// Whether an execution teardown destroys node-local sandbox state or

@@ -140,6 +140,13 @@ The following compatibility limits are important:
   Connect leaves the lifecycle policy unchanged when `timeout` is omitted. An
   explicit timeout replaces the current timeout, including with a shorter
   value; if no E2B policy exists, it creates an auto-delete policy.
+- `kill` answers `204` once the delete is durable. If a Kubernetes sandbox's
+  runtime teardown cannot be confirmed, the sandbox stays in `deleting` while
+  its delete operation retries the teardown at a capped backoff. ECW treats it
+  as gone: it is omitted from list results, its detail returns `404`, and a
+  repeated `kill` answers `204`. The SPACE API reports the same sandbox as
+  `deleting`, and its delete operation stays queued until the teardown is
+  confirmed.
 - Template `startCmd` is installed as a systemd unit and runs on cold boot;
   SPACE does not yet publish the warm snapshot used by E2B for this behavior.
 - Template `readyCmd` is accepted for SDK compatibility but is not enforced.

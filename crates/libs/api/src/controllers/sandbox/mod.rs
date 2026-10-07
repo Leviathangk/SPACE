@@ -501,7 +501,8 @@ fn retry_after_cause_terminal_phase(cause: ControllerRetryAfterCause) -> Reconne
         // outcome; it shouldn't reach the reconnect terminal path. Map it to the
         // API phase defensively.
         ControllerRetryAfterCause::ClusterActivationAdmission
-        | ControllerRetryAfterCause::PoolSlotRelease => ReconnectTerminalPhase::Api,
+        | ControllerRetryAfterCause::PoolSlotRelease
+        | ControllerRetryAfterCause::TeardownRedrive => ReconnectTerminalPhase::Api,
     }
 }
 
@@ -513,7 +514,8 @@ fn retry_after_cause_reason(cause: ControllerRetryAfterCause) -> ReconnectReason
         ControllerRetryAfterCause::GuestNotReady => ReconnectReason::GuestNotReady,
         // See note above: not a reconnect cause. Treat as a retryable wait.
         ControllerRetryAfterCause::ClusterActivationAdmission
-        | ControllerRetryAfterCause::PoolSlotRelease => ReconnectReason::WaitBudget,
+        | ControllerRetryAfterCause::PoolSlotRelease
+        | ControllerRetryAfterCause::TeardownRedrive => ReconnectReason::WaitBudget,
     }
 }
 
@@ -525,7 +527,8 @@ fn retry_after_cause_outcome(cause: ControllerRetryAfterCause) -> ReconnectOutco
         | ControllerRetryAfterCause::GuestNotReady
         // See note above: not a reconnect cause. Treat as retryable (exhausted).
         | ControllerRetryAfterCause::ClusterActivationAdmission
-        | ControllerRetryAfterCause::PoolSlotRelease => ReconnectOutcome::Exhausted,
+        | ControllerRetryAfterCause::PoolSlotRelease
+        | ControllerRetryAfterCause::TeardownRedrive => ReconnectOutcome::Exhausted,
     }
 }
 

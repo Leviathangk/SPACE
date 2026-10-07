@@ -576,6 +576,58 @@ async fn backdated_fork_and_admin_operations_remain_outside_m1_deadline() -> Tes
     Ok(())
 }
 
+/// A delete re-driving a teardown it could not confirm is the only owner of
+/// the row it kept in `deleting`. Neither the retry budget (one attempt here)
+/// nor the native operation deadline (the operation is backdated past it) may
+/// end it; both still end every other requeue, as the tests above pin.
+#[tokio::test]
+async fn teardown_redrives_outlive_the_retry_budget_and_the_native_deadline() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = seed_org(&db.pool).await?;
+    let store = PublicOperationStore::new(db.pool.clone());
+    let operation_id = create_queued_operation(
+        &store,
+        OrgId::from_uuid(org_id),
+        ApiProduct::Native,
+        OperationKind::DeleteSandbox,
+        "sbx_teardown_redrive",
+    )
+    .await?;
+    backdate_operations(&db.pool, &[operation_id]).await?;
+    let executor = FixedExecutor::requeue(
+        &[OperationKind::DeleteSandbox],
+        PublicOperationRequeueReason::TeardownRedrive,
+        "sandbox runtime teardown could not be confirmed",
+    );
+
+    for _ in 0..3 {
+        sqlx::query(sql!(
+            "UPDATE public_operations SET next_attempt_at = NOW() WHERE operation_id = $1"
+        ))
+        .bind(operation_id.as_uuid())
+        .execute(&db.pool)
+        .await?;
+        let report = tick(&single_claim_config(), &store, &executor).await?;
+        assert_eq!(report.retried, 1, "{report:?}");
+        assert_eq!(report.failed, 0, "{report:?}");
+    }
+
+    assert_eq!(
+        operation_state(&db.pool, operation_id).await?,
+        OperationState::Queued.as_str()
+    );
+    let attempts: i32 = sqlx::query_scalar(sql!(
+        "SELECT attempts FROM public_operations WHERE operation_id = $1"
+    ))
+    .bind(operation_id.as_uuid())
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(attempts, 0, "a re-drive spends no retry budget");
+    Ok(())
+}
+
 #[tokio::test]
 async fn success_after_native_m1_age_threshold_still_wins() -> TestResult {
     let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {

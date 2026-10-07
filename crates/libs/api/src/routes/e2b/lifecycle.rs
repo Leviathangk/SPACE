@@ -563,6 +563,19 @@ impl Drop for DeleteOperationObserver {
     }
 }
 
+async fn sandbox_claimed_deleting(
+    pool: &sqlx::PgPool,
+    sandbox_id: pplx_space_common_core::types::SandboxId,
+) -> Result<bool, E2bApiError> {
+    let sandbox = crate::controllers::sandbox::fetch_sandbox(pool, sandbox_id)
+        .await
+        .map_err(|error| {
+            tracing::error!(%sandbox_id, %error, "failed to observe sandbox delete lifecycle");
+            E2bApiError::internal("Internal server error")
+        })?;
+    Ok(sandbox.is_some_and(|sandbox| sandbox.lifecycle == SandboxLifecycle::Deleting.as_str()))
+}
+
 async fn wait_for_delete_operation(
     store: &PublicOperationStore,
     org_id: OrgId,
@@ -592,6 +605,22 @@ async fn wait_for_delete_operation(
                         operation.terminal_error.as_ref(),
                         &operation.progress_message,
                     ));
+                }
+                // A queued delete whose sandbox is claimed `deleting` is being
+                // re-driven: its teardown could not be confirmed and the
+                // operation keeps retrying it. The kill was accepted durably,
+                // and ECW hides `deleting` sandboxes, so answer it as done.
+                OperationState::Queued
+                    if sandbox_claimed_deleting(store.pool(), sandbox_id.into()).await? =>
+                {
+                    tracing::info!(
+                        %operation_id,
+                        %sandbox_id,
+                        phase = "http_observer",
+                        result = "teardown_redrive",
+                        "sandbox delete accepted; its teardown is being re-driven"
+                    );
+                    return Ok(StatusCode::NO_CONTENT);
                 }
                 OperationState::Queued | OperationState::Running => {
                     tokio::time::sleep(DELETE_OPERATION_POLL).await;

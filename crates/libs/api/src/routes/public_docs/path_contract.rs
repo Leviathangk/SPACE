@@ -240,7 +240,7 @@ pub(super) fn insert_sandbox_operation_paths(
         DELETE_SANDBOX,
         json!({
             "summary": "Delete a sandbox",
-            "description": "Returns an operation handle while the sandbox is being deleted. Poll the operation for completion. Reusing the same idempotency key for the same sandbox returns the original operation.",
+            "description": "Returns an operation handle while the sandbox is being deleted. Poll the operation for completion. If the sandbox's runtime teardown cannot be confirmed, the sandbox reports `deleting` and the operation stays queued, retrying the teardown with a capped backoff until it succeeds. Reusing the same idempotency key for the same sandbox returns the original operation.",
             "parameters": [idempotency_key_parameter.clone()],
             "responses": {
                 "202": {

@@ -68,6 +68,12 @@ pub enum ControllerRetryAfterCause {
     /// a failure: the async dispatcher re-queues it without spending its
     /// transient-error retry budget.
     PoolSlotRelease,
+    /// A Kubernetes delete could not confirm its runtime teardown and kept the
+    /// row in `deleting`. Nothing else owns that row when the orphaned-sandbox
+    /// reconciler runs dry, so the async dispatcher re-drives the delete with
+    /// a capped backoff, without spending its retry budget or ending it at the
+    /// native operation deadline.
+    TeardownRedrive,
 }
 
 impl ControllerError {

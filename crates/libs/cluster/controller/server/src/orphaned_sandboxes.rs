@@ -1335,9 +1335,17 @@ impl OrphanActionSink for SubstrateActionSink {
 }
 
 impl SubstrateActionSink {
-    /// Returns true only when no cleanup is needed or Kubernetes confirms the
-    /// observed pod is absent. Recovery and quarantine use the result only
-    /// for telemetry; irreversible database deletion requires confirmation.
+    /// Returns true only when no cleanup is needed or Kubernetes confirms
+    /// every pod the row names is absent. Recovery and quarantine use the
+    /// result only for telemetry; irreversible database deletion requires
+    /// confirmation.
+    ///
+    /// A `deleting` row is finalized by this path, and finalizing cascades
+    /// its execution rows, which are the only record of its pods. The guard
+    /// names at most the active execution's pod, while a delete whose
+    /// teardown failed can leave older generations' pods behind with no
+    /// active execution at all. So for that row every tracked pod is deleted
+    /// and confirmed, not just the observed one.
     async fn delete_observed_pod(
         &self,
         sandbox_id: SandboxId,
@@ -1347,11 +1355,54 @@ impl SubstrateActionSink {
         let Some(pod_cleaner) = &self.pod_cleaner else {
             return true;
         };
-        let Some(pod_name) = guard.observed_pod_cleanup_name() else {
-            return true;
+        let pod_names = match guard {
+            ClassifyGuard::LegacyDeleting { .. } => {
+                match tracked_execution_pod_names(&self.pool, sandbox_id).await {
+                    Ok(pod_names) => pod_names,
+                    Err(err) => {
+                        tracing::warn!(
+                            sandbox_id = %sandbox_id,
+                            error = %err,
+                            "reconciler could not list the pods a deleting sandbox tracks"
+                        );
+                        emit_orphan_reconcile_event(
+                            sandbox_id,
+                            SandboxEventType::CleanupFailed,
+                            reason,
+                            details_for_guard(guard).error(err.to_string()),
+                        );
+                        return false;
+                    }
+                }
+            }
+            ClassifyGuard::PodName { .. } | ClassifyGuard::Forgotten => {
+                guard.observed_pod_cleanup_name().into_iter().collect()
+            }
         };
+        for pod_name in pod_names {
+            if !Self::delete_and_confirm_pod(
+                pod_cleaner.as_ref(),
+                sandbox_id,
+                guard,
+                &pod_name,
+                reason,
+            )
+            .await
+            {
+                return false;
+            }
+        }
+        true
+    }
 
-        match pod_cleaner.delete_projection_pod(&pod_name).await {
+    async fn delete_and_confirm_pod(
+        pod_cleaner: &dyn ProjectionPodCleaner,
+        sandbox_id: SandboxId,
+        guard: &ClassifyGuard,
+        pod_name: &str,
+        reason: &'static str,
+    ) -> bool {
+        match pod_cleaner.delete_projection_pod(pod_name).await {
             Ok(K8sBlockingDeleteOutcome::Deleted | K8sBlockingDeleteOutcome::NotFound) => true,
             // `PreconditionFailed` is unreachable here — this cleanup sends no
             // UID precondition — but treated like an unconfirmed outcome so a
@@ -1769,6 +1820,22 @@ impl SubstrateActionSink {
     ) -> Result<Vec<OrphanCandidateRow>, sqlx::Error> {
         list_candidates_after(&self.pool, after_sandbox_id, upper_bound, limit).await
     }
+}
+
+/// Every pod the sandbox's executions name, active or not, oldest first.
+async fn tracked_execution_pod_names(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT pod_name
+           FROM sandbox_k8s_executions
+          WHERE sandbox_id = $1
+          ORDER BY generation"
+    ))
+    .bind(sandbox_id)
+    .fetch_all(pool)
+    .await
 }
 
 async fn list_candidates_after(

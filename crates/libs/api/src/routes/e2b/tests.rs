@@ -3583,12 +3583,14 @@ async fn connect_route_never_bad_gateways_for_db_state_shapes() -> TestResult {
             ConnectRouteActiveNode::ReadyWorker,
             StatusCode::CONFLICT,
         ),
+        // Gone to ECW, like `deleted`: a delete that could not confirm its
+        // teardown is still re-driving it behind this row.
         ConnectRouteDbShape::error(
             "deleting teardown row",
             "deleting",
             "on_node",
             ConnectRouteActiveNode::ReadyWorker,
-            StatusCode::CONFLICT,
+            StatusCode::NOT_FOUND,
         ),
         ConnectRouteDbShape::error(
             "cleanup_required teardown row",
