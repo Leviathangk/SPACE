@@ -1,0 +1,519 @@
+//! Template-owned boot startup. PID1 runs the application; spaced only gates
+//! public boot readiness. The internal agent-ready flag remains independent.
+
+use crate::SpacedGuestService;
+#[cfg(target_os = "linux")]
+use crate::identity::GuestAccount;
+#[cfg(target_os = "linux")]
+use pplx_space_common_core::types::{EnvKey, EnvMap, EnvValue, RuntimeApp};
+use pplx_space_common_core::types::{
+    MAX_TEMPLATE_RUNTIME_BYTES, TEMPLATE_RUNTIME_BUILD_MASK, TEMPLATE_RUNTIME_PATH, TemplateRuntime,
+};
+use std::collections::BTreeMap;
+use std::io::{self, Read};
+use std::path::Path;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use tokio::process::Command;
+use tokio::time::Instant;
+use tonic::Status;
+
+#[cfg(target_os = "linux")]
+mod runner;
+#[cfg(target_os = "linux")]
+pub use runner::run_runtime_launcher;
+#[cfg(not(target_os = "linux"))]
+pub fn run_runtime_launcher(
+    _name: pplx_space_common_core::types::RuntimeAppName,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "template runtimes require Linux",
+    ))
+}
+
+const BOOT_DECLARATION: &str = "/run/space-runtime/declaration.toml";
+pub const GENERATOR_SCRIPT: &[u8] =
+    b"#!/bin/sh\nexec /usr/local/bin/spaced-svc --runtime-generate \"$1\"\n";
+pub const SYSTEMD_UNIT: &[u8] = include_bytes!("template_runtime/space-runtime@.service");
+#[cfg(target_os = "linux")]
+const OUTPUT_LIMIT: u64 = 1024 * 1024;
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+struct InvocationConfig {
+    declaration: RuntimeApp,
+    env: EnvMap,
+}
+
+#[derive(Clone, Copy, Debug, thiserror::Error)]
+enum RuntimeFailure {
+    #[cfg(target_os = "linux")]
+    #[error("invalid template runtime configuration")]
+    Configuration,
+    #[error("template runtime backend is unavailable or incompatible")]
+    Backend,
+}
+
+fn read_declaration() -> io::Result<Option<TemplateRuntime>> {
+    read_regular(Path::new(TEMPLATE_RUNTIME_PATH), MAX_TEMPLATE_RUNTIME_BYTES)?
+        .map(|bytes| {
+            TemplateRuntime::from_bytes(&bytes)
+                .map_err(|_| io::Error::other("invalid template runtime declaration"))
+        })
+        .transpose()
+}
+
+fn builder_boot(cmdline: &str) -> bool {
+    cmdline
+        .split_whitespace()
+        .any(|argument| argument == TEMPLATE_RUNTIME_BUILD_MASK)
+}
+
+fn boot_declaration() -> io::Result<Option<TemplateRuntime>> {
+    // The generator freezes absence too. Reloading PID1 or restarting an app
+    // must not apply tenant edits to startup intent halfway through a boot.
+    let Some(bytes) = read_regular(Path::new(BOOT_DECLARATION), MAX_TEMPLATE_RUNTIME_BYTES)? else {
+        // Guests without startup intent need no generator evidence. A present
+        // declaration must never become ready if generator setup failed.
+        return if read_declaration()?.is_none() {
+            Ok(None)
+        } else {
+            Err(io::Error::other(
+                "runtime generator did not prepare boot declaration",
+            ))
+        };
+    };
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    TemplateRuntime::from_bytes(&bytes)
+        .map(Some)
+        .map_err(|_| io::Error::other("invalid boot declaration"))
+}
+
+/// PID1 invokes this before loading units, and again on daemon-reload. Only
+/// dependency links are generated: service policy stays in the platform unit.
+pub fn generate_runtime_units(output: &Path) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::DirBuilderExt;
+    if builder_boot(&std::fs::read_to_string("/proc/cmdline")?) {
+        return Ok(());
+    }
+    if read_regular(Path::new(BOOT_DECLARATION), MAX_TEMPLATE_RUNTIME_BYTES)?.is_none() {
+        let bytes = read_declaration()?
+            .map(|runtime| runtime.canonical_bytes())
+            .transpose()
+            .map_err(io::Error::other)?
+            .unwrap_or_default();
+        let directory = Path::new(BOOT_DECLARATION)
+            .parent()
+            .expect("absolute boot path");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(directory)?;
+        let mut file = tempfile::NamedTempFile::new_in(directory)?;
+        file.write_all(&bytes)?;
+        file.persist(BOOT_DECLARATION)
+            .map_err(|error| error.error)?;
+    }
+    if let Some(runtime) = boot_declaration()? {
+        let wants = output.join("space.target.wants");
+        std::fs::create_dir_all(&wants)?;
+        for app in runtime.apps() {
+            std::os::unix::fs::symlink(
+                "/etc/systemd/system/space-runtime@.service",
+                wants.join(app.name().unit()),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+impl SpacedGuestService {
+    pub(crate) async fn wait_template_runtime_boot_ready(
+        &self,
+        deadline: Instant,
+    ) -> Result<bool, Status> {
+        if self.inner.runtime_boot_ready.load(Ordering::Acquire) {
+            return Ok(true);
+        }
+        let directory = self.inner.runtime_state_directory.clone();
+        let declaration = tokio::task::spawn_blocking(move || {
+            if let Some(directory) = directory
+                && read_regular(&directory.join("boot-ready"), 16)?.as_deref() == Some(b"ready\n")
+            {
+                return Ok(None);
+            }
+            if std::fs::read_to_string("/proc/cmdline").is_ok_and(|cmdline| builder_boot(&cmdline))
+            {
+                return Ok(None);
+            }
+            boot_declaration()
+        })
+        .await
+        .map_err(|_| Status::internal("template runtime inspection failed"))?
+        .map_err(|_| Status::failed_precondition("invalid template runtime configuration"))?;
+        let Some(declaration) = declaration else {
+            self.record_runtime_boot_ready().await?;
+            return Ok(true);
+        };
+        loop {
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            let units: Vec<_> = declaration
+                .apps()
+                .iter()
+                .map(|app| app.name().unit())
+                .collect();
+            let mut args = vec![
+                "show",
+                "--property=Id,LoadState,ActiveState,NotifyAccess,MainPID,InactiveExitTimestampMonotonic",
+            ];
+            args.extend(units.iter().map(String::as_str));
+            let output = match tokio::time::timeout_at(deadline, systemctl(&args)).await {
+                Err(_) => return Ok(false),
+                Ok(Err(_)) => {
+                    return Err(Status::unavailable("template runtime backend unavailable"));
+                }
+                Ok(Ok(output)) => output,
+            };
+            let all_ready = observe_apps(&output, &units)?;
+            if all_ready {
+                self.record_runtime_boot_ready().await?;
+                return Ok(true);
+            }
+            tokio::time::sleep_until(deadline.min(Instant::now() + Duration::from_millis(300)))
+                .await;
+        }
+    }
+
+    async fn record_runtime_boot_ready(&self) -> Result<(), Status> {
+        if let Some(directory) = self.inner.runtime_state_directory.clone() {
+            tokio::task::spawn_blocking(move || -> io::Result<()> {
+                use std::io::Write;
+                use std::os::unix::fs::DirBuilderExt;
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(&directory)?;
+                // /run survives agent restarts and memory restore, but not cold boot.
+                // This is guest-local lifecycle evidence, never host authorization.
+                let mut receipt = tempfile::NamedTempFile::new_in(&directory)?;
+                receipt.write_all(b"ready\n")?;
+                receipt
+                    .persist(directory.join("boot-ready"))
+                    .map_err(|error| error.error)?;
+                Ok(())
+            })
+            .await
+            .map_err(|_| Status::internal("runtime receipt task failed"))?
+            .map_err(|_| Status::unavailable("cannot persist runtime readiness"))?;
+        }
+        self.inner.runtime_boot_ready.store(true, Ordering::Release);
+        Ok(())
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum BootObservation {
+    Starting,
+    Ready,
+}
+
+fn observe_boot(output: &[u8]) -> Result<BootObservation, Status> {
+    let output = std::str::from_utf8(output)
+        .map_err(|_| Status::failed_precondition("invalid runtime backend state"))?;
+    let properties: BTreeMap<_, _> = output
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect();
+    let failed = || Status::failed_precondition("template runtime startup failed");
+    if properties.get("LoadState") != Some(&"loaded") {
+        return Err(failed());
+    }
+    match properties.get("ActiveState").copied() {
+        Some("active")
+            if properties.get("NotifyAccess") == Some(&"none")
+                && properties
+                    .get("MainPID")
+                    .and_then(|pid| pid.parse::<u32>().ok())
+                    .is_some_and(|pid| pid > 0) =>
+        {
+            Ok(BootObservation::Ready)
+        }
+        Some("failed") => Err(failed()),
+        Some("inactive")
+            if properties
+                .get("InactiveExitTimestampMonotonic")
+                .is_some_and(|value| *value != "0") =>
+        {
+            Err(failed())
+        }
+        Some("active" | "inactive" | "activating" | "deactivating") => {
+            Ok(BootObservation::Starting)
+        }
+        _ => Err(failed()),
+    }
+}
+
+fn observe_apps(output: &[u8], units: &[String]) -> Result<bool, Status> {
+    let text = std::str::from_utf8(output)
+        .map_err(|_| Status::failed_precondition("invalid runtime backend state"))?;
+    let blocks: BTreeMap<_, _> = text
+        .split("\n\n")
+        .filter_map(|block| {
+            block
+                .lines()
+                .find_map(|line| line.strip_prefix("Id="))
+                .map(|id| (id, block))
+        })
+        .collect();
+    let mut ready = true;
+    for unit in units {
+        let block = blocks
+            .get(unit.as_str())
+            .ok_or_else(|| Status::unavailable("template app state missing"))?;
+        if observe_boot(block.as_bytes()).map_err(|status| {
+            Status::new(status.code(), format!("template app {unit} startup failed"))
+        })? == BootObservation::Starting
+        {
+            ready = false;
+        }
+    }
+    Ok(ready)
+}
+
+/// Construction-only inspection: stdout is exact declaration bytes or absence.
+/// The mask is checked before callers may mutate an inherited runtime template.
+pub fn inspect_template_runtime() -> io::Result<Vec<u8>> {
+    if !builder_boot(&std::fs::read_to_string("/proc/cmdline")?) {
+        return Err(io::Error::other(
+            "builder runtime mask missing; upgrade the sandbox manager",
+        ));
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        // Masked units cannot expose service properties. Inspect the installed
+        // platform unit while retaining the kernel mask for the whole build.
+        let version = systemctl(&["--version"])
+            .await
+            .map_err(|_| io::Error::other("systemd unavailable"))?;
+        if std::str::from_utf8(&version)
+            .ok()
+            .and_then(|text| text.split_whitespace().nth(1))
+            .and_then(|value| value.parse::<u32>().ok())
+            .is_none_or(|version| version < 254)
+        {
+            return Err(io::Error::other("runtime requires systemd 254 or newer"));
+        }
+        systemctl(&["daemon-reload"])
+            .await
+            .map_err(|_| io::Error::other("cannot load runtime backend configuration"))?;
+        systemctl(&["is-active", "--quiet", "space.target"])
+            .await
+            .map_err(|_| io::Error::other("platform target inactive; rebuild base"))?;
+        Ok::<_, io::Error>(())
+    })?;
+    let unit = read_regular(
+        Path::new("/etc/systemd/system/space-runtime@.service"),
+        16 * 1024,
+    )?
+    .ok_or_else(|| io::Error::other("runtime unit missing; rebuild the base"))?;
+    // A single platform-owned unit has an exact contract, not tenant-authored
+    // policy. The builder rejects alterations instead of interpreting unit text.
+    if unit != SYSTEMD_UNIT {
+        return Err(io::Error::other(
+            "unsupported runtime unit; rebuild the base",
+        ));
+    }
+    if read_regular(
+        Path::new("/etc/systemd/system-generators/space-runtime"),
+        4096,
+    )?
+    .as_deref()
+        != Some(GENERATOR_SCRIPT)
+    {
+        return Err(io::Error::other(
+            "runtime generator missing or unsupported; rebuild base",
+        ));
+    }
+    use std::os::unix::fs::PermissionsExt;
+    if std::fs::metadata("/etc/systemd/system-generators/space-runtime")?
+        .permissions()
+        .mode()
+        & 0o111
+        == 0
+    {
+        return Err(io::Error::other("runtime generator is not executable"));
+    }
+    let bytes = read_regular(Path::new(TEMPLATE_RUNTIME_PATH), MAX_TEMPLATE_RUNTIME_BYTES)?;
+    validate_unit_overrides(bytes.is_some())?;
+    if let Some(bytes) = &bytes {
+        TemplateRuntime::from_bytes(bytes)
+            .map_err(|_| io::Error::other("invalid declaration; use SetRuntime or ClearRuntime"))?;
+    }
+    Ok(bytes.unwrap_or_default())
+}
+
+/// Do not follow symlinks or block opening FIFOs/devices. Only ENOENT is absence.
+fn read_regular(path: &Path, limit: usize) -> io::Result<Option<Vec<u8>>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "runtime configuration is not a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "runtime configuration exceeds size limit",
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+async fn systemctl(args: &[&str]) -> Result<Vec<u8>, RuntimeFailure> {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+    let mut child = Command::new("/usr/bin/systemctl")
+        .args(args)
+        .env("SYSTEMD_PAGER", "")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| RuntimeFailure::Backend)?;
+    let mut output = Vec::new();
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or(RuntimeFailure::Backend)?
+        .take(16 * 1024 + 1);
+    let operation = async {
+        stdout
+            .read_to_end(&mut output)
+            .await
+            .map_err(|_| RuntimeFailure::Backend)?;
+        if output.len() > 16 * 1024 {
+            return Err(RuntimeFailure::Backend);
+        }
+        let status = child.wait().await.map_err(|_| RuntimeFailure::Backend)?;
+        if !status.success() {
+            return Err(RuntimeFailure::Backend);
+        }
+        Ok(output)
+    };
+    tokio::time::timeout(Duration::from_secs(2), operation)
+        .await
+        .map_err(|_| RuntimeFailure::Backend)?
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_config(declaration: RuntimeApp) -> Result<InvocationConfig, RuntimeFailure> {
+    let account = GuestAccount::resolve(declaration.user().clone())
+        .map_err(|_| RuntimeFailure::Configuration)?;
+    let mut env: BTreeMap<EnvKey, EnvValue> = [
+        (
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned(),
+        ),
+        ("HOME", account.home().to_string_lossy().into_owned()),
+        ("USER", account.name().as_str().to_owned()),
+        ("LOGNAME", account.name().as_str().to_owned()),
+        ("SHELL", account.shell().to_string_lossy().into_owned()),
+    ]
+    .into_iter()
+    .map(|(key, value)| {
+        Ok((
+            EnvKey::parse(key).map_err(|_| RuntimeFailure::Configuration)?,
+            EnvValue::parse(value).map_err(|_| RuntimeFailure::Configuration)?,
+        ))
+    })
+    .collect::<Result<_, RuntimeFailure>>()?;
+    env.extend(declaration.env().as_map().clone());
+    for key in ["NOTIFY_SOCKET", "WATCHDOG_PID", "WATCHDOG_USEC"] {
+        env.remove(&EnvKey::parse(key).map_err(|_| RuntimeFailure::Configuration)?);
+    }
+    Ok(InvocationConfig {
+        declaration,
+        env: EnvMap::new(env).map_err(|_| RuntimeFailure::Configuration)?,
+    })
+}
+
+fn validate_unit_overrides(has_runtime: bool) -> io::Result<()> {
+    for directory in [
+        "/etc/systemd/system",
+        "/run/systemd/system",
+        "/usr/lib/systemd/system",
+        "/lib/systemd/system",
+    ] {
+        let path = Path::new(directory);
+        let overrides = path.join("space-runtime@.service.d");
+        match std::fs::read_dir(overrides) {
+            Ok(mut entries) => {
+                if entries.next().is_some() {
+                    return Err(io::Error::other("runtime unit overrides are unsupported"));
+                }
+            }
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+        if !has_runtime {
+            continue; // Legacy-only output remains valid during rolling ECW upgrades.
+        }
+        for name in ["e2b-template-start.service", "space-start-cmd.service"] {
+            if path.join(name).symlink_metadata().is_ok() {
+                return Err(io::Error::other("rebuild legacy startup from recipe"));
+            }
+        }
+        let entries = match std::fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("space-runtime@")
+                && name != "space-runtime@.service"
+                && name != "space-runtime@.service.d"
+            {
+                return Err(io::Error::other(
+                    "runtime instance overrides are unsupported",
+                ));
+            }
+            if entry.file_name().as_encoded_bytes().ends_with(b".wants")
+                || entry.file_name().as_encoded_bytes().ends_with(b".requires")
+            {
+                for name in ["e2b-template-start.service", "space-start-cmd.service"] {
+                    if entry.path().join(name).symlink_metadata().is_ok() {
+                        return Err(io::Error::other("rebuild legacy startup from recipe"));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;

@@ -224,8 +224,11 @@ impl BridgeGuestMeta for SpacedGuestService {
         request: Request<BridgeGuestWaitReadyRequest>,
     ) -> Result<Response<BridgeGuestWaitReadyResponse>, Status> {
         let timeout = validate_timeout(request.into_inner().timeout)?;
-        let ready = self.wait_until_ready(timeout.as_duration()).await;
-        let response = self.current_wait_ready_response();
+        let deadline = tokio::time::Instant::now() + timeout.as_duration();
+        let agent_ready = self.wait_until_ready(timeout.as_duration()).await;
+        let ready = agent_ready && self.wait_template_runtime_boot_ready(deadline).await?;
+        let mut response = self.current_wait_ready_response();
+        response.ready = ready;
         if ready {
             self.emit_ready_event();
         }

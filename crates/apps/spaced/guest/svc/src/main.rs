@@ -23,6 +23,21 @@ struct Cli {
     /// binary is in every guest, where `sleep` may not be.
     #[arg(long = "hold-cgroup", hide = true)]
     hold_cgroup: bool,
+
+    #[arg(long, hide = true)]
+    runtime_runner: Option<String>,
+
+    #[arg(long, hide = true)]
+    runtime_generate: Option<std::path::PathBuf>,
+
+    #[arg(long, hide = true)]
+    runtime_generator_script: bool,
+
+    #[arg(long, hide = true)]
+    runtime_inspect: bool,
+
+    #[arg(long, hide = true)]
+    runtime_unit: bool,
 }
 
 impl From<Cli> for SpacedGuestRunConfig {
@@ -35,6 +50,34 @@ impl From<Cli> for SpacedGuestRunConfig {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if cli.runtime_generator_script {
+        use std::io::Write;
+        std::io::stdout()
+            .write_all(pplx_space_spaced_guest_server::template_runtime::GENERATOR_SCRIPT)?;
+        return Ok(());
+    }
+    if let Some(directory) = cli.runtime_generate {
+        return Ok(
+            pplx_space_spaced_guest_server::template_runtime::generate_runtime_units(&directory)?,
+        );
+    }
+    if cli.runtime_unit {
+        use std::io::Write;
+        std::io::stdout()
+            .write_all(pplx_space_spaced_guest_server::template_runtime::SYSTEMD_UNIT)?;
+        return Ok(());
+    }
+    if cli.runtime_inspect {
+        use std::io::Write;
+        let bytes = pplx_space_spaced_guest_server::template_runtime::inspect_template_runtime()?;
+        std::io::stdout().write_all(&bytes)?;
+        return Ok(());
+    }
+    if let Some(name) = cli.runtime_runner {
+        return Ok(
+            pplx_space_spaced_guest_server::template_runtime::run_runtime_launcher(name.parse()?)?,
+        );
+    }
     if cli.hold_cgroup {
         // No runtime, telemetry or cgroup setup: SIGTERM from the unit's stop
         // ends the process with the default disposition.

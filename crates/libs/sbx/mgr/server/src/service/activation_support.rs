@@ -1407,12 +1407,8 @@ pub(super) async fn complete_restore_and_mark_final(
     );
 
     if final_state == SandboxState::Started
-        && let Err(status) = wait_ready_via_spaced_host(
-            sandbox_id,
-            Duration::from_secs(u64::from(DEFAULT_BLOCKING_READY_TIMEOUT_SECS)),
-            "restore",
-        )
-        .await
+        && let Err(status) =
+            wait_ready_via_spaced_host(sandbox_id, RESTORE_GUEST_READY_TIMEOUT, "restore").await
     {
         return Err(activation_failure_status_if_current(
             &db,

@@ -5322,6 +5322,7 @@ dependencies = [
  "sqlx",
  "tempfile",
  "thiserror 2.0.20",
+ "toml",
  "tracing",
  "uuid",
 ]
@@ -6886,6 +6887,7 @@ dependencies = [
  "prost",
  "prost-types",
  "rustix",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",

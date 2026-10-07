@@ -208,7 +208,12 @@ const TEMPLATE_DIR: &str = pplx_space_common_core::host::linux::paths::TEMPLATE_
 const NET_GATEWAY_SIDECAR_PID_NAME: &str = "space-netgtw-svc";
 
 const MAX_WRITE_BATCH_ENTRIES: usize = pplx_space_common_core::spaced::MAX_WRITE_BATCH_ENTRIES;
-const DEFAULT_BLOCKING_READY_TIMEOUT_SECS: u32 = 30;
+// Covers the 60-second template startup cap plus guest boot. Explicit caller
+// deadlines still win; warm resume only checks the per-boot readiness receipt.
+const DEFAULT_BLOCKING_READY_TIMEOUT_SECS: u32 = 90;
+// Restores resume an already-started application. Keep guest readiness separate
+// from cold startup so it leaves room for the subsequent network gate.
+const RESTORE_GUEST_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_RESUME_READY_TIMEOUT_SECS: u32 = 5;
 const GRPC_TIMEOUT_METADATA_KEY: &str = "grpc-timeout";
 const SPACE_TMPLMGR_ACCOUNT: &str = user_names::SPACE_TMPLMGR;

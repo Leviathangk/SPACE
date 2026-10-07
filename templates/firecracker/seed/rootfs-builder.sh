@@ -486,6 +486,12 @@ systemctl set-default space.target 2>/dev/null || true
 # spaced guest daemon — runs as root, listens on /run/spaced.sock for
 # CLI and agent processes (user UID 2000), and vsock for host communication.
 if [ -f /usr/local/bin/spaced-svc ]; then
+  # Keep the platform unit paired with the installed guest binary.
+  /usr/local/bin/spaced-svc --runtime-unit > /etc/systemd/system/space-runtime@.service
+  mkdir -p /etc/systemd/system-generators
+  /usr/local/bin/spaced-svc --runtime-generator-script > /etc/systemd/system-generators/space-runtime
+  chmod 0755 /etc/systemd/system-generators/space-runtime
+
   # The cgroup for commands spaced starts through the API, inside space.slice
   # with the rest of user work. spaced creates its workloads/ leaf and places
   # each command there before exec. Workloads end with spaced, as they would
