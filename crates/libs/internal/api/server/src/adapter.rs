@@ -1105,6 +1105,7 @@ impl ClusterApi for ClusterApiService {
         let response = tokio::time::timeout(
             budget,
             data_plane_sessions::resolve_session_route(
+                budget,
                 self.ingress_activation.as_deref(),
                 &self.pool,
                 self.route_ed25519_authority.as_deref(),
@@ -1159,6 +1160,7 @@ impl ClusterApi for ClusterApiService {
         let response = tokio::time::timeout(
             budget,
             data_plane_sessions::unstable_resolve_sandbox_service_route(
+                budget,
                 self.ingress_activation.as_deref(),
                 &self.pool,
                 self.route_ed25519_authority.as_deref(),

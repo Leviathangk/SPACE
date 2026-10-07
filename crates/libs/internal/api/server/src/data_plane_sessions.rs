@@ -83,6 +83,7 @@ struct SessionRouteRow {
     token_hash: Option<String>,
     token_expires_at: Option<OffsetDateTime>,
     sandbox_active_node_id: Option<NodeId>,
+    sandbox_lifecycle: String,
     node_address: Option<String>,
     node_managed_by: Option<String>,
     k8s_node_name: Option<String>,
@@ -161,7 +162,8 @@ struct ReconnectRow {
     last_reconnect_reason: String,
 }
 
-pub(super) async fn resolve_session_route(
+async fn resolve_session_route_attempt(
+    budget: Duration,
     activation: Option<&dyn crate::ingress_activation::IngressActivation>,
     pool: &sqlx::PgPool,
     route_ed25519_authority: Option<&SpaceApiRouteEd25519Authority>,
@@ -183,6 +185,7 @@ pub(super) async fn resolve_session_route(
         row.kind.parse::<SessionKind>(),
         Ok(SessionKind::Port | SessionKind::Protocol)
     ) {
+        validate_ingress_session(&row)?;
         Some(
             pplx_space_common_svc::ingress_admission::IngressPreparationPermit::acquire(Some(
                 row.sandbox_id,
@@ -197,12 +200,7 @@ pub(super) async fn resolve_session_route(
     ) && let Some(activation) = activation
     {
         validate_ingress_session(&row)?;
-        activation
-            .prepare(
-                row.sandbox_id,
-                pplx_space_common_svc::ingress_admission::preparation_timeout(),
-            )
-            .await?;
+        activation.prepare(row.sandbox_id, budget).await?;
         row = fetch_route_row(pool, &session_id, protocol_session_id.as_deref()).await?;
         validate_ingress_session(&row)?;
         validate_attach_authorization(
@@ -211,6 +209,12 @@ pub(super) async fn resolve_session_route(
             token_sha256.as_deref(),
             required_scope.as_deref(),
         )?;
+    }
+    if matches!(
+        row.kind.parse::<SessionKind>(),
+        Ok(SessionKind::Port | SessionKind::Protocol)
+    ) {
+        require_started_ingress(&row.sandbox_lifecycle)?;
     }
     let current_node_id = row.sandbox_active_node_id.ok_or_else(|| {
         Status::failed_precondition("data-plane session sandbox is not assigned to a node")
@@ -444,7 +448,8 @@ pub(super) async fn record_session_reconnect(
     })
 }
 
-pub(super) async fn unstable_resolve_sandbox_service_route(
+async fn unstable_resolve_sandbox_service_route_attempt(
+    budget: Duration,
     activation: Option<&dyn crate::ingress_activation::IngressActivation>,
     pool: &sqlx::PgPool,
     route_ed25519_authority: Option<&SpaceApiRouteEd25519Authority>,
@@ -479,12 +484,7 @@ pub(super) async fn unstable_resolve_sandbox_service_route(
     if transport == SandboxServiceRouteTransport::ServicePortIngress
         && let Some(activation) = activation
     {
-        activation
-            .prepare(
-                sandbox_id,
-                pplx_space_common_svc::ingress_admission::preparation_timeout(),
-            )
-            .await?;
+        activation.prepare(sandbox_id, budget).await?;
         row = fetch_sandbox_service_route_row(pool, sandbox_id).await?;
         validate_unstable_sandbox_service_route_authorization(
             pool,
@@ -496,6 +496,9 @@ pub(super) async fn unstable_resolve_sandbox_service_route(
         .await?;
     }
 
+    if transport == SandboxServiceRouteTransport::ServicePortIngress {
+        require_started_ingress(&row.lifecycle)?;
+    }
     let current_node_id = row.active_node_id.ok_or_else(|| {
         sandbox_service_route_not_ready_status(
             Code::FailedPrecondition,
@@ -800,6 +803,7 @@ async fn fetch_route_row(
                 d.scopes,
                 d.token_hash,
                 d.token_expires_at,
+                s.lifecycle AS sandbox_lifecycle,
                 COALESCE(direct_route.current_node_id, s.active_node_id)
                     AS sandbox_active_node_id,
                 HOST(n.address) AS node_address,
@@ -891,6 +895,7 @@ async fn update_route_row(
                    d.scopes,
                    d.token_hash,
                    d.token_expires_at,
+                   s.lifecycle AS sandbox_lifecycle,
                    COALESCE(direct_route.current_node_id, s.active_node_id)
                        AS sandbox_active_node_id,
                    HOST(n.address) AS node_address,
@@ -1801,3 +1806,95 @@ fn optional(value: Option<&str>) -> Option<String> {
 
 #[cfg(test)]
 mod tests;
+
+/// Try the current worker route before asking the lifecycle API to activate.
+/// Both attempts authorize access; neither forwards application bytes.
+pub(super) async fn resolve_session_route(
+    budget: Duration,
+    activation: Option<&dyn crate::ingress_activation::IngressActivation>,
+    pool: &sqlx::PgPool,
+    route_ed25519_authority: Option<&SpaceApiRouteEd25519Authority>,
+    refresh_authority: Option<DataPlaneSessionRefreshAuthority>,
+    request: ResolveDataPlaneSessionRouteRequest,
+) -> Result<ResolveDataPlaneSessionRouteResponse, Status> {
+    let deadline = tokio::time::Instant::now() + budget;
+    match resolve_session_route_attempt(
+        budget,
+        None,
+        pool,
+        route_ed25519_authority,
+        refresh_authority,
+        request.clone(),
+    )
+    .await
+    {
+        Err(error) if activation.is_some() && activation_may_repair(&error) => {
+            resolve_session_route_attempt(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+                activation,
+                pool,
+                route_ed25519_authority,
+                refresh_authority,
+                request,
+            )
+            .await
+        }
+        result => result,
+    }
+}
+
+/// Try the current worker route before asking the lifecycle API to activate.
+/// Both attempts authorize access; neither forwards application bytes.
+pub(super) async fn unstable_resolve_sandbox_service_route(
+    budget: Duration,
+    activation: Option<&dyn crate::ingress_activation::IngressActivation>,
+    pool: &sqlx::PgPool,
+    route_ed25519_authority: Option<&SpaceApiRouteEd25519Authority>,
+    ecw_credential_keyring: &EcwCredentialKeyring,
+    request: UnstableResolveSandboxServiceRouteRequest,
+) -> Result<UnstableResolveSandboxServiceRouteResponse, Status> {
+    let deadline = tokio::time::Instant::now() + budget;
+    match unstable_resolve_sandbox_service_route_attempt(
+        budget,
+        None,
+        pool,
+        route_ed25519_authority,
+        ecw_credential_keyring,
+        request.clone(),
+    )
+    .await
+    {
+        Err(error) if activation.is_some() && activation_may_repair(&error) => {
+            unstable_resolve_sandbox_service_route_attempt(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+                activation,
+                pool,
+                route_ed25519_authority,
+                ecw_credential_keyring,
+                request,
+            )
+            .await
+        }
+        result => result,
+    }
+}
+
+fn activation_may_repair(error: &Status) -> bool {
+    matches!(
+        error.code(),
+        Code::Unavailable | Code::FailedPrecondition | Code::NotFound | Code::Aborted
+    )
+}
+
+fn require_started_ingress(lifecycle: &str) -> Result<(), Status> {
+    match lifecycle.parse::<SandboxLifecycle>() {
+        Ok(SandboxLifecycle::Started) => Ok(()),
+        Ok(_) => Err(sandbox_service_route_not_ready_status(
+            Code::FailedPrecondition,
+            "sandbox execution is not started",
+        )),
+        Err(error) => Err(Status::internal(format!(
+            "invalid sandbox lifecycle: {error}"
+        ))),
+    }
+}

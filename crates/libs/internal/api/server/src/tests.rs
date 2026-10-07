@@ -2145,6 +2145,17 @@ async fn data_plane_route_resolve_hydrates_backend_and_bumps_generation() -> Tes
     Ok(())
 }
 
+struct UnavailableIngressActivation(std::sync::atomic::AtomicUsize);
+#[tonic::async_trait]
+impl crate::ingress_activation::IngressActivation for UnavailableIngressActivation {
+    async fn prepare(&self, _: SandboxId, _: std::time::Duration) -> Result<(), Status> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(Status::unavailable(
+            "synthetic activation owner unavailable",
+        ))
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn data_plane_route_resolve_mints_service_port_route_token_for_port_session() -> TestResult {
     if !pplx_space_test_env::enter_test_process(&[
@@ -2160,9 +2171,13 @@ async fn data_plane_route_resolve_mints_service_port_route_token_for_port_sessio
         return Ok(());
     }
 
-    let Some(fixture) = cluster_fixture().await? else {
+    let Some(mut fixture) = cluster_fixture().await? else {
         return Ok(());
     };
+    let activation = std::sync::Arc::new(UnavailableIngressActivation(
+        std::sync::atomic::AtomicUsize::new(0),
+    ));
+    fixture.service.ingress_activation = Some(activation.clone());
     let node_id = NodeId::new();
     let sandbox_id = SandboxId::new();
     let session_id = format!("port_{}", Uuid::now_v7());
@@ -2193,7 +2208,7 @@ async fn data_plane_route_resolve_mints_service_port_route_token_for_port_sessio
     let response = fixture
         .service
         .resolve_data_plane_session_route(data_plane_request(ResolveDataPlaneSessionRouteRequest {
-            session_id,
+            session_id: session_id.clone(),
             protocol_session_id: None,
             token_sha256: None,
             required_scope: None,
@@ -2216,6 +2231,31 @@ async fn data_plane_route_resolve_mints_service_port_route_token_for_port_sessio
         claims.route_identity.execution_generation(),
         ExecutionGeneration::new(13).unwrap()
     );
+
+    assert_eq!(
+        activation.0.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "healthy ingress must serve while the activation owner is unavailable"
+    );
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle = 'suspended', active_node_id = NULL WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(&fixture.service.pool)
+    .await?;
+    let error = fixture
+        .service
+        .resolve_data_plane_session_route(data_plane_request(ResolveDataPlaneSessionRouteRequest {
+            session_id,
+            protocol_session_id: None,
+            token_sha256: None,
+            required_scope: None,
+            requested_transport: Some(SandboxServiceRouteTransport::ServicePortIngress as i32),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.message(), "synthetic activation owner unavailable");
+    assert_eq!(activation.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     Ok(())
 }
 
@@ -2740,9 +2780,13 @@ async fn ecw_route_resolve_allows_service_with_traffic_token() -> TestResult {
         return Ok(());
     }
 
-    let Some(fixture) = cluster_fixture().await? else {
+    let Some(mut fixture) = cluster_fixture().await? else {
         return Ok(());
     };
+    let activation = std::sync::Arc::new(UnavailableIngressActivation(
+        std::sync::atomic::AtomicUsize::new(0),
+    ));
+    fixture.service.ingress_activation = Some(activation.clone());
     let node_id = NodeId::new();
     let sandbox_id = SandboxId::new();
 
@@ -2861,6 +2905,48 @@ async fn ecw_route_resolve_allows_service_with_traffic_token() -> TestResult {
         .await
         .expect_err("wrong traffic token should fail");
     assert_eq!(invalid.code(), Code::PermissionDenied);
+
+    assert_eq!(
+        activation.0.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "healthy ingress must serve while the activation owner is unavailable"
+    );
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle = 'suspended', active_node_id = NULL WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(&fixture.service.pool)
+    .await?;
+    for (proof, expected, calls) in [
+        (
+            sha256_hex("invalid-traffic-token"),
+            Code::Unauthenticated,
+            0,
+        ),
+        (sha256_hex(&token), Code::Unavailable, 1),
+    ] {
+        let error = fixture
+            .service
+            .unstable_resolve_sandbox_service_route(Request::new(
+                UnstableResolveSandboxServiceRouteRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                    port: 8080,
+                    route_kind: SandboxServiceRouteKind::ServicePort as i32,
+                    transport: SandboxServiceRouteTransport::ServicePortIngress as i32,
+                    credential_proofs: vec![route_credential_proof(
+                        SandboxServiceRouteCredentialKind::SandboxTrafficToken,
+                        proof,
+                    )],
+                },
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), expected);
+        assert_eq!(
+            activation.0.load(std::sync::atomic::Ordering::SeqCst),
+            calls
+        );
+    }
     Ok(())
 }
 
