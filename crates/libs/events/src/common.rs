@@ -112,6 +112,7 @@ impl SandboxEvent {
             age_secs = detail_str(&details.age_secs),
             action_count = detail_str(&details.action_count),
             error_count = detail_str(&details.error_count),
+            claim_generation = detail_str(&details.claim_generation),
             force = detail_bool(details.force),
             keep_filesystem = detail_bool(details.keep_filesystem),
             return_after_slot_release = detail_bool(details.return_after_slot_release),

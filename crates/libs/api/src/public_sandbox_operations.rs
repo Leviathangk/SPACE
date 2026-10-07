@@ -214,11 +214,9 @@ impl PublicOperationExecutionResult {
     /// `claim_generation`th claim. The operation is the only owner of the row
     /// it kept in `deleting`, so this spends no retry budget and is not ended
     /// by the native operation deadline; [`teardown_redrive_delay`] bounds how
-    /// often it runs instead.
-    pub(crate) fn teardown_redrive(
-        progress_message: impl Into<String>,
-        claim_generation: i64,
-    ) -> Self {
+    /// often it runs instead. Built only through [`delete_redrive_result`],
+    /// which reports the re-drive.
+    fn teardown_redrive(progress_message: impl Into<String>, claim_generation: i64) -> Self {
         Self {
             requeue_reason: PublicOperationRequeueReason::TeardownRedrive,
             ..Self::retry(progress_message, teardown_redrive_delay(claim_generation))
@@ -239,6 +237,87 @@ pub(crate) fn teardown_redrive_delay(claim_generation: i64) -> Duration {
     TEARDOWN_REDRIVE_INITIAL_DELAY
         .saturating_mul(1 << doublings)
         .min(TEARDOWN_REDRIVE_MAX_DELAY)
+}
+
+/// Why a delete operation is re-driving its sandbox's teardown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeleteRedriveCause {
+    /// The delete reported an unconfirmed teardown
+    /// (`ControllerRetryAfterCause::TeardownRedrive`).
+    TeardownUnconfirmed,
+    /// Some other error left the row claimed `deleting`. The catch-all, and
+    /// the one a permanent fault would keep re-driving.
+    RowLeftDeleting,
+}
+
+impl DeleteRedriveCause {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::TeardownUnconfirmed => "teardown_unconfirmed",
+            Self::RowLeftDeleting => "row_left_deleting",
+        }
+    }
+}
+
+/// Re-drives between repeated `delete_redriving` events, after the one on
+/// the first re-drive. At the backoff cap that is about one an hour for a
+/// delete that stays stuck.
+const DELETE_REDRIVE_EVENT_EVERY: i64 = 12;
+
+/// Re-queue a delete that keeps its sandbox row claimed `deleting`, and say
+/// so. A re-drive has no budget and no deadline, so nothing else would ever
+/// surface one that cannot succeed: each re-drive is counted
+/// (`operations.delete_redrive`), and a `delete_redriving` event carrying the
+/// error and the claim generation fires on the first re-drive and then every
+/// [`DELETE_REDRIVE_EVENT_EVERY`] re-drives.
+pub(crate) fn delete_redrive_result(
+    operation: &ClaimedPublicOperation,
+    sandbox_id: SandboxId,
+    error: &str,
+    cause: DeleteRedriveCause,
+) -> PublicOperationExecutionResult {
+    // Every claim counts an attempt, and a re-drive gives its attempt back,
+    // so the claims this operation spent re-driving before this one are the
+    // claims it made beyond the attempts it kept.
+    let prior_redrives = operation
+        .claim_generation
+        .saturating_sub(i64::from(operation.attempts))
+        .max(0);
+    pplx_space_metrics::operations::delete_redrive(
+        operation.api_product.as_str(),
+        cause.as_str(),
+        redriving_for_at_least(prior_redrives),
+    );
+    if prior_redrives % DELETE_REDRIVE_EVENT_EVERY == 0 {
+        pplx_space_events::SandboxEvent::new(
+            sandbox_id,
+            pplx_space_events::SandboxEventType::DeleteRedriving,
+            pplx_space_events::SandboxEventSource::ClusterController,
+        )
+        .emit_with(
+            pplx_space_events::SandboxEventDetails::default()
+                .action("delete")
+                .operation(operation.id.to_string())
+                .reason(cause.as_str())
+                .error(error)
+                .claim_generation(operation.claim_generation.to_string())
+                .trigger(pplx_space_events::SandboxEventTrigger::System),
+        );
+    }
+    PublicOperationExecutionResult::teardown_redrive(error, operation.claim_generation)
+}
+
+/// A lower bound on how long a delete with `prior_redrives` re-drives behind
+/// it has been re-driving. Each re-drive waited at least its scheduled delay,
+/// and the delay never shrinks with the claim count, so the shortest history
+/// is the one where every re-drive came first. From the seventh claim on the
+/// delay is at its cap.
+fn redriving_for_at_least(prior_redrives: i64) -> Duration {
+    let ramp: Duration = (1..=prior_redrives.min(7))
+        .map(teardown_redrive_delay)
+        .sum();
+    let capped = u32::try_from(prior_redrives.saturating_sub(7).max(0)).unwrap_or(u32::MAX);
+    ramp.saturating_add(TEARDOWN_REDRIVE_MAX_DELAY.saturating_mul(capped))
 }
 
 #[derive(Clone)]
@@ -565,14 +644,23 @@ impl SandboxLifecycleOperationExecutor {
                 // `deleting` has no other owner while the orphaned-sandbox
                 // reconciler runs dry, so this operation keeps re-driving it.
                 // The usual way here is an unconfirmed teardown, which says so
-                // itself; a failed compensating write after a deferral is the
-                // rare other one.
-                if error.retry_after_cause() != Some(ControllerRetryAfterCause::TeardownRedrive)
-                    && sandbox_left_deleting(&self.pool, sandbox_uuid.into()).await
+                // itself; anything else that leaves the row claimed is the
+                // catch-all.
+                let cause = if error.retry_after_cause()
+                    == Some(ControllerRetryAfterCause::TeardownRedrive)
                 {
-                    return Ok(PublicOperationExecutionResult::teardown_redrive(
-                        error.to_string(),
-                        operation.claim_generation,
+                    Some(DeleteRedriveCause::TeardownUnconfirmed)
+                } else if sandbox_left_deleting(&self.pool, sandbox_uuid.into()).await {
+                    Some(DeleteRedriveCause::RowLeftDeleting)
+                } else {
+                    None
+                };
+                if let Some(cause) = cause {
+                    return Ok(delete_redrive_result(
+                        operation,
+                        sandbox_uuid.into(),
+                        &error.to_string(),
+                        cause,
                     ));
                 }
                 return Err(error.into());
@@ -1095,12 +1183,6 @@ fn controller_error_result(
     operation: &ClaimedPublicOperation,
     error: ControllerError,
 ) -> PublicOperationExecutionResult {
-    if error.retry_after_cause() == Some(ControllerRetryAfterCause::TeardownRedrive) {
-        return PublicOperationExecutionResult::teardown_redrive(
-            error.to_string(),
-            operation.claim_generation,
-        );
-    }
     if let Some(retry_after) = error.retry_after_header()
         && error.retry_after_cause()
             == Some(crate::controllers::ControllerRetryAfterCause::PoolSlotRelease)

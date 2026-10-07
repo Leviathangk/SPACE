@@ -52,6 +52,11 @@ pub enum SandboxEventType {
     DeleteCompleted,
     DeleteFailed,
     DeleteSuperseded,
+    /// A delete could not confirm its teardown, or otherwise failed while
+    /// leaving its row claimed `deleting`, and its operation is re-driving it
+    /// with no retry budget or deadline. Emitted on the first re-drive and
+    /// then at most once every few claims, not once per retry.
+    DeleteRedriving,
     PauseRequested,
     PauseCompleted,
     PauseFailed,
@@ -265,6 +270,7 @@ pub const SANDBOX_EVENT_TYPES: &[SandboxEventType] = &[
     SandboxEventType::DeleteCompleted,
     SandboxEventType::DeleteFailed,
     SandboxEventType::DeleteSuperseded,
+    SandboxEventType::DeleteRedriving,
     SandboxEventType::PauseRequested,
     SandboxEventType::PauseCompleted,
     SandboxEventType::PauseFailed,
@@ -395,6 +401,7 @@ impl SandboxEventType {
             Self::DeleteCompleted => "delete_completed",
             Self::DeleteFailed => "delete_failed",
             Self::DeleteSuperseded => "delete_superseded",
+            Self::DeleteRedriving => "delete_redriving",
             Self::PauseRequested => "pause_requested",
             Self::PauseCompleted => "pause_completed",
             Self::PauseFailed => "pause_failed",
@@ -519,7 +526,8 @@ impl SandboxEventType {
             // the row stays eligible for a later tick.
             Self::ArtifactBackupQueued
             | Self::SnapshotArtifactUploadQueued
-            | Self::SweepDeferred => SandboxEventPhase::Queued,
+            | Self::SweepDeferred
+            | Self::DeleteRedriving => SandboxEventPhase::Queued,
             Self::CreateCompleted
             | Self::ForkArtifactReady
             | Self::ForkTargetActivated

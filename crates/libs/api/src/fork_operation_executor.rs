@@ -249,7 +249,7 @@ impl ForkSandboxOperationExecutor {
                     ),
                     ForkExecutionError::Retry(_)
                     | ForkExecutionError::Wait(_)
-                    | ForkExecutionError::TeardownRedrive(_) => unreachable!(),
+                    | ForkExecutionError::TeardownRedrive { .. } => unreachable!(),
                 };
                 if let Err(error) = self.cleanup_terminal_targets(operation).await {
                     tracing::warn!(
@@ -257,10 +257,12 @@ impl ForkSandboxOperationExecutor {
                         error = ?error,
                         "terminal fork target cleanup will be retried"
                     );
-                    if let ForkExecutionError::TeardownRedrive(message) = error {
-                        return PublicOperationExecutionResult::teardown_redrive(
-                            message,
-                            operation.claim_generation,
+                    if let ForkExecutionError::TeardownRedrive { target_id, message } = error {
+                        return crate::public_sandbox_operations::delete_redrive_result(
+                            operation,
+                            target_id,
+                            &message,
+                            crate::public_sandbox_operations::DeleteRedriveCause::TeardownUnconfirmed,
                         );
                     }
                     return retry("terminal fork target cleanup is pending");
@@ -309,10 +311,12 @@ impl ForkSandboxOperationExecutor {
             }
             Err(ForkExecutionError::Retry(message)) => retry(message),
             Err(ForkExecutionError::Wait(message)) => wait(message),
-            Err(ForkExecutionError::TeardownRedrive(message)) => {
-                PublicOperationExecutionResult::teardown_redrive(
-                    message,
-                    operation.claim_generation,
+            Err(ForkExecutionError::TeardownRedrive { target_id, message }) => {
+                crate::public_sandbox_operations::delete_redrive_result(
+                    operation,
+                    target_id,
+                    &message,
+                    crate::public_sandbox_operations::DeleteRedriveCause::TeardownUnconfirmed,
                 )
             }
         }
@@ -345,7 +349,7 @@ impl ForkSandboxOperationExecutor {
             self.controller
                 .delete_control_plane(self.store.pool(), target_id, Some(&target))
                 .await
-                .map_err(ForkExecutionError::target_delete_error)?;
+                .map_err(|error| ForkExecutionError::target_delete_error(target_id, error))?;
         }
         Ok(())
     }
@@ -1246,7 +1250,10 @@ impl ForkSandboxOperationExecutor {
                 .delete(self.store.pool(), target_id, Some(sandbox))
                 .await
                 .map_err(|failure| {
-                    ForkExecutionError::target_delete_error(ControllerError::from(failure))
+                    ForkExecutionError::target_delete_error(
+                        target_id,
+                        ControllerError::from(failure),
+                    )
                 })?;
         }
         crate::reconcile_queue::finalize_sandbox_db_delete_user_initiated(
@@ -1801,8 +1808,12 @@ enum ForkExecutionError {
     Wait(String),
     /// A target delete kept its row in `deleting` because the teardown could
     /// not be confirmed. Re-driven like the sandbox delete operation: without
-    /// spending the retry budget, at a capped backoff.
-    TeardownRedrive(String),
+    /// spending the retry budget, at a capped backoff, and reported the same
+    /// way.
+    TeardownRedrive {
+        target_id: SandboxId,
+        message: String,
+    },
 }
 
 impl From<crate::fork_operation_store::ForkOperationStoreError> for ForkExecutionError {
@@ -1858,11 +1869,14 @@ impl ForkExecutionError {
         Self::Retry(error.to_string())
     }
 
-    fn target_delete_error(error: ControllerError) -> Self {
+    fn target_delete_error(target_id: SandboxId, error: ControllerError) -> Self {
         if error.retry_after_cause()
             == Some(crate::controllers::ControllerRetryAfterCause::TeardownRedrive)
         {
-            Self::TeardownRedrive(error.to_string())
+            Self::TeardownRedrive {
+                target_id,
+                message: error.to_string(),
+            }
         } else {
             Self::Retry(error.to_string())
         }

@@ -71,6 +71,14 @@ fn verify_before_destroy_sweep_outcomes_have_domain_names_and_phases() {
         SandboxEventType::SweepDeferred.phase(),
         SandboxEventPhase::Queued
     );
+    assert_eq!(
+        SandboxEventType::DeleteRedriving.as_str(),
+        "delete_redriving"
+    );
+    assert_eq!(
+        SandboxEventType::DeleteRedriving.phase(),
+        SandboxEventPhase::Queued
+    );
 }
 
 #[test]
