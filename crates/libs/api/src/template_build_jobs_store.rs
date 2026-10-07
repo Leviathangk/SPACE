@@ -6,7 +6,7 @@ use pplx_space_common_core::{
         BuildRunId, BuildRunIdParseError, NodeId, OrgId, SystemPublicationGrantId, TemplateName,
     },
 };
-use sqlx::PgPool;
+use sqlx::{PgExecutor, PgPool};
 
 #[derive(Clone)]
 pub struct TemplateBuildJobsStore {
@@ -274,40 +274,6 @@ impl TemplateBuildJobsStore {
         .map_err(Into::into)
     }
 
-    pub(crate) async fn record_build_spec(
-        &self,
-        org_id: OrgId,
-        template_name: &TemplateName,
-        build_id: &str,
-        spec: BuildSpec,
-    ) -> Result<(), TemplateBuildJobsStoreError> {
-        if !template_build_owner_matches(&self.pool, template_name, org_id).await? {
-            return Err(TemplateBuildJobsStoreError::OwnershipConflict);
-        }
-        let result = sqlx::query(sql!(
-            "INSERT INTO template_build_jobs (template_id, build_id, cpu_count, memory_mb, tags, org_id)
-             VALUES ($1, $2, $3, $4, $5, $6)
-             ON CONFLICT (template_id, build_id) DO UPDATE
-             SET cpu_count = EXCLUDED.cpu_count,
-                 memory_mb = EXCLUDED.memory_mb,
-                 tags = EXCLUDED.tags
-             WHERE template_build_jobs.org_id IS NULL OR template_build_jobs.org_id = EXCLUDED.org_id"
-        ))
-        .bind(template_name.as_str())
-        .bind(build_id)
-        .bind(spec.cpu_count.map(|value| value as i32))
-        .bind(spec.memory_mb.map(|value| value as i32))
-        .bind(spec.tags)
-        .bind(org_id.as_uuid())
-        .execute(&self.pool)
-        .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(TemplateBuildJobsStoreError::OwnershipConflict);
-        }
-        Ok(())
-    }
-
     pub(crate) async fn lookup_build_spec(
         &self,
         org_id: OrgId,
@@ -342,7 +308,7 @@ impl TemplateBuildJobsStore {
 }
 
 pub(crate) async fn template_build_owner_matches(
-    pool: &PgPool,
+    executor: impl PgExecutor<'_>,
     template_name: &TemplateName,
     org_id: OrgId,
 ) -> Result<bool, sqlx::Error> {
@@ -351,8 +317,39 @@ pub(crate) async fn template_build_owner_matches(
     ))
     .bind(template_name.as_str())
     .bind(org_id.as_uuid())
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
+}
+
+/// Record `org_id`'s build specification for `(template_name, build_id)`.
+/// Returns false when the row belongs to another organization. Callers check
+/// template ownership and admit the specification first; see
+/// `TemplateBuildAdmissionStore::admit_build_spec`.
+pub(crate) async fn insert_build_spec(
+    executor: impl PgExecutor<'_>,
+    org_id: OrgId,
+    template_name: &TemplateName,
+    build_id: &str,
+    spec: BuildSpec,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(sql!(
+        "INSERT INTO template_build_jobs (template_id, build_id, cpu_count, memory_mb, tags, org_id)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (template_id, build_id) DO UPDATE
+         SET cpu_count = EXCLUDED.cpu_count,
+             memory_mb = EXCLUDED.memory_mb,
+             tags = EXCLUDED.tags
+         WHERE template_build_jobs.org_id IS NULL OR template_build_jobs.org_id = EXCLUDED.org_id"
+    ))
+    .bind(template_name.as_str())
+    .bind(build_id)
+    .bind(spec.cpu_count.map(|value| value as i32))
+    .bind(spec.memory_mb.map(|value| value as i32))
+    .bind(spec.tags)
+    .bind(org_id.as_uuid())
+    .execute(executor)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 fn optional_i32_to_u32(value: Option<i32>) -> Result<Option<u32>, TemplateBuildJobsStoreError> {

@@ -38,6 +38,7 @@ pub mod reconcile_trigger;
 pub(crate) mod redis_otel;
 pub mod routes;
 mod run;
+pub mod template_build_admission_store;
 pub mod template_build_jobs_store;
 mod template_inventory_store;
 mod template_releases_store;

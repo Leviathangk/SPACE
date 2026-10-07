@@ -21,6 +21,18 @@ pub use crate::blob_storage::BlobStorageError;
 const BLOB_DIR: &str = "build-manager/blobs/sha256";
 const STALE_UPLOAD_TEMP_AGE: Duration = Duration::from_secs(6 * 60 * 60);
 const DEFAULT_LOCAL_BLOB_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+/// Age past which an upload rewrites an existing shared input object instead
+/// of reusing it.
+///
+/// Shared inputs have no reference count. A deployment's bucket may expire
+/// them by age since their last write, and the API honours an upload mapping
+/// for 7 days after recording it; a build accepted from that mapping
+/// materializes its inputs within the 6-hour tenant queue timeout. Rewriting
+/// any object older than one day when a new mapping is recorded keeps every
+/// object an accepted build can still read inside an age-based expiry longer
+/// than 1 + 7 days + 6 hours. A shorter expiry can delete inputs queued builds
+/// still need.
+pub const SHARED_INPUT_LEASE_RENEWAL_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 static NEXT_UPLOAD_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, thiserror::Error)]
@@ -213,7 +225,7 @@ impl BlobStore {
             .credentials(&stored.sha256, &key, StorageAccess::ReadWrite)
             .await?;
         let target = remote.target(&key);
-        if let Some(meta) = remote
+        let existing = remote
             .object_store
             .head(&credentials, target)
             .await
@@ -221,10 +233,17 @@ impl BlobStore {
                 operation: "check",
                 sha256: stored.sha256.clone(),
                 source,
-            })?
+            })?;
+        if let Some(meta) = &existing
             && meta.size == stored.size_bytes
         {
-            return Ok(stored);
+            if !shared_input_lease_expiring(meta.last_modified, jiff::Timestamp::now()) {
+                return Ok(stored);
+            }
+            pplx_space_metrics::template::build_gc(
+                pplx_space_metrics::template::TemplateBuildGcKind::InputLeaseRenewal,
+                1,
+            );
         }
 
         let uploaded = remote
@@ -497,6 +516,20 @@ fn blob_object_key(key_prefix: &str, sha256: &str) -> String {
     } else {
         format!("{key_prefix}/{key}")
     }
+}
+
+/// Whether an existing shared input written at `last_modified` must be
+/// rewritten to stay readable for a new reference. A store that does not
+/// report the write time gets a rewrite: reuse is only an optimization.
+fn shared_input_lease_expiring(
+    last_modified: Option<jiff::Timestamp>,
+    now: jiff::Timestamp,
+) -> bool {
+    let Some(last_modified) = last_modified else {
+        return true;
+    };
+    now.duration_since(last_modified)
+        >= jiff::SignedDuration::from_secs(SHARED_INPUT_LEASE_RENEWAL_AGE.as_secs() as i64)
 }
 
 fn verify_size(sha256: &str, expected: u64, actual: u64) -> Result<(), BlobError> {

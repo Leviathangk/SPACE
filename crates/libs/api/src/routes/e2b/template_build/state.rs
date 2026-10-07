@@ -17,6 +17,8 @@
 //!   the same alias would otherwise clobber each other's tags or
 //!   sizing).
 //!
+//! Each tenant write is admitted against per-organization and cluster-wide
+//! limits, and expires; `template_build_admission_store` owns both.
 use pplx_space_common_core::{
     sql,
     types::{OrgId, TemplateName},
@@ -25,30 +27,37 @@ use std::sync::Arc;
 
 use sqlx::PgPool;
 
+use crate::template_build_admission_store::{
+    InputReservation, TemplateBuildAdmissionError, TemplateBuildAdmissionStore, TemplateBuildLimits,
+};
 pub(super) use crate::template_build_jobs_store::{BuildJob, BuildSpec};
 use crate::template_build_jobs_store::{
     TemplateBuildJobsStore, TemplateBuildJobsStoreError, template_build_owner_matches,
 };
 
-#[derive(Debug, thiserror::Error)]
-pub(super) enum RecordBlobError {
-    #[error("template build blob storage failed: {0}")]
-    Storage(#[from] sqlx::Error),
-    #[error("template build upload conflicts with existing ownership or content")]
-    Conflict,
-}
+pub(super) use crate::template_build_admission_store::RecordInputError as RecordBlobError;
 
 pub struct TemplateBuildState {
     pool: PgPool,
     jobs: TemplateBuildJobsStore,
+    admission: TemplateBuildAdmissionStore,
 }
 
 impl TemplateBuildState {
     pub fn new(pool: PgPool) -> Arc<Self> {
+        Self::with_limits(pool, TemplateBuildLimits::default())
+    }
+
+    pub fn with_limits(pool: PgPool, limits: TemplateBuildLimits) -> Arc<Self> {
         Arc::new(Self {
             jobs: TemplateBuildJobsStore::new(pool.clone()),
+            admission: TemplateBuildAdmissionStore::new(pool.clone(), limits),
             pool,
         })
+    }
+
+    pub(super) fn limits(&self) -> &TemplateBuildLimits {
+        self.admission.limits()
     }
 
     pub(super) async fn lookup_build(
@@ -62,41 +71,63 @@ impl TemplateBuildState {
             .await
     }
 
+    pub(super) async fn reserve_upload(
+        &self,
+        org_id: OrgId,
+    ) -> Result<InputReservation, TemplateBuildAdmissionError> {
+        self.admission.reserve_input_upload(org_id).await
+    }
+
+    pub(super) async fn template_owner_matches(
+        &self,
+        template_name: &TemplateName,
+        org_id: OrgId,
+    ) -> Result<bool, sqlx::Error> {
+        template_build_owner_matches(&self.pool, template_name, org_id).await
+    }
+
+    pub(super) async fn settle_upload(
+        &self,
+        reservation: InputReservation,
+        size_bytes: u64,
+    ) -> Result<(), sqlx::Error> {
+        self.admission.settle_input(reservation, size_bytes).await
+    }
+
+    pub(super) async fn release_upload(&self, reservation: InputReservation) {
+        if let Err(error) = self.admission.release_input_reservation(reservation).await {
+            tracing::warn!(
+                %error,
+                "failed to release a template file upload reservation; it expires on its own"
+            );
+        }
+    }
+
     pub(super) async fn record_blob(
         &self,
+        reservation: InputReservation,
         org_id: OrgId,
         template_name: &TemplateName,
         files_hash: &str,
         blob_sha256: &str,
+        size_bytes: u64,
     ) -> Result<(), RecordBlobError> {
-        if !template_build_owner_matches(&self.pool, template_name, org_id).await? {
-            return Err(RecordBlobError::Conflict);
-        }
-        // The SDK's file hash excludes archive metadata, so same-owner reuploads can
-        // have different blob digests even when the file contents are unchanged.
-        // Mappings recorded before uploads carried an owner have a NULL org_id;
-        // the first owned upload claims them so later writers meet the owner check.
-        let result = sqlx::query(sql!(
-            "INSERT INTO template_build_blobs (template_id, files_hash, blob_sha256, org_id)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (template_id, files_hash) DO UPDATE
-             SET blob_sha256 = EXCLUDED.blob_sha256,
-                 org_id = EXCLUDED.org_id
-             WHERE template_build_blobs.org_id IS NULL
-                OR template_build_blobs.org_id = EXCLUDED.org_id"
-        ))
-        .bind(template_name.as_str())
-        .bind(files_hash)
-        .bind(blob_sha256)
-        .bind(org_id.as_uuid())
-        .execute(&self.pool)
-        .await?;
-        if result.rows_affected() == 0 {
-            return Err(RecordBlobError::Conflict);
-        }
-        Ok(())
+        self.admission
+            .record_input(
+                reservation,
+                org_id,
+                template_name,
+                files_hash,
+                blob_sha256,
+                size_bytes,
+            )
+            .await
     }
 
+    /// The blob an unexpired upload mapping names. A mapping recorded before
+    /// retention existed has no retention row and is honoured for the same
+    /// lifetime from its own creation; past it, the shared object may already
+    /// be gone.
     pub(super) async fn lookup_blob(
         &self,
         org_id: OrgId,
@@ -108,16 +139,24 @@ impl TemplateBuildState {
         }
         sqlx::query_scalar::<_, String>(sql!(
             r#"
-            SELECT blob_sha256
-            FROM template_build_blobs
-            WHERE template_id = $1
-              AND files_hash = $2
-              AND (org_id = $3 OR org_id IS NULL)
+            SELECT blobs.blob_sha256
+            FROM template_build_blobs blobs
+            LEFT JOIN template_build_input_retention retention
+              ON retention.template_id = blobs.template_id
+             AND retention.files_hash = blobs.files_hash
+            WHERE blobs.template_id = $1
+              AND blobs.files_hash = $2
+              AND (blobs.org_id = $3 OR blobs.org_id IS NULL)
+              AND COALESCE(
+                      retention.expires_at,
+                      blobs.created_at + make_interval(secs => $4)
+                  ) > NOW()
             "#
         ))
         .bind(template_name.as_str())
         .bind(files_hash)
         .bind(org_id.as_uuid())
+        .bind(self.limits().input_mapping_ttl.as_secs_f64())
         .fetch_optional(&self.pool)
         .await
     }
@@ -128,9 +167,9 @@ impl TemplateBuildState {
         template_name: &TemplateName,
         build_id: &str,
         spec: BuildSpec,
-    ) -> Result<(), TemplateBuildJobsStoreError> {
-        self.jobs
-            .record_build_spec(org_id, template_name, build_id, spec)
+    ) -> Result<(), TemplateBuildAdmissionError> {
+        self.admission
+            .admit_build_spec(org_id, template_name, build_id, spec)
             .await
     }
 
@@ -143,6 +182,55 @@ impl TemplateBuildState {
         self.jobs
             .lookup_build_spec(org_id, template_name, build_id)
             .await
+    }
+
+    pub(super) async fn admit_build(
+        &self,
+        org_id: OrgId,
+        template_name: &TemplateName,
+        build_id: &str,
+    ) -> Result<(), TemplateBuildAdmissionError> {
+        self.admission
+            .admit_build(org_id, template_name, build_id)
+            .await
+    }
+
+    pub(super) async fn release_build(
+        &self,
+        org_id: OrgId,
+        template_name: &TemplateName,
+        build_id: &str,
+    ) {
+        if let Err(error) = self
+            .admission
+            .release_build(org_id, template_name, build_id)
+            .await
+        {
+            tracing::warn!(
+                %error,
+                %template_name,
+                "failed to release an undispatched template build admission; it expires on its own"
+            );
+        }
+    }
+
+    pub(super) async fn finish_build(
+        &self,
+        org_id: OrgId,
+        template_name: &TemplateName,
+        build_id: &str,
+    ) {
+        if let Err(error) = self
+            .admission
+            .finish_build(org_id, template_name, build_id)
+            .await
+        {
+            tracing::warn!(
+                %error,
+                %template_name,
+                "failed to record a finished template build; its admission expires on its own"
+            );
+        }
     }
 }
 

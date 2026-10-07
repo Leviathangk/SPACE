@@ -172,7 +172,7 @@ pub async fn create_template_v3(
             },
         )
         .await
-        .map_err(|err| super::template_build_store_error("record template build spec", err))?;
+        .map_err(|err| super::template_build_admission_error("record template build spec", err))?;
 
     Ok((
         StatusCode::ACCEPTED,
@@ -261,7 +261,7 @@ fn normalize_template_alias(raw: &str) -> Result<TemplateName, E2bApiError> {
 // ---------------------------------------------------------------------------
 
 pub async fn get_file_upload(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(AuthOrg(org)): Extension<AuthOrg>,
     OriginalUri(original_uri): OriginalUri,
     headers: HeaderMap,
@@ -270,10 +270,24 @@ pub async fn get_file_upload(
     // Validate the templateID so the returned PUT URL doesn't carry
     // unsanitized path segments back to us; the PUT handler runs the same
     // validation, but rejecting here lets the SDK fail fast.
-    let template_id = TemplateName::parse(template_id)
-        .map_err(|err| E2bApiError::bad_request(format!("invalid templateID: {err}")))?
-        .as_str()
-        .to_string();
+    let template_name = TemplateName::parse(template_id)
+        .map_err(|err| E2bApiError::bad_request(format!("invalid templateID: {err}")))?;
+    // No upload capability for a template another organization owns: the
+    // upload could only be refused after the builder stored its bytes.
+    if !state
+        .template_build_state
+        .template_owner_matches(&template_name, org.id)
+        .await
+        .map_err(|error| {
+            super::template_build_sql_error("check template file upload owner", &error)
+        })?
+    {
+        return Err(E2bApiError::new(
+            StatusCode::CONFLICT,
+            "template belongs to another organization",
+        ));
+    }
+    let template_id = template_name.as_str().to_string();
 
     // We don't yet cache uploads across builds; always tell the SDK to PUT.
     // E2B 2.34 uploads with a fresh httpx client that has neither the API
@@ -375,11 +389,19 @@ pub async fn start_build(
         spec.memory_mb,
     )
     .await?;
+    // Admission precedes dispatch so concurrent triggers cannot overshoot the
+    // organization's or cluster's active-build limit, and a build already
+    // dispatched cannot be dispatched again under the same ID.
     state
+        .template_build_state
+        .admit_build(actor.org_id, &template_name, &build_id)
+        .await
+        .map_err(|err| super::template_build_admission_error("admit template build", err))?;
+    if let Err(error) = state
         .template_controller
         .submit_template_build(TemplateBuildSubmission {
-            target: TemplateBuildTarget::Organization(template_name),
-            client_build_id: Some(build_id),
+            target: TemplateBuildTarget::Organization(template_name.clone()),
+            client_build_id: Some(build_id.clone()),
             recipe,
             force: req.force_build(),
             publish_tags: publish_tags(spec.tags),
@@ -391,7 +413,16 @@ pub async fn start_build(
             org_id: actor.org_id,
         })
         .await
-        .map_err(template_build_submit_error)?;
+    {
+        // A dispatch that failed holds no builder capacity; give the unit
+        // back. If an ambiguous failure did start the build, it still runs
+        // under build-manager's own queue and execution bounds.
+        state
+            .template_build_state
+            .release_build(actor.org_id, &template_name, &build_id)
+            .await;
+        return Err(template_build_submit_error(error));
+    }
 
     Ok((StatusCode::ACCEPTED, Json(serde_json::json!({}))))
 }
@@ -451,6 +482,12 @@ pub async fn get_build_status(
     };
 
     let (status, reason) = map_state(resp.state, resp.error);
+    if matches!(status, "ready" | "error") {
+        state
+            .template_build_state
+            .finish_build(org.id, &template_name, &build_id)
+            .await;
+    }
     Ok(Json(TemplateBuildInfo {
         build_id,
         log_entries: vec![],
@@ -481,11 +518,16 @@ fn template_build_submit_error(error: ControllerError) -> E2bApiError {
     if error.is_lock_contention() {
         return controller_error(error);
     }
-    E2bApiError::new(
-        error.status(),
-        format!("BuilderApi/BuildTemplate rpc: {error}"),
-    )
+    let status = error.status();
+    let response = E2bApiError::new(status, format!("BuilderApi/BuildTemplate rpc: {error}"));
+    // A full builder queue drains as queued builds start or time out.
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return response.with_retry_after(BUILDER_QUEUE_FULL_RETRY_AFTER);
+    }
+    response
 }
+
+const BUILDER_QUEUE_FULL_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn template_build_status_error(error: TemplateBuildStatusPollError) -> E2bApiError {
     let TemplateBuildStatusPollError::Failed(error) = error else {

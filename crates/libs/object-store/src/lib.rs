@@ -111,6 +111,9 @@ pub struct ObjectMeta {
     pub size: u64,
     /// Provider-supplied entity tag, if available.
     pub etag: Option<String>,
+    /// When the store last wrote the current object version, if reported.
+    /// Age-based expiry rules on the bucket count from this instant.
+    pub last_modified: Option<jiff::Timestamp>,
 }
 
 /// Errors raised by [`ObjectStore`] implementations.
@@ -858,6 +861,9 @@ impl ObjectStore for S3ObjectStore {
             Ok(resp) => Ok(Some(ObjectMeta {
                 size: resp.content_length().unwrap_or(0).max(0).cast_unsigned(),
                 etag: resp.e_tag().map(str::to_string),
+                last_modified: resp.last_modified().and_then(|time| {
+                    jiff::Timestamp::new(time.secs(), time.subsec_nanos() as i32).ok()
+                }),
             })),
             Err(SdkError::ServiceError(svc))
                 if matches!(svc.err(), HeadObjectError::NotFound(_)) =>

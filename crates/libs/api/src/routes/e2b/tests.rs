@@ -13,7 +13,7 @@ use base64::Engine;
 #[cfg(feature = "kubernetes")]
 use k8s_openapi::api::core::v1::{Pod, PodIP, PodStatus};
 use pplx_space_common_core::sql;
-use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, TestDb, pg_test_db};
+use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, TestDb, TestDbResult, pg_test_db};
 use pplx_space_node_api_sim::{SimWorkerHarness, state::status};
 use rstest::{fixture, rstest};
 use serde::Deserialize;
@@ -982,8 +982,11 @@ fn retired_legacy_upload_query(path: &str) -> String {
 async fn template_file_upload_without_api_key_admits_only_an_owner_capability(
     #[case] query: &str,
     #[case] expected: StatusCode,
-) {
-    let state = test_state().await;
+) -> TestDbResult<()> {
+    // An admitted upload reserves its organization's input quota before
+    // reading the body, so this needs a database the reservation can reach.
+    let db = pg_test_db().await?;
+    let state = AppState::from_pool(db.pool.clone()).await?;
     let path = "/e2b/api/v1/internal/e2b-files/code-runtime/abc123";
     let query = match query {
         "owner" => mint_file_upload_query(OrgId::from_uuid(SEED_ORG_ID), path).unwrap(),
@@ -1009,6 +1012,7 @@ async fn template_file_upload_without_api_key_admits_only_an_owner_capability(
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert!(String::from_utf8_lossy(&body).contains("upload body is empty"));
     }
+    Ok(())
 }
 
 #[rstest]

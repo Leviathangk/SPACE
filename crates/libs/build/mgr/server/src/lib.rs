@@ -21,7 +21,8 @@ use pplx_space_build_mgr_client::proto::{
     StartBuildResponse, UploadBlobChunk, UploadBlobPhase, UploadBlobResponse,
 };
 use pplx_space_common_jobs::{
-    BackgroundWorker, Job, JobError, JobExecutor, LeaseConfig, WorkerConfig,
+    BackgroundWorker, Job, JobError, JobExecutor, JobPriority, LeaseConfig, PriorityBand,
+    WorkerConfig,
 };
 use rusqlite::{Connection, params};
 use tokio_util::sync::CancellationToken;
@@ -44,6 +45,21 @@ pub struct BuildManagerDaemonService {
     blob_store: blob::BlobStore,
 }
 
+/// Pending plus running organization builds one build manager accepts.
+/// Per-organization limits are cluster-wide and enforced by the API; this
+/// bounds what any mix of organizations can queue on one node.
+pub const TENANT_BUILDS_PER_NODE: usize = 16;
+/// An organization build still queued after this long is failed so it stops
+/// holding queue capacity; the client resubmits. Operator builds are exempt.
+pub const TENANT_BUILD_QUEUE_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
+/// Operator builds (no organization) run in a band above organization
+/// builds, with an executor slot of their own, so a tenant backlog never
+/// delays them.
+const SYSTEM_BUILD_PRIORITY: JobPriority = JobPriority::new(100);
+const SYSTEM_BUILD_RESERVED_SLOTS: usize = 1;
+const SYSTEM_BUILDS_PER_NODE: usize = 16;
+const QUEUED_BUILD_TIMEOUT_ERROR: &str =
+    "build waited longer than the build-manager queue timeout; resubmit the build";
 const BUILD_JOB_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 const BUILD_JOB_MAX_ATTEMPTS: i32 = 1;
 const BUILD_JOB_LEASE_TTL: Duration = Duration::from_secs(90);
@@ -96,7 +112,17 @@ impl BuildManagerDaemonService {
                 BUILD_JOB_TIMEOUT,
                 BUILD_JOB_MAX_ATTEMPTS,
             )
-            .with_lease(build_job_lease_config()),
+            .with_lease(build_job_lease_config())
+            .with_kind_concurrency(jobs::BUILD_JOB_KIND, max_concurrent_builds)
+            .with_kind_active_job_limit(jobs::BUILD_JOB_KIND, TENANT_BUILDS_PER_NODE)
+            .with_kind_priority_bands(
+                jobs::BUILD_JOB_KIND,
+                [PriorityBand::new(
+                    SYSTEM_BUILD_PRIORITY,
+                    SYSTEM_BUILD_RESERVED_SLOTS,
+                    SYSTEM_BUILDS_PER_NODE,
+                )],
+            ),
         );
         Self {
             db,
@@ -146,11 +172,17 @@ impl BuildManagerDaemonService {
                 _ = interval.tick() => {
                     let blob_store = self.blob_store.clone();
                     match tokio::task::spawn_blocking(move || blob_store.prune_local_blobs()).await {
-                        Ok(Ok(pruned)) if pruned.files > 0 => tracing::info!(
-                            files = pruned.files,
-                            bytes = pruned.bytes,
-                            "pruned expired local build input blobs"
-                        ),
+                        Ok(Ok(pruned)) if pruned.files > 0 => {
+                            pplx_space_metrics::template::build_gc(
+                                pplx_space_metrics::template::TemplateBuildGcKind::LocalInput,
+                                pruned.files,
+                            );
+                            tracing::info!(
+                                files = pruned.files,
+                                bytes = pruned.bytes,
+                                "pruned expired local build input blobs"
+                            );
+                        }
                         Ok(Ok(_)) => {}
                         Ok(Err(error)) => tracing::warn!(%error, "failed to prune local build input blobs"),
                         Err(error) => tracing::warn!(%error, "local build input blob reaper task failed"),
@@ -161,16 +193,40 @@ impl BuildManagerDaemonService {
         }
     }
 
+    /// Fails builds that can no longer finish or have waited too long: running
+    /// builds whose owning process is gone, and organization builds queued past
+    /// [`TENANT_BUILD_QUEUE_TIMEOUT`].
     pub fn mark_expired_build_leases_failed(&self) -> usize {
-        let expired = {
+        let (expired, timed_out) = {
             let conn = self.db.lock().expect("build-manager db mutex poisoned");
-            jobs::fail_expired_running_builds(&conn, INTERRUPTED_BUILD_ERROR).unwrap_or_else(
-                |error| {
+            let expired = jobs::fail_expired_running_builds(&conn, INTERRUPTED_BUILD_ERROR)
+                .unwrap_or_else(|error| {
                     tracing::error!(%error, "failed to mark expired build leases failed");
                     Vec::new()
-                },
+                });
+            let timed_out = jobs::fail_queued_builds_older_than(
+                &conn,
+                TENANT_BUILD_QUEUE_TIMEOUT,
+                SYSTEM_BUILD_PRIORITY,
+                QUEUED_BUILD_TIMEOUT_ERROR,
             )
+            .unwrap_or_else(|error| {
+                tracing::error!(%error, "failed to time out queued builds");
+                0
+            });
+            (expired, timed_out)
         };
+        if timed_out > 0 {
+            tracing::warn!(
+                count = timed_out,
+                timeout_seconds = TENANT_BUILD_QUEUE_TIMEOUT.as_secs(),
+                "failed organization builds that waited past the queue timeout"
+            );
+            pplx_space_metrics::template::build_gc(
+                pplx_space_metrics::template::TemplateBuildGcKind::QueuedBuild,
+                timed_out as u64,
+            );
+        }
         if !expired.is_empty() {
             tracing::warn!(
                 count = expired.len(),
@@ -184,7 +240,7 @@ impl BuildManagerDaemonService {
                 }
             }
         }
-        expired.len()
+        expired.len() + timed_out
     }
 
     pub fn start_draining(&self) {
@@ -769,12 +825,41 @@ impl BuildManager for BuildManagerDaemonService {
             template_org,
             system_publication_grant_id,
         };
-        // Every submission gets its own job (no dedup key); the worker's
-        // serialized-subjects lease claim queues same-template jobs FIFO
-        // instead of rejecting them.
-        let job_id =
-            self.worker
-                .submit_json(jobs::BUILD_JOB_KIND, &payload, Some(&template_id), None)?;
+        let priority = if payload.template_org.is_some() {
+            JobPriority::default()
+        } else {
+            SYSTEM_BUILD_PRIORITY
+        };
+        // Every submission gets its own job (no dedup key). The insert is
+        // admitted atomically against its priority band's active limit, so a
+        // full tenant queue refuses organization builds without touching the
+        // operator band.
+        let job_id = self
+            .worker
+            .submit_json_with_priority(
+                jobs::BUILD_JOB_KIND,
+                &payload,
+                Some(&template_id),
+                None,
+                priority,
+            )
+            .map_err(|status| {
+                if status.code() != tonic::Code::ResourceExhausted {
+                    return status;
+                }
+                pplx_space_metrics::template::build_admission(
+                    pplx_space_metrics::template::TemplateBuildAdmissionResource::NodeQueue,
+                    pplx_space_metrics::template::TemplateBuildAdmissionOutcome::GlobalLimit,
+                );
+                Status::resource_exhausted(format!(
+                    "build-manager queue is full ({} active builds in this band); retry later",
+                    if priority == SYSTEM_BUILD_PRIORITY {
+                        SYSTEM_BUILDS_PER_NODE
+                    } else {
+                        TENANT_BUILDS_PER_NODE
+                    }
+                ))
+            })?;
         tracing::info!(
             job_id = %job_id,
             template_id = %template_id,

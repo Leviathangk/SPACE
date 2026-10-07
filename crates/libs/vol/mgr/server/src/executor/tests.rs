@@ -275,6 +275,7 @@ async fn streamed_pull_decodes_inline_and_never_double_decodes() {
     let meta = ObjectMeta {
         size: compressed_len,
         etag: Some("\"stream\"".to_string()),
+        last_modified: None,
     };
     let store = Arc::new(StreamingMockStore {
         inner: MockObjectStore::new([Some(meta)], body),
@@ -354,6 +355,7 @@ async fn memory_role_uses_sparse_output_regardless_of_persisted_mode() {
         let meta = ObjectMeta {
             size: body.len() as u64,
             etag: Some(format!("\"memory-{stream_decode_pulls}-{persisted_mode}\"")),
+            last_modified: None,
         };
         let store = Arc::new(StreamingMockStore {
             inner: MockObjectStore::new([Some(meta)], body.clone()),
@@ -418,6 +420,7 @@ async fn run_streamed_artifact_pull(
     let meta = ObjectMeta {
         size: body.len() as u64,
         etag: Some("\"streamed-artifact\"".to_string()),
+        last_modified: None,
     };
     let store = Arc::new(StreamingMockStore {
         inner: MockObjectStore::new([Some(meta.clone()), Some(meta)], body),
@@ -599,6 +602,7 @@ async fn streamed_pull_fails_on_truncated_frame() {
     let meta = ObjectMeta {
         size: truncated.len() as u64,
         etag: Some("\"trunc\"".to_string()),
+        last_modified: None,
     };
     let store = Arc::new(StreamingMockStore {
         inner: MockObjectStore::new([Some(meta)], truncated),
@@ -647,6 +651,7 @@ async fn raw_pull_bypasses_streaming_and_keeps_wire_bytes() {
     let meta = ObjectMeta {
         size: body.len() as u64,
         etag: Some("\"raw\"".to_string()),
+        last_modified: None,
     };
     let store = Arc::new(StreamingMockStore {
         inner: MockObjectStore::new([Some(meta)], body.clone()),
@@ -1102,6 +1107,7 @@ async fn push_rejects_truncated_durable_object() {
     let truncated = ObjectMeta {
         size: 10,
         etag: None,
+        last_modified: None,
     };
     let store = Arc::new(MockObjectStore::new([Some(truncated)], Vec::new()));
     let executor = test_executor(store.clone());
@@ -1139,6 +1145,7 @@ async fn push_accepts_fully_durable_object() {
     let full = ObjectMeta {
         size: 4096,
         etag: None,
+        last_modified: None,
     };
     let store = Arc::new(MockObjectStore::new([Some(full)], Vec::new()));
     let executor = test_executor(store.clone());
@@ -1237,6 +1244,7 @@ fn materialization_provenance_preserves_shared_replica_contract() {
     let object = ObjectMeta {
         size: 101,
         etag: Some("\"etag-a\"".to_string()),
+        last_modified: None,
     };
     let materialization: MaterializationObservation = serde_json::from_value(serde_json::json!({
         "mode": "shadow",
@@ -1332,6 +1340,7 @@ fn file_replica_provenance_matches_only_same_transfer_contract() {
     let object = ObjectMeta {
         size: 17,
         etag: Some("\"etag-a\"".to_string()),
+        last_modified: None,
     };
     let provenance = file_replica_provenance(&base, &object, 17);
 
@@ -1377,6 +1386,7 @@ fn file_replica_provenance_matches_only_same_transfer_contract() {
     let changed_object = ObjectMeta {
         size: 18,
         etag: object.etag.clone(),
+        last_modified: None,
     };
     assert_ne!(
         provenance,
@@ -1386,6 +1396,7 @@ fn file_replica_provenance_matches_only_same_transfer_contract() {
     let changed_etag = ObjectMeta {
         size: object.size,
         etag: Some("\"etag-b\"".to_string()),
+        last_modified: None,
     };
     assert_ne!(
         provenance,
@@ -1405,6 +1416,7 @@ async fn verified_replica_with_valid_provenance_skips_download() {
     let object = ObjectMeta {
         size: 7,
         etag: Some("\"etag-a\"".to_string()),
+        last_modified: None,
     };
     write_test_provenance(&payload, &object, &local_path, 7).await;
     let store = Arc::new(MockObjectStore::new([Some(object)], b"new-replica"));
@@ -1441,6 +1453,7 @@ async fn verified_replica_does_not_reuse_unconfirmed_shadow_provenance() {
     let object = ObjectMeta {
         size: body.len() as u64,
         etag: Some("\"memory-etag\"".to_string()),
+        last_modified: None,
     };
     let shadow_observation = MaterializationObservation {
         mode: MaterializationMode::Shadow,
@@ -1507,6 +1520,7 @@ async fn artifact_pull_reuses_sparse_memory_across_persisted_modes() {
     let object = ObjectMeta {
         size: body.len() as u64,
         etag: Some("\"memory-etag\"".to_string()),
+        last_modified: None,
     };
     let store = Arc::new(MockObjectStore::new([Some(object)], body));
     let executor = TransferExecutor::new_for_test(
@@ -1604,6 +1618,7 @@ async fn enabled_memory_rematerializes_matching_dense_verified_replica() {
     let object = ObjectMeta {
         size: body.len() as u64,
         etag: Some("\"memory-etag\"".to_string()),
+        last_modified: None,
     };
     let dense_observation = MaterializationObservation {
         mode: MaterializationMode::Disabled,
@@ -1674,6 +1689,7 @@ async fn unspecified_canonical_pull_reuses_legacy_verified_replica() {
     let object = ObjectMeta {
         size: 7,
         etag: Some("\"etag-a\"".to_string()),
+        last_modified: None,
     };
     let legacy_provenance = VerifiedReplicaProvenance {
         version: VERIFIED_REPLICA_PROVENANCE_VERSION,
@@ -1723,6 +1739,7 @@ async fn verified_replica_with_mismatched_provenance_redownloads() {
     let stale_object = ObjectMeta {
         size: 3,
         etag: Some("\"old-etag\"".to_string()),
+        last_modified: None,
     };
     write_test_provenance(&payload, &stale_object, &local_path, 3).await;
 
@@ -1730,6 +1747,7 @@ async fn verified_replica_with_mismatched_provenance_redownloads() {
     let current_object = ObjectMeta {
         size: body.len() as u64,
         etag: Some("\"new-etag\"".to_string()),
+        last_modified: None,
     };
     let store = Arc::new(MockObjectStore::new([Some(current_object.clone())], body));
     let executor = test_executor(store.clone());
@@ -1780,6 +1798,7 @@ async fn explicit_memory_rematerializes_legacy_opaque_verified_replica() {
     let object = ObjectMeta {
         size: body.len() as u64,
         etag: Some("\"memory-etag\"".to_string()),
+        last_modified: None,
     };
     write_test_provenance(&legacy_payload, &object, &local_path, expected.len() as u64).await;
 
@@ -1825,15 +1844,18 @@ async fn verified_replica_source_metadata_change_after_download_is_retriable() {
     let stale = ObjectMeta {
         size: 5,
         etag: Some("\"stale\"".to_string()),
+        last_modified: None,
     };
     write_test_provenance(&payload, &stale, &local_path, 5).await;
     let before = ObjectMeta {
         size: 5,
         etag: Some("\"before\"".to_string()),
+        last_modified: None,
     };
     let after = ObjectMeta {
         size: 5,
         etag: Some("\"after\"".to_string()),
+        last_modified: None,
     };
     let store = Arc::new(MockObjectStore::new(
         [Some(before.clone()), Some(before), Some(after)],
@@ -1881,6 +1903,7 @@ async fn legacy_pull_overwrite_invalidates_stale_verified_provenance() {
     let stale = ObjectMeta {
         size: 9,
         etag: Some("\"stale\"".to_string()),
+        last_modified: None,
     };
     write_test_provenance(&payload, &stale, &local_path, 9).await;
     let store = Arc::new(MockObjectStore::new([], b"legacy-new"));

@@ -3,6 +3,9 @@ use pplx_space_db_test_fixtures::{TestDb, TestDbResult, pg_test_db};
 use rstest::{fixture, rstest};
 
 use super::*;
+use crate::template_build_admission_store::{
+    TemplateBuildAdmissionError, TemplateBuildAdmissionStore, TemplateBuildLimits,
+};
 
 const TEST_ORG: OrgId = OrgId::from_uuid(uuid::Uuid::from_u128(1));
 
@@ -34,6 +37,20 @@ async fn store_fixture() -> TestDbResult<StoreFixture> {
     })
 }
 
+/// Specifications are written through their admission; see
+/// `template_build_admission_store` for the limits themselves.
+async fn record_build_spec(
+    fixture: &StoreFixture,
+    org_id: OrgId,
+    template_name: &TemplateName,
+    build_id: &str,
+    spec: BuildSpec,
+) -> Result<(), TemplateBuildAdmissionError> {
+    TemplateBuildAdmissionStore::new(fixture.db.pool.clone(), TemplateBuildLimits::default())
+        .admit_build_spec(org_id, template_name, build_id, spec)
+        .await
+}
+
 fn template_name() -> TemplateName {
     TemplateName::parse("code-runtime").unwrap()
 }
@@ -52,10 +69,14 @@ async fn records_e2b_build_on_the_pending_job(
         cpu_count: Some(4),
         memory_mb: Some(8192),
     };
-    fixture
-        .store
-        .record_build_spec(TEST_ORG, &template_name, &client_build_id, spec.clone())
-        .await?;
+    record_build_spec(
+        &fixture,
+        TEST_ORG,
+        &template_name,
+        &client_build_id,
+        spec.clone(),
+    )
+    .await?;
 
     fixture
         .store
@@ -191,10 +212,7 @@ async fn job_writes_preserve_owner_and_legacy_nulls(
     let fixture = store_fixture.await?;
     let name = template_name();
     let other = OrgId::from_uuid(uuid::Uuid::from_u128(2));
-    fixture
-        .store
-        .record_build_spec(TEST_ORG, &name, "owned", BuildSpec::default())
-        .await?;
+    record_build_spec(&fixture, TEST_ORG, &name, "owned", BuildSpec::default()).await?;
     sqlx::query(sql!(
         "INSERT INTO template_build_jobs (template_id, build_id) VALUES ($1, 'legacy')"
     ))
@@ -203,10 +221,7 @@ async fn job_writes_preserve_owner_and_legacy_nulls(
     .await?;
     let job = BuildRunId::new();
 
-    let conflict = fixture
-        .store
-        .record_build_spec(other, &name, "owned", BuildSpec::default())
-        .await;
+    let conflict = record_build_spec(&fixture, other, &name, "owned", BuildSpec::default()).await;
     fixture
         .store
         .record_accepted_build(TEST_ORG, &name, Some("owned"), job, None, None)
@@ -218,7 +233,7 @@ async fn job_writes_preserve_owner_and_legacy_nulls(
 
     assert!(matches!(
         conflict,
-        Err(TemplateBuildJobsStoreError::OwnershipConflict)
+        Err(TemplateBuildAdmissionError::OwnershipConflict)
     ));
     let rows: Vec<(String, Option<uuid::Uuid>)> = sqlx::query_as(sql!(
         "SELECT build_id, org_id FROM template_build_jobs WHERE template_id = $1 ORDER BY build_id"
@@ -253,18 +268,12 @@ async fn input_writes_reject_a_different_template_owner(
     .await?;
     let other = OrgId::from_uuid(uuid::Uuid::from_u128(2));
 
-    let rejected = fixture
-        .store
-        .record_build_spec(other, &name, "foreign", BuildSpec::default())
-        .await;
-    fixture
-        .store
-        .record_build_spec(TEST_ORG, &name, "owner", BuildSpec::default())
-        .await?;
+    let rejected = record_build_spec(&fixture, other, &name, "foreign", BuildSpec::default()).await;
+    record_build_spec(&fixture, TEST_ORG, &name, "owner", BuildSpec::default()).await?;
 
     assert!(matches!(
         rejected,
-        Err(TemplateBuildJobsStoreError::OwnershipConflict)
+        Err(TemplateBuildAdmissionError::OwnershipConflict)
     ));
     let count: i64 = sqlx::query_scalar(sql!(
         "SELECT COUNT(*) FROM template_build_jobs WHERE template_id = $1"
@@ -324,18 +333,17 @@ async fn new_create_old_submit_new_poll_preserves_in_flight_build(
     let fixture = store_fixture.await?;
     let name = template_name();
     let job = BuildRunId::new();
-    fixture
-        .store
-        .record_build_spec(
-            TEST_ORG,
-            &name,
-            "build",
-            BuildSpec {
-                cpu_count: Some(4),
-                ..Default::default()
-            },
-        )
-        .await?;
+    record_build_spec(
+        &fixture,
+        TEST_ORG,
+        &name,
+        "build",
+        BuildSpec {
+            cpu_count: Some(4),
+            ..Default::default()
+        },
+    )
+    .await?;
     let old_spec: Option<i32> = sqlx::query_scalar(sql!(
         "SELECT cpu_count FROM template_build_jobs WHERE template_id = $1 AND build_id = 'build'"
     ))

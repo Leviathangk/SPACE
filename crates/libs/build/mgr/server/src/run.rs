@@ -39,7 +39,8 @@ pub struct BuildMgrRunConfig {
     /// Address the build-manager gRPC surface listens on.
     pub listen: SocketAddr,
     /// How many builds may run concurrently on this node. Clamped to at least
-    /// one, so a zero here still makes progress.
+    /// one, so a zero here still makes progress. Operator builds additionally
+    /// have one reserved slot that organization builds cannot use.
     pub max_concurrent_builds: usize,
     /// Build-manager's SQLite database. A `String` because that is what
     /// [`BuildManagerDaemonService::new`] takes; its parent directory is

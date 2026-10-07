@@ -16,6 +16,7 @@ use crate::storage::StorageProbe;
 #[derive(Clone, Default)]
 struct MockObjectStore {
     objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    written_at: Arc<Mutex<HashMap<String, jiff::Timestamp>>>,
     get_count: Arc<AtomicU64>,
     put_count: Arc<AtomicU64>,
 }
@@ -30,7 +31,25 @@ impl MockObjectStore {
     }
 
     fn insert(&self, key: String, bytes: Vec<u8>) {
+        self.written_at
+            .lock()
+            .unwrap()
+            .insert(key.clone(), jiff::Timestamp::now());
         self.objects.lock().unwrap().insert(key, bytes);
+    }
+
+    fn backdate(&self, key: &str, age: Duration) {
+        let written_at = jiff::Timestamp::now()
+            .checked_sub(jiff::SignedDuration::try_from(age).unwrap())
+            .unwrap();
+        self.written_at
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), written_at);
+    }
+
+    fn written_at(&self, key: &str) -> Option<jiff::Timestamp> {
+        self.written_at.lock().unwrap().get(key).copied()
     }
 
     fn get(&self, key: &str) -> Option<Vec<u8>> {
@@ -53,6 +72,7 @@ impl ObjectStore for MockObjectStore {
             .map(|bytes| ObjectMeta {
                 size: bytes.len() as u64,
                 etag: None,
+                last_modified: self.written_at(target.key),
             }))
     }
 
@@ -63,10 +83,7 @@ impl ObjectStore for MockObjectStore {
         body: Bytes,
     ) -> Result<(), ObjectStoreError> {
         self.put_count.fetch_add(1, Ordering::Relaxed);
-        self.objects
-            .lock()
-            .unwrap()
-            .insert(target.key.to_string(), body.to_vec());
+        self.insert(target.key.to_string(), body.to_vec());
         Ok(())
     }
 
@@ -388,6 +405,42 @@ async fn existing_shared_blob_is_not_uploaded_again(shared_blob_stores: SharedBl
     }
 
     assert_eq!(shared_blob_stores.object_store.put_count(), 1);
+}
+
+/// The bucket expires build inputs by age since their last write, so a new
+/// reference to an old object must renew that write or the object can expire
+/// while the reference is still live.
+#[rstest]
+#[tokio::test]
+async fn reuploaded_shared_blob_renews_its_storage_lease_once_aged(
+    shared_blob_stores: SharedBlobStores,
+) {
+    let bytes = b"aged template build input";
+    let upload = shared_blob_stores.upload(bytes);
+    let stored = shared_blob_stores
+        .uploader
+        .finish_upload(upload)
+        .await
+        .unwrap();
+    let key = blob_object_key("test-prefix", &stored.sha256);
+    shared_blob_stores
+        .object_store
+        .backdate(&key, Duration::from_secs(2 * 24 * 60 * 60));
+    let aged = shared_blob_stores.object_store.written_at(&key).unwrap();
+
+    let upload = shared_blob_stores.upload(bytes);
+    shared_blob_stores
+        .uploader
+        .finish_upload(upload)
+        .await
+        .unwrap();
+
+    assert_eq!(shared_blob_stores.object_store.put_count(), 2);
+    let renewed = shared_blob_stores.object_store.written_at(&key).unwrap();
+    assert!(
+        renewed > aged,
+        "a renewed object restarts its bucket expiry"
+    );
 }
 
 #[rstest]

@@ -191,6 +191,34 @@ retain their existing publication authority.
 | `SPACE_OBJECT_STORE_STATIC_SESSION_TOKEN` | unset | Session token for temporary static credentials. |
 | `SPACE_SNAPSHOT_BUCKET`, `SPACE_SNAPSHOT_REGION`, `SPACE_SNAPSHOT_ENDPOINT` | unset | Unset disables snapshot upload. |
 
+### Template build input lifecycle
+
+Build managers store each uploaded template build input under
+`<prefix>/build-inputs/sha256/<digest>` in the object-store bucket. SPACE does
+not track or delete these objects. Bound their retention with an age-based
+lifecycle rule on that prefix in the bucket: expire current versions after a
+fixed age since their last write, expire noncurrent versions, and abort
+incomplete multipart uploads. Lifecycle expiry is asynchronous; the provider
+removes eligible objects after a delay it does not guarantee. Without such a
+rule, for example on a local object store, inputs are never deleted.
+
+Keep the current-version age above 8 days and 6 hours. Build managers rewrite
+an input older than one day when a new upload references it, the API honours
+an upload for 7 days, and a queued build reads its inputs within 6 hours, so a
+shorter age can delete inputs that queued builds still need.
+
+The API charges each upload's bytes to the uploading organization for 16
+days after the upload. The charge is per upload, so replacing an upload
+mapping or failing after the builder stored the bytes still counts. This bounds
+how many bytes one organization can upload in any 16-day window. It is not a
+bound on what the bucket retains: objects whose lifecycle expiry is late, or
+that no rule expires, stay stored after their charge ends. Confirming remote
+retention and collecting unreferenced inputs is not implemented.
+
+A build manager without a configured object store keeps inputs only on its
+local disk, where the build input storage reservation bounds them and they are
+not pruned.
+
 ## Authentication, TLS and credentials
 
 | Variable | Default | Notes |

@@ -150,6 +150,18 @@ The following compatibility limits are important:
   are not supported.
 - `code-interpreter-v1` is translated to SPACE's `code-runtime` template. That
   template must exist if callers rely on the alias.
+- Template builds are bounded per organization and across the cluster. An
+  organization may hold 32 pending build specifications, 4 active builds, 2
+  concurrent file uploads, 1,024 retained uploaded files, and 64 GiB of
+  uploaded bytes. Every upload's bytes count for 16 days, including uploads
+  that replace a file or fail after the bytes were stored. A request over a
+  limit returns `429` with `Retry-After`; uploading to or triggering a build of
+  another organization's template returns `409`, as does triggering a build
+  that is already running. A build specification that is never started expires
+  after 24 hours, an uploaded file mapping after 7 days, and a build record
+  after 30 days. A dispatched build counts as active until a status
+  poll observes its end, or for at most 13 hours. A build still queued on a
+  builder after 6 hours fails and must be resubmitted.
 
 ECW routes are not included in the SPACE OpenAPI document. Treat the pinned SDK
 tests and the behavior documented here as the compatibility baseline. When

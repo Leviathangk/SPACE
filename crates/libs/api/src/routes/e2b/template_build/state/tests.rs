@@ -2,6 +2,24 @@ use super::*;
 use pplx_space_db_test_fixtures::{TestDbResult, pg_test_db};
 use rstest::rstest;
 
+/// Record an upload mapping the way the upload route does: reserve, then
+/// record against the reservation.
+async fn record_upload(
+    state: &TemplateBuildState,
+    org_id: OrgId,
+    name: &TemplateName,
+    files_hash: &str,
+    blob_sha256: &str,
+) -> Result<(), RecordBlobError> {
+    let reservation = state
+        .reserve_upload(org_id)
+        .await
+        .expect("an empty store admits the upload");
+    state
+        .record_blob(reservation, org_id, name, files_hash, blob_sha256, 1)
+        .await
+}
+
 #[rstest]
 #[case::same_owner_retry(1, "original", true)]
 #[case::same_owner_reupload(1, "replacement", true)]
@@ -17,10 +35,10 @@ async fn owned_blob_writes_allow_only_the_owner_to_replace_content(
     let state = TemplateBuildState::new(db.pool.clone());
     let name = TemplateName::parse("build-inputs").unwrap();
     let owner = OrgId::from_uuid(uuid::Uuid::from_u128(1));
-    state.record_blob(owner, &name, "files", "original").await?;
+    record_upload(&state, owner, &name, "files", "original").await?;
     let caller = OrgId::from_uuid(uuid::Uuid::from_u128(caller));
 
-    let result = state.record_blob(caller, &name, "files", digest).await;
+    let result = record_upload(&state, caller, &name, "files", digest).await;
 
     assert_eq!(result.is_ok(), accepted);
     if !accepted {
@@ -63,7 +81,7 @@ async fn owned_upload_claims_an_unowned_legacy_mapping() -> TestDbResult<()> {
     let owner = OrgId::from_uuid(uuid::Uuid::from_u128(1));
     insert_unowned_blob(&db.pool, &name, "files", "legacy").await?;
 
-    state.record_blob(owner, &name, "files", "retry").await?;
+    record_upload(&state, owner, &name, "files", "retry").await?;
 
     let row: (String, Option<uuid::Uuid>) = sqlx::query_as(sql!(
         "SELECT blob_sha256, org_id FROM template_build_blobs WHERE template_id = $1 AND files_hash = 'files'"
@@ -81,8 +99,8 @@ async fn concurrent_cross_org_blob_writers_cannot_replace_the_winner() -> TestDb
     let second_owner = OrgId::from_uuid(uuid::Uuid::from_u128(2));
 
     let (a, b) = tokio::join!(
-        state.record_blob(first_owner, &name, "files", "a"),
-        state.record_blob(second_owner, &name, "files", "b")
+        record_upload(&state, first_owner, &name, "files", "a"),
+        record_upload(&state, second_owner, &name, "files", "b")
     );
 
     let winner = match (a, b) {
@@ -119,7 +137,7 @@ async fn copy_reads_enforce_known_owners_and_preserve_legacy_uploads(
     match owner {
         Some(id) => {
             let owner = OrgId::from_uuid(uuid::Uuid::from_u128(id));
-            state.record_blob(owner, &name, "files", &digest).await?;
+            record_upload(&state, owner, &name, "files", &digest).await?;
         }
         None => insert_unowned_blob(&db.pool, &name, "files", &digest).await?,
     }

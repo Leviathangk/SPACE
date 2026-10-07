@@ -296,6 +296,7 @@ impl ObjectStore for FakeStore {
             .map(|size| ObjectMeta {
                 size: *size,
                 etag: None,
+                last_modified: None,
             }))
     }
 

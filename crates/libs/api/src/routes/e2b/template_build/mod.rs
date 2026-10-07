@@ -59,6 +59,7 @@ mod upload;
 mod wire;
 
 use crate::e2b::errors::E2bApiError;
+use crate::template_build_admission_store::TemplateBuildAdmissionError;
 use crate::template_build_jobs_store::TemplateBuildJobsStoreError;
 
 /// Map a template-build store error onto the ECW surface.
@@ -93,6 +94,30 @@ fn template_build_store_error(
             tracing::error!(what, error = %error, "template build store failed");
             E2bApiError::internal("Internal server error")
         }
+    }
+}
+
+/// Map a tenant admission outcome onto the ECW surface. A limit is 429 with
+/// the `Retry-After` at which retrying can first succeed; storage failures
+/// follow [`template_build_sql_error`].
+fn template_build_admission_error(
+    what: &'static str,
+    error: TemplateBuildAdmissionError,
+) -> E2bApiError {
+    match error {
+        TemplateBuildAdmissionError::Rejected(rejection) => E2bApiError::new(
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            rejection.to_string(),
+        )
+        .with_retry_after(rejection.limit.retry_after()),
+        TemplateBuildAdmissionError::OwnershipConflict
+        | TemplateBuildAdmissionError::AlreadyStarted => {
+            E2bApiError::new(axum::http::StatusCode::CONFLICT, error.to_string())
+        }
+        TemplateBuildAdmissionError::NoPendingBuild => {
+            E2bApiError::new(axum::http::StatusCode::NOT_FOUND, error.to_string())
+        }
+        TemplateBuildAdmissionError::Storage(error) => template_build_sql_error(what, &error),
     }
 }
 

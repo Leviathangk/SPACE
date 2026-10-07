@@ -231,6 +231,34 @@ pub fn fail_expired_running_builds(
     .collect()
 }
 
+/// Permanently fails pending build jobs below `exempt_priority` created more
+/// than `max_age` ago and returns how many. A single conditional `UPDATE`
+/// races safely with the lease claim, which only takes `pending` rows.
+pub fn fail_queued_builds_older_than(
+    conn: &Connection,
+    max_age: std::time::Duration,
+    exempt_priority: pplx_space_common_jobs::JobPriority,
+    error: &str,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE jobs
+         SET status = 'failed',
+             error_kind = 'permanent',
+             error = ?2,
+             completed_at = datetime('now')
+         WHERE kind = ?1
+           AND status = 'pending'
+           AND priority < ?3
+           AND created_at <= datetime('now', ?4)",
+        params![
+            BUILD_JOB_KIND,
+            error,
+            exempt_priority.get(),
+            format!("-{} seconds", max_age.as_secs()),
+        ],
+    )
+}
+
 /// Number of build jobs for `subject_id` (the template) that are pending or
 /// running, excluding `exclude_job_id`. Gates the post-publish local prune:
 /// any active sibling may be mid-register/mid-publish on an artifact the

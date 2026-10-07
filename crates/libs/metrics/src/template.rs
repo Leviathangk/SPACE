@@ -130,6 +130,151 @@ pub fn build_routing_fallback_missing_identity() {
     );
 }
 
+/// Tenant resource a template-build admission decision governs; the
+/// `resource` tag on `template.build.admission`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateBuildAdmissionResource {
+    /// A pending build specification (`POST /v3/templates`).
+    BuildSpec,
+    /// A build input upload.
+    Upload,
+    /// A dispatched build, admitted cluster-wide.
+    Build,
+    /// A build job on one build-manager's queue.
+    NodeQueue,
+}
+
+impl TemplateBuildAdmissionResource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BuildSpec => "build_spec",
+            Self::Upload => "upload",
+            Self::Build => "build",
+            Self::NodeQueue => "node_queue",
+        }
+    }
+}
+
+impl std::fmt::Display for TemplateBuildAdmissionResource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Outcome of one template-build admission decision; the `outcome` tag on
+/// `template.build.admission`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateBuildAdmissionOutcome {
+    Admitted,
+    /// The requesting organization is at its own limit.
+    OrgLimit,
+    /// Every organization together is at the shared limit.
+    GlobalLimit,
+    /// The request names work that is already admitted and still active.
+    AlreadyActive,
+}
+
+impl TemplateBuildAdmissionOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Admitted => "admitted",
+            Self::OrgLimit => "org_limit",
+            Self::GlobalLimit => "global_limit",
+            Self::AlreadyActive => "already_active",
+        }
+    }
+}
+
+impl std::fmt::Display for TemplateBuildAdmissionOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+pub fn build_admission(
+    resource: TemplateBuildAdmissionResource,
+    outcome: TemplateBuildAdmissionOutcome,
+) {
+    counter(
+        "template.build.admission",
+        1,
+        &[tag("resource", resource), tag("outcome", outcome)],
+    );
+}
+
+/// Build input bytes an upload stored (`accepted`) or streamed before it was
+/// refused (`rejected`).
+pub fn build_input_bytes(accepted: bool, bytes: u64) {
+    let result = if accepted { "accepted" } else { "rejected" };
+    counter(
+        "template.build.input.bytes",
+        bytes,
+        &[tag("result", result)],
+    );
+}
+
+/// Cluster-wide build input bytes held by live upload mappings and in-flight
+/// upload reservations, sampled at each upload admission.
+pub fn build_input_retained_bytes(bytes: u64) {
+    gauge("template.build.input.retained_bytes", bytes as f64, &[]);
+}
+
+/// Cluster-wide undispatched build specifications and admitted active builds,
+/// sampled at each admission of that resource.
+pub fn build_admitted_pending(resource: TemplateBuildAdmissionResource, count: u64) {
+    gauge(
+        "template.build.admission.pending",
+        count as f64,
+        &[tag("resource", resource)],
+    );
+}
+
+/// Template-build state retired by expiry or garbage collection; the `kind`
+/// tag on `template.build.gc`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateBuildGcKind {
+    /// Abandoned build specification past its TTL.
+    BuildSpec,
+    /// Build record past its retention.
+    BuildRecord,
+    /// Upload mapping past its TTL.
+    InputMapping,
+    /// Upload charge whose accounting window ended; nothing stored is deleted.
+    InputCharge,
+    /// Build-manager local input copy past its retention.
+    LocalInput,
+    /// Queued tenant build that waited past the queue timeout.
+    QueuedBuild,
+    /// Shared input object rewritten to restart its bucket expiry.
+    InputLeaseRenewal,
+}
+
+impl TemplateBuildGcKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BuildSpec => "build_spec",
+            Self::BuildRecord => "build_record",
+            Self::InputMapping => "input_mapping",
+            Self::InputCharge => "input_charge",
+            Self::LocalInput => "local_input",
+            Self::QueuedBuild => "queued_build",
+            Self::InputLeaseRenewal => "input_lease_renewal",
+        }
+    }
+}
+
+impl std::fmt::Display for TemplateBuildGcKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+pub fn build_gc(kind: TemplateBuildGcKind, count: u64) {
+    if count > 0 {
+        counter("template.build.gc", count, &[tag("kind", kind)]);
+    }
+}
+
 pub fn pull_duration(tags: &[String], result: &str, started_at: Instant) {
     let mut tags = tags.to_vec();
     tags.push(tag("result", result));

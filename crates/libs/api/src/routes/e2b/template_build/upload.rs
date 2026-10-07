@@ -48,6 +48,7 @@ use tokio_util::io::{StreamReader, SyncIoBridge};
 
 use super::super::super::AppState;
 use super::state::RecordBlobError;
+use crate::template_build_admission_store::AdmissionLimit;
 use crate::{e2b::errors::E2bApiError, middleware::auth::AuthOrg};
 
 /// gzip magic prefix; the e2b SDK uploads tars with `mode="w:gz"`.
@@ -61,6 +62,10 @@ const PUBLIC_SIGNING_SECRET_ENV: &str = "SPACE_PUBLIC_CURSOR_SECRET";
 const MAX_CONCURRENT_GZIP_DECODERS: usize = 2;
 const FILE_UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const FILE_UPLOAD_DEADLINE: Duration = Duration::from_secs(15 * 60);
+/// Bounds the body and the builder call together. Below
+/// `TemplateBuildLimits::upload_in_flight_window`, so an upload that still
+/// runs always counts as in flight.
+const FILE_UPLOAD_COMPLETION_DEADLINE: Duration = Duration::from_secs(20 * 60);
 const GZIP_DECODER_RETRY_AFTER: Duration = Duration::from_secs(1);
 
 static GZIP_DECODER_SLOTS: LazyLock<Arc<Semaphore>> =
@@ -439,8 +444,19 @@ fn unix_timestamp() -> Result<u64, E2bApiError> {
         .map_err(|_| E2bApiError::internal("system clock is before the Unix epoch"))
 }
 
-fn upload_body_error(error: UploadBodyError) -> E2bApiError {
+fn upload_body_error(error: UploadBodyError, max_bytes: u64) -> E2bApiError {
     match error {
+        // Below the per-upload cap, the cap is the organization's or cluster's
+        // remaining input quota: retryable once retained inputs expire.
+        UploadBodyError::TooLarge { .. } if max_bytes < BLOB_UPLOAD_LIMIT_BYTES => {
+            E2bApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "upload exceeds the {max_bytes} bytes of template file quota left; retry later"
+                ),
+            )
+            .with_retry_after(AdmissionLimit::InputBytes.retry_after())
+        }
         error @ UploadBodyError::DecoderCapacity => {
             E2bApiError::new(StatusCode::SERVICE_UNAVAILABLE, error.to_string())
                 .with_retry_after(GZIP_DECODER_RETRY_AFTER)
@@ -478,32 +494,111 @@ pub async fn put_uploaded_file(
     // which formats it into a filesystem path.
     let template_id = TemplateName::parse(template_id)
         .map_err(|err| E2bApiError::bad_request(format!("invalid templateID: {err}")))?;
+    // Refuse a template another organization owns before accepting a byte:
+    // whatever the builder stores is charged to this upload either way.
+    if !state
+        .template_build_state
+        .template_owner_matches(&template_id, org_id)
+        .await
+        .map_err(|error| {
+            super::template_build_sql_error("check template file upload owner", &error)
+        })?
+    {
+        return Err(E2bApiError::new(
+            StatusCode::CONFLICT,
+            "template belongs to another organization",
+        ));
+    }
+    // Quota is charged before any byte is forwarded. The charge holds the
+    // most this upload may store, so its cap is the smaller of the per-upload
+    // limit and what the organization and cluster have left.
+    let reservation = state
+        .template_build_state
+        .reserve_upload(org_id)
+        .await
+        .map_err(|error| {
+            super::template_build_admission_error("reserve template file upload", error)
+        })?;
+    let max_bytes = reservation.max_bytes;
     let (sender, receiver) = mpsc::channel(2);
-    let forward_body = stream_upload_body(body, sender, BLOB_UPLOAD_LIMIT_BYTES);
+    let forward_body = stream_upload_body(body, sender, max_bytes);
     let upload_blob = state
         .template_controller
         .upload_template_build_blob(ReceiverStream::new(receiver));
-    let (body_result, upload_result) = tokio::join!(forward_body, upload_blob);
+    // One deadline over the body and the builder call together, inside the
+    // window an upload counts as in flight, so no upload outlives its slot.
+    let Ok((body_result, upload_result)) = timeout(FILE_UPLOAD_COMPLETION_DEADLINE, async {
+        tokio::join!(forward_body, upload_blob)
+    })
+    .await
+    else {
+        // The builder may have stored the bytes; the charge stays at the
+        // reservation for the accounting window.
+        return Err(E2bApiError::new(
+            StatusCode::REQUEST_TIMEOUT,
+            format!(
+                "upload did not complete within {} seconds",
+                FILE_UPLOAD_COMPLETION_DEADLINE.as_secs()
+            ),
+        ));
+    };
     let (size_bytes, resp) = match (body_result, upload_result) {
         (Ok(size_bytes), Ok(resp)) => (size_bytes, resp),
-        (Err(UploadBodyError::ReceiverClosed), Err(error)) | (Ok(_), Err(error)) => {
+        (Ok(size_bytes), Err(error)) => {
+            // The body was committed, so the builder may have stored it
+            // before failing. Keep it charged.
+            if let Err(settle_error) = state
+                .template_build_state
+                .settle_upload(reservation, size_bytes)
+                .await
+            {
+                tracing::warn!(
+                    error = %settle_error,
+                    "failed to settle a failed template file upload; it stays charged at its reservation"
+                );
+            }
             return Err(E2bApiError::internal(format!(
                 "BuilderApi/UploadBuildBlob rpc: {error}"
             )));
         }
-        (Err(error), _) => return Err(upload_body_error(error)),
+        // Without a commit the builder stores nothing, so the charge returns.
+        (Err(UploadBodyError::ReceiverClosed), Err(error)) => {
+            state.template_build_state.release_upload(reservation).await;
+            return Err(E2bApiError::internal(format!(
+                "BuilderApi/UploadBuildBlob rpc: {error}"
+            )));
+        }
+        (Err(error), _) => {
+            state.template_build_state.release_upload(reservation).await;
+            if matches!(error, UploadBodyError::TooLarge { .. }) {
+                pplx_space_metrics::template::build_input_bytes(false, max_bytes);
+            }
+            return Err(upload_body_error(error, max_bytes));
+        }
     };
 
-    state
+    // Recording settles the charge first and keeps it when the mapping is
+    // refused: the builder already stored these bytes.
+    if let Err(error) = state
         .template_build_state
-        .record_blob(org_id, &template_id, &files_hash, &resp.sha256)
+        .record_blob(
+            reservation,
+            org_id,
+            &template_id,
+            &files_hash,
+            &resp.sha256,
+            size_bytes,
+        )
         .await
-        .map_err(|err| match err {
-            RecordBlobError::Conflict => E2bApiError::new(StatusCode::CONFLICT, err.to_string()),
+    {
+        return Err(match error {
+            RecordBlobError::Conflict => E2bApiError::new(StatusCode::CONFLICT, error.to_string()),
             RecordBlobError::Storage(error) => {
                 super::template_build_sql_error("record template build blob", &error)
             }
-        })?;
+        });
+    }
+    pplx_space_metrics::template::build_input_bytes(true, size_bytes);
 
     Ok((
         StatusCode::OK,

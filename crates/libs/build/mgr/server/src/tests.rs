@@ -1346,3 +1346,144 @@ async fn missing_listener_identity_prevents_durable_build_work() -> TestResult {
     assert!(!db_path.parent().unwrap().exists());
     Ok(())
 }
+
+const TENANT_A: &str = "01900000-0000-7000-8000-00000000000a";
+const TENANT_B: &str = "01900000-0000-7000-8000-00000000000b";
+
+fn tenant_build_request(template_id: &str, org_id: &str) -> StartBuildRequest {
+    StartBuildRequest {
+        org_id: Some(org_id.to_string()),
+        ..start_build_request(Some(test_recipe()), template_id, vec![])
+    }
+}
+
+/// One build slot, a tenant backlog filling the node's tenant queue, and an
+/// operator build arriving behind it: the backlog is refused at the node's
+/// tenant bound, the operator build runs in its reserved slot, and tenant
+/// capacity returns once the backlog completes.
+#[tokio::test(flavor = "current_thread")]
+async fn tenant_backlog_is_bounded_and_does_not_hold_back_system_builds() -> TestResult {
+    let backend = Arc::new(BlockingBuildBackend::default());
+    let service = BuildManagerDaemonService::with_backend(1, backend.clone())?;
+    let shutdown = CancellationToken::new();
+    let driver = tokio::spawn(service.clone().run_queue_driver(shutdown.clone()));
+
+    let mut tenant_jobs = Vec::new();
+    for index in 0..TENANT_BUILDS_PER_NODE {
+        let org = if index % 2 == 0 { TENANT_A } else { TENANT_B };
+        let response = service
+            .start_build(authorized_request(tenant_build_request(
+                &format!("tenant-{index}"),
+                org,
+            )))
+            .await?
+            .into_inner();
+        tenant_jobs.push(response.job_id);
+    }
+    backend.wait_started().await;
+
+    let refused = service
+        .start_build(authorized_request(tenant_build_request(
+            "tenant-over",
+            TENANT_A,
+        )))
+        .await;
+    let system = service
+        .start_build(authorized_request(start_build_request(
+            Some(test_recipe()),
+            "seed",
+            vec![],
+        )))
+        .await?
+        .into_inner();
+    for _ in 0..100 {
+        if backend.started_count() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let started_with_tenant_slot_held = backend.started_count();
+    // Release before asserting: a blocked build thread would otherwise hold
+    // the runtime open past a failed assertion.
+    backend.release();
+
+    assert_eq!(
+        refused.map(|_| ()).map_err(|status| status.code()),
+        Err(Code::ResourceExhausted),
+        "a full tenant queue refuses another tenant build"
+    );
+    assert_eq!(
+        started_with_tenant_slot_held, 2,
+        "the operator build starts while the tenant build holds the shared slot"
+    );
+    for job_id in tenant_jobs.iter().chain([&system.job_id]) {
+        let job = service
+            .worker
+            .wait_for_job(&job_id.parse()?, Duration::from_secs(10))
+            .await?;
+        assert_eq!(job.status, "completed");
+    }
+    service
+        .start_build(authorized_request(tenant_build_request(
+            "tenant-after",
+            TENANT_A,
+        )))
+        .await?;
+
+    shutdown.cancel();
+    let _ = driver.await;
+    Ok(())
+}
+
+/// A tenant build that never reaches a slot does not hold queue capacity
+/// forever: past the queue timeout the reaper fails it with a resubmit
+/// message. Operator builds are not timed out.
+#[tokio::test(flavor = "current_thread")]
+async fn queued_tenant_build_past_queue_timeout_fails_and_frees_capacity() -> TestResult {
+    let service =
+        BuildManagerDaemonService::with_backend(1, Arc::new(MockBuildBackend::default()))?;
+    let tenant = service
+        .start_build(authorized_request(tenant_build_request("tenant", TENANT_A)))
+        .await?
+        .into_inner();
+    let system = service
+        .start_build(authorized_request(start_build_request(
+            Some(test_recipe()),
+            "seed",
+            vec![],
+        )))
+        .await?
+        .into_inner();
+    {
+        let conn = service.db.lock().unwrap();
+        conn.execute(
+            "UPDATE jobs SET created_at = datetime('now', ?1)",
+            params![format!(
+                "-{} seconds",
+                TENANT_BUILD_QUEUE_TIMEOUT.as_secs() + 60
+            )],
+        )?;
+    }
+
+    service.mark_expired_build_leases_failed();
+
+    let status = service
+        .get_build_status(Request::new(GetBuildStatusRequest {
+            job_id: tenant.job_id.clone(),
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(status.state, BuildState::Failed as i32);
+    assert!(
+        status.error.contains("queue"),
+        "the failure names the queue timeout: {}",
+        status.error
+    );
+    let system_job = service
+        .worker
+        .get_job(&system.job_id.parse()?)?
+        .expect("system job persists");
+    assert_eq!(system_job.status, "pending");
+    assert_eq!(service.running_build_count(), 1);
+    Ok(())
+}
