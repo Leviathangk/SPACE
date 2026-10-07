@@ -365,6 +365,62 @@ async fn other_unfinished_sandbox_operation_counts_runtime_owners_and_its_reclai
     Ok(())
 }
 
+/// Two starts that both failed on the same sandbox are each only waiting
+/// for their own compensation; neither will run another attempt. If each
+/// counted the other as a runtime owner they would defer to each other
+/// until both aged out and left the pod behind.
+#[tokio::test]
+async fn other_unfinished_sandbox_operation_ignores_failures_pending_compensation() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let target_id = PublicSandboxId::new().to_string();
+    let mut operation_ids = Vec::new();
+    for _ in 0..2 {
+        match store
+            .create_operation(CreatePublicOperation {
+                org_id,
+                actor_user_id: None,
+                api_product: ApiProduct::Native,
+                kind: OperationKind::StartSandbox,
+                target_type: Some(OperationTargetType::Sandbox),
+                target_id: Some(&target_id),
+                payload_json: serde_json::json!({}),
+                idempotency: None,
+            })
+            .await?
+        {
+            CreatePublicOperationResult::Created(id) => operation_ids.push(id),
+            other => return Err(format!("operation was not created: {other:?}").into()),
+        }
+    }
+    let (compensating, waiting) = (operation_ids[0], operation_ids[1]);
+    sqlx::query(sql!(
+        "UPDATE public_operations SET state = 'running', claim_token = 'claim-a'
+          WHERE operation_id = $1"
+    ))
+    .bind(compensating.as_uuid())
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE public_operations
+            SET pending_failure_json = '{}'::jsonb, pending_failure_at = NOW()
+          WHERE operation_id = $1"
+    ))
+    .bind(waiting.as_uuid())
+    .execute(&db.pool)
+    .await?;
+
+    assert!(
+        !store
+            .other_sandbox_operation_unfinished(org_id, &target_id, compensating, "claim-a")
+            .await?
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn active_sandbox_deletes_coalesce_per_tenant_and_target() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
