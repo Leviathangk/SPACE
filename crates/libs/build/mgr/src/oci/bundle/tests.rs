@@ -78,8 +78,17 @@ fn bundle_fixture() -> BundleFixture {
     fs::write(seed.join("usr/local/bin/spaced-svc"), &static_elf)
         .expect("write static seed spaced-svc");
     fs::write(guest_bins.join("spaced"), "current-spaced").expect("write current spaced");
-    fs::write(guest_bins.join("spaced-svc"), "current-spaced-svc")
-        .expect("write current spaced-svc");
+    fs::write(
+        guest_bins.join("spaced-svc"),
+        "#!/bin/sh\ncase \"$1\" in --runtime-unit|--runtime-generator-script) ;; *) exit 1 ;; esac\nprintf 'current-runtime-unit\\n'\n",
+    )
+    .expect("write current spaced-svc");
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(
+        guest_bins.join("spaced-svc"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .expect("make guest emitter executable");
 
     BundleFixture {
         _tempdir: tempdir,
@@ -243,6 +252,15 @@ fn bundle_injection_keeps_oci_userspace_and_replaces_the_guest_contract(
         false,
     )
     .expect("install current guest binaries");
+    assert_eq!(
+        fs::read_to_string(
+            bundle_fixture
+                .target
+                .join("etc/systemd/system/space-runtime@.service")
+        )
+        .unwrap(),
+        "current-runtime-unit\n"
+    );
 
     assert_eq!(
         fs::read_to_string(bundle_fixture.target.join("usr/bin/tar")).unwrap(),
@@ -360,6 +378,15 @@ fn bundle_injection_does_not_follow_oci_directory_symlinks(bundle_fixture: Bundl
         false,
     )
     .expect("install current guest binaries");
+    assert_eq!(
+        fs::read_to_string(
+            bundle_fixture
+                .target
+                .join("etc/systemd/system/space-runtime@.service")
+        )
+        .unwrap(),
+        "current-runtime-unit\n"
+    );
 
     assert_eq!(
         fs::read_to_string(outside.join("passwd")).expect("read outside sentinel"),
