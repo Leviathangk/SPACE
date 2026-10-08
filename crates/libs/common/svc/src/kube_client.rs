@@ -1,5 +1,5 @@
 mod reflector;
-pub use reflector::spawn_reflector;
+pub use reflector::{ReflectorHealth, spawn_reflector};
 
 use std::time::Duration;
 

@@ -2,20 +2,38 @@
 
 use kube::{
     Api,
-    runtime::{WatchStreamExt, reflector, watcher},
+    runtime::{reflector, watcher},
 };
+use tokio::sync::watch;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
-/// Drive a reflector with retry backoff until service shutdown. The caller
-/// owns the store and chooses its resource scope and readiness policy.
+/// Current synchronization health of a reflector's store.
+#[derive(Clone, Debug)]
+pub struct ReflectorHealth {
+    synced: watch::Receiver<bool>,
+}
+
+impl ReflectorHealth {
+    /// A full list has completed with no subsequent observed watch failure.
+    /// Returns false during relisting and after the task stops, including panic.
+    /// Ordinary watch propagation delay still applies.
+    pub fn is_synced(&self) -> bool {
+        *self.synced.borrow() && self.synced.has_changed().is_ok()
+    }
+}
+
+/// Drive a reflector until shutdown, relisting after errors with the default
+/// watcher backoff. Callers choose whether to require current synchronization
+/// via the returned health handle or only initial readiness via their store.
 pub fn spawn_reflector<K>(
     label: &'static str,
-    writer: reflector::store::Writer<K>,
+    mut writer: reflector::store::Writer<K>,
     api: Api<K>,
     config: watcher::Config,
     shutdown: CancellationToken,
-) where
+) -> ReflectorHealth
+where
     K: kube::Resource
         + Clone
         + serde::de::DeserializeOwned
@@ -25,20 +43,50 @@ pub fn spawn_reflector<K>(
         + 'static,
     K::DynamicType: Default + Eq + std::hash::Hash + Clone,
 {
-    let stream = reflector::reflector(writer, watcher::watcher(api, config)).default_backoff();
+    let (synced, health) = watch::channel(false);
     tokio::spawn(async move {
-        let mut stream = std::pin::pin!(stream);
+        let mut backoff = watcher::DefaultBackoff::default();
         loop {
-            let event = tokio::select! {
+            let mut stream = std::pin::pin!(watcher::watcher(api.clone(), config.clone()));
+            loop {
+                let event = tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => return,
+                    event = stream.next() => event,
+                };
+                match event {
+                    Some(Ok(event)) => {
+                        if matches!(event, watcher::Event::Init) {
+                            synced.send_replace(false);
+                        }
+                        writer.apply_watcher_event(&event);
+                        if matches!(event, watcher::Event::InitDone) {
+                            synced.send_replace(true);
+                        }
+                    }
+                    Some(Err(err)) => {
+                        synced.send_replace(false);
+                        tracing::warn!(reflector = label, error = %err, "watcher error; relisting after backoff");
+                        break;
+                    }
+                    None => {
+                        tracing::warn!(reflector = label, "watcher stream ended");
+                        return;
+                    }
+                }
+            }
+            // Recreate the watcher so recovery ends at a complete list even
+            // when a resumed watch would have no object updates to emit.
+            let Some(delay) = backoff.next() else { return };
+            tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => return,
-                event = stream.next() => event,
-            };
-            let Some(event) = event else { break };
-            if let Err(err) = event {
-                tracing::warn!(reflector = label, error = %err, "watcher error");
+                _ = tokio::time::sleep(delay) => {}
             }
         }
-        tracing::warn!(reflector = label, "watcher stream ended");
     });
+    ReflectorHealth { synced: health }
 }
+
+#[cfg(test)]
+mod tests;
