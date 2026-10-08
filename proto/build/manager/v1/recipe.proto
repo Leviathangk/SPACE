@@ -108,8 +108,28 @@ message Recipe {
       Env env = 5;
       Copy copy = 6;
       PlaywrightInstall playwright_install = 7;
+      // Required oneof arms fail closed through older builders/proxies.
+      SetRuntime set_runtime = 8;
+      ClearRuntime clear_runtime = 9;
     }
   }
+
+  // Template-only boot configuration; sandbox env is not applied to this app.
+  message SetRuntime {
+    uint32 schema_version = 1;
+    repeated string command = 2;
+    string user = 3;
+    string working_directory = 4;
+    map<string, string> env = 5;
+    oneof readiness {
+      LaunchReady launch = 6;
+      ExecReady exec = 7;
+    }
+    uint64 startup_timeout_secs = 8;
+    message LaunchReady {}
+    message ExecReady { repeated string command = 1; }
+  }
+  message ClearRuntime {}
 
   message PackageInstall {
     PackageManager manager = 1;
