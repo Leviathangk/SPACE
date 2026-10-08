@@ -37,6 +37,57 @@ pub(super) fn install_current_guest_with_privilege(
         install(&source, &target_root.join(relative), 0o755, as_root)?;
     }
 
+    // Run the trusted builder binary, never one through the tenant rootfs.
+    // OCI assembly replaces guest binaries, so their platform unit must move
+    // with them rather than remaining pinned to the selected seed's version.
+    for (flag, relative, mode) in [
+        (
+            "--runtime-unit",
+            "etc/systemd/system/space-runtime@.service",
+            0o644,
+        ),
+        (
+            "--runtime-generator-script",
+            "etc/systemd/system-generators/space-runtime",
+            0o755,
+        ),
+    ] {
+        let source = guest_bin_dir.join("spaced-svc");
+        let output = std::process::Command::new(&source)
+            .arg(flag)
+            .output()
+            .map_err(|source_error| GuestBundleError::Io {
+                operation: GuestBundleOperation::Install,
+                path: source,
+                source: source_error,
+            })?;
+        if !output.status.success() || output.stdout.is_empty() || output.stdout.len() > 16 * 1024 {
+            return Err(GuestBundleError::Command {
+                operation: GuestBundleOperation::Install,
+                code: output.status.code(),
+            });
+        }
+        let mut unit = tempfile::NamedTempFile::new().map_err(|source| GuestBundleError::Io {
+            operation: GuestBundleOperation::Install,
+            path: target_root.to_path_buf(),
+            source,
+        })?;
+        unit.write_all(&output.stdout)
+            .map_err(|source| GuestBundleError::Io {
+                operation: GuestBundleOperation::Install,
+                path: unit.path().to_path_buf(),
+                source,
+            })?;
+        let relative = Path::new(relative);
+        prepare_target_file(
+            target_root,
+            relative,
+            GuestBundleOperation::Install,
+            as_root,
+        )?;
+        install(unit.path(), &target_root.join(relative), mode, as_root)?;
+    }
+
     let mut version_file =
         tempfile::NamedTempFile::new().map_err(|source| GuestBundleError::Io {
             operation: GuestBundleOperation::Install,

@@ -5,7 +5,7 @@ use oci_spec::distribution::{ParseError as OciReferenceParseError, Reference as 
 use pplx_space_build_mgr_client::proto as build_proto;
 use pplx_space_common_core::types::{
     ArtifactVersion, ArtifactVersionParseError, Digest, DigestParseError, TemplateReference,
-    TemplateReferenceParseError, TemplateSelector,
+    TemplateReferenceParseError, TemplateRuntime, TemplateRuntimeError, TemplateSelector,
 };
 use serde::Deserialize;
 
@@ -61,6 +61,10 @@ pub enum RecipeAdapterError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RecipeProtoError {
+    #[error("runtime declaration must be the only runtime step, last, with no env_refs")]
+    RuntimePlacement,
+    #[error("invalid runtime declaration: {0}")]
+    Runtime(#[from] TemplateRuntimeError),
     #[error("recipe metadata is required")]
     MissingMetadata,
     #[error("recipe origin is required")]
@@ -189,6 +193,8 @@ pub struct NamedStep {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Step {
+    SetRuntime(TemplateRuntime),
+    ClearRuntime,
     PackageInstall {
         manager: PackageManager,
         packages: Vec<String>,
@@ -288,6 +294,10 @@ fn default_browsers() -> Vec<String> {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum TomlStep {
+    SetRuntime {
+        declaration: TemplateRuntime,
+    },
+    ClearRuntime,
     AptInstall {
         packages: Vec<String>,
     },
@@ -470,6 +480,14 @@ impl TomlNamedStep {
             display_name: self.name,
             env_refs: self.env_refs,
             body: Some(match self.step {
+                TomlStep::SetRuntime { declaration } => {
+                    build_proto::recipe::step::Body::SetRuntime(
+                        pplx_space_build_mgr_client::runtime::encode(&declaration),
+                    )
+                }
+                TomlStep::ClearRuntime => build_proto::recipe::step::Body::ClearRuntime(
+                    build_proto::recipe::ClearRuntime {},
+                ),
                 TomlStep::AptInstall { packages } => {
                     build_proto::recipe::step::Body::PackageInstall(
                         build_proto::recipe::PackageInstall {
@@ -572,6 +590,18 @@ impl TryFrom<build_proto::Recipe> for Recipe {
     type Error = RecipeProtoError;
 
     fn try_from(recipe: build_proto::Recipe) -> Result<Self, Self::Error> {
+        for (index, step) in recipe.steps.iter().enumerate() {
+            if matches!(
+                step.body,
+                Some(
+                    build_proto::recipe::step::Body::SetRuntime(_)
+                        | build_proto::recipe::step::Body::ClearRuntime(_)
+                )
+            ) && (index + 1 != recipe.steps.len() || !step.env_refs.is_empty())
+            {
+                return Err(RecipeProtoError::RuntimePlacement);
+            }
+        }
         let metadata = recipe.metadata.ok_or(RecipeProtoError::MissingMetadata)?;
         let build_config = recipe.build_config.unwrap_or_default();
         Ok(Self {
@@ -760,6 +790,10 @@ trait ProtoStepBodyExt {
 impl ProtoStepBodyExt for build_proto::recipe::step::Body {
     fn try_into_step(self, index: usize) -> Result<Step, RecipeProtoError> {
         match self {
+            build_proto::recipe::step::Body::SetRuntime(value) => Ok(Step::SetRuntime(
+                pplx_space_build_mgr_client::runtime::decode(value)?,
+            )),
+            build_proto::recipe::step::Body::ClearRuntime(_) => Ok(Step::ClearRuntime),
             build_proto::recipe::step::Body::PackageInstall(step) => {
                 let manager = match build_proto::recipe::PackageManager::try_from(step.manager) {
                     Ok(build_proto::recipe::PackageManager::Unspecified) => {
@@ -891,6 +925,8 @@ impl std::fmt::Display for Step {
             Step::PackageInstall {
                 manager, packages, ..
             } => write!(f, "{manager} ({} packages)", packages.len()),
+            Step::SetRuntime(_) => write!(f, "set runtime"),
+            Step::ClearRuntime => write!(f, "clear runtime"),
             Step::Run { .. } => write!(f, "run"),
             Step::Env { vars } => write!(f, "env ({} vars)", vars.len()),
             Step::Copy { .. } => write!(f, "copy payload"),
