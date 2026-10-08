@@ -45,6 +45,9 @@ use timeouts::S3Timeouts;
 pub use download::FinishingWrite;
 use download::{ReorderWindow, SequentialWriter, open_scratch};
 
+// Amortize file-body reads without buffering an entire multipart part.
+const UPLOAD_READ_BUFFER_SIZE: usize = 1024 * 1024;
+
 /// Static credentials passed by the caller to authorize a single operation.
 ///
 /// The credentials must remain valid for the duration of the call. Long
@@ -967,16 +970,21 @@ impl ObjectStore for S3ObjectStore {
                 );
                 ObjectStoreError::Put(error)
             })?;
-            let body = ByteStream::from_path(src).await.map_err(|err| {
-                let error = DisplayErrorContext(&err).to_string();
-                warn!(
-                    bucket = target.bucket,
-                    key = target.key,
-                    error,
-                    "failed to read file for single put"
-                );
-                ObjectStoreError::Put(error)
-            })?;
+            let body = ByteStream::read_from()
+                .path(src)
+                .buffer_size(UPLOAD_READ_BUFFER_SIZE)
+                .build()
+                .await
+                .map_err(|err| {
+                    let error = DisplayErrorContext(&err).to_string();
+                    warn!(
+                        bucket = target.bucket,
+                        key = target.key,
+                        error,
+                        "failed to read file for single put"
+                    );
+                    ObjectStoreError::Put(error)
+                })?;
             self.base
                 .put_object()
                 .bucket(target.bucket)
@@ -1590,6 +1598,7 @@ impl S3ObjectStore {
                     .path(&path)
                     .offset(range.offset)
                     .length(Length::Exact(range.length))
+                    .buffer_size(UPLOAD_READ_BUFFER_SIZE)
                     .build()
                     .await
                     .map_err(|err| {
