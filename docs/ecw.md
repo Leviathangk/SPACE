@@ -140,9 +140,12 @@ The following compatibility limits are important:
   Connect leaves the lifecycle policy unchanged when `timeout` is omitted. An
   explicit timeout replaces the current timeout, including with a shorter
   value; if no E2B policy exists, it creates an auto-delete policy.
-- Template `startCmd` is installed as a systemd unit and runs on cold boot;
-  SPACE does not yet publish the warm snapshot used by E2B for this behavior.
-- Template `readyCmd` is accepted for SDK compatibility but is not enforced.
+- Template `startCmd` and `readyCmd` become native template boot intent. Startup
+  uses template ENV only, as root in `/` through `/bin/sh -lc`. Sandbox environment
+  overrides apply to later commands, not the template application. Readiness gates
+  cold boots and base snapshot creation; restoring a ready snapshot does not
+  re-run the probe. Rootfs publication does not validate application readiness.
+  See [native template startup](native-template-runtime.md) for limits and rollout.
   Per-step `force=true` is promoted to SPACE's build-wide cache switch, which
   may rebuild more layers but will not reuse the requested layer. Positive
   `minFreeDiskMb` and `teamID` are rejected explicitly.
