@@ -550,7 +550,7 @@ impl ClusterApi for ClusterApiService {
         request: Request<GetNodeNetworkPolicyStateRequest>,
     ) -> Result<Response<GetNodeNetworkPolicyStateResponse>, Status> {
         let role_hint = optional_db_role_from_proto(request.get_ref().role)?;
-        let _ = self
+        let origin = self
             .authenticated_origin_node_id(&request, &request.get_ref().node_id, role_hint)
             .await?;
         let request = request.into_inner();
@@ -569,15 +569,35 @@ impl ClusterApi for ClusterApiService {
                         COALESCE(t.network_policy_generation, 0) AS network_policy_generation
                  FROM requested r
                  LEFT JOIN templates t ON t.name = r.template
-                 WHERE t.name IS NOT NULL
+                 WHERE (t.visibility = 'generic' AND t.desired_state = 'present')
                     OR EXISTS (
                         SELECT 1
-                        FROM node_template_inventory nti
-                        WHERE nti.template_name = r.template
-                    )"
+                        FROM sandboxes sb
+                        WHERE sb.template_id = t.name
+                          AND (sb.active_node_id = $3 OR sb.target_node_id = $3)
+                    )
+                    OR ($4 = 'worker' AND EXISTS (
+                        SELECT 1
+                        FROM kubernetes_pool_configs pc
+                        JOIN template_releases pr ON pr.id = pc.template_release_id
+                        WHERE pc.enabled
+                          AND pr.template_name = t.name
+                    ))
+                    OR ($4 = 'builder' AND EXISTS (
+                        SELECT 1
+                        FROM template_build_base_grants g
+                        WHERE g.base_template_name = t.name
+                          AND g.org_id = t.org_id
+                          AND ((g.builder_node_id IS NULL
+                                AND g.granted_at > NOW() - INTERVAL '1 hour')
+                               OR (g.builder_node_id = $3
+                                   AND g.granted_at > NOW() - INTERVAL '7 days'))
+                    ))"
             ))
             .bind(&templates)
             .bind(Json(NetworkPolicyV1::deny_all()))
+            .bind(origin.id)
+            .bind(origin.role.as_str())
             .fetch_all(&self.pool)
             .await
             .map_err(|err| Status::internal(format!("query template policies: {err}")))?
@@ -611,20 +631,16 @@ impl ClusterApi for ClusterApiService {
         let sandbox_states = if sandbox_ids.is_empty() {
             Vec::new()
         } else {
-            let rows = sqlx::query_as::<_, SandboxPolicyRow>(sql!(
-                "SELECT s.id AS sandbox_id,
-                        s.template_id,
-                        s.network_policy_override_json AS network_policy_json,
-                        s.network_policy_generation,
-                        t.network_policy_json AS template_network_policy_json
-                 FROM sandboxes s
-                 LEFT JOIN templates t ON t.name = s.template_id
-                 WHERE s.id = ANY($1)"
-            ))
-            .bind(&sandbox_ids)
-            .fetch_all(&self.pool)
+            let rows = pplx_space_sandbox_store::network_policy_inputs_placed_on(
+                &self.pool,
+                origin.id,
+                &sandbox_ids,
+            )
             .await
-            .map_err(|err| Status::internal(format!("query sandbox policies: {err}")))?;
+            .map_err(|err| Status::internal(format!("query sandbox policies: {err}")))?
+            .into_iter()
+            .map(SandboxPolicyRow::try_from)
+            .collect::<Result<Vec<_>, Status>>()?;
 
             project_sandbox_network_policy_states(rows)
         };
@@ -677,19 +693,35 @@ impl ClusterApi for ClusterApiService {
              FROM requested r
              LEFT JOIN template_base_snapshot_policies p ON p.template = r.template
              LEFT JOIN local_inventory li ON li.template_name = r.template
-             WHERE EXISTS (
-                     SELECT 1
-                     FROM templates t
-                     WHERE t.name = r.template
-                 )
+             LEFT JOIN templates t ON t.name = r.template
+             WHERE (t.visibility = 'generic' AND t.desired_state = 'present')
                 OR EXISTS (
-                     SELECT 1
-                     FROM node_template_inventory nti
-                     WHERE nti.template_name = r.template
-                 )"
+                    SELECT 1
+                    FROM sandboxes sb
+                    WHERE sb.template_id = t.name
+                      AND (sb.active_node_id = $2 OR sb.target_node_id = $2)
+                )
+                OR ($3 = 'worker' AND EXISTS (
+                    SELECT 1
+                    FROM kubernetes_pool_configs pc
+                    JOIN template_releases pr ON pr.id = pc.template_release_id
+                    WHERE pc.enabled
+                      AND pr.template_name = t.name
+                ))
+                OR ($3 = 'builder' AND EXISTS (
+                    SELECT 1
+                    FROM template_build_base_grants g
+                    WHERE g.base_template_name = t.name
+                      AND g.org_id = t.org_id
+                      AND ((g.builder_node_id IS NULL
+                            AND g.granted_at > NOW() - INTERVAL '1 hour')
+                           OR (g.builder_node_id = $2
+                               AND g.granted_at > NOW() - INTERVAL '7 days'))
+                ))"
         ))
         .bind(&templates)
         .bind(origin.id)
+        .bind(origin.role.as_str())
         .fetch_all(&self.pool)
         .await
         .map_err(|err| Status::internal(format!("query template base-snapshot policies: {err}")))?;
@@ -746,6 +778,10 @@ impl ClusterApi for ClusterApiService {
             }));
         }
 
+        // Visibility follows the node's placement, as the release lookups do.
+        // The one addition is a template the node still holds while it is
+        // being retired: the node must hear `present = false` to delete it.
+        // Inventory is node-reported, so it never admits a present template.
         let rows = sqlx::query_as::<_, TemplateDesiredStateRow>(
             sql!("WITH requested AS (
                  SELECT DISTINCT UNNEST($1::TEXT[]) AS template
@@ -795,7 +831,37 @@ impl ClusterApi for ClusterApiService {
              LEFT JOIN template_base_snapshot_policies bsp
                     ON bsp.template = r.template
              LEFT JOIN local_inventory li
-                    ON li.template_name = r.template"),
+                    ON li.template_name = r.template
+             WHERE (t.visibility = 'generic' AND t.desired_state = 'present')
+                OR EXISTS (
+                    SELECT 1
+                    FROM sandboxes sb
+                    WHERE sb.template_id = t.name
+                      AND (sb.active_node_id = $3 OR sb.target_node_id = $3)
+                )
+                OR ($2 = 'worker' AND EXISTS (
+                    SELECT 1
+                    FROM kubernetes_pool_configs pc
+                    JOIN template_releases pr ON pr.id = pc.template_release_id
+                    WHERE pc.enabled
+                      AND pr.template_name = t.name
+                ))
+                OR ($2 = 'builder' AND EXISTS (
+                    SELECT 1
+                    FROM template_build_base_grants g
+                    WHERE g.base_template_name = t.name
+                      AND g.org_id = t.org_id
+                      AND ((g.builder_node_id IS NULL
+                            AND g.granted_at > NOW() - INTERVAL '1 hour')
+                           OR (g.builder_node_id = $3
+                               AND g.granted_at > NOW() - INTERVAL '7 days'))
+                ))
+                OR (t.desired_state <> 'present' AND EXISTS (
+                    SELECT 1
+                    FROM node_template_inventory nti
+                    WHERE nti.template_name = r.template
+                      AND nti.node_id = $3
+                ))"),
         )
         .bind(&templates)
         .bind(origin.role.as_str())
@@ -1105,6 +1171,7 @@ impl ClusterApi for ClusterApiService {
         let response = tokio::time::timeout(
             budget,
             data_plane_sessions::resolve_session_route(
+                budget,
                 self.ingress_activation.as_deref(),
                 &self.pool,
                 self.route_ed25519_authority.as_deref(),
@@ -1159,6 +1226,7 @@ impl ClusterApi for ClusterApiService {
         let response = tokio::time::timeout(
             budget,
             data_plane_sessions::unstable_resolve_sandbox_service_route(
+                budget,
                 self.ingress_activation.as_deref(),
                 &self.pool,
                 self.route_ed25519_authority.as_deref(),

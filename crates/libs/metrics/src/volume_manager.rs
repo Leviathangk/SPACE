@@ -1,7 +1,83 @@
+//! Volume-manager transfer measurements.
+//!
+//! Push sizing counters share `artifact`, `encoding` and `phase` tags:
+//! - `volume_manager.push.payloads`: number of observed payloads.
+//! - `volume_manager.push.logical_bytes`: source file lengths before transforms.
+//! - `volume_manager.push.wire_bytes`: complete post-transform payload lengths.
+//!
+//! `prepared` is emitted after the upload file is successfully statted, before
+//! calling the object store. It includes payloads whose upload subsequently
+//! fails or is cancelled. `verified` is emitted only after HEAD confirms the
+//! expected object length. Both are per-attempt observations: retries can count
+//! the same artifact again, including after a sibling artifact fails. They are
+//! not unique delivered bytes or network bytes including part retransmissions.
+//! Partial/failed transforms, failed stats and process death before emission
+//! are excluded. These counters must not be added across phases.
+//!
+//! With the file-backed pipeline, prepared wire bytes for non-raw encodings are
+//! completed temporary-file bytes. They do not measure physical disk I/O. The
+//! ratio of summed wire bytes to summed logical bytes gives a byte-weighted
+//! encoding ratio within one phase and encoding. Raw uploads have no transform
+//! temp file. `encoding` describes the volume-manager transform, not whether
+//! the source is encrypted: LUKS snapshot artifacts use `zstd` (or `raw` when
+//! compression is disabled), not `aead`. Their artifact tags are
+//! `encrypted_snapshot_volume` and `encrypted_rootfs_cow`.
+
 use std::time::Instant;
 
 use crate::emit::{counter, distribution, elapsed_ms, gauge, tag, timing_ms};
 use pplx_space_common_core::types::{MaterializationLayout, MaterializationMode};
+
+#[derive(Clone, Copy)]
+pub enum PushPayloadEncoding {
+    Raw,
+    Zstd,
+    Aead,
+    ZstdAead,
+}
+
+impl PushPayloadEncoding {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Zstd => "zstd",
+            Self::Aead => "aead",
+            Self::ZstdAead => "zstd_aead",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum PushPayloadPhase {
+    Prepared,
+    Verified,
+}
+
+impl PushPayloadPhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepared => "prepared",
+            Self::Verified => "verified",
+        }
+    }
+}
+
+pub fn push_payload(
+    artifact: &str,
+    encoding: PushPayloadEncoding,
+    phase: PushPayloadPhase,
+    logical_bytes: u64,
+    wire_bytes: u64,
+) {
+    let tags = &[
+        tag("artifact", artifact),
+        tag("encoding", encoding.as_str()),
+        tag("phase", phase.as_str()),
+    ];
+    counter("volume_manager.push.payloads", 1, tags);
+    counter("volume_manager.push.logical_bytes", logical_bytes, tags);
+    counter("volume_manager.push.wire_bytes", wire_bytes, tags);
+}
 
 pub fn transfer_phase_duration(
     kind: &str,

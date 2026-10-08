@@ -2145,6 +2145,17 @@ async fn data_plane_route_resolve_hydrates_backend_and_bumps_generation() -> Tes
     Ok(())
 }
 
+struct UnavailableIngressActivation(std::sync::atomic::AtomicUsize);
+#[tonic::async_trait]
+impl crate::ingress_activation::IngressActivation for UnavailableIngressActivation {
+    async fn prepare(&self, _: SandboxId, _: std::time::Duration) -> Result<(), Status> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(Status::unavailable(
+            "synthetic activation owner unavailable",
+        ))
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn data_plane_route_resolve_mints_service_port_route_token_for_port_session() -> TestResult {
     if !pplx_space_test_env::enter_test_process(&[
@@ -2160,9 +2171,13 @@ async fn data_plane_route_resolve_mints_service_port_route_token_for_port_sessio
         return Ok(());
     }
 
-    let Some(fixture) = cluster_fixture().await? else {
+    let Some(mut fixture) = cluster_fixture().await? else {
         return Ok(());
     };
+    let activation = std::sync::Arc::new(UnavailableIngressActivation(
+        std::sync::atomic::AtomicUsize::new(0),
+    ));
+    fixture.service.ingress_activation = Some(activation.clone());
     let node_id = NodeId::new();
     let sandbox_id = SandboxId::new();
     let session_id = format!("port_{}", Uuid::now_v7());
@@ -2181,11 +2196,12 @@ async fn data_plane_route_resolve_mints_service_port_route_token_for_port_sessio
         "port",
     )
     .await?;
-    sqlx::query(
+    sqlx::query(sql!(
         "UPDATE data_plane_sessions
-         SET target_port = 8080, target_protocol = 'tcp'
-         WHERE session_id = $1",
-    )
+         SET target_port = 8080, target_protocol = 'tcp',
+             token_expires_at = NOW() + INTERVAL '1 hour'
+         WHERE session_id = $1"
+    ))
     .bind(&session_id)
     .execute(&fixture.service.pool)
     .await?;
@@ -2193,7 +2209,7 @@ async fn data_plane_route_resolve_mints_service_port_route_token_for_port_sessio
     let response = fixture
         .service
         .resolve_data_plane_session_route(data_plane_request(ResolveDataPlaneSessionRouteRequest {
-            session_id,
+            session_id: session_id.clone(),
             protocol_session_id: None,
             token_sha256: None,
             required_scope: None,
@@ -2216,6 +2232,31 @@ async fn data_plane_route_resolve_mints_service_port_route_token_for_port_sessio
         claims.route_identity.execution_generation(),
         ExecutionGeneration::new(13).unwrap()
     );
+
+    assert_eq!(
+        activation.0.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "healthy ingress must serve while the activation owner is unavailable"
+    );
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle = 'suspended', active_node_id = NULL WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(&fixture.service.pool)
+    .await?;
+    let error = fixture
+        .service
+        .resolve_data_plane_session_route(data_plane_request(ResolveDataPlaneSessionRouteRequest {
+            session_id,
+            protocol_session_id: None,
+            token_sha256: None,
+            required_scope: None,
+            requested_transport: Some(SandboxServiceRouteTransport::ServicePortIngress as i32),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.message(), "synthetic activation owner unavailable");
+    assert_eq!(activation.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     Ok(())
 }
 
@@ -2740,9 +2781,13 @@ async fn ecw_route_resolve_allows_service_with_traffic_token() -> TestResult {
         return Ok(());
     }
 
-    let Some(fixture) = cluster_fixture().await? else {
+    let Some(mut fixture) = cluster_fixture().await? else {
         return Ok(());
     };
+    let activation = std::sync::Arc::new(UnavailableIngressActivation(
+        std::sync::atomic::AtomicUsize::new(0),
+    ));
+    fixture.service.ingress_activation = Some(activation.clone());
     let node_id = NodeId::new();
     let sandbox_id = SandboxId::new();
 
@@ -2861,6 +2906,48 @@ async fn ecw_route_resolve_allows_service_with_traffic_token() -> TestResult {
         .await
         .expect_err("wrong traffic token should fail");
     assert_eq!(invalid.code(), Code::PermissionDenied);
+
+    assert_eq!(
+        activation.0.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "healthy ingress must serve while the activation owner is unavailable"
+    );
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle = 'suspended', active_node_id = NULL WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(&fixture.service.pool)
+    .await?;
+    for (proof, expected, calls) in [
+        (
+            sha256_hex("invalid-traffic-token"),
+            Code::PermissionDenied,
+            0,
+        ),
+        (sha256_hex(&token), Code::Unavailable, 1),
+    ] {
+        let error = fixture
+            .service
+            .unstable_resolve_sandbox_service_route(Request::new(
+                UnstableResolveSandboxServiceRouteRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                    port: 8080,
+                    route_kind: SandboxServiceRouteKind::ServicePort as i32,
+                    transport: SandboxServiceRouteTransport::ServicePortIngress as i32,
+                    credential_proofs: vec![route_credential_proof(
+                        SandboxServiceRouteCredentialKind::SandboxTrafficToken,
+                        proof,
+                    )],
+                },
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), expected);
+        assert_eq!(
+            activation.0.load(std::sync::atomic::Ordering::SeqCst),
+            calls
+        );
+    }
     Ok(())
 }
 
@@ -6821,5 +6908,278 @@ async fn restore_locations_keep_digests_during_catalog_deletion() -> TestResult 
             Err(status) => assert_eq!(status.code(), Code::NotFound),
         }
     }
+    Ok(())
+}
+
+/// The node-bound template and policy reads answer for the templates the
+/// node has a sandbox placed on, warms, or builds from, plus generic ones,
+/// and for the sandboxes placed on it: the same placement the release lookups
+/// use. Inventory is reported by the node itself, so holding a template only
+/// lets the node hear that the template is being retired.
+#[tokio::test(flavor = "current_thread")]
+async fn node_template_and_policy_reads_follow_placement() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000003")?;
+    let (release_id, _) = seed_private_release(&fixture, "private-base", owner).await?;
+    register_template(&fixture.service, "code-runtime").await?;
+    let host_ip = std::net::Ipv4Addr::new(10, 0, 0, 30);
+    let other_ip = std::net::Ipv4Addr::new(10, 0, 0, 31);
+    let builder_ip = std::net::Ipv4Addr::new(10, 0, 0, 40);
+    let host = insert_k8s_node(pool, host_ip, "worker").await?;
+    let other = insert_k8s_node(pool, other_ip, "worker").await?;
+    let builder = insert_k8s_node(pool, builder_ip, "builder").await?;
+    let sandbox_id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (
+             id, user_id, org_id, managed_by, lifecycle, placement,
+             active_node_id, target_node_id, command_ready_pending,
+             network_policy_generation, template_id
+         )
+         VALUES ($1, $2::uuid, $3::uuid, 'k8s', 'started', 'on_node', $4, $4, TRUE, 1, 'private-base')"
+    ))
+    .bind(sandbox_id)
+    .bind(SEEDED_USER_ID)
+    .bind(owner)
+    .bind(host)
+    .execute(pool)
+    .await?;
+
+    struct Seen {
+        policy: Vec<String>,
+        sandboxes: Vec<String>,
+        desired: Vec<(String, Option<bool>)>,
+        base: Vec<String>,
+    }
+    async fn seen_by(
+        fixture: &ClusterFixture,
+        node: Uuid,
+        node_ip: std::net::Ipv4Addr,
+        role: ProtoNodeRole,
+        sandbox_id: Uuid,
+    ) -> TestResult<Seen> {
+        let node_ip = std::net::IpAddr::V4(node_ip);
+        let templates = vec!["private-base".to_string(), "code-runtime".to_string()];
+        let role = Some(role as i32);
+        let policy = fixture
+            .service
+            .get_node_network_policy_state(request_from_node(
+                GetNodeNetworkPolicyStateRequest {
+                    node_id: node.to_string(),
+                    templates: templates.clone(),
+                    sandbox_ids: vec![sandbox_id.to_string()],
+                    role,
+                },
+                node_ip,
+            ))
+            .await?
+            .into_inner();
+        let desired = fixture
+            .service
+            .get_node_template_desired_state(request_from_node(
+                GetNodeTemplateDesiredStateRequest {
+                    node_id: node.to_string(),
+                    templates: templates.clone(),
+                    role,
+                },
+                node_ip,
+            ))
+            .await?
+            .into_inner();
+        let base = fixture
+            .service
+            .get_node_template_base_snapshot_policy_state(request_from_node(
+                GetNodeTemplateBaseSnapshotPolicyStateRequest {
+                    node_id: node.to_string(),
+                    templates,
+                    role,
+                },
+                node_ip,
+            ))
+            .await?
+            .into_inner();
+        let mut seen = Seen {
+            policy: policy.templates.into_iter().map(|t| t.template).collect(),
+            sandboxes: policy.sandboxes.into_iter().map(|s| s.sandbox_id).collect(),
+            desired: desired
+                .templates
+                .into_iter()
+                .map(|t| (t.template, t.present))
+                .collect(),
+            base: base.templates.into_iter().map(|t| t.template).collect(),
+        };
+        seen.policy.sort();
+        seen.desired.sort();
+        seen.base.sort();
+        Ok(seen)
+    }
+    fn assert_seen(seen: &Seen, templates: &[&str], sandbox: Option<Uuid>, label: &str) {
+        let templates: Vec<String> = templates.iter().map(|t| t.to_string()).collect();
+        let present: Vec<(String, Option<bool>)> =
+            templates.iter().map(|t| (t.clone(), Some(true))).collect();
+        assert_eq!(seen.policy, templates, "{label}: policy templates");
+        assert_eq!(seen.base, templates, "{label}: base-snapshot templates");
+        assert_eq!(seen.desired, present, "{label}: desired templates");
+        let sandbox: Vec<String> = sandbox.into_iter().map(|id| id.to_string()).collect();
+        assert_eq!(seen.sandboxes, sandbox, "{label}: sandboxes");
+    }
+    const BOTH: &[&str] = &["code-runtime", "private-base"];
+    const GENERIC: &[&str] = &["code-runtime"];
+    let worker = ProtoNodeRole::Worker;
+
+    let seen = seen_by(&fixture, host, host_ip, worker, sandbox_id).await?;
+    assert_seen(&seen, BOTH, Some(sandbox_id), "active host");
+    let seen = seen_by(&fixture, other, other_ip, worker, sandbox_id).await?;
+    assert_seen(&seen, GENERIC, None, "unplaced worker");
+    let seen = seen_by(
+        &fixture,
+        builder,
+        builder_ip,
+        ProtoNodeRole::Builder,
+        sandbox_id,
+    )
+    .await?;
+    assert_seen(&seen, GENERIC, None, "unplaced builder");
+
+    // A pending migration is a target placement: the destination may read
+    // before the sandbox is active there, and the source keeps reading while
+    // it still hosts the sandbox.
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET target_node_id = $1 WHERE id = $2"
+    ))
+    .bind(other)
+    .bind(sandbox_id)
+    .execute(pool)
+    .await?;
+    let seen = seen_by(&fixture, host, host_ip, worker, sandbox_id).await?;
+    assert_seen(&seen, BOTH, Some(sandbox_id), "migration source");
+    let seen = seen_by(&fixture, other, other_ip, worker, sandbox_id).await?;
+    assert_seen(&seen, BOTH, Some(sandbox_id), "migration target");
+
+    // Once the sandbox is active only on the destination, the source loses it.
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET active_node_id = $1, target_node_id = NULL WHERE id = $2"
+    ))
+    .bind(other)
+    .bind(sandbox_id)
+    .execute(pool)
+    .await?;
+    let seen = seen_by(&fixture, other, other_ip, worker, sandbox_id).await?;
+    assert_seen(&seen, BOTH, Some(sandbox_id), "active destination");
+    let seen = seen_by(&fixture, host, host_ip, worker, sandbox_id).await?;
+    assert_seen(&seen, GENERIC, None, "former host");
+
+    // Inventory is what the node reports about itself, so holding a template
+    // is not a placement.
+    sqlx::query(sql!(
+        "INSERT INTO node_template_inventory (node_id, template_name)
+         VALUES ($1, 'private-base')"
+    ))
+    .bind(host)
+    .execute(pool)
+    .await?;
+    let seen = seen_by(&fixture, host, host_ip, worker, sandbox_id).await?;
+    assert_seen(&seen, GENERIC, None, "self-reported inventory");
+
+    // An enabled warm pool covers registered workers, not builders.
+    let config_id: Uuid = sqlx::query_scalar(sql!(
+        "INSERT INTO kubernetes_pool_configs (
+             template_release_id, vcpu, memory_mib, target_ready_slots,
+             refill_per_tick, max_warming_slots, namespace, enabled, managed_by
+         )
+         VALUES ($1, 2, 4096, 1, 1, 1, 'space', FALSE, 'autoscaler')
+         RETURNING id"
+    ))
+    .bind(release_id)
+    .fetch_one(pool)
+    .await?;
+    let seen = seen_by(&fixture, host, host_ip, worker, sandbox_id).await?;
+    assert_seen(&seen, GENERIC, None, "disabled pool");
+    sqlx::query(sql!(
+        "UPDATE kubernetes_pool_configs SET enabled = TRUE WHERE id = $1"
+    ))
+    .bind(config_id)
+    .execute(pool)
+    .await?;
+    let seen = seen_by(&fixture, host, host_ip, worker, sandbox_id).await?;
+    assert_seen(&seen, BOTH, None, "enabled pool, worker");
+    let seen = seen_by(
+        &fixture,
+        builder,
+        builder_ip,
+        ProtoNodeRole::Builder,
+        sandbox_id,
+    )
+    .await?;
+    assert_seen(&seen, GENERIC, None, "enabled pool, builder");
+    sqlx::query(sql!(
+        "UPDATE kubernetes_pool_configs SET enabled = FALSE WHERE id = $1"
+    ))
+    .bind(config_id)
+    .execute(pool)
+    .await?;
+
+    // A fresh build grant covers registered builders, not workers.
+    sqlx::query(sql!(
+        "INSERT INTO template_build_base_grants (id, template_id, base_template_name, org_id)
+         VALUES ($1, 'private-child', 'private-base', $2)"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(owner)
+    .execute(pool)
+    .await?;
+    let seen = seen_by(
+        &fixture,
+        builder,
+        builder_ip,
+        ProtoNodeRole::Builder,
+        sandbox_id,
+    )
+    .await?;
+    assert_seen(&seen, BOTH, None, "fresh grant, builder");
+    let seen = seen_by(&fixture, host, host_ip, worker, sandbox_id).await?;
+    assert_seen(&seen, GENERIC, None, "fresh grant, worker");
+    sqlx::query(sql!("DELETE FROM template_build_base_grants"))
+        .execute(pool)
+        .await?;
+
+    // Retiring a template: a node that still holds it hears `present = false`
+    // and nothing else, while placement keeps serving the sandbox's host.
+    sqlx::query(sql!(
+        "UPDATE templates SET desired_state = 'deleting' WHERE name = 'private-base'"
+    ))
+    .execute(pool)
+    .await?;
+    let retiring = vec![
+        ("code-runtime".to_string(), Some(true)),
+        ("private-base".to_string(), Some(false)),
+    ];
+    let holder = seen_by(&fixture, host, host_ip, worker, sandbox_id).await?;
+    assert_eq!(holder.policy, GENERIC, "retiring holder: policy templates");
+    assert_eq!(
+        holder.base, GENERIC,
+        "retiring holder: base-snapshot templates"
+    );
+    assert_eq!(
+        holder.desired, retiring,
+        "retiring holder: desired templates"
+    );
+    assert!(holder.sandboxes.is_empty(), "retiring holder: sandboxes");
+    let active = seen_by(&fixture, other, other_ip, worker, sandbox_id).await?;
+    assert_eq!(
+        active.policy, BOTH,
+        "retiring sandbox host: policy templates"
+    );
+    assert_eq!(
+        active.base, BOTH,
+        "retiring sandbox host: base-snapshot templates"
+    );
+    assert_eq!(
+        active.desired, retiring,
+        "retiring sandbox host: desired templates"
+    );
+    assert_eq!(active.sandboxes, vec![sandbox_id.to_string()]);
     Ok(())
 }

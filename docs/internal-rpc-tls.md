@@ -115,3 +115,44 @@ plaintext, independent of client development settings. Deployment tooling may
 use this contract to distinguish TLS-only images from images that support a
 dual-protocol migration. Capability versions describe behavior rather than Rust
 source layout; update the declaration together with changes to that behavior.
+
+## Ingress activation delegation
+
+`IngressActivationApi/PrepareIngress` is an internal gRPC service hosted by
+`space-api-svc`, using its existing lifecycle controller. Configure
+`SPACE_INGRESS_ACTIVATION_LISTEN` on the API deployments that serve it. When
+unset, the API continues serving its existing HTTP surface without an activation
+listener. The local Kind chart exposes this listener on port 9801.
+
+Configure `SPACE_INGRESS_ACTIVATION_ENDPOINT` (an HTTPS URL) and the shared CA
+bundle on cluster API. Without an endpoint, cluster API still starts and serves
+healthy routes; delegated wakes return `Unavailable` with an unconfigured
+endpoint diagnostic. `SPACE_INGRESS_ACTIVATION_TLS_SERVER_NAME` optionally overrides
+the endpoint's certificate name. Provision a separate listener certificate/key
+with `SPACE_INTERNAL_RPC_TLS_CERT` and `SPACE_INTERNAL_RPC_TLS_KEY`; API HTTP
+routing does not expose this RPC.
+
+The listener uses the existing **Cluster** bearer-authentication surface.
+On the hosting API deployment, enable Kubernetes TokenReview, disable static
+fallback, and set `SPACE_CLUSTER_API_AUTH_ALLOWED_SERVICE_ACCOUNTS` to only the
+trusted cluster-API route-resolver identities. Those callers must already have
+authorized the user's session or service-port credentials. Mount a projected
+token for the configured cluster-API audience on the caller via
+`SPACE_CLUSTER_API_TOKEN_PATH`. Static-only local deployments use
+`SPACE_INTERNAL_TOKEN`. The RPC always requests implicit Access activation,
+so worker-local access-wake policy remains authoritative.
+
+Deploy API listeners, their Service, TLS identity, TokenReview permissions, and
+network access first. Verify authenticated delegation and policy-denied access
+before deploying cluster API with its endpoint. There is no fallback that
+constructs a local controller if delegation fails. Healthy worker routes do not
+call the activation service. An ingress worker probe uses at most one second
+and one quarter of the remaining deadline, preserving time for recovery.
+Failed ingress preparation gets at most one delegated activation and one
+re-resolution, within the caller's original deadline and before forwarding
+application bytes. Non-ingress route failures are returned without this retry.
+
+For rollback, retain the activation listener until all delegating cluster-API
+replicas have been replaced. Reverting cluster API to a build that constructs a
+local substrate also restores that build's cache memory requirements. Neither
+an old API without the RPC nor a missing endpoint can serve delegated wakes.

@@ -39,6 +39,8 @@ spec:
             - --listen
             - "0.0.0.0:{{ .Values.service.port }}"
           env:
+            - name: SPACE_INGRESS_ACTIVATION_ENDPOINT
+              value: {{ .Values.activationEndpoint | quote }}
             # Local Kind only; deployed services require authenticated internal RPC TLS.
             - name: SPACE_INTERNAL_RPC_INSECURE_DEV
               value: "true"
