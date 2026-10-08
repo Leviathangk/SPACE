@@ -4712,6 +4712,23 @@ impl TransferExecutor {
             ))),
             Ok(meta) => {
                 let wire_size = meta.len();
+                use pplx_space_metrics::volume_manager::{
+                    PushPayloadEncoding, PushPayloadPhase, push_payload,
+                };
+                let artifact = transfer_artifact_tag(p.effective_snapshot_artifact());
+                let encoding = match (self.config.compress, p.encryption.is_some()) {
+                    (false, false) => PushPayloadEncoding::Raw,
+                    (true, false) => PushPayloadEncoding::Zstd,
+                    (false, true) => PushPayloadEncoding::Aead,
+                    (true, true) => PushPayloadEncoding::ZstdAead,
+                };
+                push_payload(
+                    artifact,
+                    encoding,
+                    PushPayloadPhase::Prepared,
+                    original_size,
+                    wire_size,
+                );
                 match self.store.put_file(creds, target, &put_source).await {
                     // A successful `put_file` is not sufficient: a truncated /
                     // partial multipart upload can still return `Ok` (e.g. a
@@ -4724,6 +4741,13 @@ impl TransferExecutor {
                     // to a corrupt artifact.
                     Ok(_) => match self.store.head(creds, target).await {
                         Ok(Some(durable)) if durable.size == wire_size => {
+                            push_payload(
+                                artifact,
+                                encoding,
+                                PushPayloadPhase::Verified,
+                                original_size,
+                                wire_size,
+                            );
                             bytes_len_to_job_i64(original_size, "upload source size")
                         }
                         Ok(Some(durable)) => Err(JobError::Retriable(format!(
