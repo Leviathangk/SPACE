@@ -373,7 +373,7 @@ SSHSOCKET
 systemctl enable ssh.socket 2>/dev/null || true
 
 # All the work users run lives in space.slice: API workloads
-# (space-workloads.service, below with spaced) and SSH sessions and the E2B
+# (space-workloads.service, below with spaced) and SSH sessions and the native
 # template start command (space-sessions.slice). The guest's infrastructure,
 # spaced and the system daemons, stays in system.slice. spaced caps
 # space.slice's memory and tasks at startup, from the guest's size (systemctl
@@ -399,7 +399,7 @@ MemoryMax=90%
 TasksMax=90%
 SPACESLICE
 
-# SSH sessions and the E2B template start command run in their own slice,
+# SSH sessions and the native template start command run in their own slice,
 # outside spaced.service, whose KillMode would end them whenever spaced
 # restarts. logind is masked, so PAM opens no session scopes: a session stays
 # in ssh.service's cgroup, here.
@@ -416,15 +416,6 @@ Conflicts=shutdown.target
 TasksMax=80%
 SESSIONSSLICE
 
-# The E2B template start command (e2b-template-start.service, written by the
-# API's template build) runs with SSH sessions, under the envelope's limits
-# rather than systemd's per-unit task cap.
-mkdir -p /etc/systemd/system/e2b-template-start.service.d
-cat > /etc/systemd/system/e2b-template-start.service.d/00-space-sessions.conf <<'STARTSLICE'
-[Service]
-Slice=space-sessions.slice
-TasksMax=infinity
-STARTSLICE
 mkdir -p /etc/systemd/system/ssh.service.d
 cat > /etc/systemd/system/ssh.service.d/00-space-sessions.conf <<'SSHSLICE'
 [Service]
@@ -472,16 +463,20 @@ cat > /etc/systemd/system/space.target <<'SPACETARGET'
 Description=SPACE Sandbox Target
 DefaultDependencies=no
 Requires=local-fs.target spaced.service space-user-sessions.service
-Wants=ssh.socket
+Wants=ssh.socket space-runtime.service
 After=local-fs.target spaced.service space-user-sessions.service
 Conflicts=shutdown.target
-Before=shutdown.target
+Before=shutdown.target space-runtime.service
 AllowIsolate=yes
 
 [Install]
 Alias=default.target
 SPACETARGET
 systemctl set-default space.target 2>/dev/null || true
+
+# The guest binary owns the fixed native startup unit; templates carry only
+# validated declarations. Boot ordering leaves the agent available for debugging.
+/usr/local/bin/spaced-svc --runtime-unit > /etc/systemd/system/space-runtime.service
 
 # spaced guest daemon — runs as root, listens on /run/spaced.sock for
 # CLI and agent processes (user UID 2000), and vsock for host communication.
