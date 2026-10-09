@@ -1,6 +1,58 @@
 use super::*;
 
 #[test]
+fn termination_waits_for_known_quiescence_and_removal() {
+    // Synthetic filesystem observations: the async supervisor owns timing.
+    let root = tempfile::tempdir().unwrap();
+    let paths = [root.path().join("sidecar"), root.path().join("vm")];
+    for path in &paths {
+        fs::create_dir(path).unwrap();
+        fs::write(path.join("cgroup.kill"), "").unwrap();
+        fs::write(path.join("cgroup.events"), "populated 1\n").unwrap();
+    }
+    let sandbox_id = SandboxId::new();
+    for _ in 0..60 {
+        assert!(
+            try_terminate_cgroup_paths(sandbox_id, &paths)
+                .unwrap_err()
+                .is_retryable()
+        );
+    }
+    for path in &paths {
+        assert_eq!(fs::read_to_string(path.join("cgroup.kill")).unwrap(), "1");
+    }
+    fs::remove_dir_all(&paths[0]).unwrap();
+    assert!(
+        try_terminate_cgroup_paths(sandbox_id, &paths)
+            .unwrap_err()
+            .is_retryable()
+    );
+    fs::remove_dir_all(&paths[1]).unwrap();
+    assert_eq!(
+        try_terminate_cgroup_paths(sandbox_id, &paths)
+            .unwrap()
+            .paths_present,
+        0
+    );
+    assert!(
+        try_terminate_cgroup_paths(sandbox_id, &paths).is_ok(),
+        "repeated Stop is idempotent"
+    );
+}
+
+#[test]
+fn termination_never_treats_unknown_population_as_empty() {
+    for events in [Some("populated unknown\n"), None] {
+        let root = tempfile::tempdir().unwrap();
+        if let Some(events) = events {
+            fs::write(root.path().join("cgroup.events"), events).unwrap();
+        }
+        try_terminate_cgroup_paths(SandboxId::new(), &[root.path().to_owned()]).unwrap_err();
+        assert!(root.path().exists());
+    }
+}
+
+#[test]
 fn cgroup_kill_request_writes_kernel_trigger_when_available() {
     let root = tempfile::tempdir().unwrap();
     let kill_file = root.path().join("cgroup.kill");

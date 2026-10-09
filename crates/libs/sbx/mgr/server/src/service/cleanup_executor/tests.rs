@@ -28,6 +28,121 @@ fn work(conn: &rusqlite::Connection, kill: bool) -> (JobId, CleanupWork) {
 }
 
 #[tokio::test]
+async fn blocking_stop_follows_a_retryable_attempt_to_durable_completion() {
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new();
+    let subject = sandbox_id.to_string();
+    insert_test_sandbox(&conn, &subject, SandboxState::Stopping);
+    let service = service_for_teardown_test(conn);
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let attempts = Arc::clone(&calls);
+    *service.cleanup_executor.dispatch.lock().unwrap() = Some(Arc::new(move |_, _| {
+        let first = attempts.fetch_add(1, Ordering::SeqCst) == 0;
+        Box::pin(async move {
+            if first {
+                Err(Status::unavailable("runtime still exiting"))
+            } else {
+                Ok(())
+            }
+        })
+    }));
+    let label = SandboxRuntimeLabel::from_sandbox_id(sandbox_id);
+    let request = SynchronousCleanupRequest {
+        sandbox_id: &subject,
+        uuid8: label.as_str(),
+        keep_filesystem: true,
+        context: "blocking stop regression",
+        completion: CleanupCompletion::MarkStopped,
+        immediate_kill: true,
+        guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
+        published_artifact: None,
+    };
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        service.run_cleanup_to_completion_using_admission(request, None, None, CleanupWait::Stop),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        crate::db::get_sandbox(&service.db.lock().unwrap(), &subject)
+            .unwrap()
+            .unwrap()
+            .state,
+        SandboxState::Stopped
+    );
+    service.shutdown_token.cancel();
+    service.task_tracker.close();
+    service.task_tracker.wait().await;
+}
+
+#[tokio::test]
+async fn stop_waiter_bounds_retries_without_losing_the_durable_job() {
+    use tonic::Code;
+    for (state, code, expected) in [
+        (
+            JobStatus::Pending,
+            Code::Unavailable,
+            Code::DeadlineExceeded,
+        ),
+        (
+            JobStatus::Pending,
+            Code::ResourceExhausted,
+            Code::DeadlineExceeded,
+        ),
+        (
+            JobStatus::Pending,
+            Code::DeadlineExceeded,
+            Code::DeadlineExceeded,
+        ),
+        (
+            JobStatus::Pending,
+            Code::PermissionDenied,
+            Code::PermissionDenied,
+        ),
+        (JobStatus::Pending, Code::Internal, Code::Internal),
+        (JobStatus::Failed, Code::Unavailable, Code::Unavailable),
+        (JobStatus::Cancelled, Code::Unavailable, Code::Aborted),
+    ] {
+        let conn = crate::db::test_conn();
+        let (id, _) = work(&conn, true);
+        jobs::mark_job_running(&conn, &id).unwrap();
+        let failure = serde_json::to_string(&CleanupFailure {
+            code: code as i32,
+            message: "test failure".into(),
+        })
+        .unwrap();
+        match state {
+            JobStatus::Pending => {
+                jobs::retry_running_job(&conn, &id, &failure, 30).unwrap();
+            }
+            JobStatus::Failed => {
+                jobs::fail_job_permanent(&conn, &id, &failure, None).unwrap();
+            }
+            JobStatus::Cancelled => {
+                jobs::request_job_cancellation(&conn, &id).unwrap();
+                jobs::mark_job_cancelled(&conn, &id).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let service = service_for_teardown_test(conn);
+        let result = service
+            .wait_stop_cleanup_job(id, Duration::from_millis(50))
+            .await;
+        assert_eq!(result.unwrap_err().code(), expected, "{state:?} {code:?}");
+        assert_eq!(
+            jobs::get_job(&service.db.lock().unwrap(), &id)
+                .unwrap()
+                .unwrap()
+                .status,
+            state.as_str()
+        );
+        assert!(service.cleanup_executor.waiters.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
 async fn burst_is_bounded_fair_coalesced_and_independent_of_waiter_cancellation() {
     let conn = crate::db::test_conn();
     let jobs: Vec<_> = (0..64).map(|n| work(&conn, n % 2 == 0)).collect();
@@ -893,7 +1008,11 @@ async fn selected_cancellation_cannot_publish_success_after_a_stale_waiter_read(
     .unwrap();
     let waiter_service = service.clone();
     let awaited = id;
-    let waiter = tokio::spawn(async move { waiter_service.wait_cleanup_job(awaited).await });
+    let waiter = tokio::spawn(async move {
+        waiter_service
+            .wait_stop_cleanup_job(awaited, Duration::from_secs(10))
+            .await
+    });
     tokio::time::timeout(Duration::from_secs(5), barrier.entered.notified())
         .await
         .unwrap();

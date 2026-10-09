@@ -4224,6 +4224,7 @@ impl SandboxManagerService {
             },
             Some(admission),
             None,
+            super::cleanup_executor::CleanupWait::Attempt,
         )
         .await?;
         emit_sandbox_event(

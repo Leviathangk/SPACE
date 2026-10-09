@@ -25,7 +25,7 @@ pub const DEFAULT_PARENT_CPU_RESERVED_COUNT: u32 = 2;
 const MIB_BYTES: u64 = 1024 * 1024;
 const CGROUP_CPU_PERIOD_US: u64 = 100_000;
 
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct CgroupCleanupReport {
     pub paths_present: usize,
     pub paths_removed: usize,
@@ -37,11 +37,82 @@ pub struct CgroupCleanupReport {
 
 #[derive(Debug, thiserror::Error)]
 #[error("failed to remove cgroup {path} after {attempts} attempts: {source}")]
-struct CgroupRemovalError {
+pub struct CgroupRemovalError {
     path: PathBuf,
     attempts: usize,
     #[source]
     source: std::io::Error,
+}
+
+impl CgroupRemovalError {
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self.source.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+        ) || self.source.raw_os_error() == Some(libc::EBUSY)
+    }
+}
+
+/// One termination attempt under the caller's execution fence. The async
+/// supervisor owns the deadline and waits between attempts without retaining
+/// a blocking thread or blocking-work permit.
+pub fn try_terminate_sandbox_cgroups(
+    sandbox_id: SandboxId,
+) -> Result<CgroupCleanupReport, CgroupRemovalError> {
+    try_terminate_cgroup_paths(sandbox_id, &sandbox_cgroup_paths(&sandbox_id.to_string()))
+}
+
+fn try_terminate_cgroup_paths(
+    sandbox_id: SandboxId,
+    paths: &[PathBuf],
+) -> Result<CgroupCleanupReport, CgroupRemovalError> {
+    // Signal both trees before observing either. SIGKILL delivery is not proof
+    // of exit: teardown can outlive the last cgroup.procs entry.
+    for path in paths {
+        if !request_cgroup_kill(path) {
+            kill_cgroup_processes(path);
+        }
+    }
+    let mut report = CgroupCleanupReport::default();
+    let mut pending = None;
+    for path in paths {
+        let observation = cgroup_is_quiescent(path)
+            .and_then(|quiet| {
+                if quiet {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "cgroup is still populated",
+                    ))
+                }
+            })
+            .map_err(|source| CgroupRemovalError {
+                path: path.clone(),
+                attempts: 0,
+                source,
+            });
+        match observation.and_then(|()| remove_cgroup_path(sandbox_id, path, 1)) {
+            Ok(path_report) => report.include(path_report),
+            Err(error) if error.is_retryable() => pending = Some(error),
+            Err(error) => return Err(error),
+        }
+    }
+    match pending {
+        Some(error) => Err(error),
+        None => Ok(report),
+    }
+}
+
+impl CgroupCleanupReport {
+    fn include(&mut self, path: CgroupPathCleanupReport) {
+        self.paths_present += usize::from(path.present);
+        self.paths_removed += usize::from(path.removed);
+        self.attempts += path.attempts;
+        self.cgroup_kill_requests += path.cgroup_kill_requests;
+        self.killed_pids += path.killed_pids;
+        self.child_cgroups_removed += path.child_cgroups_removed;
+    }
 }
 
 #[derive(Default)]
@@ -639,18 +710,7 @@ fn remove_sandbox_cgroups_with_report_attempts(
 
     for cgroup_path in sandbox_cgroup_paths(sandbox_id) {
         match remove_cgroup_path(typed_sandbox_id, &cgroup_path, remove_attempts) {
-            Ok(path_report) => {
-                if path_report.present {
-                    report.paths_present += 1;
-                }
-                if path_report.removed {
-                    report.paths_removed += 1;
-                }
-                report.attempts += path_report.attempts;
-                report.cgroup_kill_requests += path_report.cgroup_kill_requests;
-                report.killed_pids += path_report.killed_pids;
-                report.child_cgroups_removed += path_report.child_cgroups_removed;
-            }
+            Ok(path_report) => report.include(path_report),
             Err(error) => {
                 errors.push(error.to_string());
             }
@@ -725,7 +785,7 @@ fn remove_cgroup_path(
         };
         report.killed_pids += killed_pids;
 
-        // `cgroup.kill` reaps the subtree's processes, but the child cgroup
+        // `cgroup.kill` signals the subtree's processes, but the child cgroup
         // directories themselves (e.g. a jailer-created nested cgroup) are not
         // removed by it, and `rmdir` of a parent that still has descendants
         // returns EBUSY. Remove any descendant cgroups bottom-up first.
@@ -755,7 +815,7 @@ fn remove_cgroup_path(
                             .filter(std::fs::FileType::is_dir)
                             .count()
                     });
-                    tracing::info!(
+                    tracing::debug!(
                         %sandbox_id,
                         cgroup_path = %cgroup_path.display(),
                         cgroup_remove_attempt = attempt + 1,

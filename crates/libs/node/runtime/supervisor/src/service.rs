@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 
 use crate::cgroups::{
-    apply_firecracker_cgroup_fixups, cgroup_update_error_to_status, remove_sandbox_cgroups_blocking,
+    apply_firecracker_cgroup_fixups, cgroup_update_error_to_status, terminate_sandbox_cgroups,
 };
 use crate::inventory::{
     live_firecracker_pidfile, live_runtime_pid, live_sidecar_pid_from_cgroup, sandbox_runtime_pids,
@@ -907,8 +907,7 @@ impl RuntimeSupervisorService {
             };
             signal_sandbox_pids(&sandbox_id, &still_alive, libc::SIGKILL, &mut actions);
         }
-        let blocking_slot = self.acquire_blocking_slot().await?;
-        remove_sandbox_cgroups_blocking(sandbox_id, blocking_slot)
+        terminate_sandbox_cgroups(sandbox_id, Arc::clone(&self.blocking_slots))
             .await
             .map(|cgroup_actions| {
                 actions.extend(cgroup_actions);
