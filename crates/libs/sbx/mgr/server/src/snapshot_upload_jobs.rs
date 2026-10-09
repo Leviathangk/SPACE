@@ -924,6 +924,7 @@ pub(crate) async fn begin_with_cluster_api(
         },
         snapshot_name: request.snapshot_name.map(str::to_owned),
         execution: Some(request.execution.execution().into()),
+        capture_host_cpu: None,
     };
 
     client
