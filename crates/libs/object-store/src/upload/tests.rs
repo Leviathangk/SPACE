@@ -112,7 +112,7 @@ async fn handle(
         }
         Method::PUT => {
             let number = query(&uri, "partNumber").map(|s| s.parse::<i32>().unwrap());
-            if number.is_some()
+            if !body.is_empty()
                 && headers
                     .get("x-amz-content-sha256")
                     .and_then(|v| v.to_str().ok())
@@ -144,7 +144,9 @@ async fn handle(
                     "<Error><Code>BadDigest</Code></Error>",
                 );
             }
-            if number == Some(1) && attempt == 1 && matches!(server.behavior, Behavior::RetryFirst)
+            if number.unwrap_or(1) == 1
+                && attempt == 1
+                && matches!(server.behavior, Behavior::RetryFirst)
             {
                 return xml(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -245,7 +247,7 @@ fn source(bytes: Vec<u8>) -> UploadSource {
 async fn reconstructs_empty_short_exact_and_multipart_objects_and_replays_parts() {
     for (size, behavior) in [
         (0, Behavior::Normal),
-        (37, Behavior::Normal),
+        (37, Behavior::RetryFirst),
         (PART, Behavior::Normal),
         (PART + 19, Behavior::OutOfOrder),
         (2 * PART + 1, Behavior::RetryFirst),
@@ -277,7 +279,11 @@ async fn reconstructs_empty_short_exact_and_multipart_objects_and_replays_parts(
             );
         }
         if matches!(behavior, Behavior::RetryFirst) {
-            let first: Vec<_> = state.requests.iter().filter(|(_, n, _)| *n == 1).collect();
+            let first: Vec<_> = state
+                .requests
+                .iter()
+                .filter(|(_, n, _)| *n == if size < PART { 0 } else { 1 })
+                .collect();
             assert_eq!(first.len(), 2);
             assert_eq!(
                 first[0].2, first[1].2,
@@ -313,6 +319,8 @@ impl AsyncRead for ReadFailure {
 async fn producer_failure_or_rejected_upload_never_publishes_and_awaits_abort() {
     for (size, behavior, producer_fails, read_fails) in [
         (0, Behavior::Normal, true, false),
+        (37, Behavior::Normal, true, false),
+        (37, Behavior::RejectDigest, false, false),
         (PART + 23, Behavior::Normal, true, false),
         (PART + 23, Behavior::Normal, false, true),
         (PART + 23, Behavior::RejectDigest, false, false),
@@ -352,7 +360,7 @@ async fn producer_failure_or_rejected_upload_never_publishes_and_awaits_abort() 
         let state = server.recorded.lock().unwrap();
         assert!(state.objects.is_empty());
         assert!(state.completed.is_empty());
-        assert_eq!(state.aborts, usize::from(size != 0));
+        assert_eq!(state.aborts, usize::from(size >= PART));
     }
 }
 
@@ -360,6 +368,7 @@ async fn producer_failure_or_rejected_upload_never_publishes_and_awaits_abort() 
 async fn producer_success_is_required_after_eof_before_completion() {
     let (server, endpoint) = Server::start(Behavior::Normal).await;
     let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+    let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
     let (reader, mut writer) = tokio::io::duplex(8);
     let producer = tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;
@@ -369,7 +378,10 @@ async fn producer_success_is_required_after_eof_before_completion() {
     });
     let source = UploadSource::new(
         reader,
-        async move { producer.await.map_err(io::Error::other)? },
+        async move {
+            waiting_tx.send(()).unwrap();
+            producer.await.map_err(io::Error::other)?
+        },
         CancellationToken::new(),
     );
     let task = tokio::spawn(async move {
@@ -383,8 +395,11 @@ async fn producer_success_is_required_after_eof_before_completion() {
             )
             .await
     });
-    server.wait_for(|s| s.requests.len() == 1).await;
-    assert!(server.recorded.lock().unwrap().completed.is_empty());
+    waiting_rx.await.unwrap();
+    assert!(
+        server.recorded.lock().unwrap().requests.is_empty(),
+        "single PUT must wait for producer success"
+    );
     finish_tx.send(()).unwrap();
     assert_eq!(task.await.unwrap().unwrap(), 17);
     assert_eq!(server.recorded.lock().unwrap().objects, vec![vec![42; 17]]);
@@ -489,6 +504,54 @@ async fn shared_budget_backpressures_independent_stores_without_deadlocking_uplo
     .await
     .expect("budget waiters must not block part completion");
     assert_eq!(server.recorded.lock().unwrap().objects.len(), 2);
+    assert_eq!(budget.permits.available_permits(), 2 * PART / MIB);
+}
+
+#[tokio::test]
+async fn prefetch_keeps_producer_running_without_exceeding_upload_concurrency() {
+    let (server, endpoint) = Server::start(Behavior::HoldParts).await;
+    let budget = UploadBufferBudget::new(2 * PART).unwrap();
+    let read = Arc::new(AtomicUsize::new(0));
+    let reader = CountingReader {
+        cursor: io::Cursor::new(payload(3 * PART)),
+        read: read.clone(),
+    };
+    let task_budget = budget.clone();
+    let job = tokio::spawn(async move {
+        store()
+            .put_stream(
+                &credentials(),
+                target(&endpoint),
+                UploadSource::new(reader, async { Ok(()) }, CancellationToken::new()),
+                task_budget,
+                StreamingUploadOptions::new(PART, 1, (3 * PART) as u64).unwrap(),
+            )
+            .await
+    });
+    server.wait_for(|s| s.requests.len() == 1).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while read.load(Ordering::SeqCst) < 2 * PART {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the next part must fill while the first request is blocked");
+    assert_eq!(
+        server.recorded.lock().unwrap().requests.len(),
+        1,
+        "prefetch must not increase request concurrency"
+    );
+    assert_eq!(read.load(Ordering::SeqCst), 2 * PART);
+    assert_eq!(budget.permits.available_permits(), 0);
+    server.release.add_permits(3);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(10), job)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        (3 * PART) as u64
+    );
     assert_eq!(budget.permits.available_permits(), 2 * PART / MIB);
 }
 

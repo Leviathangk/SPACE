@@ -251,6 +251,8 @@ pub struct VolmgrRunConfig {
     pub transfer_drain_timeout: Duration,
     /// Compress snapshot files with zstd before uploading to S3.
     pub compress: bool,
+    /// Deployment upload policy for ordinary and LUKS snapshots.
+    pub snapshot_upload_mode: crate::SnapshotUploadMode,
     /// Decode zstd pulls inline with the ranged download (one pass) instead of
     /// a separate read-back decompress step.
     pub stream_decode_pulls: bool,
@@ -494,6 +496,7 @@ pub async fn run(
             max_attempts: config.transfer_max_attempts,
             executor: TransferExecutorConfig {
                 compress: config.compress,
+                snapshot_upload_mode: config.snapshot_upload_mode.clone(),
                 stream_decode_pulls: config.stream_decode_pulls,
                 codec_concurrency: config.codec_concurrency,
                 codec_priority_reserve: config.codec_priority_reserve,
@@ -558,6 +561,7 @@ pub async fn run(
         server_drain_timeout_secs = config.server_drain_timeout.as_secs(),
         transfer_drain_timeout_secs = config.transfer_drain_timeout.as_secs(),
         compress = config.compress,
+        stream_push_buffer_budget_bytes = config.snapshot_upload_mode.buffer_budget_bytes(),
         stream_decode_pulls = config.stream_decode_pulls,
         service_mutex_timeout_secs = config.service_mutex_timeout.as_secs(),
         "volume manager active; listening on production socket"

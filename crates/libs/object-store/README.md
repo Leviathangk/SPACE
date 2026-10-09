@@ -42,9 +42,11 @@ bound the number of producers. For example, evaluating 64 MiB parts with a
 shared 1 GiB budget permits at most 16 simultaneously retained full part buffers;
 this is a sizing example, not a production default.
 
-Non-empty sources use multipart upload, including a single short part. Empty
-sources use a checksum-protected single PUT, after producer success. Every part
-has Content-MD5 over its exact retained bytes; SDK retries replay those bytes.
+Sources that reach EOF before filling the first part use a checksum-protected
+single PUT after producer success, including empty sources. Larger sources use
+multipart upload. Every body has Content-MD5 over its exact retained bytes; SDK
+retries replay those bytes. A budgeted next part can fill while requests are in
+flight, without increasing the configured HTTP request concurrency.
 Oversized output fails rather than publishing a valid-looking truncated prefix.
 
 ## Failure, ownership and rollback
@@ -58,7 +60,7 @@ Oversized output fails rather than publishing a valid-looking truncated prefix.
 | Blocking allocation/hash outlives cancellation | Its buffer permit remains charged until the worker and every body owner release the allocation. |
 | Process death, ambiguous create response, failed abort | Bucket lifecycle cleanup must reclaim abandoned multipart uploads. No in-process guard is crash-safe. |
 | Ambiguous completion | Return failure without deleting the destination. The caller owns verification and a new whole-upload attempt under its existing overwrite/identity policy. |
-| Whole-upload retry | Create a fresh producer and multipart upload. Do not reuse part offsets or assume regenerated codec output is identical. |
+| Whole-upload retry | Create a fresh producer and upload attempt. Do not reuse part offsets or assume regenerated codec output is identical. |
 
 The SDK supplies request-class timeouts and finite retries. The caller supplies
 an end-to-end job deadline for budget waits, producer work and cleanup. The
