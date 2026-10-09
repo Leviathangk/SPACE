@@ -9,6 +9,8 @@ pub mod run;
 pub mod service;
 pub mod staging;
 
+pub use executor::{SnapshotUploadMode, StreamingPushBudget};
+
 pub use run::{
     DEFAULT_CODEC_CONCURRENCY, DEFAULT_CODEC_PRIORITY_RESERVE, DEFAULT_PULL_CONCURRENCY,
     DEFAULT_PUSH_CONCURRENCY, DEFAULT_SERVER_DRAIN_TIMEOUT_SECS,

@@ -1,3 +1,7 @@
+mod stream_push;
+use stream_push::StreamPushConfig;
+pub use stream_push::{SnapshotUploadMode, StreamingPushBudget};
+
 use pplx_space_common_core::types::JobId;
 
 use std::collections::HashMap;
@@ -3308,9 +3312,9 @@ async fn apply_file_mode(
 /// with zstd before upload and transparently decompressing on download.
 ///
 /// **Push with compression:**
-/// The file is compressed to a sibling `.zst.tmp` file before upload. The
-/// S3 key is unchanged — the object's bytes are compressed, but the key path
-/// stays the same. The temp file is always deleted after the upload attempt.
+/// Eligible staged snapshots can stream compression directly to S3; other
+/// sources use a sibling `.zst.tmp` file, removed after the upload attempt.
+/// Either path preserves the S3 key and compressed-object format.
 ///
 /// **Pull with compression awareness:**
 /// After download the first 4 bytes are checked for the zstd frame magic. If
@@ -3332,6 +3336,7 @@ pub struct TransferExecutor {
     /// `None` disables priority-aware admission.
     codec_priority_threshold: Option<JobPriority>,
     stream_writeback: Arc<StreamWritebackCoordinator>,
+    stream_push: Option<StreamPushConfig>,
     shadow_staging_dir: PathBuf,
     shadow_comparison_permits: Arc<tokio::sync::Semaphore>,
     shadow_comparisons: ShadowComparisonController,
@@ -3442,6 +3447,8 @@ async fn remove_sparse_shadow_snapshot(path: &Path, reason: &'static str) {
 pub struct TransferExecutorConfig {
     /// Compress snapshot files with zstd before uploading to S3.
     pub compress: bool,
+    /// Deployment upload policy with one shared streaming-buffer budget.
+    pub snapshot_upload_mode: SnapshotUploadMode,
     /// Maximum concurrent CPU-bound zstd passes (compress or decompress).
     /// `0` auto-sizes to the CPU quota. See [`resolved_codec_concurrency`].
     pub codec_concurrency: usize,
@@ -3502,6 +3509,7 @@ impl TransferExecutor {
         };
         let shadow_comparisons = ShadowComparisonController::new();
         Self {
+            stream_push: StreamPushConfig::new(&config.snapshot_upload_mode, total),
             store,
             config,
             destination_pull_locks: Arc::new(DashMap::new()),
@@ -4080,7 +4088,20 @@ impl TransferExecutor {
         // Single-file transfers are always plaintext (`resolved_dek = None`)
         // and own their staged source cleanup (`cleanup_staged = true`).
         let result = match job.kind.as_str() {
-            "push" => self.execute_push(job, &p, &creds, target, true, None).await,
+            "push" => {
+                self.execute_push(
+                    job,
+                    &p,
+                    &creds,
+                    target,
+                    PushExecutionOptions {
+                        cleanup_staged: true,
+                        resolved_dek: None,
+                        cancellation,
+                    },
+                )
+                .await
+            }
             "pull" => self
                 .execute_pull_cancellable(
                     job,
@@ -4269,8 +4290,18 @@ impl TransferExecutor {
                     // after the fan-out (a per-entry success is not terminal
                     // for the artifact).
                     ArtifactKind::Push => {
-                        self.execute_push(job, &synthetic, creds, target, false, resolved_dek)
-                            .await
+                        self.execute_push(
+                            job,
+                            &synthetic,
+                            creds,
+                            target,
+                            PushExecutionOptions {
+                                cleanup_staged: false,
+                                resolved_dek,
+                                cancellation,
+                            },
+                        )
+                        .await
                     }
                     ArtifactKind::Pull => self
                         .execute_pull_cancellable(
@@ -4517,6 +4548,12 @@ async fn stage_encrypted_temp(
     }
 }
 
+struct PushExecutionOptions<'a> {
+    cleanup_staged: bool,
+    resolved_dek: Option<&'a [u8]>,
+    cancellation: CancellationToken,
+}
+
 impl TransferExecutor {
     async fn execute_push(
         &self,
@@ -4524,18 +4561,24 @@ impl TransferExecutor {
         p: &TransferPayload,
         creds: &pplx_space_object_store::ObjectCredentials,
         target: ObjectTarget<'_>,
-        cleanup_staged: bool,
-        resolved_dek: Option<&[u8]>,
+        options: PushExecutionOptions<'_>,
     ) -> Result<i64, JobError> {
         let result = self
-            .execute_push_inner(job, p, creds, target, resolved_dek)
+            .execute_push_inner(
+                job,
+                p,
+                creds,
+                target,
+                options.resolved_dek,
+                options.cancellation,
+            )
             .await;
         // Single-file pushes clean their staged source here. Artifact entries
         // pass `cleanup_staged = false`: a per-entry success is NOT terminal
         // for the artifact (a sibling may force a retry that must re-read this
         // entry's staged bytes), so `execute_artifact` runs one artifact-level
         // cleanup after the whole fan-out instead.
-        if cleanup_staged {
+        if options.cleanup_staged {
             self.cleanup_staged_on_terminal(job, p, &result).await;
         }
         result
@@ -4548,6 +4591,7 @@ impl TransferExecutor {
         creds: &pplx_space_object_store::ObjectCredentials,
         target: ObjectTarget<'_>,
         resolved_dek: Option<&[u8]>,
+        cancellation: CancellationToken,
     ) -> Result<i64, JobError> {
         // Prefer the staged copy when set: bytes there are immune to a later
         // unlink of the caller's original path between submit and execute.
@@ -4592,6 +4636,28 @@ impl TransferExecutor {
             .map(|m| m.len())
             .map_err(|e| JobError::Permanent(format!("stat source file for size: {e}")))?;
 
+        if let Some(config) = &self.stream_push
+            && self.config.compress
+            && let Some(options) = config.options(p, original_size)
+            && let Some(uploader) = self.store.streaming_upload()
+        {
+            return self
+                .execute_stream_push(
+                    job,
+                    p,
+                    creds,
+                    target,
+                    stream_push::StreamPushAttempt {
+                        uploader,
+                        config,
+                        options,
+                        original_size,
+                        cancellation,
+                    },
+                )
+                .await;
+        }
+
         // Build the upload pipeline: source → [zstd?] → [AES-GCM?] → S3.
         //
         // On the encrypted path the two transforms run back-to-back inside
@@ -4602,9 +4668,8 @@ impl TransferExecutor {
         // compressed-bytes write + read per artifact (gigabytes per upload
         // for large artifacts).
         //
-        // The plaintext + compress-only path still uses `compress_to_temp`
-        // because there's no downstream consumer to pipe into; the
-        // resulting `.zst.tmp` is itself the upload source.
+        // Ineligible sources and stores without streaming support retain the
+        // file-backed transform and upload path.
         let mut transient_temps: Vec<PathBuf> = Vec::new();
 
         let put_source: PathBuf = match &p.encryption {

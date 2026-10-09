@@ -7139,6 +7139,7 @@ name = "pplx-space-volmgr"
 version = "0.8.0"
 dependencies = [
  "async-trait",
+ "axum",
  "bytes",
  "dashmap",
  "futures-util",
