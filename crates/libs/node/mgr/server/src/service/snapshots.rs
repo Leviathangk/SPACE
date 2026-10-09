@@ -1251,8 +1251,8 @@ pub(super) async fn set_firecracker_paused(
 
 /// Stops the runtime before the encrypted seal, re-issuing the idempotent stop
 /// while it fails server-side because the killed Firecracker is still exiting.
-/// Any server-side `Internal` is retried, so a persistent cgroup error surfaces
-/// only after the bounded attempts.
+/// New supervisors report drain timeouts as `Unavailable`. Keep `Internal`
+/// handling while older supervisors still report busy cgroups that way.
 async fn stop_runtime_for_encrypted_seal(
     service: &NodeManagerService,
     sandbox_id: &str,
@@ -1262,7 +1262,10 @@ async fn stop_runtime_for_encrypted_seal(
         match stop_sandbox_runtime_with_supervisor(service, sandbox_id, true, None).await {
             Ok(_) => return Ok(()),
             Err(error)
-                if error.code() == tonic::Code::Internal && attempt < ENC_CAPTURE_STOP_ATTEMPTS =>
+                if matches!(
+                    error.code(),
+                    tonic::Code::Internal | tonic::Code::Unavailable
+                ) && attempt < ENC_CAPTURE_STOP_ATTEMPTS =>
             {
                 tracing::warn!(
                     sandbox_id,

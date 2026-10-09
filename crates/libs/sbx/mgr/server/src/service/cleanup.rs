@@ -1,5 +1,6 @@
 use pplx_space_common_core::types::{JobId, LocalArtifactId};
 
+use super::cleanup_executor::CleanupWait;
 use super::cleanup_support::{
     ActivationCleanupSpec, CLEANUP_HANDOFF_RETRY, CleanupCompletion, CleanupFenceAuthorization,
     CleanupLock, CleanupLockGuard, CleanupLockMap, CleanupLockTryResult, NetGatewayStatsSnapshot,
@@ -2369,7 +2370,7 @@ impl SandboxManagerService {
         &self,
         request: SynchronousCleanupRequest<'_>,
     ) -> Result<(), Status> {
-        self.run_cleanup_to_completion_using_admission(request, None, None)
+        self.run_cleanup_to_completion_using_admission(request, None, None, CleanupWait::Attempt)
             .await
     }
 
@@ -2378,8 +2379,13 @@ impl SandboxManagerService {
         request: SynchronousCleanupRequest<'_>,
         cleanup_id: SandboxCleanupEpisodeId,
     ) -> Result<(), Status> {
-        self.run_cleanup_to_completion_using_admission(request, None, Some(cleanup_id))
-            .await
+        self.run_cleanup_to_completion_using_admission(
+            request,
+            None,
+            Some(cleanup_id),
+            CleanupWait::Attempt,
+        )
+        .await
     }
 
     pub(super) async fn run_admitted_cleanup_to_completion(
@@ -2387,8 +2393,27 @@ impl SandboxManagerService {
         request: SynchronousCleanupRequest<'_>,
         admission: CleanupAdmission,
     ) -> Result<(), Status> {
-        self.run_cleanup_to_completion_using_admission(request, Some(admission), None)
-            .await
+        self.run_cleanup_to_completion_using_admission(
+            request,
+            Some(admission),
+            None,
+            CleanupWait::Attempt,
+        )
+        .await
+    }
+
+    pub(super) async fn run_admitted_stop_to_completion(
+        &self,
+        request: SynchronousCleanupRequest<'_>,
+        admission: CleanupAdmission,
+    ) -> Result<(), Status> {
+        self.run_cleanup_to_completion_using_admission(
+            request,
+            Some(admission),
+            None,
+            CleanupWait::Stop,
+        )
+        .await
     }
 
     pub(super) async fn execute_cleanup_attempt(
