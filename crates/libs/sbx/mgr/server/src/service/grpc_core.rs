@@ -875,7 +875,7 @@ impl SandboxManagerService {
                     )));
                 }
             } else if blocking {
-                self.run_admitted_cleanup_to_completion(
+                self.run_admitted_stop_to_completion(
                     SynchronousCleanupRequest {
                         sandbox_id: id,
                         uuid8: uuid8.as_str(),
