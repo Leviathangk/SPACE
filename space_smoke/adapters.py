@@ -2879,6 +2879,19 @@ ON CONFLICT (key_hash) DO NOTHING;
         for key in (nf.BOUNDARY_LABEL, nf.CRED_AUTHORITY_POOL_LABEL, nf.OWNED_LABEL, nf.BLOCKED_LABEL):
             self.admin_label_node(node, key, snap_labels.get(key))
         live_meta = live.get("metadata") or {}
+        # Keyed on the probe value, not on drift, and applied under node-ctl's
+        # field manager: a `kubectl label` would take the key away from that
+        # manager, and node-ctl's unknown-CPU apply could then no longer
+        # remove it.
+        if (live_meta.get("labels") or {}).get(nf.HOST_CPU_LABEL) == nf.PROBE_HOST_CPU:  # type: ignore[union-attr]
+            repairs.append("restoring the host-cpu label")
+            _require_ok(
+                self.kubectl(
+                    "apply", "--server-side", "--force-conflicts", f"--field-manager={nf.HOST_CPU_FIELD_MANAGER}", "-f", "-",
+                    input_text=nf.host_cpu_manifest(node, snap_labels.get(nf.HOST_CPU_LABEL)), timeout=30,
+                ),
+                f"restore the host-cpu label on {node}",
+            )
         for key in sorted(set(live_meta.get("labels") or {}) | set(live_meta.get("annotations") or {})):
             if nf.PROBE_KEY_MARKER in key:
                 repairs.append(f"removing probe key {key}")
