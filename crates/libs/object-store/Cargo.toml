@@ -20,7 +20,9 @@ aws-smithy-runtime-api = { workspace = true, features = ["client"] }
 aws-smithy-types = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
+futures-util = { workspace = true }
 http = { workspace = true }
+http-body = { workspace = true }
 jiff = { workspace = true }
 md-5 = { workspace = true }
 percent-encoding = { workspace = true }
@@ -28,6 +30,7 @@ rand = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt", "sync", "time"] }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 
 # internal
@@ -37,6 +40,5 @@ pplx-space-metrics = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
-futures-util = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }

@@ -38,12 +38,16 @@ mod download;
 #[cfg(test)]
 mod test_support;
 mod timeouts;
+mod upload;
 
 use attempts::{AttemptObserver, AttemptTarget};
 use timeouts::S3Timeouts;
 
 pub use download::FinishingWrite;
 use download::{ReorderWindow, SequentialWriter, open_scratch};
+pub use upload::{
+    StreamingUpload, StreamingUploadError, StreamingUploadOptions, UploadBufferBudget, UploadSource,
+};
 
 // Amortize file-body reads without buffering an entire multipart part.
 const UPLOAD_READ_BUFFER_SIZE: usize = 1024 * 1024;
@@ -260,6 +264,12 @@ struct RangedDownloadPlan<'a> {
 /// instance can serve any bucket in any region.
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
+    /// Select this capability before starting a producer. Unsupported backends
+    /// keep their file-backed path; there is no implicit buffering fallback.
+    fn streaming_upload(&self) -> Option<&dyn StreamingUpload> {
+        None
+    }
+
     /// Returns metadata for `target`, or `None` if the object does not exist.
     async fn head(
         &self,
@@ -843,6 +853,10 @@ impl S3ObjectStore {
 
 #[async_trait]
 impl ObjectStore for S3ObjectStore {
+    fn streaming_upload(&self) -> Option<&dyn StreamingUpload> {
+        Some(self)
+    }
+
     async fn head(
         &self,
         creds: &ObjectCredentials,
@@ -2167,6 +2181,39 @@ impl AbortGuard {
 
     fn disarm(mut self) {
         self.armed = false;
+    }
+
+    /// Await cleanup on ordinary failure. Drop still provides a best-effort
+    /// fallback if this attempt itself is cancelled.
+    async fn abort(self) {
+        let target = ObjectTarget {
+            bucket: &self.bucket,
+            key: &self.key,
+            region: &self.region,
+            endpoint: self.endpoint.as_deref(),
+            path_style: self.path_style,
+        };
+        let cfg = S3ObjectStore::op_config_with(&self.creds, &target, self.timeouts.clone());
+        if let Err(err) = self
+            .client
+            .abort_multipart_upload()
+            .bucket(&self.bucket)
+            .key(&self.key)
+            .upload_id(&self.upload_id)
+            .customize()
+            .config_override(cfg)
+            .send()
+            .await
+        {
+            observe_s3_error(
+                S3Operation::AbortMultipartUpload,
+                &self.bucket,
+                &self.key,
+                &err,
+            );
+            warn!(error = %err, key = self.key, "failed to abort multipart upload");
+        }
+        self.disarm();
     }
 }
 
