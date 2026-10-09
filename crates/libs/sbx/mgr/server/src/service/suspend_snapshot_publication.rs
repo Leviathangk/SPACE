@@ -400,7 +400,7 @@ pub(super) fn validate_suspend_snapshot_artifact_files(
     };
     let mut actual_bytes = 0_u64;
     for artifact in artifacts {
-        let path = snapshot.snapshot_dir.join(artifact.local_name);
+        let path = crate::snapshot_upload::local_artifact_path(&snapshot.snapshot_dir, &artifact);
         let file = match std::fs::symlink_metadata(&path) {
             Ok(file) => file,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {

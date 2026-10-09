@@ -455,6 +455,42 @@ impl NodeManager for NodeManagerService {
         NodeManagerService::btrfs_materialize_rootfs_send(self, request).await
     }
 
+    async fn get_btrfs_send_capabilities(
+        &self,
+        request: Request<crate::proto::GetBtrfsSendCapabilitiesRequest>,
+    ) -> Result<Response<crate::proto::GetBtrfsSendCapabilitiesResponse>, Status> {
+        NodeManagerService::get_btrfs_send_capabilities(self, request).await
+    }
+
+    type BtrfsReadSendSourceStream = std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<crate::proto::BtrfsSendChunk, Status>> + Send>,
+    >;
+
+    async fn btrfs_stage_send_source(
+        &self,
+        request: Request<crate::proto::BtrfsStageSendSourceRequest>,
+    ) -> Result<Response<crate::proto::BtrfsSendLease>, Status> {
+        NodeManagerService::btrfs_stage_send_source(self, request).await
+    }
+    async fn btrfs_read_send_source(
+        &self,
+        request: Request<crate::proto::BtrfsSendLease>,
+    ) -> Result<Response<Self::BtrfsReadSendSourceStream>, Status> {
+        NodeManagerService::btrfs_read_send_source(self, request).await
+    }
+    async fn btrfs_delete_send_source(
+        &self,
+        request: Request<crate::proto::BtrfsSendLease>,
+    ) -> Result<Response<crate::proto::BtrfsDeleteSendSourceResponse>, Status> {
+        NodeManagerService::btrfs_delete_send_source(self, request).await
+    }
+    async fn btrfs_list_send_sources(
+        &self,
+        request: Request<crate::proto::BtrfsListSendSourcesRequest>,
+    ) -> Result<Response<crate::proto::BtrfsListSendSourcesResponse>, Status> {
+        NodeManagerService::btrfs_list_send_sources(self, request).await
+    }
+
     async fn btrfs_receive_instance(
         &self,
         request: Request<BtrfsReceiveInstanceRequest>,

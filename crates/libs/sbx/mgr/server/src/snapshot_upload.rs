@@ -452,6 +452,10 @@ pub struct SnapshotUploadJobs {
     /// remains readable without pretending that its metadata was staged.
     #[serde(default)]
     pub includes_metadata_job: bool,
+    /// Source length is known only after upload. Submit the metadata last,
+    /// after all VM jobs, and persist that handle before finalization.
+    #[serde(default)]
+    pub deferred_metadata: bool,
 }
 
 struct MetadataStagingDirGuard {
@@ -606,6 +610,22 @@ pub(crate) fn upload_artifacts_for_meta(meta: &SnapshotMeta) -> Vec<Artifact> {
     }
 }
 
+/// Resolve the local representation for presence and size checks. The
+/// privileged reader separately verifies descriptors and retained identity.
+pub(crate) fn local_artifact_path(snapshot_dir: &Path, artifact: &Artifact) -> PathBuf {
+    let path = snapshot_dir.join(artifact.local_name);
+    if artifact.kind == SnapshotArtifact::RootfsBtrfsSend
+        && !path.exists()
+        && snapshot_dir
+            .join("rootfs.btrfs-source/source.json")
+            .is_file()
+    {
+        snapshot_dir.join("rootfs.btrfs-source/source/rootfs.ext4")
+    } else {
+        path
+    }
+}
+
 /// Compute the snapshot's logical size from the on-disk VM artifacts and
 /// write the `snapshot.json` sidecar so it can be uploaded as a regular
 /// staged artifact alongside them.
@@ -634,7 +654,7 @@ pub(crate) fn write_snapshot_metadata_to(
 ) -> Result<SnapshotMeta, SnapshotMetadataWriteError> {
     let mut size_bytes: u64 = 0;
     for artifact in vm_artifacts {
-        let path = artifact_dir.join(artifact.local_name);
+        let path = local_artifact_path(artifact_dir, artifact);
         let len = std::fs::metadata(&path)
             .map_err(|source| SnapshotMetadataWriteError::StatArtifact {
                 artifact: artifact.local_name,
@@ -750,7 +770,7 @@ pub fn prepare_suspend_snapshot(
     };
 
     for artifact in &vm_artifacts {
-        if !snapshot_dir.join(artifact.local_name).exists() {
+        if !local_artifact_path(snapshot_dir, artifact).is_file() {
             return Err(format!(
                 "required snapshot artifact missing: {}",
                 artifact.local_name
@@ -761,7 +781,13 @@ pub fn prepare_suspend_snapshot(
     // Size and write `snapshot.json` now so it uploads as a regular staged
     // artifact below; `meta_final` carries the computed `size_bytes`
     // through to the durable worker payload.
-    let metadata_staging_dir = if artifact_kind == ArtifactKind::Disk {
+    let deferred_metadata = !meta.encrypted
+        && format == SuspendSnapshotFormat::BtrfsSend
+        && !snapshot_dir.join(ROOTFS_BTRFS_SEND_FILENAME).exists()
+        && snapshot_dir
+            .join("rootfs.btrfs-source/source.json")
+            .is_file();
+    let metadata_staging_dir = if artifact_kind == ArtifactKind::Disk || deferred_metadata {
         Some(
             snapshot_dir
                 .parent()
@@ -788,6 +814,7 @@ pub fn prepare_suspend_snapshot(
         job_ids: Vec::new(),
         metadata_staging_dir: metadata_staging_guard.disarm(),
         includes_metadata_job: true,
+        deferred_metadata,
     })
 }
 
@@ -799,7 +826,8 @@ pub async fn submit_prepared_snapshot(
     prepared: &SnapshotUploadJobs,
 ) -> Result<SnapshotUploadJobs, String> {
     let mut prepared = prepared.clone();
-    if let Some(source_id) = prepared.meta.rootfs_send_source_id
+    if !prepared.deferred_metadata
+        && let Some(source_id) = prepared.meta.rootfs_send_source_id
         && !tokio::fs::try_exists(prepared.snapshot_dir.join(ROOTFS_BTRFS_SEND_FILENAME))
             .await
             .map_err(|error| format!("stat rootfs send: {error}"))?
@@ -838,6 +866,9 @@ pub async fn submit_prepared_snapshot(
     let mut errors = Vec::new();
 
     for artifact in &artifacts {
+        if prepared.deferred_metadata && artifact.kind == SnapshotArtifact::Metadata {
+            continue;
+        }
         let src = if artifact.kind == SnapshotArtifact::Metadata {
             metadata_dir.join(artifact.local_name)
         } else {
@@ -852,14 +883,30 @@ pub async fn submit_prepared_snapshot(
         let s3_uri = build_artifact_uri(&key, &prepared.config);
         let local_path = src.to_string_lossy().into_owned();
 
-        match client
-            .submit_push_file(PushFileRequest {
-                subject_id: format!("sandbox:{}", prepared.meta.sandbox_id),
-                local_path,
-                s3_uri,
-            })
-            .await
-        {
+        let submitted =
+            if prepared.deferred_metadata && artifact.kind == SnapshotArtifact::RootfsBtrfsSend {
+                client
+                    .submit_push_btrfs_send(pplx_space_volmgr_client::proto::PushBtrfsSendRequest {
+                        sandbox_id: prepared.meta.sandbox_id.clone(),
+                        artifact_dir: prepared.snapshot_dir.to_string_lossy().into_owned(),
+                        source_id: prepared
+                            .meta
+                            .rootfs_send_source_id
+                            .ok_or("deferred send requires source identity")?
+                            .to_string(),
+                        s3_uri,
+                    })
+                    .await
+            } else {
+                client
+                    .submit_push_file(PushFileRequest {
+                        subject_id: format!("sandbox:{}", prepared.meta.sandbox_id),
+                        local_path,
+                        s3_uri,
+                    })
+                    .await
+            };
+        match submitted {
             Ok(resp) => {
                 let job_id = match resp.into_inner().job_id.parse::<JobId>() {
                     Ok(job_id) => job_id,
@@ -963,3 +1010,52 @@ pub(crate) fn build_storage_uri(
 
 #[cfg(test)]
 mod tests;
+
+/// Publish remote metadata only after all stream lengths are known. The local
+/// sidecar continues describing its retained representation for crash recovery.
+pub(crate) async fn submit_streamed_metadata(
+    payload: &SnapshotUploadJobs,
+    logical_bytes: u64,
+) -> Result<JobId, String> {
+    let directory = payload
+        .metadata_staging_dir
+        .as_ref()
+        .ok_or("deferred metadata requires private staging")?;
+    tokio::fs::create_dir_all(directory)
+        .await
+        .map_err(|error| error.to_string())?;
+    let path = directory.join(SNAPSHOT_METADATA_FILENAME);
+    let remote = SnapshotMeta {
+        size_bytes: logical_bytes,
+        rootfs_send_source_id: None,
+        ..payload.meta.clone()
+    };
+    let bytes = serde_json::to_vec_pretty(&remote).map_err(|error| error.to_string())?;
+    // Volume-manager stages only after the complete write. The job's immutable
+    // backup-attempt key makes resubmission after an ambiguous reply idempotent.
+    tokio::fs::write(&path, bytes)
+        .await
+        .map_err(|error| error.to_string())?;
+    let key = snapshot_object_key(
+        &payload.config.key_prefix,
+        &payload.meta.sandbox_id,
+        &payload.snapshot_id,
+        SnapshotArtifact::Metadata,
+    );
+    let mut client = pplx_space_volmgr_client::connect(VOLMGR_SOCKET)
+        .await
+        .map_err(|error| error.to_string())?;
+    let response = client
+        .submit_push_file(PushFileRequest {
+            subject_id: format!("sandbox:{}", payload.meta.sandbox_id),
+            local_path: path.to_string_lossy().into_owned(),
+            s3_uri: build_artifact_uri(&key, &payload.config),
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    response
+        .into_inner()
+        .job_id
+        .parse::<JobId>()
+        .map_err(|error| error.to_string())
+}

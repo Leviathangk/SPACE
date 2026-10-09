@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod artifact;
+mod btrfs_push;
 pub mod credentials;
 pub mod crypto;
 pub mod db;

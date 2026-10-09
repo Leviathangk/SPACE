@@ -16,6 +16,8 @@ use tokio::io::AsyncWrite;
 
 use super::*;
 
+mod btrfs;
+
 const MIB: usize = 1024 * 1024;
 const PART_BYTES: usize = 64 * MIB;
 const PIPE_BYTES: usize = 8 * MIB;

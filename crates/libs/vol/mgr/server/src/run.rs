@@ -524,6 +524,12 @@ pub async fn run(
     let transfer_admission = service.transfer_admission();
     let service_for_drain = service.clone();
     worker.recover_and_log("vol-mgr.transfer");
+    let source_cleanup_token = shutdown_token.child_token();
+    let source_cleanup = tokio::spawn(
+        service
+            .clone()
+            .run_btrfs_source_cleanup(source_cleanup_token.clone()),
+    );
     let pruner_token = shutdown_token.child_token();
     let pruner_handle = tokio::spawn(
         worker
@@ -601,6 +607,10 @@ pub async fn run(
             timeout_secs = config.server_drain_timeout.as_secs(),
             "state-mutation admission exceeded its warning deadline; retaining ownership"
         );
+    }
+    source_cleanup_token.cancel();
+    if let Err(error) = source_cleanup.await {
+        tracing::warn!(%error, "send source cleanup task failed");
     }
     pruner_token.cancel();
     queue_metrics_token.cancel();

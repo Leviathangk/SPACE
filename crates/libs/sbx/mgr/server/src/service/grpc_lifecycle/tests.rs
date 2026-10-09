@@ -513,6 +513,23 @@ fn disk_artifact_backup_uses_the_codec_witnessed_by_its_bytes() {
         SuspendSnapshotFormat::BtrfsSend,
         "a disk artifact containing rootfs.btrfs-send must not be uploaded as rootfs.ext4",
     );
+    std::fs::remove_file(artifact_dir.join(crate::snapshot_upload::ROOTFS_BTRFS_SEND_FILENAME))
+        .unwrap();
+    std::fs::create_dir_all(artifact_dir.join("rootfs.btrfs-source/source")).unwrap();
+    std::fs::write(
+        artifact_dir.join("rootfs.btrfs-source/source.json"),
+        b"retained identity",
+    )
+    .unwrap();
+    std::fs::write(
+        artifact_dir.join("rootfs.btrfs-source/source/rootfs.ext4"),
+        b"retained rootfs",
+    )
+    .unwrap();
+    assert_eq!(
+        artifact_backup_format(&artifact).unwrap(),
+        SuspendSnapshotFormat::BtrfsSend
+    );
 }
 
 fn insert_suspended_test_sandbox(conn: &rusqlite::Connection, sandbox_id: &str) {

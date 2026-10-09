@@ -7151,6 +7151,7 @@ dependencies = [
  "pplx-space-common-svc",
  "pplx-space-credmgr-client",
  "pplx-space-metrics",
+ "pplx-space-node-mgr-client",
  "pplx-space-object-store",
  "pplx-space-volmgr-client",
  "rusqlite",

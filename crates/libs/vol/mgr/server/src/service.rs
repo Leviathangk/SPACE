@@ -81,7 +81,9 @@ fn transfer_scope_job_ids(
 #[derive(Clone)]
 pub struct VolumeManagerService {
     db: Arc<Mutex<rusqlite::Connection>>,
-    worker: BackgroundWorker<TransferExecutor>,
+    pub(crate) worker: BackgroundWorker<TransferExecutor>,
+    pub(crate) btrfs_submission: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) btrfs_push_enabled: bool,
     shadow_comparisons: ShadowComparisonController,
     staging: StagingDir,
     transfer_admission: TransferAdmission,
@@ -206,9 +208,12 @@ impl VolumeManagerService {
         let staging = StagingDir::ensure(staging_dir)?;
         let worker_config = WorkerConfig::new(1, config.transfer_timeout, config.max_attempts)
             .with_kind_concurrency(PUSH_KIND, config.push_concurrency)
+            .with_kind_concurrency(crate::btrfs_push::KIND, config.push_concurrency)
             .with_kind_concurrency(PULL_KIND, config.pull_concurrency)
             .with_kind_active_job_limit(PULL_KIND, config.pull_concurrency)
             .with_kind_priority_bands(PULL_KIND, config.pull_priority_bands);
+        let btrfs_push_enabled = config.executor.compress
+            && config.executor.snapshot_upload_mode.buffer_budget_bytes() > 0;
         let executor = TransferExecutor::new(config.executor, staging.root().to_path_buf());
         let shadow_comparisons = executor.shadow_comparison_controller();
         let worker = BackgroundWorker::new(Arc::clone(&db), executor, worker_config);
@@ -216,6 +221,8 @@ impl VolumeManagerService {
             db,
             worker,
             shadow_comparisons,
+            btrfs_submission: Default::default(),
+            btrfs_push_enabled,
             staging,
             transfer_admission: TransferAdmission::open(),
             peer_authorizer: UdsPeerAuthorizer::new(
@@ -413,7 +420,7 @@ impl VolumeManagerService {
         Ok(out)
     }
 
-    fn lock_db(&self) -> Result<MutexGuard<'_, rusqlite::Connection>, Status> {
+    pub(crate) fn lock_db(&self) -> Result<MutexGuard<'_, rusqlite::Connection>, Status> {
         self.db
             .lock()
             .map_err(|e| Status::internal(format!("lock vol-mgr db: {e}")))
@@ -1188,6 +1195,57 @@ impl VolumeManager for VolumeManagerService {
         Ok(Response::new(SubmitTransferResponse {
             job_id: job_id.to_string(),
         }))
+    }
+
+    async fn get_push_capabilities(
+        &self,
+        request: Request<crate::proto::GetPushCapabilitiesRequest>,
+    ) -> Result<Response<crate::proto::GetPushCapabilitiesResponse>, Status> {
+        self.peer_authorizer.authorize_request(
+            &request,
+            "get_push_capabilities",
+            TRANSFER_MANAGER_PEERS,
+        )?;
+        // Negotiate through the actual service identity before the producer
+        // omits its file. Old servers and deployments without socket/peer
+        // permission must keep materializing sends during rolling upgrades.
+        let ready = if self.btrfs_push_enabled {
+            let probe = async {
+                pplx_space_node_mgr_client::lazy()
+                    .get_btrfs_send_capabilities(
+                        pplx_space_node_mgr_client::proto::GetBtrfsSendCapabilitiesRequest {},
+                    )
+                    .await
+                    .map(|response| response.into_inner().supported)
+            };
+            matches!(
+                tokio::time::timeout(Duration::from_secs(1), probe).await,
+                Ok(Ok(true))
+            )
+        } else {
+            false
+        };
+        Ok(Response::new(crate::proto::GetPushCapabilitiesResponse {
+            btrfs_send: ready,
+        }))
+    }
+
+    async fn submit_push_btrfs_send(
+        &self,
+        request: Request<crate::proto::PushBtrfsSendRequest>,
+    ) -> Result<Response<SubmitTransferResponse>, Status> {
+        let peer = self.peer_authorizer.authorize_request(
+            &request,
+            "submit_push_btrfs_send",
+            TRANSFER_MANAGER_PEERS,
+        )?;
+        let _admission = self.transfer_admission.enter()?;
+        let req = request.into_inner();
+        let subject = parse_subject(&format!("sandbox:{}", req.sandbox_id))?;
+        self.authorize_sandbox_subject(&peer, &subject, "submit_push_btrfs_send")?;
+        parse_uri(&req.s3_uri)?;
+        // Existing sources must remain recoverable after disabling new capture.
+        self.submit_btrfs_push(req).await.map(Response::new)
     }
 
     async fn submit_pull_file(

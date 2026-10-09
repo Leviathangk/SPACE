@@ -213,6 +213,33 @@ impl JobExecutor for SnapshotUploadExecutor {
                 }
             }
         }
+        let vm_artifact_count = artifacts.len().saturating_sub(1);
+        if payload.deferred_metadata && payload.job_ids.len() == vm_artifact_count {
+            let logical_bytes = artifact_results
+                .iter()
+                .map(|observation| observation.bytes)
+                .sum();
+            let metadata_job =
+                crate::snapshot_upload::submit_streamed_metadata(&payload, logical_bytes)
+                    .await
+                    .map_err(JobError::retriable)?;
+            payload.job_ids.push(metadata_job);
+            persist_submitted_transfer_ids(&self.db, &job.job_id, &payload)?;
+            match wait_for_artifact_job(&sandbox_id, &metadata_job, cancellation.clone()).await {
+                Ok(observation) => artifact_results.push(observation),
+                Err(error) => {
+                    if matches!(error, JobError::Permanent(_)) {
+                        converge_failed_upload(&payload, "vol_mgr_transfer", error.message()).await;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        if artifact_results.len() != artifacts.len() {
+            let error = JobError::permanent("snapshot upload is missing artifact or metadata jobs");
+            converge_failed_upload(&payload, "incomplete_transfer_set", error.message()).await;
+            return Err(error);
+        }
         crate::snapshot_upload::cleanup_metadata_staging_dir(&payload);
 
         // All VM files and staged metadata are uploaded before publishing Ready.
