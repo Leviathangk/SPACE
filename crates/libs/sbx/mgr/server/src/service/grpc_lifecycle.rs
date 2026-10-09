@@ -781,6 +781,7 @@ fn suspend_snapshot_metadata(
             auto_lifecycle: sandbox.auto_lifecycle.clone(),
         }),
         rootfs_diff_format,
+        rootfs_send_source_id: None,
         // Set by the suspend publication once it knows whether the sandbox's
         // live rootfs is encrypted (BYOK); plaintext suspends leave it false.
         encrypted: false,

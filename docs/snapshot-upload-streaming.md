@@ -124,3 +124,37 @@ both `snapshot.luks` and `cow.luks` selected for streaming. Verify guest data an
 successful VM execution; a local-cache wake or synthetic ciphertext round trip
 does not establish this. Confirm abort-incomplete lifecycle cleanup on the
 actual snapshot bucket used by that canary, including non-production buckets.
+
+## Recoverable btrfs send sources
+
+`SPACE_SNAPSHOT_STREAM_BTRFS_SEND=true` on sandbox-manager opts new captures
+into retaining a `rootfs.btrfs-source` bundle beside the ordinary send file.
+The default remains the existing materialized path. This ownership layer alone
+saves no I/O: uploads still stage and read `rootfs.btrfs-send`.
+
+Each bundle contains private copy-on-write snapshots of the frozen rootfs and
+its template parent, plus a versioned manifest binding their subvolume UUIDs to
+one source identity. Template GC and sandbox resuspend can remove their original
+inputs without invalidating the retained bundle. These copies share extents;
+retaining them can delay physical reclamation as the live rootfs changes.
+
+A prepared upload whose send file is missing asks node-manager to regenerate it
+using the identity persisted in snapshot metadata. Node-manager validates the
+identity and read-only inputs, creates a fresh `instance.ro` wire clone, and
+atomically publishes a complete stream. Fresh attempts need not be byte-identical.
+The upload restages the regenerated file and refreshes its metadata before
+submission. The existing artifact owner and recursive cleanup own the bundle;
+an RPC disconnect does not release ownership while a kernel send is running.
+
+| Event | Result |
+| --- | --- |
+| Original sandbox or template disappears | Private source and parent still support regeneration. |
+| Process restarts | Manifest and read-only subvolumes are reopened; no live descriptor is required. |
+| Artifact is replaced or source identity changes | Regeneration rejects the stale identity. |
+| Send fails or caller cancels | No partial send file is published; artifact cleanup owns any interrupted wire clone. |
+| Artifact is retired | Existing subvolume-aware cleanup removes the nested bundle. |
+
+Older node-managers ignore the retention hint and produce the usual file.
+Disabling new capture retention does not disable regeneration of existing
+bundles. This phase adds protobuf fields and a recovery RPC, and an optional
+metadata field; it does not change the SQLite schema or remote btrfs-send format.

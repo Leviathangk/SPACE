@@ -401,6 +401,24 @@ impl Drop for SubvolumeCleanupGuard {
 }
 
 impl NodeManagerService {
+    async fn retain_send_source(
+        &self,
+        retain: bool,
+        artifact: &Path,
+        parent: &Path,
+        source: &Path,
+    ) -> Result<Option<uuid::Uuid>, Status> {
+        if !retain {
+            return Ok(None);
+        }
+        let (artifact, parent, source) =
+            (artifact.to_owned(), parent.to_owned(), source.to_owned());
+        self.off_runtime("retain immutable send source", move || {
+            super::btrfs_send_source::capture(&artifact, &parent, &source).map(Some)
+        })
+        .await
+    }
+
     async fn encode_pinned_stream(
         &self,
         parent: &Path,
@@ -621,6 +639,14 @@ impl NodeManagerService {
             .await?;
         }
 
+        let source_id = self
+            .retain_send_source(
+                req.retain_source,
+                &snapshot_dir,
+                &send_parent.path,
+                &instance_ro_path,
+            )
+            .await?;
         let stream_path = rootfs_btrfs_send_path(&snapshot_dir);
         let stream_bytes = match self
             .encode_pinned_stream(&send_parent.path, &instance_ro_path, &stream_path)
@@ -675,6 +701,7 @@ impl NodeManagerService {
         );
         Ok(Response::new(BtrfsEncodeRootfsSendResponse {
             stream_bytes,
+            source_id: source_id.map(|id| id.to_string()),
         }))
     }
 
@@ -769,6 +796,14 @@ impl NodeManagerService {
         }
         let mut wire_source_cleanup =
             SubvolumeCleanupGuard::new(wire_source.clone(), "delete named snapshot wire clone");
+        let source_id = self
+            .retain_send_source(
+                req.retain_source,
+                &destination,
+                &send_parent.path,
+                &wire_source,
+            )
+            .await?;
         let stream_path = rootfs_btrfs_send_path(&destination);
         let send_result = self
             .encode_pinned_stream(&send_parent.path, &wire_source, &stream_path)
@@ -798,6 +833,7 @@ impl NodeManagerService {
         );
         Ok(Response::new(BtrfsEncodeSnapshotRootfsSendResponse {
             stream_bytes,
+            source_id: source_id.map(|id| id.to_string()),
         }))
     }
 

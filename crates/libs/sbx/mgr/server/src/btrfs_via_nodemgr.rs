@@ -70,6 +70,7 @@ pub(crate) async fn encode_rootfs_send(
             content_hash: content_hash.to_string(),
             dest_dir: Some(snapshot_dir.to_string()),
             execution_fence: Some(execution_fence.into()),
+            retain_source: retain_send_sources(),
         })
         .await
         .map_err(|status| BtrfsViaNodemgrError::Rpc {
@@ -99,6 +100,7 @@ pub(crate) async fn encode_snapshot_rootfs_send(
             content_hash: content_hash.to_string(),
             snapshot_name: snapshot_name.to_string(),
             dest_dir: dest_dir.to_string(),
+            retain_source: retain_send_sources(),
         })
         .await
         .map_err(|status| BtrfsViaNodemgrError::Rpc {
@@ -160,4 +162,37 @@ pub(crate) async fn delete_sandbox_instance(
             status,
         })?;
     Ok(())
+}
+
+/// Capture policy is separate from recovery: disabling new captures must not
+/// prevent an already-published source from being regenerated.
+fn retain_send_sources() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("SPACE_SNAPSHOT_STREAM_BTRFS_SEND").is_ok_and(|value| value == "true")
+    });
+    *ENABLED
+}
+
+pub(crate) async fn materialize_rootfs_send(
+    sandbox_id: &str,
+    artifact_dir: &std::path::Path,
+    source_id: uuid::Uuid,
+) -> Result<u64, BtrfsViaNodemgrError> {
+    let mut client = pplx_space_node_mgr_client::connect()
+        .await
+        .map_err(|e| BtrfsViaNodemgrError::Connect(e.to_string()))?;
+    client
+        .btrfs_materialize_rootfs_send(
+            pplx_space_node_mgr_client::proto::BtrfsMaterializeRootfsSendRequest {
+                sandbox_id: sandbox_id.to_owned(),
+                artifact_dir: artifact_dir.to_string_lossy().into_owned(),
+                source_id: source_id.to_string(),
+            },
+        )
+        .await
+        .map(|response| response.into_inner().stream_bytes)
+        .map_err(|status| BtrfsViaNodemgrError::Rpc {
+            rpc: "BtrfsMaterializeRootfsSend",
+            status,
+        })
 }

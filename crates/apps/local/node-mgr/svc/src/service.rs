@@ -1280,6 +1280,13 @@ impl NodeManager for LocalNodeManager {
         Err(not_btrfs())
     }
 
+    async fn btrfs_materialize_rootfs_send(
+        &self,
+        _request: Request<BtrfsMaterializeRootfsSendRequest>,
+    ) -> Result<Response<BtrfsEncodeRootfsSendResponse>, Status> {
+        Err(not_btrfs())
+    }
+
     async fn btrfs_receive_instance(
         &self,
         _request: Request<BtrfsReceiveInstanceRequest>,

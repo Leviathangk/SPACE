@@ -436,6 +436,7 @@ fn disk_artifact_meta() -> (
                 auto_lifecycle: pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
             }),
             rootfs_diff_format: None,
+            rootfs_send_source_id: None,
             encrypted: false,
             local_artifact_id: Some(LocalArtifactId::new()),
             artifact_kind: Some(pplx_space_common_core::types::ArtifactKind::Disk),

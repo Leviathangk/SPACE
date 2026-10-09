@@ -213,6 +213,11 @@ service NodeManager {
   rpc BtrfsEncodeSnapshotRootfsSend(BtrfsEncodeSnapshotRootfsSendRequest)
       returns (BtrfsEncodeSnapshotRootfsSendResponse);
 
+  // Regenerate a missing send file from a retained immutable source bundle.
+  // The expected source identity fences replacement of an artifact directory.
+  rpc BtrfsMaterializeRootfsSend(BtrfsMaterializeRootfsSendRequest)
+      returns (BtrfsEncodeRootfsSendResponse);
+
   // Consume a `rootfs.btrfs-send` stream pulled to the sandbox's
   // local snapshot dir and reconstruct the sandbox's `instance/`
   // subvolume against the local template. Validates the local
@@ -1033,11 +1038,15 @@ message BtrfsEncodeRootfsSendRequest {
   // sandbox's snapshot roots; absent uses the canonical local restore dir.
   optional string dest_dir = 4;
   ExecutionFence execution_fence = 5;
+  // Retain a private COW source and parent for regeneration. Old servers
+  // ignore this hint and return no source identity.
+  bool retain_source = 6;
 }
 message BtrfsEncodeRootfsSendResponse {
   // Size of the produced rootfs.btrfs-send stream, returned so the
   // caller can record / log it without having to stat the file.
   uint64 stream_bytes = 1;
+  optional string source_id = 2;
 }
 
 message BtrfsEncodeSnapshotRootfsSendRequest {
@@ -1050,9 +1059,17 @@ message BtrfsEncodeSnapshotRootfsSendRequest {
   // Host-absolute artifact destination. Restricted to this sandbox's
   // snapshot roots and required to be separate from the read-only source.
   string dest_dir = 5;
+  bool retain_source = 6;
 }
 message BtrfsEncodeSnapshotRootfsSendResponse {
   uint64 stream_bytes = 1;
+  optional string source_id = 2;
+}
+
+message BtrfsMaterializeRootfsSendRequest {
+  string sandbox_id = 1;
+  string artifact_dir = 2;
+  string source_id = 3;
 }
 
 // A canonical instance belongs to an execution; restore staging belongs to a

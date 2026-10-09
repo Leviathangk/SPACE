@@ -629,6 +629,7 @@ mod adapter;
 mod artifact_fs;
 pub mod btrfs_balance;
 mod btrfs_delegation;
+mod btrfs_send_source;
 pub mod cgroup_reclaim;
 mod cleanup_helpers;
 mod cleanup_inspect;

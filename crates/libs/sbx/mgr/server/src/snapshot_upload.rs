@@ -157,6 +157,10 @@ pub struct SnapshotMeta {
     /// migration story for already-uploaded snapshots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rootfs_diff_format: Option<String>,
+    /// Node-local immutable source identity. Retention belongs to the enclosing
+    /// local artifact; remote restores use the ordinary btrfs-send object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rootfs_send_source_id: Option<uuid::Uuid>,
     /// BYOK encrypted snapshot marker. When `true`, the artifact set is the
     /// encrypted shape — `snapshot.luks` (sealed vmstate+memory) and `cow.luks`
     /// (encrypted rootfs delta) — instead of the plaintext vmstate/memory/rootfs
@@ -640,8 +644,28 @@ pub(crate) fn write_snapshot_metadata_to(
         size_bytes = size_bytes.saturating_add(len);
     }
 
+    #[derive(serde::Deserialize)]
+    struct SourceIdentity {
+        source_id: uuid::Uuid,
+    }
+    let rootfs_send_source_id = if format_from_meta(meta) == SuspendSnapshotFormat::BtrfsSend {
+        let path = artifact_dir.join("rootfs.btrfs-source/source.json");
+        match std::fs::read(path) {
+            Ok(bytes) => Some(serde_json::from_slice::<SourceIdentity>(&bytes)?.source_id),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(source) => {
+                return Err(SnapshotMetadataWriteError::StatArtifact {
+                    artifact: "rootfs.btrfs-source",
+                    source,
+                });
+            }
+        }
+    } else {
+        None
+    };
     let meta_final = SnapshotMeta {
         size_bytes,
+        rootfs_send_source_id,
         ..meta.clone()
     };
     let meta_json = serde_json::to_string_pretty(&meta_final)?;
@@ -774,6 +798,34 @@ pub fn prepare_suspend_snapshot(
 pub async fn submit_prepared_snapshot(
     prepared: &SnapshotUploadJobs,
 ) -> Result<SnapshotUploadJobs, String> {
+    let mut prepared = prepared.clone();
+    if let Some(source_id) = prepared.meta.rootfs_send_source_id
+        && !tokio::fs::try_exists(prepared.snapshot_dir.join(ROOTFS_BTRFS_SEND_FILENAME))
+            .await
+            .map_err(|error| format!("stat rootfs send: {error}"))?
+    {
+        crate::btrfs_via_nodemgr::materialize_rootfs_send(
+            &prepared.meta.sandbox_id,
+            &prepared.snapshot_dir,
+            source_id,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let metadata_dir = prepared
+            .metadata_staging_dir
+            .as_deref()
+            .unwrap_or(&prepared.snapshot_dir);
+        prepared.meta = write_snapshot_metadata_to(
+            &prepared.meta,
+            &prepared.snapshot_dir,
+            &artifact_files_for_kind(
+                artifact_kind_from_meta(&prepared.meta),
+                format_from_meta(&prepared.meta),
+            ),
+            metadata_dir,
+        )
+        .map_err(|error| error.to_string())?;
+    }
     let artifacts = upload_artifacts_for_meta(&prepared.meta);
     let metadata_dir = prepared
         .metadata_staging_dir

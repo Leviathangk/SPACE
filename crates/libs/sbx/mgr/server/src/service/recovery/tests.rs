@@ -33,6 +33,7 @@ fn snapshot_meta_with_sandbox(
         },
         sandbox,
         rootfs_diff_format: None,
+        rootfs_send_source_id: None,
         encrypted: false,
         local_artifact_id: None,
         artifact_kind: None,

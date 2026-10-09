@@ -448,6 +448,13 @@ impl NodeManager for NodeManagerService {
         .await
     }
 
+    async fn btrfs_materialize_rootfs_send(
+        &self,
+        request: Request<crate::proto::BtrfsMaterializeRootfsSendRequest>,
+    ) -> Result<Response<BtrfsEncodeRootfsSendResponse>, Status> {
+        NodeManagerService::btrfs_materialize_rootfs_send(self, request).await
+    }
+
     async fn btrfs_receive_instance(
         &self,
         request: Request<BtrfsReceiveInstanceRequest>,
