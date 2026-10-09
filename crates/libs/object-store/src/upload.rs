@@ -275,7 +275,7 @@ async fn read_part(
         let end = buffer.len
             + (remaining + 1)
                 .min((buffer.data.len() - buffer.len) as u64)
-                .min(64 * 1024) as usize;
+                .min(MIB as u64) as usize;
         let count = source
             .reader
             .as_mut()
@@ -298,7 +298,9 @@ async fn read_part(
             });
         }
         // AsyncRead may be immediately ready (for example, an in-memory
-        // source). Bound copying per poll as well as hashing off-runtime.
+        // source). Bound copying per poll as well as hashing off-runtime. A
+        // 1 MiB quantum also avoids waking a blocking producer for every small
+        // fragment of space released in its bounded pipe.
         tokio::task::yield_now().await;
     }
     // Bytes owns the permit too: HTTP/SDK clones cannot outlive its charge.
@@ -367,6 +369,29 @@ impl S3ObjectStore {
             self.put_bytes(creds, target, first.body).await?;
             return Ok(0);
         }
+        if first.eof {
+            // The whole encoded object fits one part. Keep the single-PUT
+            // latency of file uploads, but require producer finalization and
+            // retain the budgeted body and precomputed digest through retries.
+            source.finish().await?;
+            let size = first.body.len() as u64;
+            self.base
+                .put_object()
+                .bucket(target.bucket)
+                .key(target.key)
+                .content_length(size as i64)
+                .content_md5(first.md5)
+                .body(part_body(first.body))
+                .customize()
+                .config_override(self.op_config(creds, &target, S3Operation::PutObject))
+                .send()
+                .await
+                .map_err(|err| {
+                    observe_s3_error(S3Operation::PutObject, target.bucket, target.key, &err);
+                    ObjectStoreError::Put(DisplayErrorContext(&err).to_string())
+                })?;
+            return Ok(size);
+        }
         let created = self
             .base
             .create_multipart_upload()
@@ -396,9 +421,9 @@ impl S3ObjectStore {
         let mut completed = Vec::new();
         in_flight.push(self.upload_stream_part(creds, target, upload_id, 1, first));
         while !eof {
-            if in_flight.len() >= options.concurrency {
-                completed.push(in_flight.next().await.expect("in-flight part")?);
-            }
+            // Fill the next budgeted part while existing requests run. Waiting
+            // for an upload slot before reading would unnecessarily stop the
+            // caller's encoder; the shared budget bounds this extra prefetch.
             let read = read_part(source, budget, options, total);
             tokio::pin!(read);
             let part = loop {
@@ -413,6 +438,9 @@ impl S3ObjectStore {
             };
             eof = part.eof;
             if !part.body.is_empty() {
+                if in_flight.len() >= options.concurrency {
+                    completed.push(in_flight.next().await.expect("in-flight part")?);
+                }
                 total += part.body.len() as u64;
                 in_flight.push(self.upload_stream_part(
                     creds,

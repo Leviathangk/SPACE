@@ -85,6 +85,9 @@ An operation's `state` describes the lifecycle request; the sandbox's `state` de
 
 ## Lifecycle and persistence
 
+[Snapshot upload streaming](snapshot-upload-streaming.md) describes the worker
+transfer pipeline, memory bounds, failure ownership, and rollout behavior.
+
 Pause and suspend both stop execution, but retain state differently. Use wake to return a paused or suspended sandbox to running, and wait for its operation and readiness before issuing another command.
 
 | State | Process execution | What is retained | Next action |

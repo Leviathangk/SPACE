@@ -89,7 +89,7 @@ fn common_object_parent_stays_within_one_artifact_directory() {
 }
 
 #[derive(Default)]
-struct MockObjectStore {
+pub(super) struct MockObjectStore {
     heads: Mutex<VecDeque<Option<ObjectMeta>>>,
     body: Vec<u8>,
     head_calls: AtomicUsize,
@@ -98,7 +98,10 @@ struct MockObjectStore {
 }
 
 impl MockObjectStore {
-    fn new(heads: impl IntoIterator<Item = Option<ObjectMeta>>, body: impl Into<Vec<u8>>) -> Self {
+    pub(super) fn new(
+        heads: impl IntoIterator<Item = Option<ObjectMeta>>,
+        body: impl Into<Vec<u8>>,
+    ) -> Self {
         Self {
             heads: Mutex::new(heads.into_iter().collect()),
             body: body.into(),
@@ -116,7 +119,7 @@ impl MockObjectStore {
         self.head_calls.load(Ordering::SeqCst)
     }
 
-    fn put_calls(&self) -> usize {
+    pub(super) fn put_calls(&self) -> usize {
         self.put_calls.load(Ordering::SeqCst)
     }
 }
@@ -684,7 +687,7 @@ async fn raw_pull_bypasses_streaming_and_keeps_wire_bytes() {
     assert_eq!(store.inner.get_calls(), 1, "raw pulls use the plain path");
 }
 
-fn test_creds() -> ObjectCredentials {
+pub(super) fn test_creds() -> ObjectCredentials {
     ObjectCredentials {
         access_key_id: "akid".to_string(),
         secret_access_key: "secret".to_string(),
@@ -903,7 +906,7 @@ fn rootfs_payload_requires_a_scoped_assignment() {
     );
 }
 
-fn test_target() -> ObjectTarget<'static> {
+pub(super) fn test_target() -> ObjectTarget<'static> {
     ObjectTarget {
         bucket: "bucket",
         key: "snapshots/a/snapshot.luks",
@@ -925,7 +928,7 @@ fn test_executor(store: Arc<dyn ObjectStore>) -> TransferExecutor {
     )
 }
 
-fn test_job(kind: &str) -> Job {
+pub(super) fn test_job(kind: &str) -> Job {
     Job {
         job_id: "019d84bd-280d-7331-99c6-b63377f3a3a2".parse().unwrap(),
         kind: kind.to_string(),
@@ -1063,7 +1066,7 @@ fn verified_payload(local_path: &Path) -> TransferPayload {
     }
 }
 
-fn push_payload(local_path: &Path) -> TransferPayload {
+pub(super) fn push_payload(local_path: &Path) -> TransferPayload {
     TransferPayload {
         subject_id: "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string(),
         local_path: local_path.to_string_lossy().into_owned(),
@@ -1113,6 +1116,7 @@ async fn push_rejects_truncated_durable_object() {
             &test_creds(),
             test_target(),
             None,
+            CancellationToken::new(),
         )
         .await;
 
@@ -1150,6 +1154,7 @@ async fn push_accepts_fully_durable_object() {
             &test_creds(),
             test_target(),
             None,
+            CancellationToken::new(),
         )
         .await
         .expect("a fully durable object must finalize successfully");
