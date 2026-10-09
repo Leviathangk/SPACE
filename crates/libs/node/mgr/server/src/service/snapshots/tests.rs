@@ -359,13 +359,13 @@ async fn service_with_stop(
 
 #[tokio::test]
 async fn encrypted_seal_stop_retries_while_the_runtime_is_still_exiting() {
-    let (service, id, _socket, server) = service_with_stop(tonic::Code::Internal, 2).await;
-
-    super::stop_runtime_for_encrypted_seal(&service, &id.to_string())
-        .await
-        .expect("stop succeeds once the runtime finishes exiting");
-
-    crate::runtime_supervisor_client::tests::stop_supervisor_server(server).await;
+    for code in [tonic::Code::Internal, tonic::Code::Unavailable] {
+        let (service, id, _socket, server) = service_with_stop(code, 2).await;
+        super::stop_runtime_for_encrypted_seal(&service, &id.to_string())
+            .await
+            .expect("stop succeeds once the runtime finishes exiting");
+        crate::runtime_supervisor_client::tests::stop_supervisor_server(server).await;
+    }
 }
 
 #[tokio::test]

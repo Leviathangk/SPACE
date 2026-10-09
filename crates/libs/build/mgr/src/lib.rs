@@ -922,24 +922,8 @@ impl TemplateBuilder {
                 tracing::warn!(error = %e, "guest exit request failed; force cleanup may be needed");
                 eprintln!("Guest exit request failed, force cleaning: {e}");
             }
-            let pid = start_resp.pid;
-            let deadline = std::time::Instant::now() + SHUTDOWN_TIMEOUT;
-            loop {
-                if !vm::is_process_alive(pid) {
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    tracing::warn!(
-                        shutdown_timeout_secs = SHUTDOWN_TIMEOUT.as_secs(),
-                        "build VM did not exit before shutdown timeout"
-                    );
-                    eprintln!(
-                        "Build VM did not exit within {}s, force cleaning...",
-                        SHUTDOWN_TIMEOUT.as_secs()
-                    );
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if let Err(error) = vm::wait_for_exit(&sandbox_id, start_resp.pid, SHUTDOWN_TIMEOUT).await {
+                tracing::warn!(%error, shutdown_timeout_secs = SHUTDOWN_TIMEOUT.as_secs(), "build VM graceful exit unconfirmed; requesting runtime cleanup");
             }
             Ok::<(), BuildError>(())
         })
@@ -971,13 +955,8 @@ impl TemplateBuilder {
             );
         }
 
-        if runtime_build.requires_durable_stop() && vm::is_process_alive(start_resp.pid) {
-            delete_sandbox_best_effort(&mut sbx, &sandbox_id, "runtime VM still alive").await;
-            return Err(BuildError::message(
-                "cannot seal runtime while build VM is alive",
-            ));
-        }
-
+        // For runtime-bearing images, confirmed Stop proves the runtime cgroups
+        // are gone; no container-local /proc check can strengthen that barrier.
         // Copy the modified rootfs out BEFORE delete removes it.
         let cache_rootfs =
             pplx_space_common_core::host::linux::paths::sandbox_rootfs_path(&sandbox_id);
