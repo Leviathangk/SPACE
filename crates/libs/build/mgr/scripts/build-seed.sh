@@ -112,7 +112,10 @@ echo "Architecture: ${ARCH} (containerd: ${CONTAINER_PLATFORM}, rust: ${RUST_TAR
 OUTDIR="${SPACE_SEED_OUTPUT_DIR:-${REPO_ROOT}/templates/firecracker/seed/output/${ID}}"
 CACHEDIR="${SPACE_SEED_CACHE_DIR:-${REPO_ROOT}/templates/firecracker/seed/.cache}"
 GUEST_BINS=(spaced-svc spaced)
-CONTAINER_NAME="space-seed-builder-${ID}-$$"
+# containerd IDs are limited to 76 characters. Hash the full ID and PID so
+# long or non-containerd-safe template names still produce distinct valid IDs.
+CONTAINER_HASH="$(printf '%s' "${ID}-$$" | sha256sum)"
+CONTAINER_NAME="space-seed-builder-${CONTAINER_HASH:0:24}"
 STAGE_ROOT="${SPACE_SEED_STAGE_ROOT:-$(dirname "${CACHEDIR}")/scratch-bundles}"
 BUNDLE_DIR=""
 INPUT_DIR=""

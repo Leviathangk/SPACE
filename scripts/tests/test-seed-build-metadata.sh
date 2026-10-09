@@ -56,7 +56,13 @@ case "${1:-}" in
       exit 97
     }
     env_file=""
+    container_name=""
+    previous_arg=""
     while [[ $# -gt 0 ]]; do
+      if [[ "$1" == /bin/bash ]]; then
+        container_name="$previous_arg"
+      fi
+      previous_arg="$1"
       if [[ "$1" == type=bind,src=*,dst=/workspace/inputs,* ]]; then
         src="${1#type=bind,src=}"
         src="${src%%,dst=*}"
@@ -68,10 +74,19 @@ case "${1:-}" in
       echo "rootfs-builder env file was not staged" >&2
       exit 1
     }
+    [[ ${#container_name} -le 76 && "$container_name" =~ ^[a-zA-Z0-9]+([._-][a-zA-Z0-9]+)*$ ]] || {
+      echo "invalid container ID (${#container_name} characters): $container_name" >&2
+      exit 1
+    }
+    printf '%s\n' "$container_name" >"${CAPTURED_CONTAINER:?}"
     cp "$env_file" "${CAPTURED_ENV:?CAPTURED_ENV is required}"
     mkdir -p "${SPACE_SEED_OUTPUT_DIR:?SPACE_SEED_OUTPUT_DIR is required}"
     printf 'rootfs\n' >"${SPACE_SEED_OUTPUT_DIR}/rootfs.ext4"
     printf '{}\n' >"${SPACE_SEED_OUTPUT_DIR}/metadata.json"
+    exit 0
+    ;;
+  tasks|containers)
+    printf '%s\n' "${!#}" >>"${CAPTURED_CLEANUP:?}"
     exit 0
     ;;
   *)
@@ -137,6 +152,8 @@ run_success() {
   env \
     PATH="${fake_bin}:${PATH}" \
     ALLOW_CTR_RUN=1 \
+    CAPTURED_CONTAINER="${case_root}/container-name" \
+    CAPTURED_CLEANUP="${case_root}/cleanup-names" \
     CAPTURED_ENV="$captured_env" \
     SPACE_SEED_OUTPUT_DIR="$out_dir" \
     SPACE_SEED_CACHE_DIR="$cache_dir" \
@@ -149,7 +166,7 @@ run_success() {
     SPACE_SEED_UBUNTU_VERSION="26.04" \
     SPACE_SEED_UBUNTU_DATE="release" \
     "$@" \
-    "$script" --id "$name" --pubkey "$pubkey" >/dev/null
+    "${BUILD_SCRIPT:-$script}" --id "${TEMPLATE_ID:-$name}" --pubkey "$pubkey" >/dev/null
 }
 
 run_failure() {
@@ -298,6 +315,36 @@ set -e
 grep -F "$kernel_pair_error" "$rootfs_stderr" >/dev/null || {
   echo "rootfs-builder: expected error containing: ${kernel_pair_error}" >&2
   sed 's/^/  /' "$rootfs_stderr" >&2
+  exit 1
+}
+
+# Substitute only the shell PID in a disposable copy so the real build path
+# exercises a seven-digit PID without depending on the host's process counter.
+pid_script="${tmp_dir}/build-seed.sh"
+sed 's/\$\$/1234567/g' "$script" >"$pid_script"
+chmod +x "$pid_script"
+long_id="$(printf '%050d' 0)"
+very_long_id="$(printf '%05000d' 0)"
+previous_name=""
+for template_id in "$long_id" "$very_long_id" "${very_long_id}1" 'seed / invalid:_characters'; do
+  TEMPLATE_ID="$template_id" BUILD_SCRIPT="$pid_script" run_success container-id
+  container_name="$(cat "${case_root}/container-name")"
+  [[ "$container_name" != "$previous_name" ]] || {
+    echo "different template IDs produced the same container name" >&2
+    exit 1
+  }
+  expected_cleanup="$(printf '%s\n%s' "$container_name" "$container_name")"
+  [[ "$(cat "${case_root}/cleanup-names")" == "$expected_cleanup" ]] || {
+    echo "cleanup did not use the build container name" >&2
+    exit 1
+  }
+  previous_name="$container_name"
+  rm -rf "$case_root"
+done
+sed 's/\$\$/1234568/g' "$script" >"$pid_script"
+TEMPLATE_ID='seed / invalid:_characters' BUILD_SCRIPT="$pid_script" run_success container-id
+[[ "$(cat "${case_root}/container-name")" != "$previous_name" ]] || {
+  echo "different PIDs produced the same container name" >&2
   exit 1
 }
 
