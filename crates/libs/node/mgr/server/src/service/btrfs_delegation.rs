@@ -648,10 +648,13 @@ impl NodeManagerService {
             )
             .await?;
         let stream_path = rootfs_btrfs_send_path(&snapshot_dir);
-        let stream_bytes = match self
-            .encode_pinned_stream(&send_parent.path, &instance_ro_path, &stream_path)
-            .await
-        {
+        let encode_result = if req.defer_send && source_id.is_some() {
+            Ok(0)
+        } else {
+            self.encode_pinned_stream(&send_parent.path, &instance_ro_path, &stream_path)
+                .await
+        };
+        let stream_bytes = match encode_result {
             Ok(stream_bytes) => stream_bytes,
             Err(error) => {
                 let instance_ro_path = instance_ro_path.clone();
@@ -805,9 +808,12 @@ impl NodeManagerService {
             )
             .await?;
         let stream_path = rootfs_btrfs_send_path(&destination);
-        let send_result = self
-            .encode_pinned_stream(&send_parent.path, &wire_source, &stream_path)
-            .await;
+        let send_result = if req.defer_send && source_id.is_some() {
+            Ok(0)
+        } else {
+            self.encode_pinned_stream(&send_parent.path, &wire_source, &stream_path)
+                .await
+        };
         // Even on cancellation the send ioctl has returned before cleanup.
         // The wire clone is dead weight on success and failure alike.
         wire_source_cleanup.disarm();

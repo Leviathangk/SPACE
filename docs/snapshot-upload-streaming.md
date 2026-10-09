@@ -3,8 +3,9 @@
 Volume-manager can feed its zstd encoder directly into the object store's
 bounded multipart uploader. For a compressed artifact of size C, this avoids
 writing a C-byte temporary file and reading it again for MD5 and upload. It
-does not remove source staging, btrfs-send materialization, compression, or S3
-payload bytes. Physical device-read savings depend on page-cache hits.
+does not remove source staging, compression, or S3 payload bytes. The separate
+btrfs source path below also avoids materializing the uncompressed send stream.
+Physical device-read savings depend on page-cache hits.
 
 The deployment setting `SPACE_VOLUME_STREAM_PUSH_BUFFER_BUDGET_BYTES` controls
 both mode and aggregate retained-part memory. It is read once at service startup:
@@ -79,7 +80,8 @@ does not evict restore output or other service caches.
 | Artifact sibling fails | Successful entries may already exist remotely | Existing artifact-level cleanup retains all retry sources until the whole artifact is terminal. |
 
 Retries regenerate a complete stream. They do not resume an old multipart
-upload or assume regeneration is byte-identical. The queued JSON, SQLite schema,
+upload or assume regeneration is byte-identical. For file-source uploads, the queued JSON,
+SQLite schema,
 protobuf API, object keys, and zstd/LUKS formats are unchanged. The existing
 consumer can read streamed objects.
 
@@ -125,36 +127,155 @@ successful VM execution; a local-cache wake or synthetic ciphertext round trip
 does not establish this. Confirm abort-incomplete lifecycle cleanup on the
 actual snapshot bucket used by that canary, including non-production buckets.
 
-## Recoverable btrfs send sources
+## Streaming from retained btrfs sources
 
-`SPACE_SNAPSHOT_STREAM_BTRFS_SEND=true` on sandbox-manager opts new captures
-into retaining a `rootfs.btrfs-source` bundle beside the ordinary send file.
-The default remains the existing materialized path. This ownership layer alone
-saves no I/O: uploads still stage and read `rootfs.btrfs-send`.
+`SPACE_SNAPSHOT_STREAM_BTRFS_SEND=true` on sandbox-manager opts new btrfs
+captures into retaining an immutable `rootfs.btrfs-source` bundle. It defers
+send-file creation only when volume-manager advertises streaming support
+(compression enabled, a positive upload buffer budget, and an authorized
+node-manager capability probe). The default remains
+the existing materialized path. LUKS artifacts keep their existing upload path;
+this option changes the btrfs-send codec, not encryption policy.
 
 Each bundle contains private copy-on-write snapshots of the frozen rootfs and
-its template parent, plus a versioned manifest binding their subvolume UUIDs to
-one source identity. Template GC and sandbox resuspend can remove their original
-inputs without invalidating the retained bundle. These copies share extents;
-retaining them can delay physical reclamation as the live rootfs changes.
+its template parent, plus a manifest binding their read-only subvolume UUIDs to
+one source identity. Template GC and later sandbox writes cannot change them.
+These copies share extents but can delay physical reclamation until artifact
+retirement. They are not copies of the entire rootfs written to disk.
 
-A prepared upload whose send file is missing asks node-manager to regenerate it
-using the identity persisted in snapshot metadata. Node-manager validates the
-identity and read-only inputs, creates a fresh `instance.ro` wire clone, and
-atomically publishes a complete stream. Fresh attempts need not be byte-identical.
-The upload restages the regenerated file and refreshes its metadata before
-submission. The existing artifact owner and recursive cleanup own the bundle;
-an RPC disconnect does not release ownership while a kernel send is running.
+Before acknowledging submission, node-manager creates an independent upload
+lease under `/space/cache/.btrfs-send-staging`. Volume-manager persists that lease
+in a `push_btrfs_send` job. Sandbox teardown can then remove the original artifact
+without breaking upload retries. No SQLite migration is needed: the source
+reference lives in the existing job payload. The new protobuf RPCs are additive.
 
-| Event | Result |
+For each attempt, node-manager creates a fresh wire clone, sends into a kernel
+pipe, and relays bounded chunks over its existing Unix gRPC socket. Volume-manager
+compresses the stream into the same shared multipart budget used by other pushes.
+Node-manager permits four concurrent send readers independently of its filesystem
+mutation lane. Each relay queues at most four 256 KiB data frames, plus its pipe,
+current frame and gRPC transport buffers. Filesystem cache remains additional
+memory. Volume-manager retains its existing codec reserve and producer limit.
+
+Completion requires a successful kernel send, an exact terminal byte count,
+successful gRPC trailers, encoder finalization, and an S3 HEAD length check.
+Retries start a new send and multipart upload; regenerated streams need not be
+byte-identical. The remote zstd/btrfs-send format and restore decoder do not change.
+This removes one uncompressed send-file write and its compression read. It does
+not eliminate reads of the source rootfs or reduce S3 bytes.
+
+The logical send length is unknown until encoding finishes. Sandbox-manager
+therefore submits remote metadata after all VM artifacts complete, writes it
+outside the reclaimable artifact directory, and persists the metadata job ID
+before polling it. Ready publication still waits for every artifact and metadata.
+The local sidecar retains source identity for recovery; the remote sidecar records
+the actual logical upload total and omits that node-local identity.
+
+| State or failure | Owner and recovery |
 | --- | --- |
-| Original sandbox or template disappears | Private source and parent still support regeneration. |
-| Process restarts | Manifest and read-only subvolumes are reopened; no live descriptor is required. |
-| Artifact is replaced or source identity changes | Regeneration rejects the stale identity. |
-| Send fails or caller cancels | No partial send file is published; artifact cleanup owns any interrupted wire clone. |
-| Artifact is retired | Existing subvolume-aware cleanup removes the nested bundle. |
+| Capture interrupted | The artifact owner reclaims partial subvolumes; no complete source identity is published. |
+| Staging succeeds but job insertion/reply fails | Submission and the orphan census serialize. A retry rejoins the same durable job when present; an unreferenced lease is reclaimed by the next census. |
+| Upload pending, running, or cancelling | The persisted volume job retains its lease. Retries reopen and verify immutable inputs. |
+| Resubmit the same source and destination | Pending/running/cancelling jobs and completed uploads are reused without staging another lease. Failed/cancelled jobs get a new job and a fresh lease; their old leases remain eligible for terminal cleanup. |
+| Reader disconnect, timeout, or daemon shutdown | Close the pipe read end, join the kernel writer, then release its lease lock and reader slot. A retry generates a fresh stream. |
+| Job commits completed, failed, or cancelled | The one-minute orphan sweep can release its lease. It cannot race an active kernel reader because deletion takes the same lease lock. |
+| Census incomplete or malformed payload | Delete nothing; log and retry next minute. Each sweep is bounded to 30 seconds. |
+| Snapshot superseded or source identity changed | Reject reuse of the replacement source; existing job retry/failure convergence owns the outcome. |
+| Upload budget becomes zero | Existing source jobs compress into a temporary file and use the supported file uploader. New captures materialize their send file. |
+| Metadata submission or finalization interrupted | Recover persisted VM/metadata job IDs and retry the immutable backup attempt; do not publish Ready early. |
 
-Older node-managers ignore the retention hint and produce the usual file.
-Disabling new capture retention does not disable regeneration of existing
-bundles. This phase adds protobuf fields and a recovery RPC, and an optional
-metadata field; it does not change the SQLite schema or remote btrfs-send format.
+Deploy node-manager and the volume-manager identity update first: the latter adds
+socket access through `space-nodeclients`, while per-operation authorization grants
+only stage/read/list/release send-source operations. Then deploy volume-manager
+and sandbox-manager, and opt in new capture after validation. Old servers retain
+the file path when capability negotiation is unavailable. Deployments that still
+share sandbox-manager's UID with volume-manager must migrate to the dedicated
+volume-manager identity before enabling this path; negotiation otherwise keeps
+the materialized file. The capability probe adds at most two seconds before
+falling back if a service is unavailable.
+
+Turning the capture option off stops new deferred captures. Setting the upload
+budget to zero changes how existing source jobs upload; it does not remove their
+source dependencies. Before downgrading binaries, drain source jobs and materialize
+any retained local artifacts needed by old readers using `BtrfsMaterializeRootfsSend`.
+Do not downgrade node-manager while source-aware volume jobs remain. Source cleanup
+continues while streaming is disabled. Normal artifact retirement reclaims the
+original bundle; the upload lease has independent terminal cleanup.
+
+### Isolated btrfs transfer measurement
+
+An optimized Linux harness compared four concurrent 4 GiB synthetic rootfs
+sends using the existing staged-file upload path and the new direct-source path.
+Both used the same uploader, four codec slots, and a 1 GiB part budget. Separate
+cgroups limited the source service to 2 GiB and the upload executor to 12 GiB.
+Four interleaved batches per path produced these medians:
+
+| Per 16 GiB input batch | Materialized send → streamed upload | Direct send → streamed upload |
+| --- | ---: | ---: |
+| Send preparation plus upload | 19.1 s | 10.5 s (45% lower) |
+| Device reads across both cgroups | 30.2 GiB | 16.0 GiB (47% lower) |
+| Device writes across both cgroups | 16.01 GiB | <1 MiB |
+| Total CPU time | 53.5 CPU-s | 71.4 CPU-s (34% higher) |
+| S3 object bytes | 4.01 GiB | 4.01 GiB |
+
+All 32 objects were downloaded, decoded, received by btrfs, and rootfs-hash
+verified. Four further uploads verified budget-zero fallback. Median peak
+anonymous memory was 10.3 → 19.8 MiB in the source service and 904 → 734 MiB in
+the uploader; the configured part cap remained unchanged. Neither cgroup OOMed.
+These are synthetic transfer results, not fleet percentages or VM restore-tail
+measurements. Source capture/staging happened before the measured transfer;
+retained COW extents can add a capacity cost until their owner retires them.
+
+A separate transport-only probe drained the same send bytes without compression
+or S3: an FD-passing prototype took 4.94 s and 24.5 CPU-s, versus 6.65 s and
+48.6 CPU-s for the gRPC relay (three batches each). The relay therefore has a
+measured CPU cost. This implementation keeps the existing authenticated RPC
+transport and node-owned read end, which lets node-manager stop a backpressured
+kernel writer when its RPC consumer disappears. FD passing would require a
+separate authenticated handoff protocol and cancellation rules for a read end
+owned by another process. It remains a concrete CPU optimization opportunity;
+its transport-only result is not an end-to-end S3 upload measurement.
+
+### Enablement gates for direct btrfs sends
+
+The transfer benchmark excludes capture and upload-lease staging. The current
+first-attempt path creates six subvolume snapshots: the initial `instance.ro`,
+the bundle's parent and source, the lease's parent and source, and the attempt's
+wire clone. The materialized path creates one `instance.ro`. These are snapshot
+operations, not six full data copies or a measurement of six distinct filesystem
+commits. Their transaction and metadata costs must be included in end-to-end
+suspend measurements on a busy filesystem.
+
+Two bundle subvolumes remain until local artifact retirement; the two lease
+subvolumes remain until the transfer becomes terminal and cleanup runs. Retained
+parents can keep template extents allocated after template GC. Logical artifact
+sizes and GC's accounted bytes do not establish physical space reclaimed.
+
+An in-memory reference count cannot replace independent upload leases: artifact
+deletion, job submission, and restart recovery have different owners. A durable
+pin shared with artifact cleanup could avoid the lease copies, but needs its own
+crash-safe handoff and orphan reconciliation. Likewise, successful remote upload
+does not currently permit deleting the bundle: local artifact validation,
+promotion/reupload, and downgrade materialization still use it. Ordinary local
+wake uses the retained instance rootfs, but that alone is insufficient to release
+the artifact's recovery inputs.
+
+Before widening enablement, use a small canary and matched controls to verify:
+
+- Full suspend and upload latency, including capture and staging, plus concurrent
+  restore latency. Compare step tails and filesystem commit stalls under load.
+- Physical cache-device reads/writes and write latency at comparable traffic.
+  Logical send bytes are not measured device savings; node-manager write
+  accounting is supporting evidence, not a substitute for device counters.
+- Subvolume count, btrfs unallocated space, metadata usage/reserve, and actual
+  extent reclamation through template churn and local artifact retirement. Cover
+  the retention cycle, not only the first upload burst.
+- A real same-node VM wake after deferred capture: verify no send file exists,
+  restart the managers, then check persisted guest disk and memory markers and
+  confirm no remote restore supplied the state. Also verify remote restore and
+  materialized-path rollback. The existing decode/receive/hash checks do not
+  establish this VM-level local-wake behavior.
+
+Broad enablement remains pending these measurements. Disabling new captures
+stops further accumulation; existing bundles and leases still follow their
+normal ownership and retirement rules.

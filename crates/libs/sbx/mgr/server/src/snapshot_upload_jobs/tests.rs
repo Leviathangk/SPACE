@@ -755,6 +755,7 @@ pub(crate) fn reclaim_fixture_payload(
         job_ids: Vec::new(),
         metadata_staging_dir: None,
         includes_metadata_job: true,
+        deferred_metadata: false,
     }
 }
 
@@ -776,6 +777,8 @@ fn submitted_transfer_ids_replace_the_durable_prepared_intent() {
         "running",
         &prepared_json,
     );
+    payload.deferred_metadata = true;
+    payload.meta.rootfs_send_source_id = Some(uuid::Uuid::now_v7());
     payload.job_ids = vec![JobId::new(), JobId::new(), JobId::new()];
     let db = std::sync::Arc::new(std::sync::Mutex::new(conn));
 
@@ -796,6 +799,27 @@ fn submitted_transfer_ids_replace_the_durable_prepared_intent() {
             .unwrap();
         let recovered: SnapshotUploadJobs = serde_json::from_str(&persisted).unwrap();
         assert_eq!(recovered.job_ids, payload.job_ids);
+        assert!(recovered.deferred_metadata);
+        assert_eq!(
+            recovered.meta.rootfs_send_source_id,
+            payload.meta.rootfs_send_source_id
+        );
+        // The second durable checkpoint includes metadata; a restart must
+        // poll this handle instead of recreating the sidecar after teardown.
+        let mut finalized = recovered;
+        finalized.job_ids.push(JobId::new());
+        persist_submitted_transfer_ids(&db, &job_id.parse().unwrap(), &finalized).unwrap();
+        let saved: String = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT payload FROM jobs WHERE job_id = ?1",
+                [job_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let restarted: SnapshotUploadJobs = serde_json::from_str(&saved).unwrap();
+        assert_eq!(restarted.job_ids, finalized.job_ids);
     }
 }
 

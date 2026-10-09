@@ -1287,6 +1287,43 @@ impl NodeManager for LocalNodeManager {
         Err(not_btrfs())
     }
 
+    async fn get_btrfs_send_capabilities(
+        &self,
+        _request: Request<GetBtrfsSendCapabilitiesRequest>,
+    ) -> Result<Response<GetBtrfsSendCapabilitiesResponse>, Status> {
+        Ok(Response::new(GetBtrfsSendCapabilitiesResponse {
+            supported: false,
+        }))
+    }
+
+    type BtrfsReadSendSourceStream =
+        std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<BtrfsSendChunk, Status>> + Send>>;
+
+    async fn btrfs_stage_send_source(
+        &self,
+        _request: Request<BtrfsStageSendSourceRequest>,
+    ) -> Result<Response<BtrfsSendLease>, Status> {
+        Err(not_btrfs())
+    }
+    async fn btrfs_read_send_source(
+        &self,
+        _request: Request<BtrfsSendLease>,
+    ) -> Result<Response<Self::BtrfsReadSendSourceStream>, Status> {
+        Err(not_btrfs())
+    }
+    async fn btrfs_delete_send_source(
+        &self,
+        _request: Request<BtrfsSendLease>,
+    ) -> Result<Response<BtrfsDeleteSendSourceResponse>, Status> {
+        Err(not_btrfs())
+    }
+    async fn btrfs_list_send_sources(
+        &self,
+        _request: Request<BtrfsListSendSourcesRequest>,
+    ) -> Result<Response<BtrfsListSendSourcesResponse>, Status> {
+        Err(not_btrfs())
+    }
+
     async fn btrfs_receive_instance(
         &self,
         _request: Request<BtrfsReceiveInstanceRequest>,

@@ -40,19 +40,28 @@ pub(super) fn capture(artifact: &Path, parent: &Path, source: &Path) -> Result<U
     let artifact = trusted_paths::open_directory(artifact)?;
     let parent = trusted_paths::open_directory(parent)?;
     let source = trusted_paths::open_directory(source)?;
-    let received_uuid = btrfs::info(&parent)
+    capture_open(&artifact, &parent, &source, Uuid::now_v7())
+}
+
+pub(super) fn capture_open(
+    artifact: &File,
+    parent: &File,
+    source: &File,
+    source_id: Uuid,
+) -> Result<Uuid, Status> {
+    let received_uuid = btrfs::info(parent)
         .map_err(artifact_fs::error)?
         .1
         .received_uuid
         .ok_or_else(|| Status::failed_precondition("send parent has no received identity"))?;
     nix::sys::stat::mkdirat(
-        &artifact,
+        artifact,
         DIRECTORY,
         nix::sys::stat::Mode::from_bits_truncate(0o750),
     )
     .map_err(artifact_fs::error)?;
     let bundle =
-        artifact_fs::directory(&artifact, DIRECTORY.as_ref()).map_err(artifact_fs::error)?;
+        artifact_fs::directory(artifact, DIRECTORY.as_ref()).map_err(artifact_fs::error)?;
     trusted_paths::set_permissions(
         &bundle,
         Some(pplx_space_common_core::host::linux::identities::gids::SPACE_CACHE_RW),
@@ -62,17 +71,17 @@ pub(super) fn capture(artifact: &Path, parent: &Path, source: &Path) -> Result<U
         // Templates use a deterministic received UUID and stransid=0. Preserve
         // that remote identity on the private, byte-identical parent before
         // sealing it. Never change the original template's identity or flags.
-        btrfs::snapshot(&parent, &bundle, "parent".as_ref(), false).map_err(artifact_fs::error)?;
+        btrfs::snapshot(parent, &bundle, "parent".as_ref(), false).map_err(artifact_fs::error)?;
         let private_parent =
             artifact_fs::directory(&bundle, "parent".as_ref()).map_err(artifact_fs::error)?;
         btrfs::stamp(&private_parent, received_uuid).map_err(artifact_fs::error)?;
         btrfs::set_readonly(&private_parent, true).map_err(artifact_fs::error)?;
-        btrfs::snapshot(&source, &bundle, "source".as_ref(), true).map_err(artifact_fs::error)?;
+        btrfs::snapshot(source, &bundle, "source".as_ref(), true).map_err(artifact_fs::error)?;
         let private_source =
             artifact_fs::directory(&bundle, "source".as_ref()).map_err(artifact_fs::error)?;
         let manifest = Manifest {
             version: 1,
-            source_id: Uuid::now_v7(),
+            source_id,
             source_uuid: subvolume_uuid(&private_source)?,
             parent_uuid: subvolume_uuid(&private_parent)?,
             received_uuid,
@@ -103,7 +112,7 @@ pub(super) fn capture(artifact: &Path, parent: &Path, source: &Path) -> Result<U
         Ok(manifest.source_id)
     })();
     if result.is_err()
-        && let Err(error) = artifact_fs::remove_at(&artifact, DIRECTORY.as_ref())
+        && let Err(error) = artifact_fs::remove_at(artifact, DIRECTORY.as_ref())
     {
         tracing::warn!(%error, "partial send-source cleanup deferred to artifact cleanup");
     }
@@ -118,14 +127,14 @@ fn subvolume_uuid(file: &File) -> Result<Uuid, Status> {
         .ok_or_else(|| Status::failed_precondition("send source has no subvolume identity"))
 }
 
-struct SendSource {
+pub(super) struct SendSource {
     bundle: File,
-    parent: File,
-    source: File,
+    pub(super) parent: File,
+    pub(super) source: File,
 }
 
 impl SendSource {
-    fn open(artifact: &File, expected: Uuid) -> Result<Self, Status> {
+    pub(super) fn open(artifact: &File, expected: Uuid) -> Result<Self, Status> {
         let bundle =
             artifact_fs::directory(artifact, DIRECTORY.as_ref()).map_err(artifact_fs::error)?;
         let mut bytes = Vec::new();
@@ -167,7 +176,7 @@ impl SendSource {
         })
     }
 
-    fn send(&self, output: &File) -> Result<(), Status> {
+    pub(super) fn send(&self, output: &File) -> Result<(), Status> {
         let name = format!(".send-{}", Uuid::now_v7());
         nix::sys::stat::mkdirat(
             &self.bundle,

@@ -177,6 +177,8 @@ pub struct NodeManagerService {
     sandbox_sidecar_cgroup_locks: SandboxCgroupFamilyLocks,
     sandbox_device_stack_locks: SandboxCgroupFamilyLocks,
     sandbox_artifact_locks: SandboxCgroupFamilyLocks,
+    send_source_locks: SandboxCgroupFamilyLocks,
+    send_source_slots: std::sync::Arc<tokio::sync::Semaphore>,
     artifact_work: Option<std::sync::Arc<filesystem_work::ArtifactWork>>,
     /// Shared drain ownership for detached mutations and lifecycle permits.
     device_op_tasks: tokio_util::task::TaskTracker,
@@ -332,6 +334,8 @@ impl NodeManagerService {
             )),
             device_op_tasks: task_tracker.clone(),
             sandbox_artifact_locks: Default::default(),
+            send_source_locks: Default::default(),
+            send_source_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             artifact_work: None,
             blocking_probe_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 MAX_BLOCKING_PROBES,
@@ -630,6 +634,7 @@ mod artifact_fs;
 pub mod btrfs_balance;
 mod btrfs_delegation;
 mod btrfs_send_source;
+mod btrfs_send_transport;
 pub mod cgroup_reclaim;
 mod cleanup_helpers;
 mod cleanup_inspect;

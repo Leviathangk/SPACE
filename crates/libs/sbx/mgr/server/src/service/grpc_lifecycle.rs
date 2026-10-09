@@ -599,7 +599,9 @@ fn sidecarless_format_from_artifacts(
     if probe(crate::snapshot_upload::ROOTFS_FULL_FILENAME)? {
         return Ok(pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat::Full);
     }
-    if probe(crate::snapshot_upload::ROOTFS_BTRFS_SEND_FILENAME)? {
+    if probe(crate::snapshot_upload::ROOTFS_BTRFS_SEND_FILENAME)?
+        || probe("rootfs.btrfs-source/source.json")?
+    {
         return Ok(pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat::BtrfsSend);
     }
     Ok(pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat::Full)
@@ -678,7 +680,10 @@ fn require_artifact_backup_files(
     full_current_instance: bool,
 ) -> Result<(), Status> {
     for file in crate::snapshot_upload::artifact_files_for_kind(kind, format) {
-        let path = format!("{local_path}/{}", file.local_name);
+        let path =
+            crate::snapshot_upload::local_artifact_path(std::path::Path::new(local_path), &file)
+                .to_string_lossy()
+                .into_owned();
         if !std::path::Path::new(&path).try_exists().map_err(|error| {
             Status::internal(format!("failed to stat artifact at {path}: {error}"))
         })? {
@@ -4977,7 +4982,12 @@ impl SandboxManagerService {
         // missing-file as `Status::internal` (without the terminal marker
         // the reconciler classifies on).
         for artifact in &artifact_set {
-            let path = format!("{snapshot_dir}/{}", artifact.local_name);
+            let path = crate::snapshot_upload::local_artifact_path(
+                std::path::Path::new(&snapshot_dir),
+                artifact,
+            )
+            .to_string_lossy()
+            .into_owned();
             // `try_exists` distinguishes "stat says no" (Ok(false), genuine
             // missing artifact, terminal) from "stat itself failed" (Err,
             // transient permission/IO/mount issue). Only Ok(false) maps to

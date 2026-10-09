@@ -3324,6 +3324,7 @@ async fn apply_file_mode(
 /// `Clone` is cheap — `S3ObjectStore` is internally `Arc`-wrapped.
 #[derive(Clone)]
 pub struct TransferExecutor {
+    node_manager: Option<pplx_space_node_mgr_client::NodeManagerGrpcClient>,
     store: Arc<dyn ObjectStore>,
     config: TransferExecutorConfig,
     destination_pull_locks: DestinationPullLocks,
@@ -3509,6 +3510,7 @@ impl TransferExecutor {
         };
         let shadow_comparisons = ShadowComparisonController::new();
         Self {
+            node_manager: None,
             stream_push: StreamPushConfig::new(&config.snapshot_upload_mode, total),
             store,
             config,
@@ -3526,6 +3528,16 @@ impl TransferExecutor {
             )),
             shadow_comparisons,
         }
+    }
+
+    /// Supply the privileged source service while retaining the executor's
+    /// shared admission and upload budget. Normal deployments use the local UDS.
+    pub fn with_node_manager(
+        mut self,
+        client: pplx_space_node_mgr_client::NodeManagerGrpcClient,
+    ) -> Self {
+        self.node_manager = Some(client);
+        self
     }
 
     pub fn shadow_comparison_controller(&self) -> ShadowComparisonController {
@@ -3884,6 +3896,7 @@ impl JobExecutor for TransferExecutor {
             // Single-file transfers (template raw pulls, single uploads):
             // one TransferPayload, always plaintext.
             "push" | "pull" => self.execute_single(job, cancellation).await,
+            "push_btrfs_send" => self.execute_single(job, cancellation).await,
             // Artifact transfers: one ArtifactPayload covering N entries,
             // optionally envelope-encrypted under one per-artifact DEK.
             "push_artifact" => {
@@ -3900,6 +3913,20 @@ impl JobExecutor for TransferExecutor {
 
     async fn cleanup_cancelled(&self, job: &Job) -> Result<(), JobError> {
         match job.kind.as_str() {
+            "push_btrfs_send" => {
+                let payload: crate::btrfs_push::Payload = job.payload_as()?;
+                let mut client = self
+                    .node_manager
+                    .clone()
+                    .unwrap_or_else(pplx_space_node_mgr_client::lazy);
+                client
+                    .btrfs_delete_send_source(pplx_space_node_mgr_client::proto::BtrfsSendLease {
+                        lease_id: payload.send_lease.to_string(),
+                    })
+                    .await
+                    .map(|_| ())
+                    .map_err(crate::btrfs_push::classify)
+            }
             "pull" => {
                 let payload = TransferPayload::from_json(&job.payload)?;
                 self.cleanup_cancelled_pull_path(Path::new(&payload.local_path))
@@ -4066,7 +4093,7 @@ impl TransferExecutor {
         let access = match job.kind.as_str() {
             // Push completion is verified with HeadObject before the job is
             // committed, so the exact object lease needs read as well as write.
-            "push" => StorageAccess::ReadWrite,
+            "push" | "push_btrfs_send" => StorageAccess::ReadWrite,
             "pull" => StorageAccess::Read,
             other => return Err(JobError::Permanent(format!("unknown kind: {other}"))),
         };
@@ -4088,6 +4115,10 @@ impl TransferExecutor {
         // Single-file transfers are always plaintext (`resolved_dek = None`)
         // and own their staged source cleanup (`cleanup_staged = true`).
         let result = match job.kind.as_str() {
+            "push_btrfs_send" => {
+                self.execute_btrfs_push(job, &creds, target, cancellation)
+                    .await
+            }
             "push" => {
                 self.execute_push(
                     job,

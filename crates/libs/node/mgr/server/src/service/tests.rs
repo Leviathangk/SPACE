@@ -265,6 +265,40 @@ pub(super) mod service_tests {
         assert_eq!(error.code(), tonic::Code::PermissionDenied);
     }
 
+    #[tokio::test]
+    async fn volume_manager_can_read_send_sources_without_general_node_authority() {
+        let service = service_for_unit_tests().await;
+        for (user, expected) in [
+            (users::SPACE_VOLMGR, tonic::Code::InvalidArgument),
+            (users::SPACE_SBXMGR, tonic::Code::PermissionDenied),
+            (users::SPACE_NODEAPI, tonic::Code::PermissionDenied),
+        ] {
+            let mut request = Request::new(crate::proto::BtrfsSendLease {
+                lease_id: "invalid".into(),
+            });
+            request.extensions_mut().insert(PeerIdentity::new(
+                user.uid,
+                user.primary_group.gid,
+                None,
+            ));
+            let error = service
+                .btrfs_read_send_source(request)
+                .await
+                .map(|_| ())
+                .unwrap_err();
+            assert_eq!(error.code(), expected, "{}", user.name);
+        }
+        let peer = PeerIdentity::new(
+            users::SPACE_VOLMGR.uid,
+            users::SPACE_VOLMGR.primary_group.gid,
+            None,
+        );
+        let error = node_peer_authorizer()
+            .authorize_identity(peer, "SetNetworkPoolDrain", ALLOW_NODE_ADMIN)
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+
     #[test]
     fn node_ctl_can_manage_per_sandbox_port_rpcs() {
         // SPACE_NODECTL is permitted to call the per-sandbox port RPCs
@@ -358,6 +392,8 @@ pub(super) mod service_tests {
                 std::collections::HashMap::new(),
             )),
             sandbox_artifact_locks: Default::default(),
+            send_source_locks: Default::default(),
+            send_source_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             artifact_work: None,
             device_op_tasks: tokio_util::task::TaskTracker::new(),
             blocking_probe_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
@@ -449,6 +485,8 @@ pub(super) mod service_tests {
                 std::collections::HashMap::new(),
             )),
             sandbox_artifact_locks: Default::default(),
+            send_source_locks: Default::default(),
+            send_source_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
             artifact_work: None,
             device_op_tasks: tokio_util::task::TaskTracker::new(),
             blocking_probe_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(

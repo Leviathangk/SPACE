@@ -71,6 +71,7 @@ pub(crate) async fn encode_rootfs_send(
             dest_dir: Some(snapshot_dir.to_string()),
             execution_fence: Some(execution_fence.into()),
             retain_source: retain_send_sources(),
+            defer_send: defer_send().await,
         })
         .await
         .map_err(|status| BtrfsViaNodemgrError::Rpc {
@@ -101,6 +102,7 @@ pub(crate) async fn encode_snapshot_rootfs_send(
             snapshot_name: snapshot_name.to_string(),
             dest_dir: dest_dir.to_string(),
             retain_source: retain_send_sources(),
+            defer_send: defer_send().await,
         })
         .await
         .map_err(|status| BtrfsViaNodemgrError::Rpc {
@@ -195,4 +197,29 @@ pub(crate) async fn materialize_rootfs_send(
             rpc: "BtrfsMaterializeRootfsSend",
             status,
         })
+}
+
+async fn defer_send() -> bool {
+    if !retain_send_sources() {
+        return false;
+    }
+    let probe = async {
+        let mut client = pplx_space_volmgr_client::connect(pplx_space_volmgr_client::VOLMGR_SOCKET)
+            .await
+            .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
+        client
+            .get_push_capabilities(pplx_space_volmgr_client::proto::GetPushCapabilitiesRequest {})
+            .await
+            .map(|response| response.into_inner().btrfs_send)
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(2), probe).await {
+        Ok(Ok(enabled)) => enabled,
+        result => {
+            tracing::debug!(
+                ?result,
+                "using materialized send without streaming capability"
+            );
+            false
+        }
+    }
 }

@@ -83,7 +83,7 @@ SPACE_TEMPLATE_MANAGER_GROUPS="space-nodeclients space-sbxclients space-tmplclie
 SPACE_CREDENTIAL_MANAGER_GROUPS="space-sbxclients space-volcredclients"
 # sbxclients is needed to publish volume-manager's own client socket; it does
 # not authorize this UID on the standard credential-manager listener.
-SPACE_VOLUME_MANAGER_GROUPS="space-sbxclients space-cache-rw space-volcredclients"
+SPACE_VOLUME_MANAGER_GROUPS="space-sbxclients space-cache-rw space-volcredclients space-nodeclients"
 # The runtime manager reads the world-readable vendor and cache layouts; it
 # needs only its own socket group so it can hand that group to its socket.
 SPACE_RUNTIME_MANAGER_GROUPS="space-rtmgrclients"

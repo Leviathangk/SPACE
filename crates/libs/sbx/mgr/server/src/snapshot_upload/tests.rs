@@ -73,6 +73,49 @@ fn fixture_meta(rootfs_diff_format: Option<&str>) -> SnapshotMeta {
 }
 
 #[test]
+fn deferred_send_prepares_without_a_wire_file_and_keeps_metadata_outside_the_artifact() {
+    for kind in [ArtifactKind::Full, ArtifactKind::Disk] {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact = temp.path().join("snapshot");
+        let bundle = artifact.join("rootfs.btrfs-source");
+        std::fs::create_dir_all(bundle.join("source")).unwrap();
+        let source_id = uuid::Uuid::now_v7();
+        std::fs::write(
+            bundle.join("source.json"),
+            serde_json::json!({"source_id":source_id}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(bundle.join("source/rootfs.ext4"), b"immutable rootfs").unwrap();
+        std::fs::write(artifact.join("memory"), b"memory").unwrap();
+        std::fs::write(artifact.join("vmstate"), b"state").unwrap();
+        let mut meta = fixture_meta(Some(ROOTFS_DIFF_FORMAT_BTRFS_SEND_V1));
+        meta.artifact_kind = Some(kind);
+        let prepared = prepare_suspend_snapshot(
+            &meta,
+            &uuid::Uuid::now_v7().to_string(),
+            &artifact,
+            &fixture_config(),
+            kind,
+            SuspendSnapshotFormat::BtrfsSend,
+        )
+        .unwrap();
+        assert!(prepared.deferred_metadata);
+        assert_eq!(prepared.meta.rootfs_send_source_id, Some(source_id));
+        assert!(prepared.job_ids.is_empty());
+        let metadata = prepared.metadata_staging_dir.as_ref().unwrap();
+        assert!(!metadata.starts_with(&artifact));
+        assert!(metadata.join(SNAPSHOT_METADATA_FILENAME).is_file());
+        assert!(!artifact.join(ROOTFS_BTRFS_SEND_FILENAME).exists());
+        // Teardown can remove the artifact after VM staging. The metadata
+        // worker must have a surviving, separately owned directory.
+        std::fs::remove_dir_all(&artifact).unwrap();
+        assert!(metadata.is_dir());
+        cleanup_metadata_staging_dir(&prepared);
+        assert!(!metadata.exists());
+    }
+}
+
+#[test]
 fn disk_artifacts_preserve_the_persisted_rootfs_codec() {
     let full = artifact_files_for_kind(ArtifactKind::Disk, SuspendSnapshotFormat::Full);
     assert_eq!(full.len(), 1);
@@ -277,6 +320,7 @@ fn new_payload_round_trips_metadata_job_flag() {
             "/space/cache/sbx/.artifact-metadata-snap-1",
         )),
         includes_metadata_job: true,
+        deferred_metadata: false,
     };
     let round: SnapshotUploadJobs =
         serde_json::from_str(&serde_json::to_string(&jobs).unwrap()).unwrap();
@@ -302,6 +346,7 @@ fn cleanup_metadata_staging_dir_removes_only_owned_staging_dir() {
         job_ids: Vec::new(),
         metadata_staging_dir: Some(staging_dir.clone()),
         includes_metadata_job: true,
+        deferred_metadata: false,
     };
 
     cleanup_metadata_staging_dir(&jobs);

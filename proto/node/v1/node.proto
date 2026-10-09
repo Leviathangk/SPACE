@@ -218,6 +218,13 @@ service NodeManager {
   rpc BtrfsMaterializeRootfsSend(BtrfsMaterializeRootfsSendRequest)
       returns (BtrfsEncodeRootfsSendResponse);
 
+  // Volume-manager owns an independent private copy before accepting a job.
+  rpc GetBtrfsSendCapabilities(GetBtrfsSendCapabilitiesRequest) returns (GetBtrfsSendCapabilitiesResponse);
+  rpc BtrfsStageSendSource(BtrfsStageSendSourceRequest) returns (BtrfsSendLease);
+  rpc BtrfsReadSendSource(BtrfsSendLease) returns (stream BtrfsSendChunk);
+  rpc BtrfsDeleteSendSource(BtrfsSendLease) returns (BtrfsDeleteSendSourceResponse);
+  rpc BtrfsListSendSources(BtrfsListSendSourcesRequest) returns (BtrfsListSendSourcesResponse);
+
   // Consume a `rootfs.btrfs-send` stream pulled to the sandbox's
   // local snapshot dir and reconstruct the sandbox's `instance/`
   // subvolume against the local template. Validates the local
@@ -1041,6 +1048,9 @@ message BtrfsEncodeRootfsSendRequest {
   // Retain a private COW source and parent for regeneration. Old servers
   // ignore this hint and return no source identity.
   bool retain_source = 6;
+  // Requires retain_source. The response's source_id acknowledges support;
+  // old servers still materialize the file. stream_bytes is zero when deferred.
+  bool defer_send = 7;
 }
 message BtrfsEncodeRootfsSendResponse {
   // Size of the produced rootfs.btrfs-send stream, returned so the
@@ -1060,6 +1070,9 @@ message BtrfsEncodeSnapshotRootfsSendRequest {
   // snapshot roots and required to be separate from the read-only source.
   string dest_dir = 5;
   bool retain_source = 6;
+  // Requires retain_source. The response's source_id acknowledges support;
+  // old servers still materialize the file. stream_bytes is zero when deferred.
+  bool defer_send = 7;
 }
 message BtrfsEncodeSnapshotRootfsSendResponse {
   uint64 stream_bytes = 1;
@@ -1172,3 +1185,24 @@ message BtrfsDeleteSandboxInstanceRequest {
   InstanceTarget target = 2;
 }
 message BtrfsDeleteSandboxInstanceResponse {}
+
+// These node-local capabilities are restricted to volume-manager and operators.
+message BtrfsStageSendSourceRequest {
+  string sandbox_id = 1;
+  string artifact_dir = 2;
+  string source_id = 3;
+  string lease_id = 4;
+}
+message BtrfsSendLease { string lease_id = 1; }
+message BtrfsSendChunk {
+  bytes data = 1;
+  // A terminal frame is required, even for an empty stream. EOF alone is not
+  // successful kernel-send completion. Nonterminal frames leave this absent.
+  optional uint64 completed_bytes = 2;
+}
+message BtrfsDeleteSendSourceResponse {}
+message BtrfsListSendSourcesRequest {}
+message BtrfsListSendSourcesResponse { repeated string lease_ids = 1; }
+
+message GetBtrfsSendCapabilitiesRequest {}
+message GetBtrfsSendCapabilitiesResponse { bool supported = 1; }
