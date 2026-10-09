@@ -155,9 +155,24 @@ struct Cli {
     stream_decode_pulls: bool,
 }
 
-impl From<Cli> for VolmgrRunConfig {
-    fn from(cli: Cli) -> Self {
-        Self {
+impl TryFrom<Cli> for VolmgrRunConfig {
+    type Error = anyhow::Error;
+
+    fn try_from(cli: Cli) -> Result<Self, Self::Error> {
+        let buffer_budget_bytes =
+            match std::env::var("SPACE_VOLUME_STREAM_PUSH_BUFFER_BUDGET_BYTES") {
+                Ok(value) => value.parse::<usize>().context(
+                    "SPACE_VOLUME_STREAM_PUSH_BUFFER_BUDGET_BYTES must be a nonnegative byte count",
+                )?,
+                Err(std::env::VarError::NotPresent) => 0,
+                Err(error) => {
+                    return Err(error).context("read SPACE_VOLUME_STREAM_PUSH_BUFFER_BUDGET_BYTES");
+                }
+            };
+        let snapshot_upload_mode =
+            pplx_space_volmgr::SnapshotUploadMode::from_buffer_budget_bytes(buffer_budget_bytes)
+                .context("invalid SPACE_VOLUME_STREAM_PUSH_BUFFER_BUDGET_BYTES")?;
+        Ok(Self {
             socket_path: cli.socket,
             health_socket_path: cli.health_socket,
             service_mutex_timeout: Duration::from_secs(cli.service_mutex_timeout_secs),
@@ -174,8 +189,9 @@ impl From<Cli> for VolmgrRunConfig {
             server_drain_timeout: Duration::from_secs(cli.server_drain_timeout_secs),
             transfer_drain_timeout: Duration::from_secs(cli.drain_timeout_secs),
             compress: cli.compress,
+            snapshot_upload_mode,
             stream_decode_pulls: cli.stream_decode_pulls,
-        }
+        })
     }
 }
 
@@ -198,9 +214,10 @@ fn main() -> anyhow::Result<()> {
                     .await
                     .context("credential probe timed out")?;
             }
+            let config = cli.try_into()?;
             let telemetry = pplx_space_common_svc::init_service(SERVICE_NAME)?;
             let shutdown_token = pplx_space_common_svc::shutdown_token();
-            let result = pplx_space_volmgr::run(cli.into(), shutdown_token).await;
+            let result = pplx_space_volmgr::run(config, shutdown_token).await;
             pplx_space_common_svc::shutdown_telemetry(telemetry).await;
             Ok(result?)
         })

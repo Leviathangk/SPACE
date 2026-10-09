@@ -49,6 +49,7 @@ pplx-space-object-store = { workspace = true }
 pplx-space-volmgr-client = { workspace = true }
 
 [dev-dependencies]
+axum = { workspace = true }
 bytes = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
 tempfile = { workspace = true }
