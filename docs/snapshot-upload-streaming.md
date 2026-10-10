@@ -211,7 +211,9 @@ any retained local artifacts needed by old readers using `BtrfsMaterializeRootfs
 Sandbox-manager binaries that predate source inspection read the bundle directly
 and fail on every deferred artifact. Rolling back to one also requires their
 local `size_bytes` to describe the materialized stream, so reconcile that
-metadata after materializing.
+metadata after materializing. Binaries from before the accounting split count
+the stream for a retained, materialized artifact and would misjudge one whose
+sidecar counts the image; land and roll the two changes together.
 Do not downgrade node-manager while source-aware volume jobs remain. Source cleanup
 continues while streaming is disabled. Normal artifact retirement reclaims the
 original bundle; the upload lease has independent terminal cleanup.
@@ -220,13 +222,29 @@ original bundle; the upload lease has independent terminal cleanup.
 
 The bundle's source subvolume keeps the sandbox jail's ownership, which
 sandbox-manager cannot traverse, so node-manager is the bundle's only reader.
-Sandbox-manager learns the source identity, and for a deferred capture the
-retained rootfs length, from the capture response, and persists the identity as `snapshot.json`
-`rootfs_send_source_id`. It never opens the bundle or its manifest. A local
-artifact's btrfs-send rootfs is its `rootfs.btrfs-send` file when present.
-Otherwise, a persisted identity names a retained source. For a deferred capture,
-the local `size_bytes` counts the retained rootfs length; a stream length is a
-different quantity and is never substituted for it.
+Sandbox-manager learns the source identity and the retained rootfs length from
+the capture response, and persists the identity as `snapshot.json`
+`rootfs_send_source_id`. It never opens the bundle or its manifest. A persisted
+identity names the artifact's rootfs, whether or not a `rootfs.btrfs-send` file
+is also present; that file is an upload cache, which a backup uses when it
+exists and which reclaim may remove. Without an identity, the file is the
+rootfs. The two sidecars account differently: the artifact's own `snapshot.json`
+counts the retained image and keeps the identity, so it stays valid across
+materialization and reclaim; the copy staged for upload counts the stream
+restorers will find and omits the node-local identity. A restored artifact
+drops any identity it finds, since it never has the bundle one would name.
+
+Node-manager reads the retained image length back immediately after capture.
+If that read-back fails for a deferred capture, the suspend fails; for a
+materialized capture, node-manager discards the bundle and reports no identity,
+so the stream remains an ordinary artifact.
+
+When a new suspend replaces a published snapshot, or a duplicate staging of the
+same artifact is found, sandbox-manager renames the superseded directory into
+the staging sweep's `snapshots/.suspend-gc-pending-*` lane instead of deleting
+it. Deferred capture leaves read-only subvolumes inside such directories that
+sandbox-manager cannot remove; the periodic sweep deletes them through
+node-manager, which can.
 
 `BtrfsInspectSendSource` is node-manager's read-only check of one source. It
 verifies the manifest identity, the subvolume lineage, and the read-only state,

@@ -401,10 +401,11 @@ impl Drop for SubvolumeCleanupGuard {
 }
 
 impl NodeManagerService {
-    /// Returns the retained source identity and, for a deferred send, its
-    /// rootfs image length. That length is read back through the same
-    /// verification later inspections use. A materialized send needs no
-    /// length, so it adds no read-back that could fail it.
+    /// Returns the retained source identity and its rootfs image length, read
+    /// back through the same verification later inspections use. The local
+    /// artifact counts that length, so an unverifiable source is never
+    /// reported. A deferred send has nothing else to fall back on and fails; a
+    /// materialized send drops retention and keeps its stream.
     async fn retain_send_source(
         &self,
         retain: bool,
@@ -412,7 +413,7 @@ impl NodeManagerService {
         artifact: &Path,
         parent: &Path,
         source: &Path,
-    ) -> Result<Option<(uuid::Uuid, Option<u64>)>, Status> {
+    ) -> Result<Option<(uuid::Uuid, u64)>, Status> {
         if !retain {
             return Ok(None);
         }
@@ -420,16 +421,29 @@ impl NodeManagerService {
             (artifact.to_owned(), parent.to_owned(), source.to_owned());
         self.off_runtime("retain immutable send source", move || {
             let id = super::btrfs_send_source::capture(&artifact, &parent, &source)?;
-            if !defer {
-                return Ok(Some((id, None)));
+            match super::btrfs_send_source::inspect(&artifact, id) {
+                Ok(rootfs_bytes) => Ok(Some((id, rootfs_bytes))),
+                // Not FailedPrecondition, which callers read as an ineligible
+                // source and answer with a Full fallback beside this bundle.
+                Err(status) if defer => Err(Status::internal(format!(
+                    "verify retained send source: {}",
+                    status.message()
+                ))),
+                Err(status) => {
+                    tracing::warn!(
+                        artifact = %artifact.display(),
+                        source_id = %id,
+                        error = %status.message(),
+                        "retained send source failed verification; materializing without retention"
+                    );
+                    if let Err(error) =
+                        super::btrfs_send_source::discard(&artifact)
+                    {
+                        tracing::warn!(%error, "unverified send-source cleanup deferred to artifact cleanup");
+                    }
+                    Ok(None)
+                }
             }
-            // Not FailedPrecondition, which callers read as an ineligible
-            // source and answer with a Full fallback beside this bundle.
-            let rootfs_bytes =
-                super::btrfs_send_source::inspect(&artifact, id).map_err(|status| {
-                    Status::internal(format!("verify retained send source: {}", status.message()))
-                })?;
-            Ok(Some((id, Some(rootfs_bytes))))
         })
         .await
     }
@@ -721,7 +735,7 @@ impl NodeManagerService {
         Ok(Response::new(BtrfsEncodeRootfsSendResponse {
             stream_bytes,
             source_id: retained.map(|(id, _)| id.to_string()),
-            rootfs_bytes: retained.and_then(|(_, bytes)| bytes),
+            rootfs_bytes: retained.map(|(_, bytes)| bytes),
         }))
     }
 
@@ -858,7 +872,7 @@ impl NodeManagerService {
         Ok(Response::new(BtrfsEncodeSnapshotRootfsSendResponse {
             stream_bytes,
             source_id: retained.map(|(id, _)| id.to_string()),
-            rootfs_bytes: retained.and_then(|(_, bytes)| bytes),
+            rootfs_bytes: retained.map(|(_, bytes)| bytes),
         }))
     }
 

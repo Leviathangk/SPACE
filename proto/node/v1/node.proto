@@ -1068,9 +1068,10 @@ message BtrfsEncodeRootfsSendResponse {
   // caller can record / log it without having to stat the file.
   uint64 stream_bytes = 1;
   optional string source_id = 2;
-  // Length of the retained source's rootfs image, present when the send was
-  // deferred. Callers cannot read the retained bundle, and a deferred capture
-  // has no stream to measure. This is never a send-stream length.
+  // Length of the retained source's rootfs image, present whenever source_id
+  // is. Callers cannot read the retained bundle, and their local artifact
+  // counts this image rather than the stream. This is never a send-stream
+  // length.
   optional uint64 rootfs_bytes = 3;
 }
 

@@ -270,8 +270,8 @@ pub enum SuspendSnapshotPublicationError {
         #[source]
         source: std::io::Error,
     },
-    #[error("remove duplicate staged snapshot directory {staging_dir} failed: {source}")]
-    RemoveDuplicateStaged {
+    #[error("retire duplicate staged snapshot directory {staging_dir} failed: {source}")]
+    RetireDuplicateStaged {
         staging_dir: String,
         #[source]
         source: std::io::Error,
@@ -600,6 +600,19 @@ pub(super) fn ensure_complete_suspend_snapshot_dir(
     Ok(())
 }
 
+/// Where a superseded snapshot directory goes. Deferred capture leaves
+/// read-only subvolumes inside it that this service cannot delete, so it is
+/// renamed into the staging sweep's lane and node-manager removes it.
+pub(super) fn retired_suspend_snapshot_dir(
+    sandbox_dir: &Path,
+    local_artifact_id: LocalArtifactId,
+) -> PathBuf {
+    suspend_snapshot_staging_parent_dir(sandbox_dir).join(format!(
+        "{}{local_artifact_id}",
+        super::recovery::staging_cleanup::RETIRED_PREFIX
+    ))
+}
+
 pub(super) fn publish_suspend_snapshot_dir(
     staging_dir: &Path,
     snapshot_dir: &Path,
@@ -612,9 +625,10 @@ pub(super) fn publish_suspend_snapshot_dir(
             .ok_or_else(|| SuspendSnapshotPublicationError::MissingParent {
                 snapshot_dir: path_label(snapshot_dir),
             })?;
-    std::fs::create_dir_all(parent).map_err(|source| {
+    let staging_parent = suspend_snapshot_staging_parent_dir(parent);
+    std::fs::create_dir_all(&staging_parent).map_err(|source| {
         SuspendSnapshotPublicationError::CreateParent {
-            parent: path_label(parent),
+            parent: path_label(&staging_parent),
             source,
         }
     })?;
@@ -624,8 +638,11 @@ pub(super) fn publish_suspend_snapshot_dir(
             Ok(existing_artifact_id) if existing_artifact_id == local_artifact_id => {
                 if staging_dir.exists() {
                     ensure_complete_suspend_snapshot_dir(staging_dir, local_artifact_id, verdicts)?;
-                    std::fs::remove_dir_all(staging_dir).map_err(|source| {
-                        SuspendSnapshotPublicationError::RemoveDuplicateStaged {
+                    // A fresh name: this artifact's own retired predecessor
+                    // may already hold the deterministic one.
+                    let retired = retired_suspend_snapshot_dir(parent, LocalArtifactId::new());
+                    std::fs::rename(staging_dir, &retired).map_err(|source| {
+                        SuspendSnapshotPublicationError::RetireDuplicateStaged {
                             staging_dir: path_label(staging_dir),
                             source,
                         }
@@ -644,8 +661,9 @@ pub(super) fn publish_suspend_snapshot_dir(
     }
     ensure_complete_suspend_snapshot_dir(staging_dir, local_artifact_id, verdicts)?;
 
-    let retired_dir = parent.join(format!(".snapshot-retired-{local_artifact_id}"));
-    let _ = std::fs::remove_dir_all(&retired_dir);
+    // Named for the artifact replacing it, so a retry of this publication
+    // finds and reuses the same retirement.
+    let retired_dir = retired_suspend_snapshot_dir(parent, local_artifact_id);
     let retired_existing = match std::fs::rename(snapshot_dir, &retired_dir) {
         Ok(()) => true,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
@@ -673,11 +691,10 @@ pub(super) fn publish_suspend_snapshot_dir(
         });
     }
 
-    if retired_existing && let Err(err) = std::fs::remove_dir_all(&retired_dir) {
-        tracing::warn!(
+    if retired_existing {
+        tracing::debug!(
             retired_snapshot_dir = %retired_dir.display(),
-            error = %err,
-            "failed to remove retired local snapshot after publication"
+            "superseded local snapshot retired for the staging sweep"
         );
     }
     Ok(())

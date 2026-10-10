@@ -796,10 +796,8 @@ impl SandboxManagerService {
                 captured_rootfs.and_then(crate::btrfs_via_nodemgr::CapturedRootfs::source_id);
             let mut verdicts = crate::retained_source::RetainedSourceVerdicts::default();
             let mut retained_rootfs_bytes = None;
-            if let Some(crate::btrfs_via_nodemgr::CapturedRootfs::Deferred {
-                source_id,
-                rootfs_bytes,
-            }) = captured_rootfs
+            if let Some((source_id, rootfs_bytes)) =
+                captured_rootfs.and_then(crate::btrfs_via_nodemgr::CapturedRootfs::retained)
             {
                 retained_rootfs_bytes = Some(rootfs_bytes);
                 // This attempt owns the source through its publication rename,

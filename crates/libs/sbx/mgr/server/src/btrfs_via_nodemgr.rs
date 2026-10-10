@@ -62,13 +62,17 @@ impl BtrfsViaNodemgrError {
 }
 
 /// What a btrfs-send capture left in the artifact directory.
+///
+/// A retained source, when present, names the artifact's rootfs. The
+/// `rootfs.btrfs-send` file is then an upload cache that may be reclaimed
+/// after a durable backup; node-manager regenerates it from the source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CapturedRootfs {
-    /// `rootfs.btrfs-send` was written. A retained source, if any, only
-    /// regenerates the stream after it is reclaimed.
+    /// `rootfs.btrfs-send` was written.
     Stream {
         stream_bytes: u64,
-        source_id: Option<uuid::Uuid>,
+        /// The retained source identity and its rootfs image length.
+        retained: Option<(uuid::Uuid, u64)>,
     },
     /// No stream was written; volume-manager streams from the retained source.
     Deferred {
@@ -80,8 +84,8 @@ pub(crate) enum CapturedRootfs {
 
 impl CapturedRootfs {
     /// Capability probes are advisory, so validate what node-manager actually
-    /// did. A deferral without the retained size fails rather than becoming a
-    /// zero-sized artifact.
+    /// did. A retained source without its size fails rather than becoming a
+    /// zero-sized or mis-sized artifact.
     fn from_response(
         rpc: &'static str,
         defer_requested: bool,
@@ -90,30 +94,44 @@ impl CapturedRootfs {
         rootfs_bytes: Option<u64>,
     ) -> Result<Self, BtrfsViaNodemgrError> {
         let invalid = |reason| BtrfsViaNodemgrError::InvalidResponse { rpc, reason };
-        let source_id = source_id
-            .map(str::parse::<uuid::Uuid>)
-            .transpose()
-            .map_err(|_| invalid("invalid retained source identity"))?;
+        let retained = source_id
+            .map(|source_id| -> Result<_, BtrfsViaNodemgrError> {
+                let source_id = source_id
+                    .parse::<uuid::Uuid>()
+                    .map_err(|_| invalid("invalid retained source identity"))?;
+                let rootfs_bytes = rootfs_bytes
+                    .ok_or_else(|| invalid("retained source omitted its rootfs size"))?;
+                Ok((source_id, rootfs_bytes))
+            })
+            .transpose()?;
         // A btrfs send stream always has a header, so zero bytes with a
         // retained source is node-manager's deferral acknowledgement.
-        match source_id {
-            Some(source_id) if defer_requested && stream_bytes == 0 => Ok(Self::Deferred {
-                source_id,
-                rootfs_bytes: rootfs_bytes
-                    .ok_or_else(|| invalid("deferred capture omitted the retained rootfs size"))?,
-            }),
-            source_id => Ok(Self::Stream {
+        match retained {
+            Some((source_id, rootfs_bytes)) if defer_requested && stream_bytes == 0 => {
+                Ok(Self::Deferred {
+                    source_id,
+                    rootfs_bytes,
+                })
+            }
+            retained => Ok(Self::Stream {
                 stream_bytes,
-                source_id,
+                retained,
             }),
         }
     }
 
-    pub(crate) fn source_id(self) -> Option<uuid::Uuid> {
+    pub(crate) fn retained(self) -> Option<(uuid::Uuid, u64)> {
         match self {
-            Self::Stream { source_id, .. } => source_id,
-            Self::Deferred { source_id, .. } => Some(source_id),
+            Self::Stream { retained, .. } => retained,
+            Self::Deferred {
+                source_id,
+                rootfs_bytes,
+            } => Some((source_id, rootfs_bytes)),
         }
+    }
+
+    pub(crate) fn source_id(self) -> Option<uuid::Uuid> {
+        self.retained().map(|(source_id, _)| source_id)
     }
 
     pub(crate) fn stream_bytes(self) -> u64 {

@@ -8,7 +8,10 @@ use std::path::PathBuf;
 
 const SCAN_ENTRIES: usize = 128;
 const DELETE_BATCH: usize = 8;
-const RETIRED_PREFIX: &str = ".suspend-gc-pending-";
+/// Entries under a sandbox's `snapshots/` with this prefix are logically
+/// deleted. The periodic sweep removes them through node-manager, which can
+/// delete nested subvolumes this service cannot.
+pub(in crate::service) const RETIRED_PREFIX: &str = ".suspend-gc-pending-";
 
 /// Two directory handles, independent of sandbox count. Keep enumeration across
 /// ticks so retained/busy entries and large snapshot inventories cannot hide the
