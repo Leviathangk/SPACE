@@ -4,12 +4,16 @@
 //! A small part of it can be reserved for high-priority passes: they race the
 //! reserve and the shared pool and take whichever frees first, while normal
 //! passes only ever draw on the shared pool. Tokio semaphores are FIFO and
-//! hand released permits to queued waiters first, so admission finishes
-//! passes in arrival order within each pool.
+//! hand released permits to queued waiters first, so admission starts passes
+//! in arrival order within each pool; it does not finish them in order.
 //!
-//! Every permit is an RAII value. Callers move it into the blocking closure
-//! that runs the CPU work, so it releases only when that work exits, also
-//! when the async caller is cancelled.
+//! Every permit is an RAII value. Callers normally move it into the blocking
+//! closure that runs the CPU work, so it releases only when that work exits,
+//! also when the async caller is cancelled. The exceptions: a sparse-shadow
+//! comparison holds its permit in the async task around its `spawn_blocking`,
+//! a streaming producer's slot is lent while the producer is blocked on its
+//! output, and a streamed pull's decode guard is held by the object-store
+//! download path.
 
 use std::sync::Arc;
 
@@ -121,6 +125,7 @@ pub struct CodecPermit {
 
 /// A codec permit its holder can lend while it cannot run and must
 /// reacquire before running again.
+#[must_use = "dropping a codec slot releases its admission"]
 pub struct CodecSlot {
     admission: CodecAdmission,
     priority: CodecPriority,

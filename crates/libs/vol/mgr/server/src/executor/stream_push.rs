@@ -372,7 +372,8 @@ impl Write for PipeWriter {
                 tokio::select! {
                     biased;
                     _ = self.cancellation.cancelled() => return Err(io::Error::other("snapshot compression cancelled")),
-                    reacquired = self.admission.codec.reacquire() => reacquired.map_err(io::Error::other)?,
+                    reacquired = self.admission.codec.reacquire() =>
+                        reacquired.map_err(codec_admission_closed).map_err(io::Error::other)?,
                 }
             }
             // Write must not return to zstd until CPU admission is restored.

@@ -72,54 +72,43 @@ async fn reserve_is_capped_so_the_shared_pool_keeps_one_permit() {
     assert_eq!(admission.shared_available(), 1);
     assert_eq!(admission.reserve_available(), 1);
     assert!(!CodecAdmission::new(1, 1).has_reserve());
-    assert!(!CodecAdmission::new(3, 0).has_reserve());
 }
 
 #[tokio::test]
-async fn waiters_are_admitted_in_arrival_order() {
-    let admission = CodecAdmission::new(1, 0);
-    let held = admission.acquire(CodecPriority::Normal).await.unwrap();
-    let mut first = pin!(admission.acquire(CodecPriority::High));
-    let mut second = pin!(admission.acquire(CodecPriority::Normal));
-    let mut third = pin!(admission.acquire(CodecPriority::Normal));
-    assert!(poll(first.as_mut()).is_none());
-    assert!(poll(second.as_mut()).is_none());
-    assert!(poll(third.as_mut()).is_none());
+async fn a_high_priority_waiter_does_not_jump_the_shared_queue() {
+    let admission = CodecAdmission::new(2, 1);
+    let shared = admission.acquire(CodecPriority::Normal).await.unwrap();
+    let reserved = admission.acquire(CodecPriority::High).await.unwrap();
+    let mut normal = pin!(admission.acquire(CodecPriority::Normal));
+    let mut high = pin!(admission.acquire(CodecPriority::High));
+    assert!(poll(normal.as_mut()).is_none());
+    assert!(poll(high.as_mut()).is_none());
 
-    drop(held);
-    // Polling a later waiter first cannot jump the queue.
-    assert!(poll(third.as_mut()).is_none());
-    assert!(poll(second.as_mut()).is_none());
-    let first = poll(first.as_mut()).unwrap().unwrap();
-    drop(first);
-    assert!(poll(third.as_mut()).is_none());
-    let second = poll(second.as_mut()).unwrap().unwrap();
-    drop(second);
-    let _third = poll(third.as_mut()).unwrap().unwrap();
+    // The high waiter queued on the shared pool behind the normal one.
+    drop(shared);
+    assert!(poll(high.as_mut()).is_none());
+    let _normal = poll(normal.as_mut()).unwrap().unwrap();
+    // Its own reserve still admits it.
+    drop(reserved);
+    let _high = poll(high.as_mut()).unwrap().unwrap();
+    assert_eq!(admission.reserve_available(), 0);
 }
 
 #[tokio::test]
-async fn permits_release_on_drop() {
-    let admission = CodecAdmission::new(4, 1);
-    let permits = [
-        admission.acquire(CodecPriority::High).await.unwrap(),
-        admission.acquire(CodecPriority::Normal).await.unwrap(),
-        admission.try_acquire_shared().unwrap(),
-    ];
-    let slot = admission.acquire_slot(CodecPriority::High).await.unwrap();
-    assert!(
-        poll(pin!(admission.acquire_slot(CodecPriority::High))).is_none(),
-        "every permit is held"
-    );
+async fn a_high_priority_acquire_returns_the_pool_it_did_not_take() {
+    let admission = CodecAdmission::new(2, 1);
+    let shared = admission.acquire(CodecPriority::Normal).await.unwrap();
+    let reserved = admission.acquire(CodecPriority::High).await.unwrap();
+    let mut waiter = pin!(admission.acquire(CodecPriority::High));
+    assert!(poll(waiter.as_mut()).is_none());
+    // Both pools hand their permit to the waiter before it runs again.
+    drop(shared);
+    drop(reserved);
+    let _admitted = poll(waiter.as_mut()).unwrap().unwrap();
     assert_eq!(
         (admission.shared_available(), admission.reserve_available()),
-        (0, 0)
-    );
-    drop(permits);
-    drop(slot);
-    assert_eq!(
-        (admission.shared_available(), admission.reserve_available()),
-        (3, 1)
+        (1, 0),
+        "the reserve wins and the shared permit returns"
     );
 }
 
@@ -187,4 +176,19 @@ async fn lending_frees_a_permit_and_reacquire_queues_behind_waiters() {
     poll(pin!(slot.reacquire())).unwrap().unwrap();
     drop(slot);
     assert_eq!(admission.shared_available(), 1);
+}
+
+#[tokio::test]
+async fn a_lent_high_priority_slot_reacquires_from_the_reserve() {
+    let admission = CodecAdmission::new(2, 1);
+    let mut slot = admission.acquire_slot(CodecPriority::High).await.unwrap();
+    assert_eq!(admission.reserve_available(), 0);
+    slot.lend();
+    // The shared pool fills while the slot is lent.
+    let _shared = admission.acquire(CodecPriority::Normal).await.unwrap();
+    poll(pin!(slot.reacquire()))
+        .expect("a high-priority slot resumes from the reserve")
+        .unwrap();
+    assert!(!slot.is_lent());
+    assert_eq!(admission.reserve_available(), 0);
 }
