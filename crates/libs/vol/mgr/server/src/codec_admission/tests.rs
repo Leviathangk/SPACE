@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::num::NonZeroU32;
 use std::pin::pin;
 
 use futures_util::FutureExt;
@@ -191,4 +192,85 @@ async fn a_lent_high_priority_slot_reacquires_from_the_reserve() {
         .unwrap();
     assert!(!slot.is_lent());
     assert_eq!(admission.reserve_available(), 0);
+}
+
+fn max_threads(threads: u32) -> CompressMaxThreads {
+    CompressMaxThreads::new(NonZeroU32::new(threads).unwrap())
+}
+
+#[tokio::test]
+async fn compress_extras_come_only_from_idle_shared_permits() {
+    // 3 shared + 3 reserved, up to 4 threads per pass.
+    let admission = CodecAdmission::new(6, 3).with_compress_max_threads(max_threads(4));
+
+    // A high-priority pass takes its primary from the reserve, but its
+    // extras only from shared capacity, leaving one shared permit idle.
+    let high = admission
+        .acquire_compress(CodecPriority::High, CompressPath::File)
+        .await
+        .unwrap();
+    assert_eq!(high.threads(), 3);
+    assert_eq!(admission.reserve_available(), 2);
+    assert_eq!(admission.shared_available(), 1);
+    drop(high);
+    assert_eq!(admission.shared_available(), 3);
+    assert_eq!(admission.reserve_available(), 3);
+
+    // A normal pass on an idle pool: primary plus one extra, with the last
+    // shared permit left for the next arrival.
+    let first = admission
+        .acquire_compress(CodecPriority::Normal, CompressPath::File)
+        .await
+        .unwrap();
+    assert_eq!(first.threads(), 2);
+    assert_eq!(admission.shared_available(), 1);
+    // The next pass starts at once on that spare permit, single-threaded.
+    let second = admission
+        .acquire_compress(CodecPriority::Normal, CompressPath::File)
+        .await
+        .unwrap();
+    assert_eq!(second.threads(), 1);
+    assert_eq!(admission.shared_available(), 0);
+    // With the shared pool exhausted, a protected pass still starts from the
+    // reserve, and nothing is ever borrowed from the reserve for extras.
+    let protected = admission
+        .acquire_compress(CodecPriority::High, CompressPath::File)
+        .await
+        .unwrap();
+    assert_eq!(protected.threads(), 1);
+    assert_eq!(admission.reserve_available(), 2);
+
+    drop((first, second, protected));
+    assert_eq!(admission.shared_available(), 3);
+    assert_eq!(admission.reserve_available(), 3);
+}
+
+#[tokio::test]
+async fn contended_compress_passes_run_single_threaded() {
+    let admission = CodecAdmission::new(4, 0).with_compress_max_threads(max_threads(4));
+    let mut held = Vec::new();
+    for _ in 0..4 {
+        held.push(admission.acquire(CodecPriority::Normal).await.unwrap());
+    }
+    let mut first = pin!(admission.acquire_compress(CodecPriority::Normal, CompressPath::File));
+    let mut second = pin!(admission.acquire_compress(CodecPriority::Normal, CompressPath::File));
+    assert!(poll(first.as_mut()).is_none());
+    assert!(poll(second.as_mut()).is_none());
+    // Two permits free up while two passes wait: each waiter receives one,
+    // and neither finds idle capacity for extras.
+    held.truncate(2);
+    let first = poll(first.as_mut()).unwrap().unwrap();
+    let second = poll(second.as_mut()).unwrap().unwrap();
+    assert_eq!((first.threads(), second.threads()), (1, 1));
+    drop((first, second, held));
+    assert_eq!(admission.shared_available(), 4);
+
+    // The kill switch keeps even an idle pool single-threaded.
+    let admission = CodecAdmission::new(4, 0).with_compress_max_threads(max_threads(1));
+    let grant = admission
+        .acquire_compress(CodecPriority::Normal, CompressPath::File)
+        .await
+        .unwrap();
+    assert_eq!(grant.threads(), 1);
+    assert_eq!(admission.shared_available(), 3);
 }

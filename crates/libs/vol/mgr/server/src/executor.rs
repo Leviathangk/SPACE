@@ -17,8 +17,10 @@ use std::time::Instant;
 use std::os::unix::fs::PermissionsExt;
 
 use crate::artifact::ArtifactEntryRole;
+pub use crate::codec_admission::CompressMaxThreads;
 use crate::codec_admission::{
-    CodecAdmission, CodecAdmissionClosed, CodecPermit, CodecPriority, CodecSlot,
+    CodecAdmission, CodecAdmissionClosed, CodecPermit, CodecPriority, CodecSlot, CompressGrant,
+    CompressPath,
 };
 use crate::credentials::{StorageAccess, UnwrapDekError, exchange_credentials, unwrap_dek};
 use crate::crypto::{self, CryptoError, decrypted_sibling, encrypted_sibling};
@@ -88,14 +90,16 @@ async fn frame_content_size(path: &Path) -> Option<u64> {
         .and_then(|h| zstd::zstd_safe::get_frame_content_size(h).ok().flatten())
 }
 
-/// How many CPU-bound zstd passes (compress or decompress) may run at
-/// once. `0` means auto-size to the CPU quota, or to the deployed CPU
+/// How many codec permits (one core each) CPU-bound zstd passes may hold
+/// at once. `0` means auto-size to the CPU quota, or to the deployed CPU
 /// request when the pod has no CPU limit.
 ///
-/// Each zstd pass is single-threaded, and `spawn_blocking`'s pool is ~512
-/// threads, so without admission a pull storm runs every decode
-/// concurrently on the pod's CPU share — N jobs each at 1/N speed instead
-/// of share-many at full speed. Bounding to the share keeps the same
+/// A decode pass is single-threaded and holds one permit. An upload
+/// compression pass runs one zstd thread per permit it holds, and holds more
+/// than one only when shared permits sit idle (see [`CompressGrant`]).
+/// `spawn_blocking`'s pool is ~512 threads, so without admission a pull
+/// storm runs every decode concurrently on the pod's CPU share — N jobs
+/// each at 1/N speed instead of share-many at full speed. Bounding to the share keeps the same
 /// aggregate throughput but finishes jobs in arrival order, which is what
 /// per-job completion latency is made of.
 fn resolved_codec_concurrency(configured: usize) -> usize {
@@ -1000,17 +1004,37 @@ fn ensure_pull_failure_reason(error: JobError) -> JobError {
     error.with_default_failure_reason(JobFailureReason::Internal)
 }
 
+/// `zstd::stream::copy_encode` at [`ZSTD_LEVEL`] with `threads` zstd
+/// threads. One thread is exactly `copy_encode`: compression runs inside the
+/// caller. More threads hand the input to that many zstdmt workers while the
+/// caller only copies input in and output out. Either way the result is one
+/// standard zstd frame with no pledged content size, which every existing
+/// decoder reads.
+fn copy_encode_with_threads(
+    mut source: impl Read,
+    destination: impl Write,
+    threads: u32,
+) -> std::io::Result<()> {
+    let mut encoder = zstd::stream::write::Encoder::new(destination, ZSTD_LEVEL)?;
+    if threads > 1 {
+        encoder.multithread(threads)?;
+    }
+    std::io::copy(&mut source, &mut encoder)?;
+    encoder.finish()?;
+    Ok(())
+}
+
 /// Compress `src` to a sibling `.zst.tmp` file using zstd.
 /// Returns the temp path and the original (uncompressed) size.
 /// The caller is responsible for deleting the temp file.
 ///
-/// `codec_permit` (if the caller took one) is moved into the blocking
-/// task and released only when the CPU pass exits, so a cancelled caller
-/// cannot free the permit while the detached `spawn_blocking` keeps
-/// burning CPU.
+/// `admission` (if the caller took one) is moved into the blocking task and
+/// released only when the CPU pass exits, so a cancelled caller cannot free
+/// its permits while the detached `spawn_blocking` keeps burning CPU. The
+/// pass runs one zstd thread per permit it holds.
 async fn compress_to_temp(
     src: &Path,
-    codec_permit: Option<CodecPermit>,
+    admission: Option<CompressGrant>,
 ) -> Result<(PathBuf, u64), JobError> {
     let original_size = tokio::fs::metadata(src)
         .await
@@ -1023,12 +1047,13 @@ async fn compress_to_temp(
     let tmp = tmp_path.clone();
 
     tokio::task::spawn_blocking(move || -> Result<(), JobError> {
-        let _codec_permit = codec_permit;
+        let threads = admission.as_ref().map_or(1, CompressGrant::threads);
+        let _admission = admission;
         let mut reader = std::fs::File::open(&src)
             .map_err(|e| JobError::Permanent(format!("open source for compression: {e}")))?;
         let mut writer = std::fs::File::create(&tmp)
             .map_err(|e| JobError::Permanent(format!("create compression temp file: {e}")))?;
-        zstd::stream::copy_encode(&mut reader, &mut writer, ZSTD_LEVEL)
+        copy_encode_with_threads(&mut reader, &mut writer, threads)
             .map_err(|e| JobError::Permanent(format!("zstd compress: {e}")))?;
         page_cache::advise_dontneed(&reader, &src, "compress volume upload input");
         page_cache::advise_dontneed(&writer, &tmp, "write compressed volume upload temp");
@@ -3463,6 +3488,9 @@ pub struct TransferExecutorConfig {
     /// permits. `None` disables priority-aware admission (all jobs share
     /// one pool). Derived from the lowest configured pull priority band.
     pub codec_priority_threshold: Option<JobPriority>,
+    /// Upper bound on zstd threads per upload compression pass, granted
+    /// opportunistically from idle shared codec permits.
+    pub codec_compress_max_threads: CompressMaxThreads,
     /// Process-wide high watermark for streamed output bytes awaiting
     /// writeback and cache eviction. `0` uses
     /// [`DEFAULT_STREAM_WRITEBACK_BUDGET_BYTES`].
@@ -3486,7 +3514,8 @@ impl TransferExecutor {
         shadow_staging_dir: PathBuf,
     ) -> Self {
         let total = resolved_codec_concurrency(config.codec_concurrency);
-        let codec = CodecAdmission::new(total, config.codec_priority_reserve);
+        let codec = CodecAdmission::new(total, config.codec_priority_reserve)
+            .with_compress_max_threads(config.codec_compress_max_threads);
         let stream_writeback_priority_threshold = config.codec_priority_threshold;
         // Priority-aware admission only engages when there is both a
         // threshold and a non-empty reserve; otherwise everything shares
@@ -3546,22 +3575,35 @@ impl TransferExecutor {
         )
     }
 
-    /// Admit one CPU-bound codec pass whose work scales with its *input*
-    /// (compression, encryption). Inputs below
-    /// [`CODEC_ADMISSION_MIN_INPUT_BYTES`] skip admission and return
-    /// `None`. Pass the returned permit into the blocking codec closure so
-    /// it releases only when the CPU work actually exits — the async
-    /// caller can be cancelled by the worker's transfer timeout while
-    /// `spawn_blocking` runs on.
-    async fn acquire_codec_permit_for_input(
+    /// Admit one upload compression pass, whose work scales with its
+    /// *input*. Inputs below [`CODEC_ADMISSION_MIN_INPUT_BYTES`] skip
+    /// admission and return `None`. Pass the returned grant into the blocking
+    /// codec closure so it releases only when the CPU work actually exits —
+    /// the async caller can be cancelled by the worker's transfer timeout
+    /// while `spawn_blocking` runs on.
+    async fn acquire_compress_for_input(
         &self,
         input_bytes: u64,
         priority: JobPriority,
-    ) -> Result<Option<CodecPermit>, JobError> {
+        path: CompressPath,
+    ) -> Result<Option<CompressGrant>, JobError> {
         if input_bytes < CODEC_ADMISSION_MIN_INPUT_BYTES {
             return Ok(None);
         }
-        self.acquire_codec_permit(priority).await.map(Some)
+        self.acquire_compress(priority, path).await.map(Some)
+    }
+
+    /// [`Self::acquire_codec_permit`] for an upload compression pass, topped
+    /// up with idle shared permits for extra zstd threads.
+    async fn acquire_compress(
+        &self,
+        priority: JobPriority,
+        path: CompressPath,
+    ) -> Result<CompressGrant, JobError> {
+        self.codec
+            .acquire_compress(self.codec_priority(priority), path)
+            .await
+            .map_err(codec_admission_closed)
     }
 
     /// Admit one CPU-bound decode pass. Decode work scales with the
@@ -4493,7 +4535,7 @@ async fn stage_encrypted_temp(
     src_path: &Path,
     compress: bool,
     resolved_dek: Option<&[u8]>,
-    codec_permit: Option<CodecPermit>,
+    admission: Option<CompressGrant>,
 ) -> Result<PathBuf, (PathBuf, JobError)> {
     let enc_path = encrypted_sibling(src_path);
     let src_path_buf = src_path.to_path_buf();
@@ -4530,7 +4572,8 @@ async fn stage_encrypted_temp(
         );
         let job_id = job.job_id;
         tokio::task::spawn_blocking(move || -> Result<(), JobError> {
-            let _codec_permit = codec_permit;
+            let threads = admission.as_ref().map_or(1, CompressGrant::threads);
+            let _admission = admission;
             let src_file = std::fs::File::open(&src_path_buf)
                 .map_err(|e| JobError::Permanent(format!("open source for encrypt: {e}")))?;
             let buf_reader =
@@ -4540,6 +4583,14 @@ async fn stage_encrypted_temp(
             if compress {
                 let mut zstd_reader = zstd::stream::read::Encoder::new(buf_reader, ZSTD_LEVEL)
                     .map_err(|e| JobError::Permanent(format!("zstd encoder init: {e}")))?;
+                // Same thread contract as `copy_encode_with_threads`: the
+                // AEAD stage stays on this thread and pulls compressed bytes
+                // from the zstdmt workers.
+                if threads > 1 {
+                    zstd_reader
+                        .multithread(threads)
+                        .map_err(|e| JobError::Permanent(format!("zstd encoder workers: {e}")))?;
+                }
                 crypto::encrypt_stream_blocking(&mut zstd_reader, &mut dst_file, &dek, &entry_aad)
                     .map_err(crypto_error_to_job_error)?;
             } else {
@@ -4553,6 +4604,7 @@ async fn stage_encrypted_temp(
                 subject_id,
                 enc_path = %enc_path_buf.display(),
                 compress,
+                compress_threads = threads,
                 "compress + encrypt finished"
             );
             Ok(())
@@ -4697,10 +4749,10 @@ impl TransferExecutor {
                 if self.config.compress {
                     let artifact = transfer_artifact_tag(p.effective_snapshot_artifact());
                     let codec_wait_started_at = Instant::now();
-                    let codec_permit = self
-                        .acquire_codec_permit_for_input(original_size, job.priority)
+                    let admission = self
+                        .acquire_compress_for_input(original_size, job.priority, CompressPath::File)
                         .await?;
-                    if codec_permit.is_some() {
+                    if admission.is_some() {
                         emit_transfer_phase_duration(
                             &job.kind,
                             artifact,
@@ -4709,13 +4761,15 @@ impl TransferExecutor {
                             codec_wait_started_at,
                         );
                     }
-                    let (zst_path, _) = compress_to_temp(upload_path, codec_permit).await?;
+                    let compress_threads = admission.as_ref().map_or(1, CompressGrant::threads);
+                    let (zst_path, _) = compress_to_temp(upload_path, admission).await?;
                     tracing::debug!(
                         job_id = %job.job_id,
                         subject_id = %p.subject_id,
                         local_path = %p.local_path,
                         tmp_path = %zst_path.display(),
                         original_bytes = original_size,
+                        compress_threads,
                         "compressed artifact for upload"
                     );
                     transient_temps.push(zst_path.clone());
@@ -4735,12 +4789,16 @@ impl TransferExecutor {
                 // compression runs; encryption-only pushes are AEAD-bound
                 // (multi-GiB/s) and left unadmitted.
                 let artifact = transfer_artifact_tag(p.effective_snapshot_artifact());
-                let codec_permit = if self.config.compress {
+                let admission = if self.config.compress {
                     let codec_wait_started_at = Instant::now();
-                    let permit = self
-                        .acquire_codec_permit_for_input(original_size, job.priority)
+                    let admission = self
+                        .acquire_compress_for_input(
+                            original_size,
+                            job.priority,
+                            CompressPath::Encrypted,
+                        )
                         .await?;
-                    if permit.is_some() {
+                    if admission.is_some() {
                         emit_transfer_phase_duration(
                             &job.kind,
                             artifact,
@@ -4749,7 +4807,7 @@ impl TransferExecutor {
                             codec_wait_started_at,
                         );
                     }
-                    permit
+                    admission
                 } else {
                     None
                 };
@@ -4760,7 +4818,7 @@ impl TransferExecutor {
                     upload_path,
                     self.config.compress,
                     resolved_dek,
-                    codec_permit,
+                    admission,
                 )
                 .await
                 {

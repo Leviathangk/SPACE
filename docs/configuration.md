@@ -196,6 +196,7 @@ retain their existing publication authority.
 | `SPACE_OBJECT_STORE_STATIC_SESSION_TOKEN` | unset | Session token for temporary static credentials. |
 | `SPACE_SNAPSHOT_BUCKET`, `SPACE_SNAPSHOT_REGION`, `SPACE_SNAPSHOT_ENDPOINT` | unset | Unset disables snapshot upload. Give the bucket an abort-incomplete-multipart lifecycle rule; uploads interrupted by process death otherwise keep their parts. |
 | `SPACE_VOLUME_STREAM_PUSH_BUFFER_BUDGET_BYTES` | 1 GiB | Volume-manager streams eligible snapshot uploads with this shared part budget; `0` uploads through temporary files. Whole MiB, at least 64 MiB. See [snapshot upload streaming](snapshot-upload-streaming.md). |
+| `SPACE_VOLUME_CODEC_COMPRESS_MAX_THREADS` | 4 | Volume-manager; same as `--codec-compress-max-threads`. Most zstd threads one upload compression pass may run. Threads past the first take extra codec permits only from idle shared capacity, never from the priority reserve, and one shared permit stays free, so a busy node runs one thread per pass. `1` disables multithreaded compression. |
 
 ## Authentication, TLS and credentials
 

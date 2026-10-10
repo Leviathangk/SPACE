@@ -14,7 +14,13 @@
 //! a streaming producer's slot is lent while the producer is blocked on its
 //! output, and a streamed pull's decode guard is held by the object-store
 //! download path.
+//!
+//! An upload compression pass ([`CodecAdmission::acquire_compress`]) takes
+//! its primary permit exactly like any other pass, then may top up with
+//! extra permits for zstd threads, taken without waiting and only from idle
+//! shared capacity.
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -26,6 +32,56 @@ pub enum CodecPriority {
     Normal,
     /// Reserve or shared pool, whichever frees first.
     High,
+}
+
+/// Most zstd threads one upload compression pass may run. Every thread past
+/// the first is backed by an extra codec permit taken only from idle shared
+/// capacity, so contended passes keep running single-threaded. `1`, the
+/// default, disables multithreaded compression.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompressMaxThreads(NonZeroU32);
+
+impl CompressMaxThreads {
+    pub const SINGLE: Self = Self(NonZeroU32::MIN);
+
+    pub const fn new(threads: NonZeroU32) -> Self {
+        Self(threads)
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+impl Default for CompressMaxThreads {
+    fn default() -> Self {
+        Self::SINGLE
+    }
+}
+
+/// What an upload compression pass feeds, which decides how many extra
+/// permits it may use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompressPath {
+    /// A staged file compressed to a temporary file.
+    File,
+    /// A producer streaming into a bounded multipart upload. It lends its
+    /// primary permit while the upload applies backpressure.
+    Streaming,
+    /// A btrfs send stream compressed to a temporary file.
+    BtrfsSend,
+    /// A staged file compressed and encrypted to a temporary file.
+    Encrypted,
+}
+
+/// Extra permits a pass on `path` asks for beyond its primary.
+fn extra_permits_wanted(path: CompressPath, max_threads: CompressMaxThreads) -> u32 {
+    match path {
+        CompressPath::File
+        | CompressPath::Streaming
+        | CompressPath::BtrfsSend
+        | CompressPath::Encrypted => max_threads.get() - 1,
+    }
 }
 
 /// The one way admission can fail: the permit pool closed. Admission never
@@ -40,6 +96,7 @@ pub struct CodecAdmission {
     shared: Arc<Semaphore>,
     reserve: Arc<Semaphore>,
     reserved: usize,
+    compress_max_threads: CompressMaxThreads,
 }
 
 impl CodecAdmission {
@@ -53,7 +110,14 @@ impl CodecAdmission {
             shared: Arc::new(Semaphore::new(total - reserve)),
             reserve: Arc::new(Semaphore::new(reserve)),
             reserved: reserve,
+            compress_max_threads: CompressMaxThreads::SINGLE,
         }
+    }
+
+    /// Let upload compression passes run up to `max` zstd threads.
+    pub fn with_compress_max_threads(mut self, max: CompressMaxThreads) -> Self {
+        self.compress_max_threads = max;
+        self
     }
 
     /// Whether any permits are reserved. Without a reserve,
@@ -94,6 +158,37 @@ impl CodecAdmission {
             admission: self.clone(),
             priority,
             permit: Some(permit),
+        })
+    }
+
+    /// Admit one upload compression pass on `path`: a primary permit as
+    /// [`Self::acquire_slot`] takes it, then up to `compress_max_threads - 1`
+    /// extras without waiting. Extras come only from the shared pool, so the
+    /// reserve stays whole for protected restores, and one idle shared permit
+    /// is left for the next pass to arrive. Tokio hands released permits
+    /// straight to queued waiters, so a pool with a backlog has no idle
+    /// permits and a contended pass runs single-threaded. The idle check and
+    /// the grab are not atomic; a concurrent admission can occasionally leave
+    /// the pool without its spare permit, which is still within its total.
+    pub async fn acquire_compress(
+        &self,
+        priority: CodecPriority,
+        path: CompressPath,
+    ) -> Result<CompressGrant, CodecAdmissionClosed> {
+        let primary = self.acquire_slot(priority).await?;
+        let wanted = extra_permits_wanted(path, self.compress_max_threads);
+        let spare = self.shared.available_permits().saturating_sub(1);
+        let grant = wanted.min(u32::try_from(spare).unwrap_or(u32::MAX));
+        let extras = (grant > 0)
+            .then(|| Arc::clone(&self.shared).try_acquire_many_owned(grant).ok())
+            .flatten();
+        let threads = 1 + extras.as_ref().map_or(0, |extras| {
+            u32::try_from(extras.num_permits()).expect("extras fit the requested u32")
+        });
+        Ok(CompressGrant {
+            primary,
+            _extras: extras,
+            threads,
         })
     }
 
@@ -150,6 +245,47 @@ impl CodecSlot {
             self.permit = Some(self.admission.acquire(self.priority).await?);
         }
         Ok(())
+    }
+}
+
+/// Codec admission held by one upload compression pass. Its zstd thread
+/// count is fixed when the encoder starts, so the extras are held until the
+/// pass ends; only the primary can be lent.
+pub struct CompressGrant {
+    primary: CodecSlot,
+    _extras: Option<OwnedSemaphorePermit>,
+    threads: u32,
+}
+
+impl CompressGrant {
+    /// zstd threads this grant pays for: the primary plus one per extra.
+    pub fn threads(&self) -> u32 {
+        self.threads
+    }
+
+    /// Lend the primary permit; see [`CodecSlot::lend`].
+    pub fn lend(&mut self) {
+        self.primary.lend();
+    }
+
+    pub fn is_lent(&self) -> bool {
+        self.primary.is_lent()
+    }
+
+    /// Reacquire the primary permit; see [`CodecSlot::reacquire`].
+    pub async fn reacquire(&mut self) -> Result<(), CodecAdmissionClosed> {
+        self.primary.reacquire().await
+    }
+}
+
+/// A single-threaded pass, for work that admits a codec pass without zstd.
+impl From<CodecSlot> for CompressGrant {
+    fn from(primary: CodecSlot) -> Self {
+        Self {
+            primary,
+            _extras: None,
+            threads: 1,
+        }
     }
 }
 

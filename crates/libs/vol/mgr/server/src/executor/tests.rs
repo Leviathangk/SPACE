@@ -2074,7 +2074,11 @@ fn cores_from_cfs_quota_rounds_and_floors() {
 async fn codec_admission_bypasses_small_inputs() {
     let executor = codec_test_executor(1);
     let permit = executor
-        .acquire_codec_permit_for_input(CODEC_ADMISSION_MIN_INPUT_BYTES - 1, JobPriority::default())
+        .acquire_compress_for_input(
+            CODEC_ADMISSION_MIN_INPUT_BYTES - 1,
+            JobPriority::default(),
+            CompressPath::File,
+        )
         .await
         .expect("bypass admission must not fail");
     assert!(permit.is_none(), "small inputs must skip admission");
@@ -2164,12 +2168,20 @@ async fn codec_decode_admission_takes_permit_on_unknown_size() {
 async fn codec_admission_bounds_large_inputs() {
     let executor = codec_test_executor(2);
     let first = executor
-        .acquire_codec_permit_for_input(CODEC_ADMISSION_MIN_INPUT_BYTES, JobPriority::default())
+        .acquire_compress_for_input(
+            CODEC_ADMISSION_MIN_INPUT_BYTES,
+            JobPriority::default(),
+            CompressPath::File,
+        )
         .await
         .expect("first admission must succeed")
         .expect("large input must take a permit");
     let _second = executor
-        .acquire_codec_permit_for_input(CODEC_ADMISSION_MIN_INPUT_BYTES, JobPriority::default())
+        .acquire_compress_for_input(
+            CODEC_ADMISSION_MIN_INPUT_BYTES,
+            JobPriority::default(),
+            CompressPath::File,
+        )
         .await
         .expect("second admission must succeed")
         .expect("large input must take a permit");
@@ -2177,9 +2189,10 @@ async fn codec_admission_bounds_large_inputs() {
     // Both permits are held: a third large input must queue, not run.
     let blocked = tokio::time::timeout(
         Duration::from_secs(1),
-        executor.acquire_codec_permit_for_input(
+        executor.acquire_compress_for_input(
             CODEC_ADMISSION_MIN_INPUT_BYTES,
             JobPriority::default(),
+            CompressPath::File,
         ),
     )
     .await;
@@ -2192,9 +2205,10 @@ async fn codec_admission_bounds_large_inputs() {
     drop(first);
     let third = tokio::time::timeout(
         Duration::from_secs(1),
-        executor.acquire_codec_permit_for_input(
+        executor.acquire_compress_for_input(
             CODEC_ADMISSION_MIN_INPUT_BYTES,
             JobPriority::default(),
+            CompressPath::File,
         ),
     )
     .await
@@ -2243,6 +2257,178 @@ async fn codec_priority_reserve_zero_shares_one_pool() {
     );
     assert_eq!(executor.codec.shared_available(), 3);
     assert_eq!(executor.codec.reserve_available(), 0);
+}
+
+fn compress_executor(
+    codec_concurrency: usize,
+    reserve: usize,
+    max_threads: u32,
+) -> TransferExecutor {
+    TransferExecutor::new_for_test(
+        TransferExecutorConfig {
+            compress: true,
+            codec_concurrency,
+            codec_priority_reserve: reserve,
+            codec_priority_threshold: Some(JobPriority::new(100)),
+            codec_compress_max_threads: CompressMaxThreads::new(
+                std::num::NonZeroU32::new(max_threads).unwrap(),
+            ),
+            static_credentials: Some(test_creds()),
+            ..Default::default()
+        },
+        Arc::new(MockObjectStore::default()),
+    )
+}
+
+/// Compressible, non-repeating bytes spanning several zstdmt jobs.
+fn compressible_bytes(size: usize) -> Vec<u8> {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    (0..size)
+        .map(|i| {
+            if i % 64 < 48 {
+                b"space snapshot page "[i % 20]
+            } else {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            }
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compress_pass_holds_every_permit_until_cpu_work_exits() {
+    let executor = compress_executor(4, 0, 4);
+    let dir = tempfile::tempdir().unwrap();
+    // A FIFO source keeps the blocking pass alive until the test closes it.
+    let source = dir.path().join("memory");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&source)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let admission = executor
+        .acquire_compress(JobPriority::new(0), CompressPath::File)
+        .await
+        .unwrap();
+    assert_eq!(admission.threads(), 3);
+    let caller = tokio::spawn({
+        let source = source.clone();
+        async move { compress_to_temp(&source, Some(admission)).await }
+    });
+    // Opening the write end returns once the pass has opened its input.
+    let writer = tokio::task::spawn_blocking({
+        let source = source.clone();
+        move || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(source)
+                .unwrap()
+        }
+    })
+    .await
+    .unwrap();
+    // The worker's transfer timeout can drop the caller mid-pass. The
+    // detached CPU work keeps the primary and the extras.
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    assert_eq!(executor.codec.shared_available(), 1);
+
+    let expected = compressible_bytes(20 * 1024 * 1024);
+    tokio::task::spawn_blocking({
+        let expected = expected.clone();
+        move || {
+            let mut writer = writer;
+            writer.write_all(&expected).unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while executor.codec.shared_available() < 4 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a finished pass releases all of its permits");
+    let encoded = std::fs::read(source.with_extension("zst.tmp")).unwrap();
+    assert_eq!(zstd::decode_all(encoded.as_slice()).unwrap(), expected);
+}
+
+#[tokio::test]
+async fn multithreaded_file_and_encrypted_compression_decode_identically() {
+    use crate::crypto::decrypt_stream_blocking;
+
+    let executor = compress_executor(4, 0, 4);
+    let expected = compressible_bytes(24 * 1024 * 1024);
+    let single_threaded = zstd::encode_all(expected.as_slice(), ZSTD_LEVEL).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("memory");
+    std::fs::write(&source, &expected).unwrap();
+
+    let admission = executor
+        .acquire_compress(JobPriority::new(0), CompressPath::File)
+        .await
+        .unwrap();
+    assert_eq!(admission.threads(), 3);
+    let (temp, logical) = compress_to_temp(&source, Some(admission)).await.unwrap();
+    assert_eq!(logical, expected.len() as u64);
+    assert_eq!(executor.codec.shared_available(), 4);
+    assert!(is_zstd(&temp).await);
+    assert_eq!(frame_content_size(&temp).await, None);
+    let encoded = std::fs::read(&temp).unwrap();
+    // zstdmt compresses independent jobs, so a different (still standard)
+    // encoding shows the extra threads were used.
+    assert_ne!(encoded, single_threaded);
+    assert_eq!(zstd::decode_all(encoded.as_slice()).unwrap(), expected);
+    let mut decoded = Vec::new();
+    let mut sink = MaybeZstdDecodingWriter::new(&mut decoded, true);
+    sink.write_all(&encoded).unwrap();
+    assert!(sink.finish().unwrap());
+    assert_eq!(decoded, expected);
+
+    let encryption = TransferEncryption {
+        organization_id: "019e31d9-79a6-7132-b90f-007f1c62ddea".parse().unwrap(),
+        provider: KekProvider::InMemory,
+        master_key_identifier: "test/key-1".parse().unwrap(),
+        wrapped_dek: vec![0; 16],
+    };
+    let mut payload = push_payload(&source);
+    payload.subject_id = "sandbox:019d84bd-280d-7331-99c6-b63377f3a3a2".to_string();
+    payload.encryption = Some(encryption.clone());
+    payload.artifact_id = Some("019e9000-0000-7000-8000-000000000001".to_string());
+    payload.entry_role = Some("memfile".to_string());
+    let (_, entry_aad) = derive_artifact_aads(&payload, encryption.organization_id).unwrap();
+    let key: Vec<u8> = (0..32u8).collect();
+    let admission = executor
+        .acquire_compress(JobPriority::new(0), CompressPath::Encrypted)
+        .await
+        .unwrap();
+    assert_eq!(admission.threads(), 3);
+    let ciphertext_path = stage_encrypted_temp(
+        &test_job("push"),
+        &payload,
+        &encryption,
+        &source,
+        true,
+        Some(&key),
+        Some(admission),
+    )
+    .await
+    .unwrap();
+    assert_eq!(executor.codec.shared_available(), 4);
+    let mut compressed = Vec::new();
+    decrypt_stream_blocking(
+        &mut std::fs::File::open(&ciphertext_path).unwrap(),
+        &mut compressed,
+        &key,
+        &entry_aad,
+    )
+    .unwrap();
+    assert_ne!(compressed, single_threaded);
+    assert_eq!(zstd::decode_all(compressed.as_slice()).unwrap(), expected);
 }
 #[cfg(target_os = "linux")]
 #[test]

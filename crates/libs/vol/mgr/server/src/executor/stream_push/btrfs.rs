@@ -123,11 +123,24 @@ impl TransferExecutor {
                 Err(error) => return Err(crate::btrfs_push::classify(error)),
             }
         };
+        let path = if streaming.is_some() {
+            CompressPath::Streaming
+        } else {
+            CompressPath::BtrfsSend
+        };
         let codec = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(JobError::Retriable("send admission cancelled".into())),
-            slot = self.acquire_codec_slot(job.priority) => slot?,
+            // An uncompressed copy keeps its single permit; only zstd uses extras.
+            grant = async {
+                if self.config.compress {
+                    self.acquire_compress(job.priority, path).await
+                } else {
+                    self.acquire_codec_slot(job.priority).await.map(CompressGrant::from)
+                }
+            } => grant?,
         };
+        let threads = codec.threads();
         let input = RemoteReader {
             stream: Box::pin(stream),
             buffer: std::io::Cursor::new(Vec::new()),
@@ -158,7 +171,7 @@ impl TransferExecutor {
                 };
                 let result = {
                     let mut buffered = std::io::BufWriter::with_capacity(PIPE_BYTES, &mut output);
-                    zstd::stream::copy_encode(&mut input, &mut buffered, ZSTD_LEVEL)
+                    copy_encode_with_threads(&mut input, &mut buffered, threads)
                         .and_then(|()| buffered.flush())
                 };
                 if result.is_ok() {
@@ -203,7 +216,7 @@ impl TransferExecutor {
                     .suffix(".zst.tmp")
                     .tempfile_in(directory)?;
                 if compress {
-                    zstd::stream::copy_encode(&mut input, &mut temp, ZSTD_LEVEL)?;
+                    copy_encode_with_threads(&mut input, &mut temp, threads)?;
                 } else {
                     std::io::copy(&mut input, &mut temp)?;
                 }

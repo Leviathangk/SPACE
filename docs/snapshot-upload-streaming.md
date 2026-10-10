@@ -59,10 +59,19 @@ therefore not the service's total memory allowance.
 
 Encoding takes the existing codec admission and honors the priority reserve.
 When a pipe write blocks, the producer lends that idle codec slot to queued
-work, then reacquires it before returning to zstd. The separate producer permit
-stays owned until the blocking task exits, bounding memory even when codec slots
-are lent. Inputs below the existing admission threshold retain the file path
-and its bypass. Neither codec limits nor the protected reserve are increased.
+work, then reacquires it before returning to zstd. A producer admitted with
+extra zstd threads (`SPACE_VOLUME_CODEC_COMPRESS_MAX_THREADS`, granted only
+from idle shared permits) lends just that primary slot and keeps the extras
+until it exits: the thread count is fixed for the frame, and while the write
+blocks the workers can only finish already-dispatched jobs. While object storage
+applies backpressure, those extras therefore sit idle and later shared-pool
+codec work cannot use them; extras never come from the priority reserve, so
+protected work keeps it. Multithreaded encoding also owns zstd job buffers:
+about 50–70 MiB of peak RSS at two threads and 70–95 MiB at four, against about
+5 MiB single-threaded. The separate producer permit stays owned until the
+blocking task exits, bounding memory even when codec slots are lent. Inputs
+below the existing admission threshold retain the file path and its bypass.
+Neither codec limits nor the protected reserve are increased.
 
 The producer owns its open source descriptor and producer permit until it exits.
 Compression and hashing run off Tokio workers. On Linux, as compression consumes the

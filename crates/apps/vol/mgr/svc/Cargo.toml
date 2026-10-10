@@ -30,7 +30,7 @@ datadog-otel = ["otel", "datadog"]
 
 [dependencies]
 anyhow = { workspace = true }
-clap = { workspace = true, features = ["derive"] }
+clap = { workspace = true, features = ["derive", "env"] }
 tokio = { workspace = true, features = ["time"] }
 tonic = { workspace = true }
 

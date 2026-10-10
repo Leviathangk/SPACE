@@ -501,7 +501,8 @@ async fn cancellation_while_reacquiring_codec_keeps_producer_bounded() {
                 .codec
                 .acquire_slot(CodecPriority::Normal)
                 .await
-                .unwrap(),
+                .unwrap()
+                .into(),
             _producer: config.producers.clone().acquire_owned().await.unwrap(),
         },
         waited: Duration::ZERO,
@@ -545,7 +546,8 @@ async fn producer_error_after_eof_never_completes_an_object() {
                 .codec
                 .acquire_slot(CodecPriority::Normal)
                 .await
-                .unwrap(),
+                .unwrap()
+                .into(),
             _producer: executor
                 .stream_push
                 .as_ref()
@@ -655,4 +657,86 @@ async fn compatibility_paths_keep_file_uploads_and_small_sources_bypass_codec_qu
     let state = server.recorded.lock().unwrap();
     assert_eq!(state.creates, 0);
     assert_eq!(zstd::decode_all(state.object.as_slice()).unwrap(), bytes);
+}
+
+#[tokio::test]
+async fn multithreaded_producer_lends_its_primary_and_keeps_extras_under_backpressure() {
+    for cancel in [false, true] {
+        let mut executor = TransferExecutor::new_for_test(
+            TransferExecutorConfig {
+                compress: true,
+                snapshot_upload_mode: SnapshotUploadMode::from_buffer_budget_bytes(64 * MIB)
+                    .unwrap(),
+                // 4 shared + 1 reserved permits, up to 4 threads per pass.
+                codec_concurrency: 5,
+                codec_priority_reserve: 1,
+                codec_priority_threshold: Some(JobPriority::new(100)),
+                codec_compress_max_threads: CompressMaxThreads::new(
+                    std::num::NonZeroU32::new(4).unwrap(),
+                ),
+                ..Default::default()
+            },
+            Arc::new(S3ObjectStore::new()),
+        );
+        executor.stream_push = self::executor().stream_push;
+        let executor = Arc::new(executor);
+        let server = Server::start().await;
+        server.hold_parts.store(true, Ordering::SeqCst);
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = synthetic_bytes(20 * MIB);
+        let payload = staged(dir.path(), SnapshotArtifact::Memory, &bytes);
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn({
+            let executor = executor.clone();
+            let server = server.clone();
+            let payload = payload.clone();
+            let cancellation = cancellation.clone();
+            async move { push(&executor, &server, &payload, cancellation).await }
+        });
+        server.wait_for(|s| s.puts > 0).await;
+        // The producer runs 3 threads (primary + 2 extras), leaving one
+        // shared permit idle. Queued work needing two permits proceeds only
+        // because the backpressured producer lends its primary.
+        let borrowed = tokio::time::timeout(Duration::from_secs(5), async {
+            let first = executor.codec.acquire(CodecPriority::Normal).await.unwrap();
+            let second = executor.codec.acquire(CodecPriority::Normal).await.unwrap();
+            (first, second)
+        })
+        .await
+        .expect("a backpressured producer must lend its primary codec permit");
+        assert_eq!(
+            executor.codec.shared_available(),
+            0,
+            "the extras back fixed zstd workers and stay held while lending"
+        );
+        assert_eq!(executor.codec.reserve_available(), 1);
+        drop(borrowed);
+        if cancel {
+            cancellation.cancel();
+            task.await.unwrap().unwrap_err();
+        } else {
+            server.hold_parts.store(false, Ordering::SeqCst);
+            server.release.add_permits(64);
+            assert_eq!(task.await.unwrap().unwrap(), bytes.len() as i64);
+            let object = server.recorded.lock().unwrap().object.clone();
+            assert_eq!(zstd::decode_all(object.as_slice()).unwrap(), bytes);
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while executor.codec.shared_available() < 4 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the producer releases its primary and extras when it exits");
+        assert_eq!(
+            executor
+                .stream_push
+                .as_ref()
+                .unwrap()
+                .producers
+                .available_permits(),
+            2
+        );
+        server.shutdown.cancel();
+    }
 }

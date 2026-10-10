@@ -14,8 +14,8 @@ use pplx_space_volmgr::executor::{
     DEFAULT_STREAM_PUSH_BUFFER_BUDGET_BYTES, DEFAULT_STREAM_WRITEBACK_BUDGET_BYTES,
 };
 use pplx_space_volmgr::{
-    DEFAULT_CODEC_CONCURRENCY, DEFAULT_CODEC_PRIORITY_RESERVE, DEFAULT_PULL_CONCURRENCY,
-    DEFAULT_PUSH_CONCURRENCY, DEFAULT_SERVER_DRAIN_TIMEOUT_SECS,
+    DEFAULT_CODEC_COMPRESS_MAX_THREADS, DEFAULT_CODEC_CONCURRENCY, DEFAULT_CODEC_PRIORITY_RESERVE,
+    DEFAULT_PULL_CONCURRENCY, DEFAULT_PUSH_CONCURRENCY, DEFAULT_SERVER_DRAIN_TIMEOUT_SECS,
     DEFAULT_SERVICE_MUTEX_TIMEOUT_SECS, DEFAULT_TRANSFER_DRAIN_TIMEOUT_SECS,
     DEFAULT_TRANSFER_MAX_ATTEMPTS, DEFAULT_TRANSFER_TIMEOUT_SECS, PullPriorityBand, SERVICE_NAME,
     SnapshotUploadMode, VolmgrRunConfig,
@@ -92,10 +92,10 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_PULL_CONCURRENCY)]
     pull_concurrency: usize,
 
-    /// Maximum concurrent CPU-bound zstd passes (compress or decompress)
-    /// across all transfer jobs. Each pass is single-threaded, so running
-    /// more of them than the pod's CPU quota just time-slices every job
-    /// slower. 0 auto-sizes to the CPU quota.
+    /// Codec permits (one core each) shared by CPU-bound zstd passes
+    /// (compress or decompress) across all transfer jobs. Running more zstd
+    /// threads than the pod's CPU quota just time-slices every job slower.
+    /// 0 auto-sizes to the CPU quota.
     #[arg(long, default_value_t = DEFAULT_CODEC_CONCURRENCY)]
     codec_concurrency: usize,
 
@@ -106,6 +106,17 @@ struct Cli {
     /// latency. Ignored when no pull priority bands are configured.
     #[arg(long, default_value_t = DEFAULT_CODEC_PRIORITY_RESERVE)]
     codec_priority_reserve: usize,
+
+    /// Most zstd threads one upload compression pass may run. Each thread
+    /// past the first takes an extra codec permit, only from idle shared
+    /// capacity and never from the priority reserve, so a busy node keeps one
+    /// thread per pass. 1 disables multithreaded compression.
+    #[arg(
+        long,
+        env = "SPACE_VOLUME_CODEC_COMPRESS_MAX_THREADS",
+        default_value_t = DEFAULT_CODEC_COMPRESS_MAX_THREADS
+    )]
+    codec_compress_max_threads: std::num::NonZeroU32,
 
     /// Process-wide high watermark for streamed output awaiting writeback.
     /// Producers resume after the background reaper drains half this amount.
@@ -174,6 +185,7 @@ impl TryFrom<Cli> for VolmgrRunConfig {
             pull_concurrency: cli.pull_concurrency,
             codec_concurrency: cli.codec_concurrency,
             codec_priority_reserve: cli.codec_priority_reserve,
+            codec_compress_max_threads: cli.codec_compress_max_threads,
             stream_writeback_budget_bytes: cli.stream_writeback_budget_bytes,
             pull_priority_bands: cli.pull_priority_bands,
             transfer_timeout: Duration::from_secs(cli.transfer_timeout_secs),

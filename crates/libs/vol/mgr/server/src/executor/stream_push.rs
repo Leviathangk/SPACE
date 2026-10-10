@@ -161,7 +161,7 @@ impl TransferExecutor {
         let codec = tokio::select! {
             biased;
             _ = cancellation.cancelled() => return Err(JobError::Retriable("stream upload cancelled during admission".into())),
-            slot = self.acquire_codec_slot(job.priority) => slot?,
+            grant = self.acquire_compress(job.priority, CompressPath::Streaming) => grant?,
         };
         emit_transfer_phase_duration(
             &job.kind,
@@ -234,8 +234,27 @@ impl TransferExecutor {
     }
 }
 
+/// A producer's zstd thread count is fixed for its frame when the encoder
+/// starts, so lending must not change which permits back those threads. Only
+/// the primary codec permit is lent during backpressure; the extras stay
+/// owned until the producer exits. While `PipeWriter::write` blocks, zstd
+/// receives no new input, so its workers can only finish the jobs already
+/// dispatched (at most one ~8 MiB job each, tens of milliseconds) and then
+/// idle; only during that drain can the producer use one core more than the
+/// extras it still holds. Lending the primary therefore frees one permit to
+/// queued codec work, as it did single-threaded, and the producer reacquires
+/// only that one before encoding resumes.
+///
+/// The cost is idle capacity. Streaming is the default upload path, and
+/// when object storage drains parts slower than zstd fills them a producer
+/// spends much of its upload backpressured, holding its extras idle where
+/// later shared-pool codec work cannot use them. Extras only ever come from
+/// the shared pool, so the priority reserve is unaffected. Releasing the
+/// extras as well would require waiting for them again on resume, which
+/// could stall a producer that already holds its fair share, or resume more
+/// workers than permits.
 struct ProducerAdmission {
-    codec: CodecSlot,
+    codec: CompressGrant,
     _producer: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -253,6 +272,7 @@ fn compression_source(
         // cancelling wakes a backpressured write. Producer admission survives
         // until exit; codec admission is owned whenever encoding can run.
         let started = Instant::now();
+        let threads = admission.codec.threads();
         let mut input = SourceReader {
             file,
             cancellation: producer_token.clone(),
@@ -271,7 +291,7 @@ fn compression_source(
             // before crossing the blocking/async bridge; otherwise each zstd
             // block can wake the uploader for just a handful of bytes.
             let mut buffered = std::io::BufWriter::with_capacity(PIPE_BYTES, &mut output);
-            zstd::stream::copy_encode(&mut input, &mut buffered, ZSTD_LEVEL)
+            copy_encode_with_threads(&mut input, &mut buffered, threads)
                 .and_then(|()| buffered.flush())
                 .and_then(|()| {
                     if input.consumed == size {
@@ -297,6 +317,7 @@ fn compression_source(
             logical_bytes = input.consumed,
             producer_ms = started.elapsed().as_millis(),
             pipe_write_ms = output.waited.as_millis(),
+            compress_threads = threads,
             success = result.is_ok(),
             "stream upload producer finished"
         );
@@ -361,8 +382,9 @@ impl Write for PipeWriter {
                 result = std::future::poll_fn(|cx| {
                     let result = std::pin::Pin::new(&mut self.writer).poll_write(cx, buf);
                     if result.is_pending() {
-                        // The synchronous encoder cannot run while Write is
-                        // pending. Let queued codec work use this idle slot.
+                        // The synchronous encoder cannot feed zstd while Write
+                        // is pending. Let queued codec work use this idle slot;
+                        // see `ProducerAdmission` for why extras stay held.
                         self.admission.codec.lend();
                     }
                     result
