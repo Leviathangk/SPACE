@@ -402,9 +402,9 @@ impl Drop for SubvolumeCleanupGuard {
 
 impl NodeManagerService {
     /// Returns the retained source identity and, for a deferred send, its
-    /// rootfs image length. That length is read back through the same
-    /// verification later inspections use. A materialized send needs no
-    /// length, so it adds no read-back that could fail it.
+    /// rootfs image length, read back through the same verification later
+    /// inspections use. A materialized send is sized by its stream file, so
+    /// it adds no read-back that could fail it.
     async fn retain_send_source(
         &self,
         retain: bool,
