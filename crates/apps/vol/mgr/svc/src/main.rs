@@ -10,13 +10,15 @@ use clap::Parser;
 use pplx_space_common_core::host::linux::paths::{
     VOLUME_MANAGER_DB, VOLUME_MANAGER_SOCKET, VOLUME_MANAGER_STAGING_DIR,
 };
-use pplx_space_volmgr::executor::DEFAULT_STREAM_WRITEBACK_BUDGET_BYTES;
+use pplx_space_volmgr::executor::{
+    DEFAULT_STREAM_PUSH_BUFFER_BUDGET_BYTES, DEFAULT_STREAM_WRITEBACK_BUDGET_BYTES,
+};
 use pplx_space_volmgr::{
     DEFAULT_CODEC_CONCURRENCY, DEFAULT_CODEC_PRIORITY_RESERVE, DEFAULT_PULL_CONCURRENCY,
     DEFAULT_PUSH_CONCURRENCY, DEFAULT_SERVER_DRAIN_TIMEOUT_SECS,
     DEFAULT_SERVICE_MUTEX_TIMEOUT_SECS, DEFAULT_TRANSFER_DRAIN_TIMEOUT_SECS,
     DEFAULT_TRANSFER_MAX_ATTEMPTS, DEFAULT_TRANSFER_TIMEOUT_SECS, PullPriorityBand, SERVICE_NAME,
-    VolmgrRunConfig,
+    SnapshotUploadMode, VolmgrRunConfig,
 };
 
 #[derive(Parser)]
@@ -159,19 +161,9 @@ impl TryFrom<Cli> for VolmgrRunConfig {
     type Error = anyhow::Error;
 
     fn try_from(cli: Cli) -> Result<Self, Self::Error> {
-        let buffer_budget_bytes =
-            match std::env::var("SPACE_VOLUME_STREAM_PUSH_BUFFER_BUDGET_BYTES") {
-                Ok(value) => value.parse::<usize>().context(
-                    "SPACE_VOLUME_STREAM_PUSH_BUFFER_BUDGET_BYTES must be a nonnegative byte count",
-                )?,
-                Err(std::env::VarError::NotPresent) => 0,
-                Err(error) => {
-                    return Err(error).context("read SPACE_VOLUME_STREAM_PUSH_BUFFER_BUDGET_BYTES");
-                }
-            };
-        let snapshot_upload_mode =
-            pplx_space_volmgr::SnapshotUploadMode::from_buffer_budget_bytes(buffer_budget_bytes)
-                .context("invalid SPACE_VOLUME_STREAM_PUSH_BUFFER_BUDGET_BYTES")?;
+        let snapshot_upload_mode = snapshot_upload_mode(std::env::var(
+            "SPACE_VOLUME_STREAM_PUSH_BUFFER_BUDGET_BYTES",
+        ))?;
         Ok(Self {
             socket_path: cli.socket,
             health_socket_path: cli.health_socket,
@@ -193,6 +185,24 @@ impl TryFrom<Cli> for VolmgrRunConfig {
             stream_decode_pulls: cli.stream_decode_pulls,
         })
     }
+}
+
+/// Unset streams snapshot uploads with the default part budget; `0` selects
+/// file uploads.
+fn snapshot_upload_mode(
+    value: Result<String, std::env::VarError>,
+) -> anyhow::Result<SnapshotUploadMode> {
+    let buffer_budget_bytes = match value {
+        Ok(value) => value.parse::<usize>().context(
+            "SPACE_VOLUME_STREAM_PUSH_BUFFER_BUDGET_BYTES must be a nonnegative byte count",
+        )?,
+        Err(std::env::VarError::NotPresent) => DEFAULT_STREAM_PUSH_BUFFER_BUDGET_BYTES,
+        Err(error) => {
+            return Err(error).context("read SPACE_VOLUME_STREAM_PUSH_BUFFER_BUDGET_BYTES");
+        }
+    };
+    SnapshotUploadMode::from_buffer_budget_bytes(buffer_budget_bytes)
+        .context("invalid SPACE_VOLUME_STREAM_PUSH_BUFFER_BUDGET_BYTES")
 }
 
 fn main() -> anyhow::Result<()> {

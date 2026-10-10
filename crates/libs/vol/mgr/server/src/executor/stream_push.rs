@@ -21,6 +21,9 @@ mod btrfs;
 const MIB: usize = 1024 * 1024;
 const PART_BYTES: usize = 64 * MIB;
 const PIPE_BYTES: usize = 8 * MIB;
+/// Service part budget when no deployment sets one: sixteen parts shared by
+/// every upload on the node. Zero selects file uploads.
+pub const DEFAULT_STREAM_PUSH_BUFFER_BUDGET_BYTES: usize = 16 * PART_BYTES;
 
 /// Deployment policy for snapshot uploads. Clones of a streaming policy share
 /// its one aggregate part budget; this must not be recreated for each job.
