@@ -1211,3 +1211,8 @@ impl NodeManagerService {
         Ok(Response::new(StopProcessResponse { success }))
     }
 }
+
+// Every case pins processes through Linux pidfds or reads /proc.
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+pub(super) mod tests;
