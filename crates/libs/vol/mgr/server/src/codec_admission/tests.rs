@@ -390,31 +390,27 @@ async fn a_lent_primary_is_never_counted_as_spare() {
     assert_eq!(admission.lent.load(Ordering::SeqCst), 0);
 }
 
-#[tokio::test]
-async fn simultaneous_admissions_keep_the_spare() {
-    // Both primaries are admitted before either pass looks for extras, so
-    // only five extras fit beside the spare: [3, 2], never [3, 3].
-    let admission = CodecAdmission::new(8, 0).with_compress_max_threads(max_threads(4));
-    let held: Vec<_> = (0..8)
-        .map(|_| admission.try_acquire_shared().unwrap())
-        .collect();
-    let mut first = pin!(admission.acquire_compress(CodecPriority::Normal, CompressPath::File));
-    let mut second = pin!(admission.acquire_compress(CodecPriority::Normal, CompressPath::File));
-    assert!(poll(first.as_mut()).is_none());
-    assert!(poll(second.as_mut()).is_none());
-    drop(held);
-    let first = poll(first.as_mut()).unwrap().unwrap();
-    let second = poll(second.as_mut()).unwrap().unwrap();
-    assert_eq!((first.workers(), second.workers()), (3, 2));
-    assert_eq!(admission.shared_available(), 1);
+#[test]
+fn a_slot_lent_during_the_grab_costs_an_extra() {
+    // No lend meanwhile, or a reacquire that lowered the count: keep all.
+    assert_eq!(extras_kept(1, 1, 3), 3);
+    assert_eq!(extras_kept(2, 1, 3), 3);
+    // Each slot lent meanwhile may have released a permit the grab took.
+    assert_eq!(extras_kept(0, 1, 3), 2);
+    assert_eq!(extras_kept(1, 3, 5), 3);
+    // Too few left for a multithreaded pass: keep none.
+    assert_eq!(extras_kept(0, 1, 2), 0);
+    assert_eq!(extras_kept(0, 4, 3), 0);
 }
 
+/// Stress coverage, not a deterministic race: two passes look for extras on
+/// two OS threads at once, after both primaries were handed out, so only
+/// five extras fit beside the spare. The grab is atomic, so every round
+/// leaves the spare idle. A pass that tries while the other holds its
+/// surplus sees too few idle permits and runs single-threaded, so a round
+/// can leave more than the spare.
 #[test]
 fn parallel_admissions_keep_the_spare() {
-    // The same race with the extras step on two OS threads at once. The
-    // grab is atomic, so every round leaves the spare idle. A pass that tries
-    // while the other holds its surplus sees too few idle permits and runs
-    // single-threaded, so a round can leave more than the spare.
     let admission = CodecAdmission::new(8, 0).with_compress_max_threads(max_threads(4));
     let barrier = std::sync::Barrier::new(2);
     for _ in 0..2_000 {
@@ -455,23 +451,30 @@ fn parallel_admissions_keep_the_spare() {
 }
 
 #[tokio::test]
-async fn streaming_extras_are_capped_node_wide() {
+async fn idle_capable_extras_are_capped_node_wide() {
     let admission = CodecAdmission::new(16, 0).with_compress_max_threads(max_threads(4));
     let grant = |path| admission.acquire_compress(CodecPriority::Normal, path);
     let first = grant(CompressPath::Streaming).await.unwrap();
     assert_eq!(first.workers(), 3);
-    // Plenty of idle permits, but a second streaming producer could hold
-    // its extras idle too, so it runs on its calling thread.
+    // Plenty of idle permits, but a second streaming producer, or a btrfs
+    // send waiting on its source stream, could hold its extras idle too, so
+    // it runs on its calling thread.
     let second = grant(CompressPath::Streaming).await.unwrap();
-    assert_eq!(second.workers(), 0);
-    // CPU-bound temp-file passes stay uncapped.
+    let capped_send = grant(CompressPath::BtrfsSend).await.unwrap();
+    assert_eq!((second.workers(), capped_send.workers()), (0, 0));
+    // A staged-file pass is CPU-bound while it holds extras: uncapped.
     let file = grant(CompressPath::File).await.unwrap();
-    let send = grant(CompressPath::BtrfsSend).await.unwrap();
-    assert_eq!((file.workers(), send.workers()), (3, 3));
+    assert_eq!(file.workers(), 3);
+    // Either idle-capable path can take the freed cap, and then holds it.
     drop(first);
+    let send = grant(CompressPath::BtrfsSend).await.unwrap();
+    assert_eq!(send.workers(), 3);
+    let capped = grant(CompressPath::Streaming).await.unwrap();
+    assert_eq!(capped.workers(), 0);
+    drop(send);
     let third = grant(CompressPath::Streaming).await.unwrap();
     assert_eq!(third.workers(), 3);
-    drop((second, third, file, send));
+    drop((second, capped_send, file, capped, third));
 
     // A producer granted fewer extras than its cap keeps only those tokens,
     // so the rest of the cap stays available.
@@ -591,7 +594,7 @@ fn model_walk_keeps_admission_invariants() {
         let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
         let total = 1 + rng.below(10);
         let reserve = rng.below(4);
-        let max = [1, 3, 4, 5, 6][rng.below(5)];
+        let max = [1, 3, 4, 5, 6, 64][rng.below(6)];
         let admission =
             CodecAdmission::new(total, reserve).with_compress_max_threads(max_threads(max));
         let shared_total = admission.shared_available();
@@ -678,6 +681,18 @@ fn model_walk_keeps_admission_invariants() {
                 let mut index = 0;
                 while index < pending.len() {
                     if let Some(ready) = poll(pending[index].1.as_mut()) {
+                        // Nothing has run since the grab: what it left idle.
+                        if let Held::Grant(grant, _) = &ready
+                            && pending[index].0.is_none()
+                            && grant.workers() > 0
+                        {
+                            assert!(
+                                admission.shared_available()
+                                    > admission.lent.load(Ordering::SeqCst),
+                                "seed {seed} step {step}: a grant with extras leaves the \
+                                 spare plus one permit per lent slot idle"
+                            );
+                        }
                         held.push(ready);
                         drop(pending.swap_remove(index));
                     } else {
@@ -691,7 +706,7 @@ fn model_walk_keeps_admission_invariants() {
 
             let from_shared =
                 |permit: &OwnedSemaphorePermit| Arc::ptr_eq(permit.semaphore(), &admission.shared);
-            let (mut shared_held, mut reserve_held, mut streaming_extras, mut lent) = (0, 0, 0, 0);
+            let (mut shared_held, mut reserve_held, mut idle_extras, mut lent) = (0, 0, 0, 0);
             for held in &held {
                 let (primary, grant) = match held {
                     Held::Permit(permit) => (Some(permit), None),
@@ -720,6 +735,10 @@ fn model_walk_keeps_admission_invariants() {
                     "seed {seed} step {step}: reserve permits never back extras"
                 );
                 shared_held += extras;
+                assert!(
+                    extras <= cap,
+                    "seed {seed} step {step}: at most max - 1 extras"
+                );
                 assert_eq!(
                     usize::try_from(grant.workers()).unwrap(),
                     extras,
@@ -735,7 +754,7 @@ fn model_walk_keeps_admission_invariants() {
                     .map_or(0, OwnedSemaphorePermit::num_permits);
                 if path.may_idle_extras() {
                     assert_eq!(tokens, extras);
-                    streaming_extras += extras;
+                    idle_extras += extras;
                 } else {
                     assert_eq!(tokens, 0);
                 }
@@ -746,7 +765,7 @@ fn model_walk_keeps_admission_invariants() {
             for extras in pending.iter().filter_map(|(reacquire, _)| *reacquire) {
                 lent += 1;
                 shared_held += extras;
-                streaming_extras += extras;
+                idle_extras += extras;
             }
             assert_eq!(
                 (
@@ -757,11 +776,11 @@ fn model_walk_keeps_admission_invariants() {
                 "seed {seed} step {step}: every permit is held or available"
             );
             assert!(
-                streaming_extras <= cap,
-                "seed {seed} step {step}: streaming cap"
+                idle_extras <= cap,
+                "seed {seed} step {step}: idle-capable extras cap"
             );
             assert_eq!(
-                streaming_extras + admission.idle_capable_extras.available_permits(),
+                idle_extras + admission.idle_capable_extras.available_permits(),
                 cap
             );
             assert_eq!(

@@ -85,15 +85,16 @@ fn codec_compress_max_threads_rejects_values_that_cannot_take_effect() {
     for threads in ["1", "3"] {
         Cli::try_parse_from(["space-volmgr-svc", "--codec-compress-max-threads", threads]).unwrap();
     }
-    // 2 would grant a single worker, which admission never does.
-    for threads in ["0", "2"] {
+    // 2 would grant a single worker, which admission never does, and 65
+    // exceeds the bound on one pass's workers.
+    for threads in ["0", "2", "65"] {
         let error =
             Cli::try_parse_from(["space-volmgr-svc", "--codec-compress-max-threads", threads])
                 .err()
                 .unwrap();
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
         assert!(
-            error.to_string().contains("must be 1 (off) or at least 3"),
+            error.to_string().contains("1 (off) or 3 through 64"),
             "{error}"
         );
     }

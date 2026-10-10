@@ -4588,7 +4588,8 @@ async fn stage_encrypted_temp(
                 let mut zstd_reader = zstd::stream::read::Encoder::new(buf_reader, ZSTD_LEVEL)
                     .map_err(|e| JobError::Permanent(format!("zstd encoder init: {e}")))?;
                 // Single-threaded by admission policy: read-mode zstdmt keeps
-                // about one job in flight, so workers would add no parallelism.
+                // only a job or two in flight, so workers would add little,
+                // data-dependent parallelism while holding permits.
                 crypto::encrypt_stream_blocking(&mut zstd_reader, &mut dst_file, &dek, &entry_aad)
                     .map_err(crypto_error_to_job_error)?;
             } else {

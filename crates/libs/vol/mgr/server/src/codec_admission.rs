@@ -21,8 +21,9 @@
 //! The primary backs the calling thread, which reads input, copies it into
 //! zstd jobs and writes output; each extra backs one zstd worker. A pass
 //! that cannot get [`MIN_WORKERS`] extras takes none. Extras of passes that
-//! can sit idle, streaming producers under upload backpressure, are capped
-//! node-wide at one full pass.
+//! can sit idle, streaming producers under upload backpressure and btrfs
+//! sends waiting on their source, share one node-wide cap of one full
+//! pass's extras.
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -45,22 +46,31 @@ pub enum CodecPriority {
 /// that cannot get this many extras compresses on its calling thread alone.
 const MIN_WORKERS: u32 = 2;
 
+/// Largest [`CompressMaxThreads`]: the calling thread plus 63 workers. It
+/// stays below libzstd's worker clamp on every target (64 on 32-bit, 256 on
+/// 64-bit), so the configured value is the worker count zstd runs, and it
+/// bounds the job buffers one pass can allocate, which grow with every
+/// worker.
+const MAX_THREADS: u32 = 64;
+
 /// Most codec permits one upload compression pass may hold, counting the
 /// calling thread. A pass holding N permits runs N - 1 zstd workers beside
 /// the calling thread. Every permit past the first is an extra taken only
 /// from idle shared capacity, so contended passes keep running on the
 /// calling thread alone. `1`, the default, keeps compression synchronous;
-/// otherwise the value must allow [`MIN_WORKERS`], so `2` is rejected.
+/// otherwise the value must allow [`MIN_WORKERS`], so `2` is rejected, and
+/// be at most [`MAX_THREADS`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompressMaxThreads(u32);
 
-/// A [`CompressMaxThreads`] value that is neither single-threaded nor large
-/// enough for [`MIN_WORKERS`].
+/// A [`CompressMaxThreads`] value that is neither single-threaded nor
+/// between [`MIN_WORKERS`] workers and [`MAX_THREADS`].
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "codec compress max threads must be 1 (off) or at least {least} (the \
-     calling thread plus {MIN_WORKERS} zstd workers), got {0}",
-    least = MIN_WORKERS + 1
+    "codec compress max threads must be 1 (off) or {least} through {MAX_THREADS} \
+     (the calling thread plus {MIN_WORKERS} to {most} zstd workers), got {0}",
+    least = MIN_WORKERS + 1,
+    most = MAX_THREADS - 1
 )]
 pub struct InvalidCompressMaxThreads(u32);
 
@@ -76,7 +86,7 @@ impl CompressMaxThreads {
     pub const SINGLE: Self = Self(1);
 
     pub const fn new(threads: u32) -> Result<Self, InvalidCompressMaxThreads> {
-        if threads == 1 || threads > MIN_WORKERS {
+        if threads == 1 || (threads > MIN_WORKERS && threads <= MAX_THREADS) {
             Ok(Self(threads))
         } else {
             Err(InvalidCompressMaxThreads(threads))
@@ -128,11 +138,14 @@ pub enum CompressPath {
 
 impl CompressPath {
     /// Whether the pass can hold its extras idle. A streaming producer waits
-    /// on upload backpressure for much of its upload, and its workers can't
-    /// shrink mid-frame, so their permits sit idle meanwhile. The temp-file
-    /// paths are CPU-bound for as long as they hold extras.
+    /// on upload backpressure for much of its upload, and a btrfs send reads
+    /// its input from a remote send stream and blocks on every chunk it has
+    /// not yet received. zstd workers can't shrink mid-frame, so their
+    /// permits sit idle meanwhile. Staged-file passes read local input and
+    /// write a temporary file, so they are CPU-bound for as long as they hold
+    /// extras.
     fn may_idle_extras(self) -> bool {
-        matches!(self, Self::Streaming)
+        matches!(self, Self::Streaming | Self::BtrfsSend)
     }
 }
 
@@ -162,6 +175,8 @@ pub struct CodecAdmissionClosed;
 #[derive(Clone)]
 pub struct CodecAdmission {
     shared: Arc<Semaphore>,
+    /// Permits in `shared`, held or not.
+    shared_total: usize,
     reserve: Arc<Semaphore>,
     reserved: usize,
     compress_max_threads: CompressMaxThreads,
@@ -170,7 +185,7 @@ pub struct CodecAdmission {
     lent: Arc<AtomicUsize>,
     /// One token per extra held by a pass that may hold extras idle
     /// ([`CompressPath::may_idle_extras`]), `compress_max_threads - 1` in
-    /// all: at most one fully multithreaded streaming producer at a time.
+    /// all: those passes together hold at most one full pass's extras.
     idle_capable_extras: Arc<Semaphore>,
 }
 
@@ -183,6 +198,7 @@ impl CodecAdmission {
         let reserve = reserve.min(total.saturating_sub(1));
         Self {
             shared: Arc::new(Semaphore::new(total - reserve)),
+            shared_total: total - reserve,
             reserve: Arc::new(Semaphore::new(reserve)),
             reserved: reserve,
             compress_max_threads: CompressMaxThreads::SINGLE,
@@ -193,6 +209,18 @@ impl CodecAdmission {
 
     /// Let upload compression passes hold up to `max` permits.
     pub fn with_compress_max_threads(mut self, max: CompressMaxThreads) -> Self {
+        // A normal-priority pass takes its primary, MIN_WORKERS extras and
+        // the spare all from the shared pool.
+        let normal_needs = usize::try_from(MIN_WORKERS + 2).expect("u32 fits usize");
+        if max != CompressMaxThreads::SINGLE && self.shared_total < normal_needs {
+            tracing::warn!(
+                codec_compress_max_threads = max.get(),
+                shared_codec_permits = self.shared_total,
+                needed_shared_codec_permits = normal_needs,
+                "multithreaded compression will not engage for normal-priority passes: \
+                 the shared codec pool is too small"
+            );
+        }
         self.compress_max_threads = max;
         self.idle_capable_extras = Arc::new(Semaphore::new(
             usize::try_from(max.get() - 1).expect("u32 fits usize"),
@@ -245,11 +273,13 @@ impl CodecAdmission {
     /// [`Self::acquire_slot`] takes it, then up to `compress_max_threads - 1`
     /// extras without waiting (see [`Self::try_acquire_extras`]), or none if
     /// fewer than [`MIN_WORKERS`] are available. Extras come only from the
-    /// shared pool, so the reserve stays whole for protected restores. Tokio hands released permits straight to queued waiters, so
-    /// a pool with a backlog has no idle permits and a contended pass runs
-    /// single-threaded. A streaming pass also needs one node-wide token per
-    /// extra, `compress_max_threads - 1` in all, so the extras that can idle
-    /// during upload backpressure never exceed one full pass's; it too runs
+    /// shared pool, so the reserve stays whole for protected restores. Tokio
+    /// hands released permits straight to queued waiters, so a pool with a
+    /// backlog has no idle permits and a contended pass runs single-threaded.
+    /// A pass that may hold its extras idle
+    /// ([`CompressPath::may_idle_extras`]) also needs one node-wide token per
+    /// extra, `compress_max_threads - 1` in all, so the extras such passes
+    /// hold together never exceed one full pass's; it too runs
     /// single-threaded unless it gets [`MIN_WORKERS`] tokens.
     pub async fn acquire_compress(
         &self,
@@ -257,7 +287,11 @@ impl CodecAdmission {
         path: CompressPath,
     ) -> Result<CompressGrant, CodecAdmissionClosed> {
         let primary = self.acquire_slot(priority).await?;
-        let mut wanted = extra_permits_wanted(path, self.compress_max_threads);
+        // The shared pool keeps one permit spare, so it never grants more
+        // extras than this. Clamping first keeps both searches proportional
+        // to the pool, not to the configured maximum.
+        let grantable = u32::try_from(self.shared_total.saturating_sub(1)).unwrap_or(u32::MAX);
+        let mut wanted = extra_permits_wanted(path, self.compress_max_threads).min(grantable);
         // Extras that may sit idle first claim node-wide tokens, without
         // waiting; with none free the pass runs on its calling thread.
         let mut tokens = None;
@@ -308,18 +342,21 @@ impl CodecAdmission {
     fn try_acquire_extras(&self, wanted: u32) -> Option<OwnedSemaphorePermit> {
         let lent = self.lent.load(Ordering::SeqCst);
         let keep_idle = u32::try_from(lent).ok()?.checked_add(1)?;
+        // No larger attempt can fit in the pool.
+        let wanted = wanted.min(
+            u32::try_from(self.shared_total)
+                .ok()?
+                .saturating_sub(keep_idle),
+        );
         for extras in (MIN_WORKERS..=wanted).rev() {
             let Ok(mut taken) =
                 Arc::clone(&self.shared).try_acquire_many_owned(extras.checked_add(keep_idle)?)
             else {
                 continue;
             };
-            let newly_lent = self.lent.load(Ordering::SeqCst).saturating_sub(lent);
-            let extras = usize::try_from(extras).ok()?.saturating_sub(newly_lent);
+            let kept = extras_kept(lent, self.lent.load(Ordering::SeqCst), extras);
             // Dropping `taken` returns the permits kept idle.
-            return (extras >= usize::try_from(MIN_WORKERS).ok()?)
-                .then(|| taken.split(extras))
-                .flatten();
+            return (kept > 0).then(|| taken.split(kept)).flatten();
         }
         None
     }
@@ -341,6 +378,22 @@ impl CodecAdmission {
     #[cfg(test)]
     pub fn reserve_available(&self) -> usize {
         self.reserve.available_permits()
+    }
+}
+
+/// Extras a grab that took `taken` extras keeps, given the lent count read
+/// before (`lent_before`) and after (`lent_after`) it: one fewer per slot lent
+/// meanwhile, whose released permit the grab may have taken, or none if that
+/// leaves fewer than [`MIN_WORKERS`]. A count that fell keeps them all.
+fn extras_kept(lent_before: usize, lent_after: usize, taken: u32) -> usize {
+    let newly_lent = lent_after.saturating_sub(lent_before);
+    let kept = usize::try_from(taken)
+        .expect("u32 fits usize")
+        .saturating_sub(newly_lent);
+    if kept >= usize::try_from(MIN_WORKERS).expect("u32 fits usize") {
+        kept
+    } else {
+        0
     }
 }
 

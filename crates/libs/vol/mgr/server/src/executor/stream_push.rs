@@ -252,10 +252,12 @@ impl TransferExecutor {
 /// when object storage drains parts slower than zstd fills them a producer
 /// spends much of its upload backpressured, holding its extras idle where
 /// later shared-pool codec work cannot use them. Admission bounds that cost:
-/// streaming extras share one node-wide cap of `compress_max_threads - 1`,
-/// so at most one producer's worth of extras can idle at once, and later
-/// producers run on their calling thread. Extras only ever come from the
-/// shared pool, so the priority reserve is unaffected. Releasing the extras
+/// streaming extras, with those of btrfs sends that wait on their source,
+/// share one node-wide cap of `compress_max_threads - 1`, so at most one full
+/// pass's worth of extras can idle at once, held by one pass or split across
+/// several partial ones, and passes that find too few free tokens run on
+/// their calling thread. Extras only ever come from the shared pool, so the
+/// priority reserve is unaffected. Releasing the extras
 /// as well would require waiting for them again on resume, which could stall
 /// a producer that already holds its fair share, or resume more workers than
 /// permits.

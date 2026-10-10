@@ -110,13 +110,16 @@ struct Cli {
 
     /// Most codec permits one upload compression pass may hold, counting its
     /// calling thread: N permits run N - 1 zstd workers beside it. 1, the
-    /// default, keeps compression single-threaded; otherwise it must be at
-    /// least 3, since a pass runs at least two workers or none. Permits past
-    /// the first come only from idle shared capacity, never from the priority
-    /// reserve, so a busy node compresses each pass on its calling thread
-    /// alone. Enable it only when about four or more shared permits are
-    /// usually idle: on a smaller pool an extra permit spent on workers could
-    /// have admitted a whole queued pass.
+    /// default, keeps compression single-threaded; otherwise it must be 3
+    /// through 64, since a pass runs at least two workers or none, and 63
+    /// workers stay below libzstd's clamp while bounding one pass's job
+    /// buffers. Permits past the first come only from idle shared capacity,
+    /// never from the priority reserve, so a busy node compresses each pass
+    /// on its calling thread alone. Enable it only when about four or more
+    /// shared permits are usually idle: a normal-priority pass takes its
+    /// primary, two extras and one spare from the shared pool, and on a
+    /// smaller pool an extra permit spent on workers could have admitted a
+    /// whole queued pass.
     #[arg(
         long,
         env = "SPACE_VOLUME_CODEC_COMPRESS_MAX_THREADS",
