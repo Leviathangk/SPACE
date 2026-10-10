@@ -37,6 +37,9 @@ async fn upload_executor_converges_unstaged_metadata_failure() {
     let executor = SnapshotUploadExecutor {
         db: std::sync::Arc::new(std::sync::Mutex::new(open_backfill_test_db())),
         drain_state: crate::service::tests::closed_drain_for_test(),
+        retained_source_inspector: std::sync::Arc::new(crate::retained_source::FakeInspector::new(
+            crate::retained_source::RetainedSourceCheck::Absent,
+        )),
     };
     let job = job_fixture(
         SNAPSHOT_UPLOAD_JOB_KIND,
@@ -181,6 +184,9 @@ async fn executor_rejects_non_snapshot_upload_job_kind() {
             rusqlite::Connection::open_in_memory().unwrap(),
         )),
         drain_state: std::sync::Arc::new(crate::service::drain::DrainState::default()),
+        retained_source_inspector: std::sync::Arc::new(crate::retained_source::FakeInspector::new(
+            crate::retained_source::RetainedSourceCheck::Absent,
+        )),
     };
     let job = job_fixture("future_sbx_mgr_job", "{}".to_string());
 
@@ -210,6 +216,9 @@ async fn executor_requires_begin_before_volume_staging() {
             rusqlite::Connection::open_in_memory().unwrap(),
         )),
         drain_state: std::sync::Arc::new(crate::service::drain::DrainState::default()),
+        retained_source_inspector: std::sync::Arc::new(crate::retained_source::FakeInspector::new(
+            crate::retained_source::RetainedSourceCheck::Absent,
+        )),
     };
     let artifact = "01939e3e-eeee-7000-8000-000000000022";
     let mut payload = reclaim_fixture_payload(artifact, "/space/cache/snapshot".into());
@@ -320,7 +329,7 @@ fn ready_backup_keeps_completed_evidence_when_bookkeeping_misses_execution_deadl
             self.phase.notify_one();
             tokio::time::sleep(Duration::from_secs(4)).await;
             self.phase.notify_one();
-            Ok(self.executor.complete_ready_backup(&payload, 42))
+            Ok(self.executor.complete_ready_backup(&payload, 42, None))
         }
     }
 
@@ -352,6 +361,11 @@ fn ready_backup_keeps_completed_evidence_when_bookkeeping_misses_execution_deadl
                 executor: SnapshotUploadExecutor {
                     db: std::sync::Arc::clone(&db),
                     drain_state: std::sync::Arc::new(crate::service::drain::DrainState::default()),
+                    retained_source_inspector: std::sync::Arc::new(
+                        crate::retained_source::FakeInspector::new(
+                            crate::retained_source::RetainedSourceCheck::Absent,
+                        ),
+                    ),
                 },
                 phase: std::sync::Arc::clone(&phase),
             },
@@ -502,7 +516,7 @@ fn pruning_retains_failed_backup_marker_evidence_until_repaired() {
     )
     .unwrap();
     // The remote finalize has succeeded, but its local bookkeeping fails.
-    assert!(stamp_backup_completed_and_reclaim_stream(&conn, &payload, "attempt").is_err());
+    assert!(stamp_backup_completed_and_reclaim_stream(&conn, &payload, "attempt", None).is_err());
     insert_job(&conn, "completed", "completed", &payload_for(artifact));
     insert_job(&conn, "malformed", "completed", "not-json");
     insert_job(&conn, "legacy", "completed", r#"{"meta":{}}"#);
@@ -868,7 +882,7 @@ fn bookkeeping_stamps_marker_and_deletes_only_the_stream() {
     write_snapshot_dir_fixture(&snapshot_dir);
     let payload = reclaim_fixture_payload(artifact, snapshot_dir.clone());
 
-    stamp_backup_completed_and_reclaim_stream(&conn, &payload, "backup-1").unwrap();
+    stamp_backup_completed_and_reclaim_stream(&conn, &payload, "backup-1", None).unwrap();
 
     assert!(backup_marker(&conn, artifact).is_some(), "marker stamped");
     assert!(!snapshot_dir.join(ROOTFS_BTRFS_SEND_FILENAME).exists());
@@ -893,7 +907,7 @@ fn bookkeeping_keeps_the_stream_when_pin_moved() {
     write_snapshot_dir_fixture(&snapshot_dir);
     let payload = reclaim_fixture_payload(uploaded, snapshot_dir.clone());
 
-    stamp_backup_completed_and_reclaim_stream(&conn, &payload, "backup-1").unwrap();
+    stamp_backup_completed_and_reclaim_stream(&conn, &payload, "backup-1", None).unwrap();
 
     assert!(backup_marker(&conn, uploaded).is_some(), "marker stamped");
     assert!(snapshot_dir.join(ROOTFS_BTRFS_SEND_FILENAME).exists());
@@ -910,7 +924,7 @@ fn disk_operation_backup_stamps_its_durability_marker() {
     let mut payload = reclaim_fixture_payload(artifact, snapshot_dir.clone());
     payload.meta.artifact_kind = Some(pplx_space_common_core::types::ArtifactKind::Disk);
 
-    stamp_backup_completed_and_reclaim_stream(&conn, &payload, "fork-backup-1").unwrap();
+    stamp_backup_completed_and_reclaim_stream(&conn, &payload, "fork-backup-1", None).unwrap();
 
     assert!(backup_marker(&conn, artifact).is_some(), "marker stamped");
     assert!(snapshot_dir.join(ROOTFS_BTRFS_SEND_FILENAME).exists());
@@ -931,7 +945,7 @@ fn bookkeeping_keeps_the_stream_when_not_suspended() {
     write_snapshot_dir_fixture(&snapshot_dir);
     let payload = reclaim_fixture_payload(artifact, snapshot_dir.clone());
 
-    stamp_backup_completed_and_reclaim_stream(&conn, &payload, "backup-1").unwrap();
+    stamp_backup_completed_and_reclaim_stream(&conn, &payload, "backup-1", None).unwrap();
 
     assert!(snapshot_dir.join(ROOTFS_BTRFS_SEND_FILENAME).exists());
 }
@@ -950,7 +964,7 @@ fn bookkeeping_tolerates_an_absent_stream() {
     std::fs::create_dir_all(&snapshot_dir).unwrap();
     let payload = reclaim_fixture_payload(artifact, snapshot_dir);
 
-    stamp_backup_completed_and_reclaim_stream(&conn, &payload, "backup-1").unwrap();
+    stamp_backup_completed_and_reclaim_stream(&conn, &payload, "backup-1", None).unwrap();
 
     assert!(backup_marker(&conn, artifact).is_some(), "marker stamped");
 }
@@ -1021,4 +1035,45 @@ fn backfill_stamps_unmarked_artifacts_and_buckets_the_rest() {
         backfill_backup_completed_markers(&conn, &mut BackupMarkerScan::default()).unwrap();
     assert_eq!(second.stamped, 0);
     assert_eq!(second.already_stamped, 2);
+}
+
+/// A retained artifact counts its stream until reclaim. Reclaim first switches
+/// the sidecar to the retained image, then removes the stream; without the
+/// image length it keeps both.
+#[test]
+fn bookkeeping_switches_a_retained_sidecar_to_the_image_before_reclaiming() {
+    let conn = open_reclaim_test_db();
+    let artifact = "01939e3e-eeee-7000-8000-000000000001";
+    insert_artifact(&conn, artifact, None);
+    insert_reclaim_sandbox(&conn, "sbx-reclaim", "suspended", artifact);
+    let tmp = tempfile::tempdir().unwrap();
+    let snapshot_dir = tmp.path().join("snapshot");
+    write_snapshot_dir_fixture(&snapshot_dir);
+    let stream_len = std::fs::metadata(snapshot_dir.join(ROOTFS_BTRFS_SEND_FILENAME))
+        .unwrap()
+        .len();
+    let mut payload = reclaim_fixture_payload(artifact, snapshot_dir.clone());
+    payload.meta.rootfs_send_source_id = Some(uuid::Uuid::now_v7());
+    let vm = crate::snapshot_upload::vm_artifacts_for_format(SuspendSnapshotFormat::BtrfsSend);
+    let local =
+        crate::snapshot_upload::write_snapshot_metadata(&payload.meta, &snapshot_dir, &vm, None)
+            .unwrap();
+    assert!(local.size_bytes >= stream_len);
+
+    stamp_backup_completed_and_reclaim_stream(&conn, &payload, "backup-1", None).unwrap();
+    assert!(backup_marker(&conn, artifact).is_some(), "marker stamped");
+    assert!(snapshot_dir.join(ROOTFS_BTRFS_SEND_FILENAME).exists());
+
+    stamp_backup_completed_and_reclaim_stream(&conn, &payload, "backup-1", Some(5000)).unwrap();
+    assert!(!snapshot_dir.join(ROOTFS_BTRFS_SEND_FILENAME).exists());
+    let rewritten: SnapshotMeta = serde_json::from_slice(
+        &std::fs::read(snapshot_dir.join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(rewritten.size_bytes, local.size_bytes - stream_len + 5000);
+    assert_eq!(
+        rewritten.rootfs_send_source_id,
+        payload.meta.rootfs_send_source_id
+    );
 }

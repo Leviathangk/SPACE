@@ -191,3 +191,93 @@ async fn staging_cleanup_rediscovery_survives_rollback_failed_deletion_and_resta
     assert!(sweep(&service, cache.path()).is_empty());
     assert_eq!(std::fs::read_dir(snapshots).unwrap().count(), 1101);
 }
+
+/// Publication retires a superseded snapshot into this lane while the sandbox
+/// is still `Suspending` and its locks are held. Once retired, the entry is
+/// garbage the sweep collects regardless of state: only retiring a live
+/// `.suspend-publish-*` directory needs the lifecycle gate above.
+#[tokio::test]
+async fn publication_retirement_is_owned_by_the_sweep_in_any_lifecycle_state() {
+    let cache = tempfile::tempdir().unwrap();
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    insert_test_sandbox(&conn, &id, SandboxState::Suspending);
+    let sandbox_dir = cache.path().join(&id);
+    let snapshot_dir = suspend_snapshot_publication::canonical_suspend_snapshot_dir(&sandbox_dir);
+    let (old_id, new_id) = (LocalArtifactId::new(), LocalArtifactId::new());
+    suspend_snapshot_publication::write_full_suspend_artifact(&snapshot_dir, &id, old_id, b"old");
+    let staging = suspend_snapshot_publication::suspend_snapshot_staging_dir(&sandbox_dir, new_id);
+    suspend_snapshot_publication::write_full_suspend_artifact(&staging, &id, new_id, b"new");
+    let service = SandboxManagerService::new(conn);
+    let _wake = service
+        .auto_lifecycle
+        .wake_lock(&id)
+        .try_lock_owned()
+        .unwrap();
+    let _artifact = service
+        .auto_lifecycle
+        .artifact_lock(&id)
+        .try_lock_owned()
+        .unwrap();
+
+    suspend_snapshot_publication::publish_suspend_snapshot_dir(
+        &staging,
+        &snapshot_dir,
+        new_id,
+        &Default::default(),
+    )
+    .unwrap();
+
+    assert!(
+        !suspend_snapshot_publication::retired_suspend_snapshot_dir(&sandbox_dir, new_id).exists()
+    );
+    let swept = sweep(&service, cache.path());
+    assert_eq!(swept.len(), 1);
+    let garbage = swept.into_iter().next().unwrap();
+    assert_eq!(std::fs::read(garbage.join("vmstate")).unwrap(), b"old");
+}
+
+/// A hold whose replacement is canonical was left by an interrupted release
+/// and is garbage; one whose replacement never committed is the rollback
+/// candidate publication restores, and the sweep leaves it alone.
+#[tokio::test]
+async fn sweep_releases_only_holds_displaced_by_the_canonical_artifact() {
+    let cache = tempfile::tempdir().unwrap();
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    insert_test_sandbox(&conn, &id, SandboxState::Suspended);
+    let sandbox_dir = cache.path().join(&id);
+    let snapshot_dir = suspend_snapshot_publication::canonical_suspend_snapshot_dir(&sandbox_dir);
+    let (canonical, pending, old) = (
+        LocalArtifactId::new(),
+        LocalArtifactId::new(),
+        LocalArtifactId::new(),
+    );
+    suspend_snapshot_publication::write_full_suspend_artifact(
+        &snapshot_dir,
+        &id,
+        canonical,
+        b"new",
+    );
+    let released =
+        suspend_snapshot_publication::retired_suspend_snapshot_dir(&sandbox_dir, canonical);
+    let kept = suspend_snapshot_publication::retired_suspend_snapshot_dir(&sandbox_dir, pending);
+    suspend_snapshot_publication::write_full_suspend_artifact(&released, &id, old, b"old");
+    suspend_snapshot_publication::write_full_suspend_artifact(&kept, &id, old, b"old");
+    let service = SandboxManagerService::new(conn);
+
+    let swept = sweep(&service, cache.path());
+    assert_eq!(swept.len(), 1);
+    assert!(!released.exists());
+    assert!(kept.exists());
+    let garbage = swept.into_iter().next().unwrap();
+    assert!(
+        garbage
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with(RETIRED_PREFIX)
+    );
+    assert_eq!(std::fs::read(garbage.join("vmstate")).unwrap(), b"old");
+}
