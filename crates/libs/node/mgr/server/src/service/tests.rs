@@ -266,6 +266,61 @@ pub(super) mod service_tests {
     }
 
     #[tokio::test]
+    async fn sandbox_manager_can_negotiate_and_inspect_send_sources_without_lease_access() {
+        let service = service_for_unit_tests().await;
+        for (user, allowed) in [
+            (users::SPACE_SBXMGR, true),
+            (users::SPACE_VOLMGR, true),
+            (users::SPACE_NODEAPI, false),
+        ] {
+            let mut request = Request::new(crate::proto::GetBtrfsSendCapabilitiesRequest {});
+            request.extensions_mut().insert(PeerIdentity::new(
+                user.uid,
+                user.primary_group.gid,
+                None,
+            ));
+            let result = service.get_btrfs_send_capabilities(request).await;
+            assert_eq!(result.is_ok(), allowed, "{}", user.name);
+        }
+        for (user, expected) in [
+            (users::SPACE_SBXMGR, tonic::Code::InvalidArgument),
+            (users::SPACE_VOLMGR, tonic::Code::PermissionDenied),
+            (users::SPACE_NODEAPI, tonic::Code::PermissionDenied),
+        ] {
+            let mut request = Request::new(crate::proto::BtrfsInspectSendSourceRequest {
+                sandbox_id: "invalid".into(),
+                artifact_dir: String::new(),
+                source_id: String::new(),
+            });
+            request.extensions_mut().insert(PeerIdentity::new(
+                user.uid,
+                user.primary_group.gid,
+                None,
+            ));
+            let error = service
+                .btrfs_inspect_send_source(request)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), expected, "{}", user.name);
+        }
+        // Negotiation does not grant the lease operations.
+        let mut request = Request::new(crate::proto::BtrfsListSendSourcesRequest {});
+        request.extensions_mut().insert(PeerIdentity::new(
+            users::SPACE_SBXMGR.uid,
+            users::SPACE_SBXMGR.primary_group.gid,
+            None,
+        ));
+        assert_eq!(
+            service
+                .btrfs_list_send_sources(request)
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+
+    #[tokio::test]
     async fn volume_manager_can_read_send_sources_without_general_node_authority() {
         let service = service_for_unit_tests().await;
         for (user, expected) in [

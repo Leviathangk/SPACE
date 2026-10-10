@@ -72,47 +72,182 @@ fn fixture_meta(rootfs_diff_format: Option<&str>) -> SnapshotMeta {
     }
 }
 
-#[test]
-fn deferred_send_prepares_without_a_wire_file_and_keeps_metadata_outside_the_artifact() {
-    for kind in [ArtifactKind::Full, ArtifactKind::Disk] {
+/// A deferred artifact as sandbox-manager sees it: VM state and a retained
+/// bundle it cannot traverse. Access is restored on drop for cleanup.
+struct DeferredArtifact {
+    _temp: tempfile::TempDir,
+    dir: std::path::PathBuf,
+    source_id: uuid::Uuid,
+}
+
+impl DeferredArtifact {
+    fn new() -> Self {
+        use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
-        let artifact = temp.path().join("snapshot");
-        let bundle = artifact.join("rootfs.btrfs-source");
+        let dir = temp.path().join("snapshot");
+        let bundle = dir.join(crate::retained_source::BUNDLE_DIRECTORY);
         std::fs::create_dir_all(bundle.join("source")).unwrap();
-        let source_id = uuid::Uuid::now_v7();
-        std::fs::write(
-            bundle.join("source.json"),
-            serde_json::json!({"source_id":source_id}).to_string(),
-        )
-        .unwrap();
-        std::fs::write(bundle.join("source/rootfs.ext4"), b"immutable rootfs").unwrap();
-        std::fs::write(artifact.join("memory"), b"memory").unwrap();
-        std::fs::write(artifact.join("vmstate"), b"state").unwrap();
-        let mut meta = fixture_meta(Some(ROOTFS_DIFF_FORMAT_BTRFS_SEND_V1));
-        meta.artifact_kind = Some(kind);
-        let prepared = prepare_suspend_snapshot(
-            &meta,
-            &uuid::Uuid::now_v7().to_string(),
-            &artifact,
-            &fixture_config(),
-            kind,
-            SuspendSnapshotFormat::BtrfsSend,
-        )
-        .unwrap();
-        assert!(prepared.deferred_metadata);
-        assert_eq!(prepared.meta.rootfs_send_source_id, Some(source_id));
-        assert!(prepared.job_ids.is_empty());
-        let metadata = prepared.metadata_staging_dir.as_ref().unwrap();
-        assert!(!metadata.starts_with(&artifact));
-        assert!(metadata.join(SNAPSHOT_METADATA_FILENAME).is_file());
-        assert!(!artifact.join(ROOTFS_BTRFS_SEND_FILENAME).exists());
-        // Teardown can remove the artifact after VM staging. The metadata
-        // worker must have a surviving, separately owned directory.
-        std::fs::remove_dir_all(&artifact).unwrap();
-        assert!(metadata.is_dir());
-        cleanup_metadata_staging_dir(&prepared);
-        assert!(!metadata.exists());
+        std::fs::write(bundle.join("source/rootfs.ext4"), b"jail-owned rootfs").unwrap();
+        std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::write(dir.join("memory"), b"memory").unwrap();
+        std::fs::write(dir.join("vmstate"), b"state").unwrap();
+        Self {
+            _temp: temp,
+            dir,
+            source_id: uuid::Uuid::now_v7(),
+        }
     }
+
+    fn meta(&self) -> SnapshotMeta {
+        let mut meta = fixture_meta(Some(ROOTFS_DIFF_FORMAT_BTRFS_SEND_V1));
+        meta.artifact_kind = Some(ArtifactKind::Full);
+        meta.rootfs_send_source_id = Some(self.source_id);
+        meta
+    }
+
+    fn prepare(&self, retained: Option<RetainedUpload>) -> Result<SnapshotUploadJobs, String> {
+        prepare_suspend_snapshot(
+            &self.meta(),
+            &uuid::Uuid::now_v7().to_string(),
+            &self.dir,
+            &fixture_config(),
+            ArtifactKind::Full,
+            SuspendSnapshotFormat::BtrfsSend,
+            retained,
+        )
+    }
+}
+
+impl DeferredArtifact {
+    fn remove_artifact_dir(&self) {
+        self.restore_access();
+        std::fs::remove_dir_all(&self.dir).unwrap();
+    }
+
+    fn restore_access(&self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(
+            self.dir.join(crate::retained_source::BUNDLE_DIRECTORY),
+            std::fs::Permissions::from_mode(0o750),
+        );
+    }
+}
+
+impl Drop for DeferredArtifact {
+    fn drop(&mut self) {
+        self.restore_access();
+    }
+}
+
+#[test]
+fn deferred_send_prepares_from_the_inspected_size_and_keeps_metadata_outside_the_artifact() {
+    let artifact = DeferredArtifact::new();
+    let prepared = artifact
+        .prepare(Some(RetainedUpload {
+            rootfs_bytes: 1000,
+            stream: true,
+        }))
+        .unwrap();
+    assert!(prepared.deferred_metadata);
+    assert_eq!(
+        prepared.meta.rootfs_send_source_id,
+        Some(artifact.source_id)
+    );
+    assert_eq!(
+        prepared.meta.size_bytes,
+        1000 + b"memory".len() as u64 + b"state".len() as u64
+    );
+    assert!(prepared.job_ids.is_empty());
+    let metadata = prepared.metadata_staging_dir.as_ref().unwrap();
+    assert!(!metadata.starts_with(&artifact.dir));
+    assert!(metadata.join(SNAPSHOT_METADATA_FILENAME).is_file());
+    assert!(!artifact.dir.join(ROOTFS_BTRFS_SEND_FILENAME).exists());
+    // Teardown can remove the artifact after VM staging. The metadata
+    // worker must have a surviving, separately owned directory.
+    artifact.remove_artifact_dir();
+    assert!(metadata.is_dir());
+    cleanup_metadata_staging_dir(&prepared);
+    assert!(!metadata.exists());
+}
+
+#[test]
+fn retained_source_without_streaming_prepares_for_materialization() {
+    let artifact = DeferredArtifact::new();
+    let prepared = artifact
+        .prepare(Some(RetainedUpload {
+            rootfs_bytes: 1000,
+            stream: false,
+        }))
+        .unwrap();
+    // The worker regenerates rootfs.btrfs-send from this exact source and
+    // uploads the file.
+    assert!(!prepared.deferred_metadata);
+    assert_eq!(
+        prepared.meta.rootfs_send_source_id,
+        Some(artifact.source_id)
+    );
+    assert!(prepared.metadata_staging_dir.is_none());
+}
+
+#[test]
+fn retained_source_must_be_inspected_before_preparation() {
+    let artifact = DeferredArtifact::new();
+    let error = artifact.prepare(None).unwrap_err();
+    assert!(error.contains(&artifact.source_id.to_string()), "{error}");
+    assert!(error.contains("not inspected"), "{error}");
+}
+
+#[test]
+fn btrfs_send_without_stream_or_identity_is_missing_its_stream() {
+    let artifact = DeferredArtifact::new();
+    let mut meta = artifact.meta();
+    meta.rootfs_send_source_id = None;
+    let error = prepare_suspend_snapshot(
+        &meta,
+        &uuid::Uuid::now_v7().to_string(),
+        &artifact.dir,
+        &fixture_config(),
+        ArtifactKind::Full,
+        SuspendSnapshotFormat::BtrfsSend,
+        Some(RetainedUpload {
+            rootfs_bytes: 1,
+            stream: true,
+        }),
+    )
+    .unwrap_err();
+    assert!(error.contains(ROOTFS_BTRFS_SEND_FILENAME), "{error}");
+}
+
+#[test]
+fn metadata_sizing_names_the_path_it_could_not_stat() {
+    let artifact = DeferredArtifact::new();
+    std::fs::remove_file(artifact.dir.join("memory")).unwrap();
+    let error = write_snapshot_metadata(
+        &artifact.meta(),
+        &artifact.dir,
+        &vm_artifacts_for_format(SuspendSnapshotFormat::BtrfsSend),
+        Some(1),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains(&artifact.dir.join("memory").display().to_string()),
+        "{error}"
+    );
+    // A retained source without node-manager's size cannot be sized here.
+    std::fs::write(artifact.dir.join("memory"), b"memory").unwrap();
+    let error = write_snapshot_metadata(
+        &artifact.meta(),
+        &artifact.dir,
+        &vm_artifacts_for_format(SuspendSnapshotFormat::BtrfsSend),
+        None,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        SnapshotMetadataWriteError::UnsizedRetainedSource { source_id, .. }
+            if source_id == artifact.source_id
+    ));
 }
 
 #[test]
@@ -180,7 +315,7 @@ fn write_snapshot_metadata_sizes_from_local_artifacts_at_submit_time() {
     std::fs::write(dir.join("rootfs.ext4"), vec![0u8; 30]).unwrap();
 
     let meta = fixture_meta(None);
-    let out = write_snapshot_metadata(&meta, dir, &vm).unwrap();
+    let out = write_snapshot_metadata(&meta, dir, &vm, None).unwrap();
     assert_eq!(out.size_bytes, 60, "size is the sum of local VM artifacts");
 
     let written = std::fs::read_to_string(dir.join(SNAPSHOT_METADATA_FILENAME)).unwrap();
@@ -198,7 +333,7 @@ fn write_snapshot_metadata_errors_when_an_artifact_is_missing() {
     let vm = vm_artifacts_for_format(SuspendSnapshotFormat::Full);
     std::fs::write(dir.join("vmstate"), vec![0u8; 10]).unwrap();
     // memory + rootfs.ext4 intentionally absent.
-    let err = write_snapshot_metadata(&fixture_meta(None), dir, &vm).unwrap_err();
+    let err = write_snapshot_metadata(&fixture_meta(None), dir, &vm, None).unwrap_err();
     let err = err.to_string();
     assert!(
         err.contains("memory"),
@@ -227,6 +362,7 @@ fn prepare_persists_exact_artifact_intent_without_remote_transfer_handles() {
         &fixture_config(),
         ArtifactKind::Full,
         SuspendSnapshotFormat::Full,
+        None,
     )
     .unwrap();
 
