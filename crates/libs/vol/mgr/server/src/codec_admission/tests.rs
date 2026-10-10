@@ -415,3 +415,326 @@ fn parallel_admissions_keep_the_spare() {
         );
     }
 }
+
+#[tokio::test]
+async fn streaming_extras_are_capped_node_wide() {
+    let admission = CodecAdmission::new(16, 0).with_compress_max_threads(max_threads(4));
+    let grant = |path| admission.acquire_compress(CodecPriority::Normal, path);
+    let first = grant(CompressPath::Streaming).await.unwrap();
+    assert_eq!(first.workers(), 3);
+    // Plenty of idle permits, but a second streaming producer could hold
+    // its extras idle too, so it runs on its calling thread.
+    let second = grant(CompressPath::Streaming).await.unwrap();
+    assert_eq!(second.workers(), 0);
+    // CPU-bound temp-file passes stay uncapped.
+    let file = grant(CompressPath::File).await.unwrap();
+    let send = grant(CompressPath::BtrfsSend).await.unwrap();
+    assert_eq!((file.workers(), send.workers()), (3, 3));
+    drop(first);
+    let third = grant(CompressPath::Streaming).await.unwrap();
+    assert_eq!(third.workers(), 3);
+    drop((second, third, file, send));
+
+    // A producer granted fewer extras than its cap keeps only those tokens,
+    // so the rest of the cap stays available.
+    let held: Vec<_> = (0..13)
+        .map(|_| admission.try_acquire_shared().unwrap())
+        .collect();
+    let partial = grant(CompressPath::Streaming).await.unwrap();
+    assert_eq!(partial.workers(), 1);
+    drop(held);
+    let rest = grant(CompressPath::Streaming).await.unwrap();
+    assert_eq!(rest.workers(), 2);
+    assert_eq!(admission.idle_capable_extras.available_permits(), 0);
+    drop((partial, rest));
+    assert_eq!(admission.idle_capable_extras.available_permits(), 3);
+}
+
+#[tokio::test]
+async fn grants_release_everything_on_drop_cancellation_and_panic() {
+    let admission = CodecAdmission::new(6, 1).with_compress_max_threads(max_threads(4));
+    let idle = |admission: &CodecAdmission| {
+        (
+            admission.shared_available(),
+            admission.reserve_available(),
+            admission.idle_capable_extras.available_permits(),
+            admission.lent.load(Ordering::SeqCst),
+        )
+    };
+    assert_eq!(idle(&admission), (5, 1, 3, 0));
+
+    // Drop, including a lent producer.
+    let mut producer = admission
+        .acquire_compress(CodecPriority::High, CompressPath::Streaming)
+        .await
+        .unwrap();
+    assert_eq!(producer.workers(), 3);
+    producer.lend();
+    drop(producer);
+    assert_eq!(idle(&admission), (5, 1, 3, 0));
+
+    // Cancellation: of a queued admission and of a queued reacquire.
+    let mut producer = admission
+        .acquire_compress(CodecPriority::Normal, CompressPath::Streaming)
+        .await
+        .unwrap();
+    let held: Vec<_> = std::iter::from_fn(|| admission.try_acquire_shared()).collect();
+    producer.lend();
+    let blocker = admission.try_acquire_shared().unwrap();
+    {
+        let mut queued =
+            pin!(admission.acquire_compress(CodecPriority::Normal, CompressPath::File));
+        assert!(poll(queued.as_mut()).is_none());
+        let mut reacquire = pin!(producer.reacquire());
+        assert!(poll(reacquire.as_mut()).is_none());
+        drop(blocker);
+    }
+    assert!(producer.is_lent());
+    drop((producer, held));
+    assert_eq!(idle(&admission), (5, 1, 3, 0));
+
+    // Panic in the blocking work that owns the grant.
+    let grant = admission
+        .acquire_compress(CodecPriority::Normal, CompressPath::Streaming)
+        .await
+        .unwrap();
+    let panicked = std::thread::spawn(move || {
+        let _grant = grant;
+        panic!("codec work failed");
+    })
+    .join();
+    assert!(panicked.is_err());
+    assert_eq!(idle(&admission), (5, 1, 3, 0));
+}
+
+/// Reproducible xorshift for the model walk; a property-test dependency
+/// would add little to one seeded state machine.
+struct Rng(u64);
+
+impl Rng {
+    fn below(&mut self, n: usize) -> usize {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        usize::try_from(self.0 % u64::try_from(n).unwrap()).unwrap()
+    }
+}
+
+enum Held {
+    Permit(CodecPermit),
+    Grant(CompressGrant, CompressPath),
+}
+
+/// A pending future, with the extras of the lent streaming grant it owns
+/// when it is a reacquire.
+type Pending<'a> = (
+    Option<usize>,
+    std::pin::Pin<Box<dyn Future<Output = Held> + 'a>>,
+);
+
+/// Random walk over acquire, compress grant, lend, reacquire and drop across
+/// simulated holders. Every pending future is polled to a fixpoint after each
+/// step, so every permit is either held by an observed holder or available.
+/// No runtime: Tokio's cooperative budget would make long poll loops inside a
+/// task return spurious `Pending`.
+#[test]
+fn model_walk_keeps_admission_invariants() {
+    const PATHS: [CompressPath; 4] = [
+        CompressPath::File,
+        CompressPath::Streaming,
+        CompressPath::BtrfsSend,
+        CompressPath::Encrypted,
+    ];
+    for seed in 1..=64u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let total = 1 + rng.below(10);
+        let reserve = rng.below(4);
+        let max = u32::try_from(1 + rng.below(5)).unwrap();
+        let admission =
+            CodecAdmission::new(total, reserve).with_compress_max_threads(max_threads(max));
+        let shared_total = admission.shared_available();
+        let reserve_total = admission.reserve_available();
+        let cap = usize::try_from(max - 1).unwrap();
+        let mut held: Vec<Held> = Vec::new();
+        let mut pending: Vec<Pending<'_>> = Vec::new();
+        let priority = |rng: &mut Rng| {
+            if rng.below(2) == 0 {
+                CodecPriority::Normal
+            } else {
+                CodecPriority::High
+            }
+        };
+        for step in 0..2_000 {
+            match rng.below(6) {
+                0 => {
+                    let priority = priority(&mut rng);
+                    let admission = &admission;
+                    pending.push((
+                        None,
+                        Box::pin(async move {
+                            Held::Permit(admission.acquire(priority).await.unwrap())
+                        }),
+                    ));
+                }
+                1 => {
+                    let priority = priority(&mut rng);
+                    let path = PATHS[rng.below(PATHS.len())];
+                    let admission = &admission;
+                    pending.push((
+                        None,
+                        Box::pin(async move {
+                            Held::Grant(
+                                admission.acquire_compress(priority, path).await.unwrap(),
+                                path,
+                            )
+                        }),
+                    ));
+                }
+                2 => {
+                    // Producers lend only on the streaming path.
+                    let producers: Vec<_> = held
+                        .iter_mut()
+                        .filter_map(|held| match held {
+                            Held::Grant(grant, CompressPath::Streaming) => Some(grant),
+                            _ => None,
+                        })
+                        .collect();
+                    if !producers.is_empty() {
+                        let n = rng.below(producers.len());
+                        producers.into_iter().nth(n).unwrap().lend();
+                    }
+                }
+                3 => {
+                    let lent: Vec<_> = (0..held.len())
+                        .filter(|&i| matches!(&held[i], Held::Grant(grant, _) if grant.is_lent()))
+                        .collect();
+                    if !lent.is_empty() {
+                        let Held::Grant(mut grant, path) =
+                            held.swap_remove(lent[rng.below(lent.len())])
+                        else {
+                            unreachable!()
+                        };
+                        let extras = grant
+                            ._extras
+                            .as_ref()
+                            .map_or(0, OwnedSemaphorePermit::num_permits);
+                        pending.push((
+                            Some(extras),
+                            Box::pin(async move {
+                                grant.reacquire().await.unwrap();
+                                Held::Grant(grant, path)
+                            }),
+                        ));
+                    }
+                }
+                4 if !held.is_empty() => drop(held.swap_remove(rng.below(held.len()))),
+                5 if !pending.is_empty() => drop(pending.swap_remove(rng.below(pending.len()))),
+                _ => {}
+            }
+            loop {
+                let before = pending.len();
+                let mut index = 0;
+                while index < pending.len() {
+                    if let Some(ready) = poll(pending[index].1.as_mut()) {
+                        held.push(ready);
+                        drop(pending.swap_remove(index));
+                    } else {
+                        index += 1;
+                    }
+                }
+                if pending.len() == before {
+                    break;
+                }
+            }
+
+            let from_shared =
+                |permit: &OwnedSemaphorePermit| Arc::ptr_eq(permit.semaphore(), &admission.shared);
+            let (mut shared_held, mut reserve_held, mut streaming_extras, mut lent) = (0, 0, 0, 0);
+            for held in &held {
+                let (primary, grant) = match held {
+                    Held::Permit(permit) => (Some(permit), None),
+                    Held::Grant(grant, path) => match &grant.primary.state {
+                        SlotState::Held { _permit } => (Some(_permit), Some((grant, path))),
+                        SlotState::Lent { .. } => {
+                            lent += 1;
+                            (None, Some((grant, path)))
+                        }
+                    },
+                };
+                if let Some(primary) = primary {
+                    if from_shared(&primary._permit) {
+                        shared_held += 1;
+                    } else {
+                        reserve_held += 1;
+                    }
+                }
+                let Some((grant, path)) = grant else { continue };
+                let extras = grant
+                    ._extras
+                    .as_ref()
+                    .map_or(0, OwnedSemaphorePermit::num_permits);
+                assert!(
+                    grant._extras.as_ref().is_none_or(from_shared),
+                    "seed {seed} step {step}: reserve permits never back extras"
+                );
+                shared_held += extras;
+                assert_eq!(
+                    usize::try_from(grant.workers()).unwrap(),
+                    extras,
+                    "seed {seed} step {step}: every worker is backed by an extra, lent or not"
+                );
+                let tokens = grant
+                    ._idle_capable_tokens
+                    .as_ref()
+                    .map_or(0, OwnedSemaphorePermit::num_permits);
+                if path.may_idle_extras() {
+                    assert_eq!(tokens, extras);
+                    streaming_extras += extras;
+                } else {
+                    assert_eq!(tokens, 0);
+                }
+                if *path == CompressPath::Encrypted {
+                    assert_eq!(extras, 0);
+                }
+            }
+            for extras in pending.iter().filter_map(|(reacquire, _)| *reacquire) {
+                lent += 1;
+                shared_held += extras;
+                streaming_extras += extras;
+            }
+            assert_eq!(
+                (
+                    shared_held + admission.shared_available(),
+                    reserve_held + admission.reserve_available()
+                ),
+                (shared_total, reserve_total),
+                "seed {seed} step {step}: every permit is held or available"
+            );
+            assert!(
+                streaming_extras <= cap,
+                "seed {seed} step {step}: streaming cap"
+            );
+            assert_eq!(
+                streaming_extras + admission.idle_capable_extras.available_permits(),
+                cap
+            );
+            assert_eq!(
+                admission.lent.load(Ordering::SeqCst),
+                lent,
+                "seed {seed} step {step}"
+            );
+        }
+        drop(pending);
+        drop(held);
+        assert_eq!(
+            (
+                admission.shared_available(),
+                admission.reserve_available(),
+                admission.idle_capable_extras.available_permits(),
+                admission.lent.load(Ordering::SeqCst),
+            ),
+            (shared_total, reserve_total, cap, 0),
+            "seed {seed}: everything is returned"
+        );
+    }
+}

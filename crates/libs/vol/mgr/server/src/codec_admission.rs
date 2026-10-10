@@ -19,7 +19,9 @@
 //! its primary permit exactly like any other pass, then may top up with
 //! extra permits, taken without waiting and only from idle shared capacity.
 //! The primary backs the calling thread, which reads input, copies it into
-//! zstd jobs and writes output; each extra backs one zstd worker.
+//! zstd jobs and writes output; each extra backs one zstd worker. Extras of
+//! passes that can sit idle, streaming producers under upload backpressure,
+//! are capped node-wide at one full pass.
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -77,6 +79,16 @@ pub enum CompressPath {
     Encrypted,
 }
 
+impl CompressPath {
+    /// Whether the pass can hold its extras idle. A streaming producer waits
+    /// on upload backpressure for much of its upload, and its workers can't
+    /// shrink mid-frame, so their permits sit idle meanwhile. The temp-file
+    /// paths are CPU-bound for as long as they hold extras.
+    fn may_idle_extras(self) -> bool {
+        matches!(self, Self::Streaming)
+    }
+}
+
 /// Extra permits a pass on `path` asks for beyond its primary.
 ///
 /// The encrypted pass pulls compressed bytes through zstd's read-mode
@@ -109,6 +121,10 @@ pub struct CodecAdmission {
     /// Slots whose permit is lent and that will reacquire one before they run
     /// again. Their permits sit in the pools but are not spare.
     lent: Arc<AtomicUsize>,
+    /// One token per extra held by a pass that may hold extras idle
+    /// ([`CompressPath::may_idle_extras`]), `compress_max_threads - 1` in
+    /// all: at most one fully multithreaded streaming producer at a time.
+    idle_capable_extras: Arc<Semaphore>,
 }
 
 impl CodecAdmission {
@@ -124,12 +140,16 @@ impl CodecAdmission {
             reserved: reserve,
             compress_max_threads: CompressMaxThreads::SINGLE,
             lent: Arc::new(AtomicUsize::new(0)),
+            idle_capable_extras: Arc::new(Semaphore::new(0)),
         }
     }
 
     /// Let upload compression passes hold up to `max` permits.
     pub fn with_compress_max_threads(mut self, max: CompressMaxThreads) -> Self {
         self.compress_max_threads = max;
+        self.idle_capable_extras = Arc::new(Semaphore::new(
+            usize::try_from(max.get() - 1).expect("u32 fits usize"),
+        ));
         self
     }
 
@@ -180,22 +200,38 @@ impl CodecAdmission {
     /// only from the shared pool, so the reserve stays whole for protected
     /// restores. Tokio hands released permits straight to queued waiters, so
     /// a pool with a backlog has no idle permits and a contended pass runs
-    /// single-threaded.
+    /// single-threaded. A streaming pass also needs one node-wide token per
+    /// extra, `compress_max_threads - 1` in all, so the extras that can idle
+    /// during upload backpressure never exceed one full pass's.
     pub async fn acquire_compress(
         &self,
         priority: CodecPriority,
         path: CompressPath,
     ) -> Result<CompressGrant, CodecAdmissionClosed> {
         let primary = self.acquire_slot(priority).await?;
-        let wanted = extra_permits_wanted(path, self.compress_max_threads);
+        let mut wanted = extra_permits_wanted(path, self.compress_max_threads);
+        // Extras that may sit idle first claim node-wide tokens, without
+        // waiting; with none free the pass runs on its calling thread.
+        let mut tokens = None;
+        if path.may_idle_extras() {
+            tokens = (1..=wanted).rev().find_map(|extras| {
+                Arc::clone(&self.idle_capable_extras)
+                    .try_acquire_many_owned(extras)
+                    .ok()
+            });
+            wanted = tokens.as_ref().map_or(0, permit_count);
+        }
         let extras = self.try_acquire_extras(wanted);
         // The primary backs the calling thread; each extra backs a worker.
-        let workers = extras.as_ref().map_or(0, |extras| {
-            u32::try_from(extras.num_permits()).expect("extras fit the requested u32")
-        });
+        let workers = extras.as_ref().map_or(0, permit_count);
+        // Return the tokens of extras the pool could not grant.
+        let tokens = tokens
+            .and_then(|mut tokens| tokens.split(usize::try_from(workers).ok()?))
+            .filter(|tokens| tokens.num_permits() > 0);
         Ok(CompressGrant {
             primary,
             _extras: extras,
+            _idle_capable_tokens: tokens,
             workers,
         })
     }
@@ -329,7 +365,13 @@ impl CodecSlot {
 pub struct CompressGrant {
     primary: CodecSlot,
     _extras: Option<OwnedSemaphorePermit>,
+    /// One per extra on a path that may hold extras idle.
+    _idle_capable_tokens: Option<OwnedSemaphorePermit>,
     workers: u32,
+}
+
+fn permit_count(permit: &OwnedSemaphorePermit) -> u32 {
+    u32::try_from(permit.num_permits()).expect("permit counts come from u32 requests")
 }
 
 impl CompressGrant {
@@ -360,6 +402,7 @@ impl From<CodecSlot> for CompressGrant {
         Self {
             primary,
             _extras: None,
+            _idle_capable_tokens: None,
             workers: 0,
         }
     }
