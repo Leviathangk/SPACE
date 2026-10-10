@@ -11,7 +11,7 @@ pub mod run;
 pub mod service;
 pub mod staging;
 
-pub use executor::{SnapshotUploadMode, StreamingPushBudget};
+pub use executor::{CompressMaxThreads, SnapshotUploadMode, StreamingPushBudget};
 
 pub use run::{
     DEFAULT_CODEC_COMPRESS_MAX_THREADS, DEFAULT_CODEC_CONCURRENCY, DEFAULT_CODEC_PRIORITY_RESERVE,

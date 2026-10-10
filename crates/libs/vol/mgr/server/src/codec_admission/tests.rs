@@ -1,5 +1,4 @@
 use std::future::Future;
-use std::num::NonZeroU32;
 use std::pin::pin;
 
 use futures_util::FutureExt;
@@ -195,7 +194,7 @@ async fn a_lent_high_priority_slot_reacquires_from_the_reserve() {
 }
 
 fn max_threads(threads: u32) -> CompressMaxThreads {
-    CompressMaxThreads::new(NonZeroU32::new(threads).unwrap())
+    CompressMaxThreads::new(threads).unwrap()
 }
 
 #[tokio::test]
@@ -216,21 +215,22 @@ async fn compress_extras_come_only_from_idle_shared_permits() {
     assert_eq!(admission.shared_available(), 3);
     assert_eq!(admission.reserve_available(), 3);
 
-    // A normal pass on an idle pool: primary plus one extra, with the last
-    // shared permit left for the next arrival.
+    // A normal pass on an idle pool takes its primary from the shared pool,
+    // so only one extra fits beside the spare. One worker is not worth a
+    // permit that could admit a whole pass: it runs on its calling thread
+    // and returns every permit it tried.
     let first = admission
         .acquire_compress(CodecPriority::Normal, CompressPath::File)
         .await
         .unwrap();
-    assert_eq!(first.workers(), 1);
-    assert_eq!(admission.shared_available(), 1);
-    // The next pass starts at once on that spare permit, single-threaded.
+    assert_eq!(first.workers(), 0);
+    assert_eq!(admission.shared_available(), 2);
     let second = admission
         .acquire_compress(CodecPriority::Normal, CompressPath::File)
         .await
         .unwrap();
     assert_eq!(second.workers(), 0);
-    assert_eq!(admission.shared_available(), 0);
+    assert_eq!(admission.shared_available(), 1);
     // With the shared pool exhausted, a protected pass still starts from the
     // reserve, and nothing is ever borrowed from the reserve for extras.
     let protected = admission
@@ -243,6 +243,43 @@ async fn compress_extras_come_only_from_idle_shared_permits() {
     drop((first, second, protected));
     assert_eq!(admission.shared_available(), 3);
     assert_eq!(admission.reserve_available(), 3);
+}
+
+#[tokio::test]
+async fn a_pass_runs_two_workers_or_none() {
+    let admission = CodecAdmission::new(8, 0).with_compress_max_threads(max_threads(4));
+    for path in [
+        CompressPath::File,
+        CompressPath::Streaming,
+        CompressPath::BtrfsSend,
+    ] {
+        for (idle, workers) in [(2, 0), (3, 0), (4, 2), (5, 3)] {
+            let held: Vec<_> = (0..8 - idle)
+                .map(|_| admission.try_acquire_shared().unwrap())
+                .collect();
+            let grant = admission
+                .acquire_compress(CodecPriority::Normal, path)
+                .await
+                .unwrap();
+            assert_eq!(grant.workers(), workers, "{path:?} with {idle} idle");
+            assert_eq!(
+                admission.shared_available(),
+                idle - 1 - workers as usize,
+                "{path:?} with {idle} idle: only the granted extras stay held"
+            );
+            assert_eq!(
+                admission.idle_capable_extras.available_permits(),
+                if path.may_idle_extras() {
+                    3 - workers as usize
+                } else {
+                    3
+                },
+                "{path:?} with {idle} idle: only the granted extras keep tokens"
+            );
+            drop((grant, held));
+            assert_eq!(admission.shared_available(), 8);
+        }
+    }
 }
 
 #[tokio::test]
@@ -277,7 +314,7 @@ async fn contended_compress_passes_run_single_threaded() {
 
 #[tokio::test]
 async fn a_grant_counts_its_calling_thread() {
-    for max in [1, 2, 4] {
+    for max in [1, 3, 4] {
         let admission = CodecAdmission::new(8, 0).with_compress_max_threads(max_threads(max));
         for path in [
             CompressPath::File,
@@ -356,9 +393,9 @@ async fn a_lent_primary_is_never_counted_as_spare() {
 #[tokio::test]
 async fn simultaneous_admissions_keep_the_spare() {
     // Both primaries are admitted before either pass looks for extras, so
-    // only one extra fits beside the spare: [1, 0], never [1, 1].
-    let admission = CodecAdmission::new(4, 0).with_compress_max_threads(max_threads(4));
-    let held: Vec<_> = (0..4)
+    // only five extras fit beside the spare: [3, 2], never [3, 3].
+    let admission = CodecAdmission::new(8, 0).with_compress_max_threads(max_threads(4));
+    let held: Vec<_> = (0..8)
         .map(|_| admission.try_acquire_shared().unwrap())
         .collect();
     let mut first = pin!(admission.acquire_compress(CodecPriority::Normal, CompressPath::File));
@@ -368,18 +405,20 @@ async fn simultaneous_admissions_keep_the_spare() {
     drop(held);
     let first = poll(first.as_mut()).unwrap().unwrap();
     let second = poll(second.as_mut()).unwrap().unwrap();
-    assert_eq!((first.workers(), second.workers()), (1, 0));
+    assert_eq!((first.workers(), second.workers()), (3, 2));
     assert_eq!(admission.shared_available(), 1);
 }
 
 #[test]
 fn parallel_admissions_keep_the_spare() {
     // The same race with the extras step on two OS threads at once. The
-    // grab is atomic, so every round leaves the spare idle.
-    let admission = CodecAdmission::new(4, 0).with_compress_max_threads(max_threads(4));
+    // grab is atomic, so every round leaves the spare idle. A pass that tries
+    // while the other holds its surplus sees too few idle permits and runs
+    // single-threaded, so a round can leave more than the spare.
+    let admission = CodecAdmission::new(8, 0).with_compress_max_threads(max_threads(4));
     let barrier = std::sync::Barrier::new(2);
     for _ in 0..2_000 {
-        let held: Vec<_> = (0..4)
+        let held: Vec<_> = (0..8)
             .map(|_| admission.try_acquire_shared().unwrap())
             .collect();
         let mut waiters: Vec<_> = (0..2)
@@ -404,9 +443,8 @@ fn parallel_admissions_keep_the_spare() {
                 .collect();
             threads.into_iter().map(|t| t.join().unwrap()).collect()
         });
-        assert_eq!(
-            admission.shared_available(),
-            1,
+        assert!(
+            admission.shared_available() >= 1,
             "workers {:?}",
             grants
                 .iter()
@@ -437,15 +475,19 @@ async fn streaming_extras_are_capped_node_wide() {
 
     // A producer granted fewer extras than its cap keeps only those tokens,
     // so the rest of the cap stays available.
-    let held: Vec<_> = (0..13)
+    let held: Vec<_> = (0..12)
         .map(|_| admission.try_acquire_shared().unwrap())
         .collect();
     let partial = grant(CompressPath::Streaming).await.unwrap();
-    assert_eq!(partial.workers(), 1);
+    assert_eq!(partial.workers(), 2);
+    assert_eq!(admission.idle_capable_extras.available_permits(), 1);
     drop(held);
+    // One token cannot back the two workers a multithreaded pass runs, so
+    // with plenty of idle permits the next producer still runs on its
+    // calling thread and leaves the token.
     let rest = grant(CompressPath::Streaming).await.unwrap();
-    assert_eq!(rest.workers(), 2);
-    assert_eq!(admission.idle_capable_extras.available_permits(), 0);
+    assert_eq!(rest.workers(), 0);
+    assert_eq!(admission.idle_capable_extras.available_permits(), 1);
     drop((partial, rest));
     assert_eq!(admission.idle_capable_extras.available_permits(), 3);
 }
@@ -549,7 +591,7 @@ fn model_walk_keeps_admission_invariants() {
         let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
         let total = 1 + rng.below(10);
         let reserve = rng.below(4);
-        let max = u32::try_from(1 + rng.below(5)).unwrap();
+        let max = [1, 3, 4, 5, 6][rng.below(5)];
         let admission =
             CodecAdmission::new(total, reserve).with_compress_max_threads(max_threads(max));
         let shared_total = admission.shared_available();
@@ -682,6 +724,10 @@ fn model_walk_keeps_admission_invariants() {
                     usize::try_from(grant.workers()).unwrap(),
                     extras,
                     "seed {seed} step {step}: every worker is backed by an extra, lent or not"
+                );
+                assert!(
+                    grant.workers() == 0 || grant.workers() >= MIN_WORKERS,
+                    "seed {seed} step {step}: a pass runs two workers or none"
                 );
                 let tokens = grant
                     ._idle_capable_tokens

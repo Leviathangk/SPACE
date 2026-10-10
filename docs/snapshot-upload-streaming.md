@@ -67,18 +67,32 @@ bounding memory even when codec slots are lent. Inputs below the existing
 admission threshold retain the file path and its bypass. Neither codec limits
 nor the protected reserve are increased.
 
+Multithreaded encoding is opt-in. `SPACE_VOLUME_CODEC_COMPRESS_MAX_THREADS`
+caps the permits one pass may hold, counting its calling thread; each extra
+permit, granted only from idle shared capacity, backs one zstd worker. The
+default `1` encodes on the calling thread. Values of `3` or more enable it, and
+`2` is rejected: a pass takes at least two extras or none, since one worker
+beside the calling thread buys only about a third more throughput while its
+permit could have admitted a whole queued pass. With one shared permit always
+left free, a pass therefore needs four idle shared permits to go
+multithreaded, so enable it only on nodes whose shared codec pool usually has
+that much headroom. There a solo upload finishes much faster: on a 9-permit
+shared pool at `4`, about 2.5 times. Bursts gain little, because contended
+passes run single-threaded, and the first arrivals' extras can delay the last
+passes: in a burst of six on that pool, the last temporary-file upload
+finished about an eighth later while the mean upload finished sooner.
+
 Streaming is the default upload path, so multithreaded encoding is bounded
-here. `SPACE_VOLUME_CODEC_COMPRESS_MAX_THREADS` caps the permits one pass may
-hold, counting its calling thread; each extra permit, granted only from idle
-shared capacity, backs one zstd worker. A producer lends only its primary
-slot, which backs the blocked calling thread, and keeps its extras until it
-exits: zstd cannot change the worker count mid-frame, and while the write
-blocks the workers can only finish already-dispatched jobs. While object
+here. A producer lends only its primary slot, which backs the blocked calling
+thread, and keeps its extras until it exits: zstd cannot change the worker
+count mid-frame, and while the write blocks the workers can only finish
+already-dispatched jobs. While object
 storage applies backpressure those extras sit idle, and later shared-pool
 codec work cannot use them. To bound that, streaming extras share one
 node-wide cap of `SPACE_VOLUME_CODEC_COMPRESS_MAX_THREADS - 1`: at most one
 producer's worth of extras can idle at once, and other producers encode on
-their calling thread, as they did before multithreading. Temporary-file
+their calling thread, as they did before multithreading. A producer needs two
+free cap tokens as well as two idle extras to run workers. Temporary-file
 compression is CPU-bound while it holds extras and is not capped. Extras never
 come from the priority reserve, so protected work keeps it. Multithreaded
 encoding also owns zstd job buffers: about 50–70 MiB of peak RSS at two zstd

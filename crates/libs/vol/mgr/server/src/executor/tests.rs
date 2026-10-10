@@ -2270,9 +2270,7 @@ fn compress_executor(
             codec_concurrency,
             codec_priority_reserve: reserve,
             codec_priority_threshold: Some(JobPriority::new(100)),
-            codec_compress_max_threads: CompressMaxThreads::new(
-                std::num::NonZeroU32::new(max_threads).unwrap(),
-            ),
+            codec_compress_max_threads: CompressMaxThreads::new(max_threads).unwrap(),
             static_credentials: Some(test_creds()),
             ..Default::default()
         },

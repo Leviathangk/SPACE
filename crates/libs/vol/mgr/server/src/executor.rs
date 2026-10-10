@@ -17,10 +17,12 @@ use std::time::Instant;
 use std::os::unix::fs::PermissionsExt;
 
 use crate::artifact::ArtifactEntryRole;
-pub use crate::codec_admission::CompressMaxThreads;
 use crate::codec_admission::{
     CodecAdmission, CodecAdmissionClosed, CodecPermit, CodecPriority, CodecSlot, CompressGrant,
     CompressPath,
+};
+pub use crate::codec_admission::{
+    CompressMaxThreads, InvalidCompressMaxThreads, ParseCompressMaxThreadsError,
 };
 use crate::credentials::{StorageAccess, UnwrapDekError, exchange_credentials, unwrap_dek};
 use crate::crypto::{self, CryptoError, decrypted_sibling, encrypted_sibling};

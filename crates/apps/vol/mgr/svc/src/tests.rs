@@ -79,3 +79,22 @@ fn unset_stream_push_budget_streams_and_zero_selects_file_uploads() {
     // Budget validation belongs to SnapshotUploadMode; this layer owns parsing.
     snapshot_upload_mode(Ok("1Gi".to_owned())).unwrap_err();
 }
+
+#[test]
+fn codec_compress_max_threads_rejects_values_that_cannot_take_effect() {
+    for threads in ["1", "3"] {
+        Cli::try_parse_from(["space-volmgr-svc", "--codec-compress-max-threads", threads]).unwrap();
+    }
+    // 2 would grant a single worker, which admission never does.
+    for threads in ["0", "2"] {
+        let error =
+            Cli::try_parse_from(["space-volmgr-svc", "--codec-compress-max-threads", threads])
+                .err()
+                .unwrap();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(
+            error.to_string().contains("must be 1 (off) or at least 3"),
+            "{error}"
+        );
+    }
+}

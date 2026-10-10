@@ -59,8 +59,7 @@ pub const DEFAULT_PUSH_CONCURRENCY: usize = 8;
 pub const DEFAULT_PULL_CONCURRENCY: usize = 24;
 pub const DEFAULT_CODEC_CONCURRENCY: usize = 0;
 pub const DEFAULT_CODEC_PRIORITY_RESERVE: usize = 1;
-pub const DEFAULT_CODEC_COMPRESS_MAX_THREADS: std::num::NonZeroU32 =
-    std::num::NonZeroU32::new(4).unwrap();
+pub const DEFAULT_CODEC_COMPRESS_MAX_THREADS: CompressMaxThreads = CompressMaxThreads::SINGLE;
 pub const DEFAULT_TRANSFER_TIMEOUT_SECS: u64 = 1800;
 pub const DEFAULT_TRANSFER_MAX_ATTEMPTS: i32 = 5;
 pub const DEFAULT_SERVER_DRAIN_TIMEOUT_SECS: u64 = 10;
@@ -241,7 +240,7 @@ pub struct VolmgrRunConfig {
     /// Most codec permits per upload compression pass, counting its calling
     /// thread; extras come only from idle shared codec permits. 1 keeps
     /// compression single-threaded.
-    pub codec_compress_max_threads: std::num::NonZeroU32,
+    pub codec_compress_max_threads: CompressMaxThreads,
     /// Process-wide high watermark for streamed output awaiting writeback.
     pub stream_writeback_budget_bytes: u64,
     /// Protected pull capacity bands. Duplicate minimums are rejected by [`run`].
@@ -507,9 +506,7 @@ pub async fn run(
                 codec_concurrency: config.codec_concurrency,
                 codec_priority_reserve: config.codec_priority_reserve,
                 codec_priority_threshold,
-                codec_compress_max_threads: CompressMaxThreads::new(
-                    config.codec_compress_max_threads,
-                ),
+                codec_compress_max_threads: config.codec_compress_max_threads,
                 stream_writeback_budget_bytes: config.stream_writeback_budget_bytes,
                 static_credentials,
             },

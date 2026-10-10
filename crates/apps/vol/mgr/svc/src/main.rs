@@ -14,11 +14,12 @@ use pplx_space_volmgr::executor::{
     DEFAULT_STREAM_PUSH_BUFFER_BUDGET_BYTES, DEFAULT_STREAM_WRITEBACK_BUDGET_BYTES,
 };
 use pplx_space_volmgr::{
-    DEFAULT_CODEC_COMPRESS_MAX_THREADS, DEFAULT_CODEC_CONCURRENCY, DEFAULT_CODEC_PRIORITY_RESERVE,
-    DEFAULT_PULL_CONCURRENCY, DEFAULT_PUSH_CONCURRENCY, DEFAULT_SERVER_DRAIN_TIMEOUT_SECS,
-    DEFAULT_SERVICE_MUTEX_TIMEOUT_SECS, DEFAULT_TRANSFER_DRAIN_TIMEOUT_SECS,
-    DEFAULT_TRANSFER_MAX_ATTEMPTS, DEFAULT_TRANSFER_TIMEOUT_SECS, PullPriorityBand, SERVICE_NAME,
-    SnapshotUploadMode, VolmgrRunConfig,
+    CompressMaxThreads, DEFAULT_CODEC_COMPRESS_MAX_THREADS, DEFAULT_CODEC_CONCURRENCY,
+    DEFAULT_CODEC_PRIORITY_RESERVE, DEFAULT_PULL_CONCURRENCY, DEFAULT_PUSH_CONCURRENCY,
+    DEFAULT_SERVER_DRAIN_TIMEOUT_SECS, DEFAULT_SERVICE_MUTEX_TIMEOUT_SECS,
+    DEFAULT_TRANSFER_DRAIN_TIMEOUT_SECS, DEFAULT_TRANSFER_MAX_ATTEMPTS,
+    DEFAULT_TRANSFER_TIMEOUT_SECS, PullPriorityBand, SERVICE_NAME, SnapshotUploadMode,
+    VolmgrRunConfig,
 };
 
 #[derive(Parser)]
@@ -108,16 +109,20 @@ struct Cli {
     codec_priority_reserve: usize,
 
     /// Most codec permits one upload compression pass may hold, counting its
-    /// calling thread: N permits run N - 1 zstd workers beside it. Permits
-    /// past the first come only from idle shared capacity, never from the
-    /// priority reserve, so a busy node compresses each pass on its calling
-    /// thread alone. 1 disables multithreaded compression.
+    /// calling thread: N permits run N - 1 zstd workers beside it. 1, the
+    /// default, keeps compression single-threaded; otherwise it must be at
+    /// least 3, since a pass runs at least two workers or none. Permits past
+    /// the first come only from idle shared capacity, never from the priority
+    /// reserve, so a busy node compresses each pass on its calling thread
+    /// alone. Enable it only when about four or more shared permits are
+    /// usually idle: on a smaller pool an extra permit spent on workers could
+    /// have admitted a whole queued pass.
     #[arg(
         long,
         env = "SPACE_VOLUME_CODEC_COMPRESS_MAX_THREADS",
         default_value_t = DEFAULT_CODEC_COMPRESS_MAX_THREADS
     )]
-    codec_compress_max_threads: std::num::NonZeroU32,
+    codec_compress_max_threads: CompressMaxThreads,
 
     /// Process-wide high watermark for streamed output awaiting writeback.
     /// Producers resume after the background reaper drains half this amount.

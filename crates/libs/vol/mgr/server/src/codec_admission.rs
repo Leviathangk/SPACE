@@ -19,11 +19,12 @@
 //! its primary permit exactly like any other pass, then may top up with
 //! extra permits, taken without waiting and only from idle shared capacity.
 //! The primary backs the calling thread, which reads input, copies it into
-//! zstd jobs and writes output; each extra backs one zstd worker. Extras of
-//! passes that can sit idle, streaming producers under upload backpressure,
-//! are capped node-wide at one full pass.
+//! zstd jobs and writes output; each extra backs one zstd worker. A pass
+//! that cannot get [`MIN_WORKERS`] extras takes none. Extras of passes that
+//! can sit idle, streaming producers under upload backpressure, are capped
+//! node-wide at one full pass.
 
-use std::num::NonZeroU32;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -38,23 +39,69 @@ pub enum CodecPriority {
     High,
 }
 
+/// Fewest zstd workers a multithreaded pass runs. The calling thread also
+/// feeds and drains the workers, so one worker beside it buys only about a
+/// third more throughput while its permit could admit a whole pass; a pass
+/// that cannot get this many extras compresses on its calling thread alone.
+const MIN_WORKERS: u32 = 2;
+
 /// Most codec permits one upload compression pass may hold, counting the
 /// calling thread. A pass holding N permits runs N - 1 zstd workers beside
 /// the calling thread. Every permit past the first is an extra taken only
 /// from idle shared capacity, so contended passes keep running on the
-/// calling thread alone. `1`, the default, keeps compression synchronous.
+/// calling thread alone. `1`, the default, keeps compression synchronous;
+/// otherwise the value must allow [`MIN_WORKERS`], so `2` is rejected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CompressMaxThreads(NonZeroU32);
+pub struct CompressMaxThreads(u32);
+
+/// A [`CompressMaxThreads`] value that is neither single-threaded nor large
+/// enough for [`MIN_WORKERS`].
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "codec compress max threads must be 1 (off) or at least {least} (the \
+     calling thread plus {MIN_WORKERS} zstd workers), got {0}",
+    least = MIN_WORKERS + 1
+)]
+pub struct InvalidCompressMaxThreads(u32);
+
+#[derive(Debug, thiserror::Error)]
+pub enum ParseCompressMaxThreadsError {
+    #[error("codec compress max threads must be a whole number")]
+    Integer(#[source] std::num::ParseIntError),
+    #[error(transparent)]
+    Invalid(#[from] InvalidCompressMaxThreads),
+}
 
 impl CompressMaxThreads {
-    pub const SINGLE: Self = Self(NonZeroU32::MIN);
+    pub const SINGLE: Self = Self(1);
 
-    pub const fn new(threads: NonZeroU32) -> Self {
-        Self(threads)
+    pub const fn new(threads: u32) -> Result<Self, InvalidCompressMaxThreads> {
+        if threads == 1 || threads > MIN_WORKERS {
+            Ok(Self(threads))
+        } else {
+            Err(InvalidCompressMaxThreads(threads))
+        }
     }
 
     pub const fn get(self) -> u32 {
-        self.0.get()
+        self.0
+    }
+}
+
+impl FromStr for CompressMaxThreads {
+    type Err = ParseCompressMaxThreadsError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let threads = value
+            .parse()
+            .map_err(ParseCompressMaxThreadsError::Integer)?;
+        Ok(Self::new(threads)?)
+    }
+}
+
+impl std::fmt::Display for CompressMaxThreads {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
     }
 }
 
@@ -196,13 +243,14 @@ impl CodecAdmission {
 
     /// Admit one upload compression pass on `path`: a primary permit as
     /// [`Self::acquire_slot`] takes it, then up to `compress_max_threads - 1`
-    /// extras without waiting (see [`Self::try_acquire_extras`]). Extras come
-    /// only from the shared pool, so the reserve stays whole for protected
-    /// restores. Tokio hands released permits straight to queued waiters, so
+    /// extras without waiting (see [`Self::try_acquire_extras`]), or none if
+    /// fewer than [`MIN_WORKERS`] are available. Extras come only from the
+    /// shared pool, so the reserve stays whole for protected restores. Tokio hands released permits straight to queued waiters, so
     /// a pool with a backlog has no idle permits and a contended pass runs
     /// single-threaded. A streaming pass also needs one node-wide token per
     /// extra, `compress_max_threads - 1` in all, so the extras that can idle
-    /// during upload backpressure never exceed one full pass's.
+    /// during upload backpressure never exceed one full pass's; it too runs
+    /// single-threaded unless it gets [`MIN_WORKERS`] tokens.
     pub async fn acquire_compress(
         &self,
         priority: CodecPriority,
@@ -214,7 +262,7 @@ impl CodecAdmission {
         // waiting; with none free the pass runs on its calling thread.
         let mut tokens = None;
         if path.may_idle_extras() {
-            tokens = (1..=wanted).rev().find_map(|extras| {
+            tokens = (MIN_WORKERS..=wanted).rev().find_map(|extras| {
                 Arc::clone(&self.idle_capable_extras)
                     .try_acquire_many_owned(extras)
                     .ok()
@@ -236,11 +284,11 @@ impl CodecAdmission {
         })
     }
 
-    /// Up to `wanted` shared permits, taken only if the pool keeps one idle
-    /// permit for the next pass to arrive plus one for every lent slot,
-    /// which reacquires before it runs again. A lent permit sits in the pool
-    /// but is not spare: extras taken from it would idle beside a producer
-    /// that is only waiting to resume.
+    /// Between [`MIN_WORKERS`] and `wanted` shared permits, or none, taken
+    /// only if the pool keeps one idle permit for the next pass to arrive
+    /// plus one for every lent slot, which reacquires before it runs again. A
+    /// lent permit sits in the pool but is not spare: extras taken from it
+    /// would idle beside a producer that is only waiting to resume.
     ///
     /// There is no check-then-act window: each attempt takes the extras and
     /// the permits to keep idle in one `try_acquire_many`, from the largest
@@ -251,15 +299,16 @@ impl CodecAdmission {
     /// taken, so a stale count only keeps more idle. A slot lent meanwhile
     /// increments the count before releasing its permit, so a lend that
     /// released a permit this attempt could take shows up in the second read,
-    /// and one extra is returned per new lend. Either way the error is fewer
-    /// extras, never more. While the surplus is held, a concurrent admission
+    /// and one extra is returned per new lend, or all of them if that leaves
+    /// fewer than [`MIN_WORKERS`]. Either way the error is fewer extras,
+    /// never more. While the surplus is held, a concurrent admission
     /// sees fewer idle permits and also takes fewer. Lent slots are counted
     /// whichever pool their permit came from; a lent reserve permit returns
     /// to the reserve, so counting it here also only keeps more idle.
     fn try_acquire_extras(&self, wanted: u32) -> Option<OwnedSemaphorePermit> {
         let lent = self.lent.load(Ordering::SeqCst);
         let keep_idle = u32::try_from(lent).ok()?.checked_add(1)?;
-        for extras in (1..=wanted).rev() {
+        for extras in (MIN_WORKERS..=wanted).rev() {
             let Ok(mut taken) =
                 Arc::clone(&self.shared).try_acquire_many_owned(extras.checked_add(keep_idle)?)
             else {
@@ -268,7 +317,9 @@ impl CodecAdmission {
             let newly_lent = self.lent.load(Ordering::SeqCst).saturating_sub(lent);
             let extras = usize::try_from(extras).ok()?.saturating_sub(newly_lent);
             // Dropping `taken` returns the permits kept idle.
-            return (extras > 0).then(|| taken.split(extras)).flatten();
+            return (extras >= usize::try_from(MIN_WORKERS).ok()?)
+                .then(|| taken.split(extras))
+                .flatten();
         }
         None
     }

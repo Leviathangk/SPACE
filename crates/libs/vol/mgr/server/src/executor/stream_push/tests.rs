@@ -671,9 +671,7 @@ async fn multithreaded_producer_lends_its_primary_and_keeps_extras_under_backpre
                 codec_concurrency: 5,
                 codec_priority_reserve: 1,
                 codec_priority_threshold: Some(JobPriority::new(100)),
-                codec_compress_max_threads: CompressMaxThreads::new(
-                    std::num::NonZeroU32::new(4).unwrap(),
-                ),
+                codec_compress_max_threads: CompressMaxThreads::new(4).unwrap(),
                 ..Default::default()
             },
             Arc::new(S3ObjectStore::new()),
