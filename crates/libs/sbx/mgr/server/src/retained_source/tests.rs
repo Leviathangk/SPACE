@@ -56,12 +56,23 @@ fn resolution_names_the_retained_source_from_identity_without_entering_its_bundl
         RootfsArtifact::resolve(SANDBOX_ID, artifact_dir, None).unwrap(),
         None
     );
-    // A stream file wins over the retained source it regenerates from.
+    // A stream file is the rootfs while it exists; the retained source sizes
+    // the artifact again once reclaim removes the stream.
     let stream = artifact_dir.join(ROOTFS_BTRFS_SEND_FILENAME);
     std::fs::write(&stream, b"stream").unwrap();
     assert_eq!(
         RootfsArtifact::resolve(SANDBOX_ID, artifact_dir, Some(source_id)).unwrap(),
-        Some(RootfsArtifact::SendFile { path: stream })
+        Some(RootfsArtifact::SendFile {
+            path: stream.clone()
+        })
+    );
+    std::fs::remove_file(&stream).unwrap();
+    assert_eq!(
+        RootfsArtifact::resolve(SANDBOX_ID, artifact_dir, Some(source_id)).unwrap(),
+        Some(RootfsArtifact::RetainedSource(source(
+            artifact_dir,
+            source_id
+        )))
     );
     restore_access(artifact_dir);
 }

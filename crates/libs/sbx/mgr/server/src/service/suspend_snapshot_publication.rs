@@ -106,6 +106,15 @@ pub(super) struct ValidatedSuspendSnapshotMetadata {
 }
 
 impl ValidatedSuspendSnapshotMetadata {
+    /// Local structural validation of this artifact's files; see
+    /// [`validate_suspend_snapshot_artifact_files`].
+    pub(super) fn validate_artifact_files(
+        &self,
+        verdicts: &RetainedSourceVerdicts,
+    ) -> Result<(), SuspendSnapshotValidationError> {
+        validate_suspend_snapshot_artifact_files(&self.metadata, &self.snapshot_dir, verdicts)
+    }
+
     pub(super) fn into_artifact(self) -> ValidatedSuspendSnapshotArtifact {
         ValidatedSuspendSnapshotArtifact {
             execution: self.execution,
@@ -270,8 +279,12 @@ pub enum SuspendSnapshotPublicationError {
         #[source]
         source: std::io::Error,
     },
-    #[error("remove duplicate staged snapshot directory {staging_dir} failed: {source}")]
-    RemoveDuplicateStaged {
+    #[error(
+        "retired snapshot {retired_dir} remains beside a canonical snapshot of another artifact"
+    )]
+    RetiredResidue { retired_dir: String },
+    #[error("retire duplicate staged snapshot directory {staging_dir} failed: {source}")]
+    RetireDuplicateStaged {
         staging_dir: String,
         #[source]
         source: std::io::Error,
@@ -425,10 +438,10 @@ pub(super) fn validate_suspend_snapshot_metadata(
 /// `verdicts`, gathered beforehand by the async caller; without one the
 /// artifact is pending, not incomplete.
 pub(super) fn validate_suspend_snapshot_artifact_files(
-    snapshot: &ValidatedSuspendSnapshotMetadata,
+    metadata: &crate::snapshot_upload::SnapshotMeta,
+    snapshot_dir: &Path,
     verdicts: &RetainedSourceVerdicts,
 ) -> Result<(), SuspendSnapshotValidationError> {
-    let metadata = &snapshot.metadata;
     let artifacts = if metadata.encrypted {
         crate::snapshot_upload::encrypted_vm_artifacts()
     } else {
@@ -437,28 +450,45 @@ pub(super) fn validate_suspend_snapshot_artifact_files(
         ))
     };
     let mut actual_bytes = 0_u64;
+    // A stream beside a retained source: the sidecar may count either, so a
+    // mismatch on the stream is rechecked against the retained image below.
+    let mut cached_stream: Option<(RetainedSource, u64)> = None;
     for artifact in artifacts {
-        if artifact.kind == pplx_space_common_core::types::SnapshotArtifact::RootfsBtrfsSend
-            && let Some(RootfsArtifact::RetainedSource(source)) =
-                RootfsArtifact::resolve_meta(metadata, &snapshot.snapshot_dir).map_err(|error| {
-                    SuspendSnapshotValidationError::StatArtifact {
-                        path: error.path,
-                        source: error.source,
+        if artifact.kind == pplx_space_common_core::types::SnapshotArtifact::RootfsBtrfsSend {
+            match RootfsArtifact::resolve_meta(metadata, snapshot_dir).map_err(|error| {
+                SuspendSnapshotValidationError::StatArtifact {
+                    path: error.path,
+                    source: error.source,
+                }
+            })? {
+                Some(RootfsArtifact::RetainedSource(source)) => {
+                    let rootfs_bytes = retained_rootfs_bytes(snapshot_dir, &source, verdicts)?;
+                    actual_bytes = actual_bytes
+                        .checked_add(rootfs_bytes)
+                        .ok_or(SuspendSnapshotValidationError::ArtifactSizeOverflow)?;
+                    continue;
+                }
+                Some(RootfsArtifact::SendFile { .. }) => {
+                    if let Some(source_id) = metadata.rootfs_send_source_id {
+                        cached_stream = Some((
+                            RetainedSource {
+                                sandbox_id: metadata.sandbox_id.clone(),
+                                artifact_dir: snapshot_dir.to_path_buf(),
+                                source_id,
+                            },
+                            0,
+                        ));
                     }
-                })?
-        {
-            let rootfs_bytes = retained_rootfs_bytes(&snapshot.snapshot_dir, &source, verdicts)?;
-            actual_bytes = actual_bytes
-                .checked_add(rootfs_bytes)
-                .ok_or(SuspendSnapshotValidationError::ArtifactSizeOverflow)?;
-            continue;
+                }
+                None => {}
+            }
         }
-        let path = snapshot.snapshot_dir.join(artifact.local_name);
+        let path = snapshot_dir.join(artifact.local_name);
         let file = match std::fs::symlink_metadata(&path) {
             Ok(file) => file,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
                 return Err(SuspendSnapshotValidationError::MissingArtifact {
-                    snapshot_dir: path_label(&snapshot.snapshot_dir),
+                    snapshot_dir: path_label(snapshot_dir),
                     artifact: artifact.local_name,
                 });
             }
@@ -469,13 +499,31 @@ pub(super) fn validate_suspend_snapshot_artifact_files(
         if !file.file_type().is_file() {
             return Err(SuspendSnapshotValidationError::ArtifactNotRegular { path });
         }
+        if artifact.kind == pplx_space_common_core::types::SnapshotArtifact::RootfsBtrfsSend
+            && let Some((_, stream_len)) = cached_stream.as_mut()
+        {
+            *stream_len = file.len();
+        }
         actual_bytes = actual_bytes
             .checked_add(file.len())
             .ok_or(SuspendSnapshotValidationError::ArtifactSizeOverflow)?;
     }
     if actual_bytes != metadata.size_bytes {
+        // Reclaim rewrites the sidecar to count the retained image before it
+        // removes the stream, and older sidecars count the stream while it
+        // exists. Both are verified quantities for the same artifact.
+        if let Some((source, stream_len)) = cached_stream {
+            let image = retained_rootfs_bytes(snapshot_dir, &source, verdicts)?;
+            let by_image = actual_bytes
+                .checked_sub(stream_len)
+                .and_then(|rest| rest.checked_add(image))
+                .ok_or(SuspendSnapshotValidationError::ArtifactSizeOverflow)?;
+            if by_image == metadata.size_bytes {
+                return Ok(());
+            }
+        }
         return Err(SuspendSnapshotValidationError::ArtifactSizeMismatch {
-            snapshot_dir: path_label(&snapshot.snapshot_dir),
+            snapshot_dir: path_label(snapshot_dir),
             declared_bytes: metadata.size_bytes,
             actual_bytes,
         });
@@ -538,8 +586,24 @@ pub(super) fn retained_sources_in_sandbox_dir(sandbox_dir: &Path) -> Vec<Retaine
             {
                 return None;
             }
-            match RootfsArtifact::resolve_meta(&metadata, &directory) {
-                Ok(Some(RootfsArtifact::RetainedSource(source))) => Some(source),
+            // Exactly the sources the validator needs: without verdicts it
+            // reports those, and only those, as pending. That covers a
+            // deferred artifact and one whose sidecar already counts the
+            // image while its stream still exists; a stream the sidecar
+            // counts needs no inspection.
+            let source_id = metadata.rootfs_send_source_id?;
+            match validate_suspend_snapshot_artifact_files(
+                &metadata,
+                &directory,
+                &RetainedSourceVerdicts::default(),
+            ) {
+                Err(SuspendSnapshotValidationError::RetainedSourcePending { .. }) => {
+                    Some(RetainedSource {
+                        sandbox_id: metadata.sandbox_id.clone(),
+                        artifact_dir: directory,
+                        source_id,
+                    })
+                }
                 _ => None,
             }
         })
@@ -552,7 +616,7 @@ pub(super) fn validate_recoverable_suspend_snapshot_dir(
     verdicts: &RetainedSourceVerdicts,
 ) -> Result<ValidatedSuspendSnapshotArtifact, SuspendSnapshotValidationError> {
     let metadata = validate_suspend_snapshot_metadata(snapshot_dir, expected_sandbox_id)?;
-    validate_suspend_snapshot_artifact_files(&metadata, verdicts)?;
+    metadata.validate_artifact_files(verdicts)?;
     Ok(metadata.into_artifact())
 }
 
@@ -600,6 +664,43 @@ pub(super) fn ensure_complete_suspend_snapshot_dir(
     Ok(())
 }
 
+/// A superseded snapshot waits here, outside the staging sweep's garbage lane,
+/// until its replacement is committed. Only publication and recovery read it.
+pub(super) const RETIRED_HOLD_PREFIX: &str = ".suspend-retired-";
+
+/// The hold for the snapshot a publication of `local_artifact_id` replaces.
+pub(super) fn retired_suspend_snapshot_dir(
+    sandbox_dir: &Path,
+    local_artifact_id: LocalArtifactId,
+) -> PathBuf {
+    suspend_snapshot_staging_parent_dir(sandbox_dir)
+        .join(format!("{RETIRED_HOLD_PREFIX}{local_artifact_id}"))
+}
+
+/// A fresh name in the staging sweep's lane. Deferred capture leaves read-only
+/// subvolumes inside retired snapshots that this service cannot delete; the
+/// sweep removes them through node-manager.
+fn garbage_suspend_snapshot_dir(sandbox_dir: &Path) -> PathBuf {
+    suspend_snapshot_staging_parent_dir(sandbox_dir).join(format!(
+        "{}{}",
+        super::recovery::staging_cleanup::RETIRED_PREFIX,
+        LocalArtifactId::new()
+    ))
+}
+
+/// Hand a hold to the sweep once the publication it belonged to is committed.
+pub(super) fn release_retired_suspend_snapshot(
+    sandbox_dir: &Path,
+    hold: &Path,
+) -> std::io::Result<Option<PathBuf>> {
+    let garbage = garbage_suspend_snapshot_dir(sandbox_dir);
+    match std::fs::rename(hold, &garbage) {
+        Ok(()) => Ok(Some(garbage)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 pub(super) fn publish_suspend_snapshot_dir(
     staging_dir: &Path,
     snapshot_dir: &Path,
@@ -612,24 +713,54 @@ pub(super) fn publish_suspend_snapshot_dir(
             .ok_or_else(|| SuspendSnapshotPublicationError::MissingParent {
                 snapshot_dir: path_label(snapshot_dir),
             })?;
-    std::fs::create_dir_all(parent).map_err(|source| {
+    let staging_parent = suspend_snapshot_staging_parent_dir(parent);
+    std::fs::create_dir_all(&staging_parent).map_err(|source| {
         SuspendSnapshotPublicationError::CreateParent {
-            parent: path_label(parent),
+            parent: path_label(&staging_parent),
             source,
         }
     })?;
 
+    // A hold exists only while a publication of this artifact is between its
+    // two renames or before its release. Resume it rather than stack on it:
+    // without a canonical snapshot the replacement never committed, so the
+    // held snapshot comes back; with this artifact canonical, it is garbage.
+    let hold = retired_suspend_snapshot_dir(parent, local_artifact_id);
+    if hold.exists() {
+        if !snapshot_dir.exists() {
+            std::fs::rename(&hold, snapshot_dir).map_err(|source| {
+                SuspendSnapshotPublicationError::RetireExisting {
+                    snapshot_dir: path_label(snapshot_dir),
+                    source,
+                }
+            })?;
+        } else if !matches!(
+            validate_complete_suspend_snapshot_dir(snapshot_dir, verdicts),
+            Ok(existing) if existing == local_artifact_id
+        ) {
+            return Err(SuspendSnapshotPublicationError::RetiredResidue {
+                retired_dir: path_label(&hold),
+            });
+        }
+    }
+
     if snapshot_dir.exists() {
         match validate_complete_suspend_snapshot_dir(snapshot_dir, verdicts) {
             Ok(existing_artifact_id) if existing_artifact_id == local_artifact_id => {
+                release_retired_suspend_snapshot(parent, &hold).map_err(|source| {
+                    SuspendSnapshotPublicationError::RetireExisting {
+                        snapshot_dir: path_label(&hold),
+                        source,
+                    }
+                })?;
                 if staging_dir.exists() {
                     ensure_complete_suspend_snapshot_dir(staging_dir, local_artifact_id, verdicts)?;
-                    std::fs::remove_dir_all(staging_dir).map_err(|source| {
-                        SuspendSnapshotPublicationError::RemoveDuplicateStaged {
+                    std::fs::rename(staging_dir, garbage_suspend_snapshot_dir(parent)).map_err(
+                        |source| SuspendSnapshotPublicationError::RetireDuplicateStaged {
                             staging_dir: path_label(staging_dir),
                             source,
-                        }
-                    })?;
+                        },
+                    )?;
                 }
                 return Ok(());
             }
@@ -644,9 +775,7 @@ pub(super) fn publish_suspend_snapshot_dir(
     }
     ensure_complete_suspend_snapshot_dir(staging_dir, local_artifact_id, verdicts)?;
 
-    let retired_dir = parent.join(format!(".snapshot-retired-{local_artifact_id}"));
-    let _ = std::fs::remove_dir_all(&retired_dir);
-    let retired_existing = match std::fs::rename(snapshot_dir, &retired_dir) {
+    let retired_existing = match std::fs::rename(snapshot_dir, &hold) {
         Ok(()) => true,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
         Err(err) => {
@@ -658,9 +787,9 @@ pub(super) fn publish_suspend_snapshot_dir(
     };
 
     if let Err(err) = std::fs::rename(staging_dir, snapshot_dir) {
-        if retired_existing && let Err(restore_err) = std::fs::rename(&retired_dir, snapshot_dir) {
+        if retired_existing && let Err(restore_err) = std::fs::rename(&hold, snapshot_dir) {
             tracing::error!(
-                old_snapshot_dir = %retired_dir.display(),
+                old_snapshot_dir = %hold.display(),
                 snapshot_dir = %snapshot_dir.display(),
                 error = %restore_err,
                 "failed to restore prior local snapshot after publication error"
@@ -673,11 +802,13 @@ pub(super) fn publish_suspend_snapshot_dir(
         });
     }
 
-    if retired_existing && let Err(err) = std::fs::remove_dir_all(&retired_dir) {
+    // Committed. The hold is garbage now; the sweep also releases a hold
+    // whose artifact is canonical, so a failure here only delays reclamation.
+    if retired_existing && let Err(err) = release_retired_suspend_snapshot(parent, &hold) {
         tracing::warn!(
-            retired_snapshot_dir = %retired_dir.display(),
+            retired_snapshot_dir = %hold.display(),
             error = %err,
-            "failed to remove retired local snapshot after publication"
+            "failed to release retired local snapshot after publication"
         );
     }
     Ok(())
