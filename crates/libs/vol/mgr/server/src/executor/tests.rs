@@ -2358,7 +2358,7 @@ async fn compress_pass_holds_every_permit_until_cpu_work_exits() {
 }
 
 #[tokio::test]
-async fn multithreaded_file_and_encrypted_compression_decode_identically() {
+async fn multithreaded_file_and_single_threaded_encrypted_compression_decode_identically() {
     use crate::crypto::decrypt_stream_blocking;
 
     let executor = compress_executor(4, 0, 4);
@@ -2416,7 +2416,9 @@ async fn multithreaded_file_and_encrypted_compression_decode_identically() {
         .acquire_compress(JobPriority::new(0), CompressPath::Encrypted)
         .await
         .unwrap();
-    assert_eq!(admission.workers(), 2);
+    // An idle pool still admits the encrypted pass on one permit.
+    assert_eq!(admission.workers(), 0);
+    assert_eq!(executor.codec.shared_available(), 3);
     let ciphertext_path = stage_encrypted_temp(
         &test_job("push"),
         &payload,
@@ -2437,7 +2439,8 @@ async fn multithreaded_file_and_encrypted_compression_decode_identically() {
         &entry_aad,
     )
     .unwrap();
-    assert_ne!(compressed, single_threaded);
+    // No zstdmt workers: the AEAD input is the single-threaded encoding.
+    assert_eq!(compressed, single_threaded);
     assert_eq!(zstd::decode_all(compressed.as_slice()).unwrap(), expected);
 }
 #[cfg(target_os = "linux")]

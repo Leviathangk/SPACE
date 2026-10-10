@@ -298,3 +298,24 @@ async fn a_grant_counts_its_calling_thread() {
         }
     }
 }
+
+#[tokio::test]
+async fn encrypted_passes_take_a_single_permit() {
+    assert_eq!(
+        extra_permits_wanted(CompressPath::Encrypted, max_threads(4)),
+        0
+    );
+    let admission = CodecAdmission::new(8, 2).with_compress_max_threads(max_threads(4));
+    for priority in [CodecPriority::Normal, CodecPriority::High] {
+        let grant = admission
+            .acquire_compress(priority, CompressPath::Encrypted)
+            .await
+            .unwrap();
+        assert_eq!(grant.workers(), 0);
+        assert_eq!(
+            admission.shared_available() + admission.reserve_available(),
+            7,
+            "an idle pool still admits the encrypted pass on its primary alone"
+        );
+    }
+}

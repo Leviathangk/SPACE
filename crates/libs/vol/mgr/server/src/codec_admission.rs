@@ -77,12 +77,18 @@ pub enum CompressPath {
 }
 
 /// Extra permits a pass on `path` asks for beyond its primary.
+///
+/// The encrypted pass pulls compressed bytes through zstd's read-mode
+/// encoder, which keeps only a job or two in flight and blocks each read on
+/// the oldest job, so extra workers buy little, data-dependent parallelism
+/// there while holding permits and job buffers. It always runs on its
+/// calling thread.
 fn extra_permits_wanted(path: CompressPath, max_threads: CompressMaxThreads) -> u32 {
     match path {
-        CompressPath::File
-        | CompressPath::Streaming
-        | CompressPath::BtrfsSend
-        | CompressPath::Encrypted => max_threads.get() - 1,
+        CompressPath::File | CompressPath::Streaming | CompressPath::BtrfsSend => {
+            max_threads.get() - 1
+        }
+        CompressPath::Encrypted => 0,
     }
 }
 

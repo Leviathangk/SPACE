@@ -4585,14 +4585,8 @@ async fn stage_encrypted_temp(
             if compress {
                 let mut zstd_reader = zstd::stream::read::Encoder::new(buf_reader, ZSTD_LEVEL)
                     .map_err(|e| JobError::Permanent(format!("zstd encoder init: {e}")))?;
-                // Same worker contract as `copy_encode_with_workers`: the
-                // AEAD stage stays on this thread and pulls compressed bytes
-                // from the zstdmt workers.
-                if workers > 0 {
-                    zstd_reader
-                        .multithread(workers)
-                        .map_err(|e| JobError::Permanent(format!("zstd encoder workers: {e}")))?;
-                }
+                // Single-threaded by admission policy: read-mode zstdmt keeps
+                // about one job in flight, so workers would add no parallelism.
                 crypto::encrypt_stream_blocking(&mut zstd_reader, &mut dst_file, &dek, &entry_aad)
                     .map_err(crypto_error_to_job_error)?;
             } else {
