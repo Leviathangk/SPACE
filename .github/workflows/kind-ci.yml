@@ -274,7 +274,36 @@ jobs:
             echo "::error::The Kind data plane at 127.0.0.1:8090 never became healthy"
             exit 1
           fi
-          bash scripts/tests/smoke-kind-typed.sh all "${SMOKE_SHARD}"
+          # DIAGNOSTIC ONLY (diag/oci-busy-unmount-trace): loop the OCI build under a host-wide sampler.
+          sudo python3 scripts/tests/diag-sample-mount-holders.py --interval 0.05 \
+            >"${RUNNER_TEMP}/holders.jsonl" 2>"${RUNNER_TEMP}/holders.err" &
+          sampler=$!
+          if [[ "${SMOKE_SHARD}" == "3/4" ]]; then
+            bash scripts/tests/smoke-kind-typed.sh all "${SMOKE_SHARD}" || echo "DIAG shard suite exit=$?"
+          fi
+          fails=0
+          for i in $(seq 1 30); do
+            echo "=== DIAG ITER ${i} $(date -u +%T.%N)"
+            if ! SPACE_SMOKE_BACKEND=kind SPACE_SMOKE_API_SURFACE=ecw uv run --frozen --python 3.11 \
+                -m space_smoke run local.ecw_template_build_from_oci_boots; then
+              fails=$((fails + 1)); echo "=== DIAG ITER ${i} FAILED $(date -u +%T.%N)"
+            fi
+          done
+          sudo kill "${sampler}" || true
+          echo "DIAG_SUMMARY shard=${SMOKE_SHARD} failures=${fails}/30"
+          echo "::group::OCI busy diagnostics from build-manager"
+          for pod in $(kubectl --context kind-space-local -n space get pods -l space.pplx.net/chart=space-node-stack -o name); do
+            echo "--- ${pod}"
+            timeout 30s kubectl --context kind-space-local -n space exec "${pod}" -c node-stack -- \
+              bash -c 'cat /space/logs/oci-busy-diag.log 2>/dev/null; findmnt -o TARGET,SOURCE,PROPAGATION /space/cache /' || true
+          done
+          echo "::endgroup::"
+          echo "::group::Host sampler summary"
+          head -c 2000 "${RUNNER_TEMP}/holders.err" || true
+          wc -l "${RUNNER_TEMP}/holders.jsonl" || true
+          python3 scripts/tests/diag-summarize-holders.py "${RUNNER_TEMP}/holders.jsonl" | tail -n 400 || true
+          echo "::endgroup::"
+          [[ "${fails}" == 0 ]]
 
       # Every command below is bounded, and each step has a deadline: a wedged
       # apiserver, Tilt, or node must not hold the job until its own deadline and

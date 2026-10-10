@@ -585,13 +585,18 @@ impl OciCleanup {
 
     async fn run(&mut self) -> Result<(), OciBuildError> {
         if let Some(mount_path) = &self.active_mount {
-            run(
+            let unmounted = run(
                 self.runner.as_ref(),
                 OciCommand::UnmountSnapshot {
                     mount_path: mount_path.clone(),
                 },
             )
-            .await?;
+            .await;
+            if let Err(error) = unmounted {
+                // DIAGNOSTIC ONLY (diag/oci-busy-unmount-trace): capture the holder.
+                busy_unmount_diagnostics(mount_path).await;
+                return Err(error);
+            }
             self.active_mount = None;
         }
         if let Some(snapshot_key) = &self.snapshot_key {
@@ -630,6 +635,26 @@ impl OciCleanup {
             self.owned_image_reference = None;
         }
         Ok(())
+    }
+}
+
+const BUSY_DIAG_SCRIPT: &str = include_str!("containerd/busy-diag.sh");
+
+async fn busy_unmount_diagnostics(mount_path: &Path) {
+    let output = TokioCommand::new("bash")
+        .arg("-c")
+        .arg(BUSY_DIAG_SCRIPT)
+        .arg("busy-diag")
+        .arg(mount_path)
+        .output()
+        .await;
+    match output {
+        Ok(output) => tracing::warn!(
+            stdout = %String::from_utf8_lossy(&output.stdout),
+            stderr = %String::from_utf8_lossy(&output.stderr),
+            "OCI busy unmount diagnostics"
+        ),
+        Err(error) => tracing::warn!(%error, "OCI busy unmount diagnostics failed to run"),
     }
 }
 
