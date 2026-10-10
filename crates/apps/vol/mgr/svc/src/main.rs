@@ -107,10 +107,11 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_CODEC_PRIORITY_RESERVE)]
     codec_priority_reserve: usize,
 
-    /// Most zstd threads one upload compression pass may run. Each thread
-    /// past the first takes an extra codec permit, only from idle shared
-    /// capacity and never from the priority reserve, so a busy node keeps one
-    /// thread per pass. 1 disables multithreaded compression.
+    /// Most codec permits one upload compression pass may hold, counting its
+    /// calling thread: N permits run N - 1 zstd workers beside it. Permits
+    /// past the first come only from idle shared capacity, never from the
+    /// priority reserve, so a busy node compresses each pass on its calling
+    /// thread alone. 1 disables multithreaded compression.
     #[arg(
         long,
         env = "SPACE_VOLUME_CODEC_COMPRESS_MAX_THREADS",

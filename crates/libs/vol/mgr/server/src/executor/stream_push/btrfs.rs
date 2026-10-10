@@ -140,7 +140,7 @@ impl TransferExecutor {
                 }
             } => grant?,
         };
-        let threads = codec.threads();
+        let workers = codec.workers();
         let input = RemoteReader {
             stream: Box::pin(stream),
             buffer: std::io::Cursor::new(Vec::new()),
@@ -171,7 +171,7 @@ impl TransferExecutor {
                 };
                 let result = {
                     let mut buffered = std::io::BufWriter::with_capacity(PIPE_BYTES, &mut output);
-                    copy_encode_with_threads(&mut input, &mut buffered, threads)
+                    copy_encode_with_workers(&mut input, &mut buffered, workers)
                         .and_then(|()| buffered.flush())
                 };
                 if result.is_ok() {
@@ -216,7 +216,7 @@ impl TransferExecutor {
                     .suffix(".zst.tmp")
                     .tempfile_in(directory)?;
                 if compress {
-                    copy_encode_with_threads(&mut input, &mut temp, threads)?;
+                    copy_encode_with_workers(&mut input, &mut temp, workers)?;
                 } else {
                     std::io::copy(&mut input, &mut temp)?;
                 }

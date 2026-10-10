@@ -2313,7 +2313,7 @@ async fn compress_pass_holds_every_permit_until_cpu_work_exits() {
         .acquire_compress(JobPriority::new(0), CompressPath::File)
         .await
         .unwrap();
-    assert_eq!(admission.threads(), 3);
+    assert_eq!(admission.workers(), 2);
     let caller = tokio::spawn({
         let source = source.clone();
         async move { compress_to_temp(&source, Some(admission)).await }
@@ -2372,7 +2372,7 @@ async fn multithreaded_file_and_encrypted_compression_decode_identically() {
         .acquire_compress(JobPriority::new(0), CompressPath::File)
         .await
         .unwrap();
-    assert_eq!(admission.threads(), 3);
+    assert_eq!(admission.workers(), 2);
     let (temp, logical) = compress_to_temp(&source, Some(admission)).await.unwrap();
     assert_eq!(logical, expected.len() as u64);
     assert_eq!(executor.codec.shared_available(), 4);
@@ -2388,6 +2388,16 @@ async fn multithreaded_file_and_encrypted_compression_decode_identically() {
     sink.write_all(&encoded).unwrap();
     assert!(sink.finish().unwrap());
     assert_eq!(decoded, expected);
+
+    // A single-permit grant compresses on the calling thread, byte for byte
+    // what `copy_encode` wrote before multithreading.
+    let single = compress_executor(4, 0, 1)
+        .acquire_compress(JobPriority::new(0), CompressPath::File)
+        .await
+        .unwrap();
+    assert_eq!(single.workers(), 0);
+    let (temp, _) = compress_to_temp(&source, Some(single)).await.unwrap();
+    assert_eq!(std::fs::read(&temp).unwrap(), single_threaded);
 
     let encryption = TransferEncryption {
         organization_id: "019e31d9-79a6-7132-b90f-007f1c62ddea".parse().unwrap(),
@@ -2406,7 +2416,7 @@ async fn multithreaded_file_and_encrypted_compression_decode_identically() {
         .acquire_compress(JobPriority::new(0), CompressPath::Encrypted)
         .await
         .unwrap();
-    assert_eq!(admission.threads(), 3);
+    assert_eq!(admission.workers(), 2);
     let ciphertext_path = stage_encrypted_temp(
         &test_job("push"),
         &payload,

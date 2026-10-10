@@ -17,8 +17,9 @@
 //!
 //! An upload compression pass ([`CodecAdmission::acquire_compress`]) takes
 //! its primary permit exactly like any other pass, then may top up with
-//! extra permits for zstd threads, taken without waiting and only from idle
-//! shared capacity.
+//! extra permits, taken without waiting and only from idle shared capacity.
+//! The primary backs the calling thread, which reads input, copies it into
+//! zstd jobs and writes output; each extra backs one zstd worker.
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -34,10 +35,11 @@ pub enum CodecPriority {
     High,
 }
 
-/// Most zstd threads one upload compression pass may run. Every thread past
-/// the first is backed by an extra codec permit taken only from idle shared
-/// capacity, so contended passes keep running single-threaded. `1`, the
-/// default, disables multithreaded compression.
+/// Most codec permits one upload compression pass may hold, counting the
+/// calling thread. A pass holding N permits runs N - 1 zstd workers beside
+/// the calling thread. Every permit past the first is an extra taken only
+/// from idle shared capacity, so contended passes keep running on the
+/// calling thread alone. `1`, the default, keeps compression synchronous.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompressMaxThreads(NonZeroU32);
 
@@ -114,7 +116,7 @@ impl CodecAdmission {
         }
     }
 
-    /// Let upload compression passes run up to `max` zstd threads.
+    /// Let upload compression passes hold up to `max` permits.
     pub fn with_compress_max_threads(mut self, max: CompressMaxThreads) -> Self {
         self.compress_max_threads = max;
         self
@@ -182,13 +184,14 @@ impl CodecAdmission {
         let extras = (grant > 0)
             .then(|| Arc::clone(&self.shared).try_acquire_many_owned(grant).ok())
             .flatten();
-        let threads = 1 + extras.as_ref().map_or(0, |extras| {
+        // The primary backs the calling thread; each extra backs a worker.
+        let workers = extras.as_ref().map_or(0, |extras| {
             u32::try_from(extras.num_permits()).expect("extras fit the requested u32")
         });
         Ok(CompressGrant {
             primary,
             _extras: extras,
-            threads,
+            workers,
         })
     }
 
@@ -248,19 +251,20 @@ impl CodecSlot {
     }
 }
 
-/// Codec admission held by one upload compression pass. Its zstd thread
+/// Codec admission held by one upload compression pass. Its zstd worker
 /// count is fixed when the encoder starts, so the extras are held until the
-/// pass ends; only the primary can be lent.
+/// pass ends; only the primary, which backs the calling thread, can be lent.
 pub struct CompressGrant {
     primary: CodecSlot,
     _extras: Option<OwnedSemaphorePermit>,
-    threads: u32,
+    workers: u32,
 }
 
 impl CompressGrant {
-    /// zstd threads this grant pays for: the primary plus one per extra.
-    pub fn threads(&self) -> u32 {
-        self.threads
+    /// zstd workers this grant pays for, one per extra permit. `0` means
+    /// compress synchronously on the calling thread.
+    pub fn workers(&self) -> u32 {
+        self.workers
     }
 
     /// Lend the primary permit; see [`CodecSlot::lend`].
@@ -284,7 +288,7 @@ impl From<CodecSlot> for CompressGrant {
         Self {
             primary,
             _extras: None,
-            threads: 1,
+            workers: 0,
         }
     }
 }

@@ -95,8 +95,9 @@ async fn frame_content_size(path: &Path) -> Option<u64> {
 /// request when the pod has no CPU limit.
 ///
 /// A decode pass is single-threaded and holds one permit. An upload
-/// compression pass runs one zstd thread per permit it holds, and holds more
-/// than one only when shared permits sit idle (see [`CompressGrant`]).
+/// compression pass holds one permit for its calling thread plus one per
+/// zstd worker, and holds more than one only when shared permits sit idle
+/// (see [`CompressGrant`]).
 /// `spawn_blocking`'s pool is ~512 threads, so without admission a pull
 /// storm runs every decode concurrently on the pod's CPU share — N jobs
 /// each at 1/N speed instead of share-many at full speed. Bounding to the share keeps the same
@@ -1004,20 +1005,20 @@ fn ensure_pull_failure_reason(error: JobError) -> JobError {
     error.with_default_failure_reason(JobFailureReason::Internal)
 }
 
-/// `zstd::stream::copy_encode` at [`ZSTD_LEVEL`] with `threads` zstd
-/// threads. One thread is exactly `copy_encode`: compression runs inside the
-/// caller. More threads hand the input to that many zstdmt workers while the
-/// caller only copies input in and output out. Either way the result is one
-/// standard zstd frame with no pledged content size, which every existing
-/// decoder reads.
-fn copy_encode_with_threads(
+/// `zstd::stream::copy_encode` at [`ZSTD_LEVEL`] with `workers` zstdmt
+/// workers. Zero workers is exactly `copy_encode`: compression runs on the
+/// calling thread. Otherwise the calling thread keeps reading input, copying
+/// it into zstd jobs and writing output while the workers compress, so it
+/// still needs a core of its own. Either way the result is one standard zstd
+/// frame with no pledged content size, which every existing decoder reads.
+fn copy_encode_with_workers(
     mut source: impl Read,
     destination: impl Write,
-    threads: u32,
+    workers: u32,
 ) -> std::io::Result<()> {
     let mut encoder = zstd::stream::write::Encoder::new(destination, ZSTD_LEVEL)?;
-    if threads > 1 {
-        encoder.multithread(threads)?;
+    if workers > 0 {
+        encoder.multithread(workers)?;
     }
     std::io::copy(&mut source, &mut encoder)?;
     encoder.finish()?;
@@ -1031,7 +1032,7 @@ fn copy_encode_with_threads(
 /// `admission` (if the caller took one) is moved into the blocking task and
 /// released only when the CPU pass exits, so a cancelled caller cannot free
 /// its permits while the detached `spawn_blocking` keeps burning CPU. The
-/// pass runs one zstd thread per permit it holds.
+/// pass runs one zstd worker per extra permit it holds.
 async fn compress_to_temp(
     src: &Path,
     admission: Option<CompressGrant>,
@@ -1047,13 +1048,13 @@ async fn compress_to_temp(
     let tmp = tmp_path.clone();
 
     tokio::task::spawn_blocking(move || -> Result<(), JobError> {
-        let threads = admission.as_ref().map_or(1, CompressGrant::threads);
+        let workers = admission.as_ref().map_or(0, CompressGrant::workers);
         let _admission = admission;
         let mut reader = std::fs::File::open(&src)
             .map_err(|e| JobError::Permanent(format!("open source for compression: {e}")))?;
         let mut writer = std::fs::File::create(&tmp)
             .map_err(|e| JobError::Permanent(format!("create compression temp file: {e}")))?;
-        copy_encode_with_threads(&mut reader, &mut writer, threads)
+        copy_encode_with_workers(&mut reader, &mut writer, workers)
             .map_err(|e| JobError::Permanent(format!("zstd compress: {e}")))?;
         page_cache::advise_dontneed(&reader, &src, "compress volume upload input");
         page_cache::advise_dontneed(&writer, &tmp, "write compressed volume upload temp");
@@ -3488,8 +3489,9 @@ pub struct TransferExecutorConfig {
     /// permits. `None` disables priority-aware admission (all jobs share
     /// one pool). Derived from the lowest configured pull priority band.
     pub codec_priority_threshold: Option<JobPriority>,
-    /// Upper bound on zstd threads per upload compression pass, granted
-    /// opportunistically from idle shared codec permits.
+    /// Most codec permits one upload compression pass may hold, counting its
+    /// calling thread; extras are granted opportunistically from idle shared
+    /// codec permits.
     pub codec_compress_max_threads: CompressMaxThreads,
     /// Process-wide high watermark for streamed output bytes awaiting
     /// writeback and cache eviction. `0` uses
@@ -3594,7 +3596,7 @@ impl TransferExecutor {
     }
 
     /// [`Self::acquire_codec_permit`] for an upload compression pass, topped
-    /// up with idle shared permits for extra zstd threads.
+    /// up with idle shared permits for zstd workers.
     async fn acquire_compress(
         &self,
         priority: JobPriority,
@@ -4572,7 +4574,7 @@ async fn stage_encrypted_temp(
         );
         let job_id = job.job_id;
         tokio::task::spawn_blocking(move || -> Result<(), JobError> {
-            let threads = admission.as_ref().map_or(1, CompressGrant::threads);
+            let workers = admission.as_ref().map_or(0, CompressGrant::workers);
             let _admission = admission;
             let src_file = std::fs::File::open(&src_path_buf)
                 .map_err(|e| JobError::Permanent(format!("open source for encrypt: {e}")))?;
@@ -4583,12 +4585,12 @@ async fn stage_encrypted_temp(
             if compress {
                 let mut zstd_reader = zstd::stream::read::Encoder::new(buf_reader, ZSTD_LEVEL)
                     .map_err(|e| JobError::Permanent(format!("zstd encoder init: {e}")))?;
-                // Same thread contract as `copy_encode_with_threads`: the
+                // Same worker contract as `copy_encode_with_workers`: the
                 // AEAD stage stays on this thread and pulls compressed bytes
                 // from the zstdmt workers.
-                if threads > 1 {
+                if workers > 0 {
                     zstd_reader
-                        .multithread(threads)
+                        .multithread(workers)
                         .map_err(|e| JobError::Permanent(format!("zstd encoder workers: {e}")))?;
                 }
                 crypto::encrypt_stream_blocking(&mut zstd_reader, &mut dst_file, &dek, &entry_aad)
@@ -4604,7 +4606,7 @@ async fn stage_encrypted_temp(
                 subject_id,
                 enc_path = %enc_path_buf.display(),
                 compress,
-                compress_threads = threads,
+                compress_workers = workers,
                 "compress + encrypt finished"
             );
             Ok(())
@@ -4761,7 +4763,7 @@ impl TransferExecutor {
                             codec_wait_started_at,
                         );
                     }
-                    let compress_threads = admission.as_ref().map_or(1, CompressGrant::threads);
+                    let compress_workers = admission.as_ref().map_or(0, CompressGrant::workers);
                     let (zst_path, _) = compress_to_temp(upload_path, admission).await?;
                     tracing::debug!(
                         job_id = %job.job_id,
@@ -4769,7 +4771,7 @@ impl TransferExecutor {
                         local_path = %p.local_path,
                         tmp_path = %zst_path.display(),
                         original_bytes = original_size,
-                        compress_threads,
+                        compress_workers,
                         "compressed artifact for upload"
                     );
                     transient_temps.push(zst_path.clone());

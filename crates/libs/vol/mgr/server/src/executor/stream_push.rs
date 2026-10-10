@@ -234,16 +234,17 @@ impl TransferExecutor {
     }
 }
 
-/// A producer's zstd thread count is fixed for its frame when the encoder
-/// starts, so lending must not change which permits back those threads. Only
-/// the primary codec permit is lent during backpressure; the extras stay
-/// owned until the producer exits. While `PipeWriter::write` blocks, zstd
-/// receives no new input, so its workers can only finish the jobs already
-/// dispatched (at most one ~8 MiB job each, tens of milliseconds) and then
-/// idle; only during that drain can the producer use one core more than the
-/// extras it still holds. Lending the primary therefore frees one permit to
-/// queued codec work, as it did single-threaded, and the producer reacquires
-/// only that one before encoding resumes.
+/// A producer's zstd worker count is fixed for its frame when the encoder
+/// starts (zstd rejects changing it mid-frame), so lending must not change
+/// which permits back those workers. The primary permit backs the calling
+/// thread, which is the one blocked in `PipeWriter::write` during
+/// backpressure, so only the primary is lent; the extras stay owned until
+/// the producer exits. While the write blocks, zstd receives no new input, so
+/// its workers can only finish the jobs already dispatched and then idle, and
+/// the extras keep backing exactly those workers. Lending the primary
+/// therefore frees one permit to queued codec work, as it did
+/// single-threaded, and the producer reacquires only that one before
+/// encoding resumes.
 ///
 /// The cost is idle capacity. Streaming is the default upload path, and
 /// when object storage drains parts slower than zstd fills them a producer
@@ -272,7 +273,7 @@ fn compression_source(
         // cancelling wakes a backpressured write. Producer admission survives
         // until exit; codec admission is owned whenever encoding can run.
         let started = Instant::now();
-        let threads = admission.codec.threads();
+        let workers = admission.codec.workers();
         let mut input = SourceReader {
             file,
             cancellation: producer_token.clone(),
@@ -291,7 +292,7 @@ fn compression_source(
             // before crossing the blocking/async bridge; otherwise each zstd
             // block can wake the uploader for just a handful of bytes.
             let mut buffered = std::io::BufWriter::with_capacity(PIPE_BYTES, &mut output);
-            copy_encode_with_threads(&mut input, &mut buffered, threads)
+            copy_encode_with_workers(&mut input, &mut buffered, workers)
                 .and_then(|()| buffered.flush())
                 .and_then(|()| {
                     if input.consumed == size {
@@ -317,7 +318,7 @@ fn compression_source(
             logical_bytes = input.consumed,
             producer_ms = started.elapsed().as_millis(),
             pipe_write_ms = output.waited.as_millis(),
-            compress_threads = threads,
+            compress_workers = workers,
             success = result.is_ok(),
             "stream upload producer finished"
         );

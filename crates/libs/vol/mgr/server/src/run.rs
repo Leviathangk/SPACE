@@ -238,8 +238,9 @@ pub struct VolmgrRunConfig {
     pub codec_concurrency: usize,
     /// Codec permits reserved for jobs at or above the lowest pull priority band.
     pub codec_priority_reserve: usize,
-    /// Most zstd threads per upload compression pass; extras come only from
-    /// idle shared codec permits. 1 keeps compression single-threaded.
+    /// Most codec permits per upload compression pass, counting its calling
+    /// thread; extras come only from idle shared codec permits. 1 keeps
+    /// compression single-threaded.
     pub codec_compress_max_threads: std::num::NonZeroU32,
     /// Process-wide high watermark for streamed output awaiting writeback.
     pub stream_writeback_budget_bytes: u64,

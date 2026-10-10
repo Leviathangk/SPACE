@@ -209,7 +209,7 @@ async fn compress_extras_come_only_from_idle_shared_permits() {
         .acquire_compress(CodecPriority::High, CompressPath::File)
         .await
         .unwrap();
-    assert_eq!(high.threads(), 3);
+    assert_eq!(high.workers(), 2);
     assert_eq!(admission.reserve_available(), 2);
     assert_eq!(admission.shared_available(), 1);
     drop(high);
@@ -222,14 +222,14 @@ async fn compress_extras_come_only_from_idle_shared_permits() {
         .acquire_compress(CodecPriority::Normal, CompressPath::File)
         .await
         .unwrap();
-    assert_eq!(first.threads(), 2);
+    assert_eq!(first.workers(), 1);
     assert_eq!(admission.shared_available(), 1);
     // The next pass starts at once on that spare permit, single-threaded.
     let second = admission
         .acquire_compress(CodecPriority::Normal, CompressPath::File)
         .await
         .unwrap();
-    assert_eq!(second.threads(), 1);
+    assert_eq!(second.workers(), 0);
     assert_eq!(admission.shared_available(), 0);
     // With the shared pool exhausted, a protected pass still starts from the
     // reserve, and nothing is ever borrowed from the reserve for extras.
@@ -237,7 +237,7 @@ async fn compress_extras_come_only_from_idle_shared_permits() {
         .acquire_compress(CodecPriority::High, CompressPath::File)
         .await
         .unwrap();
-    assert_eq!(protected.threads(), 1);
+    assert_eq!(protected.workers(), 0);
     assert_eq!(admission.reserve_available(), 2);
 
     drop((first, second, protected));
@@ -261,7 +261,7 @@ async fn contended_compress_passes_run_single_threaded() {
     held.truncate(2);
     let first = poll(first.as_mut()).unwrap().unwrap();
     let second = poll(second.as_mut()).unwrap().unwrap();
-    assert_eq!((first.threads(), second.threads()), (1, 1));
+    assert_eq!((first.workers(), second.workers()), (0, 0));
     drop((first, second, held));
     assert_eq!(admission.shared_available(), 4);
 
@@ -271,6 +271,30 @@ async fn contended_compress_passes_run_single_threaded() {
         .acquire_compress(CodecPriority::Normal, CompressPath::File)
         .await
         .unwrap();
-    assert_eq!(grant.threads(), 1);
+    assert_eq!(grant.workers(), 0);
     assert_eq!(admission.shared_available(), 3);
+}
+
+#[tokio::test]
+async fn a_grant_counts_its_calling_thread() {
+    for max in [1, 2, 4] {
+        let admission = CodecAdmission::new(8, 0).with_compress_max_threads(max_threads(max));
+        for path in [
+            CompressPath::File,
+            CompressPath::Streaming,
+            CompressPath::BtrfsSend,
+        ] {
+            let grant = admission
+                .acquire_compress(CodecPriority::Normal, path)
+                .await
+                .unwrap();
+            let held = 8 - admission.shared_available();
+            assert_eq!(held, max as usize, "an idle pool grants the full pass");
+            assert_eq!(
+                grant.workers() as usize,
+                held - 1,
+                "the primary backs the calling thread, each extra one worker"
+            );
+        }
+    }
 }

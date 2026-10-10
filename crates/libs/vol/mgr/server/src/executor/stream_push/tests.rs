@@ -667,7 +667,7 @@ async fn multithreaded_producer_lends_its_primary_and_keeps_extras_under_backpre
                 compress: true,
                 snapshot_upload_mode: SnapshotUploadMode::from_buffer_budget_bytes(64 * MIB)
                     .unwrap(),
-                // 4 shared + 1 reserved permits, up to 4 threads per pass.
+                // 4 shared + 1 reserved permits, up to 4 permits per pass.
                 codec_concurrency: 5,
                 codec_priority_reserve: 1,
                 codec_priority_threshold: Some(JobPriority::new(100)),
@@ -694,7 +694,7 @@ async fn multithreaded_producer_lends_its_primary_and_keeps_extras_under_backpre
             async move { push(&executor, &server, &payload, cancellation).await }
         });
         server.wait_for(|s| s.puts > 0).await;
-        // The producer runs 3 threads (primary + 2 extras), leaving one
+        // The producer holds 3 permits (primary + 2 worker extras), leaving one
         // shared permit idle. Queued work needing two permits proceeds only
         // because the backpressured producer lends its primary.
         let borrowed = tokio::time::timeout(Duration::from_secs(5), async {
