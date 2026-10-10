@@ -351,10 +351,37 @@ pub(crate) mod service_tests {
     /// `pub(crate)` because sandbox events are emitted from several modules and the
     /// tests that assert them live beside those modules, not here. Keeping this
     /// private to this file is what made emissions elsewhere look untestable.
-    #[derive(Clone, Default)]
+    /// Keep a process-wide dispatcher registered before any test installs a
+    /// scoped one. While a scoped subscriber is the only dispatcher in the
+    /// process, `tracing-core` rebuilds its callsite interest cache through
+    /// whichever thread registers a new callsite first; a concurrent test
+    /// thread without a subscriber then sets the global max level to OFF, and
+    /// the capturing thread's events are dropped before dispatch. With a
+    /// second dispatcher present, the rebuild consults every dispatcher.
+    pub(crate) fn anchor_global_tracing_dispatch() {
+        static ANCHORED: std::sync::Once = std::sync::Once::new();
+        ANCHORED.call_once(|| {
+            // Another global subscriber already serves the same purpose.
+            let _ = tracing::subscriber::set_global_default(
+                tracing::subscriber::NoSubscriber::default(),
+            );
+        });
+    }
+
+    #[derive(Clone)]
     pub(crate) struct SandboxEventCapture {
         pub(crate) types: Arc<Mutex<Vec<String>>>,
         pub(crate) events: Arc<Mutex<Vec<std::collections::BTreeMap<String, String>>>>,
+    }
+
+    impl Default for SandboxEventCapture {
+        fn default() -> Self {
+            anchor_global_tracing_dispatch();
+            Self {
+                types: Arc::default(),
+                events: Arc::default(),
+            }
+        }
     }
 
     impl<S> tracing_subscriber::Layer<S> for SandboxEventCapture
@@ -394,6 +421,7 @@ pub(crate) mod service_tests {
 
     impl LogFieldCapture {
         pub(crate) fn new(field: &'static str) -> Self {
+            anchor_global_tracing_dispatch();
             Self {
                 field,
                 values: Arc::new(Mutex::new(Vec::new())),
