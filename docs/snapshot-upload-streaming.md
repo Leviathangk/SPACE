@@ -138,12 +138,14 @@ actual snapshot bucket used by that canary, including non-production buckets.
 ## Streaming from retained btrfs sources
 
 `SPACE_SNAPSHOT_STREAM_BTRFS_SEND=true` on sandbox-manager opts new btrfs
-captures into retaining an immutable `rootfs.btrfs-source` bundle. It defers
-send-file creation only when volume-manager advertises streaming support
+suspend captures into retaining an immutable `rootfs.btrfs-source` bundle. It
+defers send-file creation only when volume-manager advertises streaming support
 (compression enabled, a positive upload buffer budget, and an authorized
-node-manager capability probe). The default remains
-the existing materialized path. LUKS artifacts keep their existing upload path;
-this option changes the btrfs-send codec, not encryption policy.
+node-manager capability probe) and node-manager advertises source inspection.
+The default remains the existing materialized path. Named operation snapshots
+always materialize: they have no local sidecar to hold a source identity. LUKS
+artifacts keep their existing upload path; this option changes the btrfs-send
+codec, not encryption policy.
 
 Each bundle contains private copy-on-write snapshots of the frozen rootfs and
 its template parent, plus a manifest binding their read-only subvolume UUIDs to
@@ -206,9 +208,58 @@ Turning the capture option off stops new deferred captures. Setting the upload
 budget to zero changes how existing source jobs upload; it does not remove their
 source dependencies. Before downgrading binaries, drain source jobs and materialize
 any retained local artifacts needed by old readers using `BtrfsMaterializeRootfsSend`.
+Sandbox-manager binaries that predate source inspection read the bundle directly
+and fail on every deferred artifact. Rolling back to one also requires their
+local `size_bytes` to describe the materialized stream, so reconcile that
+metadata after materializing.
 Do not downgrade node-manager while source-aware volume jobs remain. Source cleanup
 continues while streaming is disabled. Normal artifact retirement reclaims the
 original bundle; the upload lease has independent terminal cleanup.
+
+### Sandbox-manager's view of a retained source
+
+The bundle's source subvolume keeps the sandbox jail's ownership, which
+sandbox-manager cannot traverse, so node-manager is the bundle's only reader.
+Sandbox-manager learns the source identity and the retained rootfs length from
+the capture response, and persists the identity as `snapshot.json`
+`rootfs_send_source_id`. It never opens the bundle or its manifest. A local
+artifact's btrfs-send rootfs is its `rootfs.btrfs-send` file when present.
+Otherwise, a persisted identity names a retained source. For a deferred capture,
+the local `size_bytes` counts the retained rootfs length; a stream length is a
+different quantity and is never substituted for it.
+
+`BtrfsInspectSendSource` is node-manager's read-only check of one source. It
+verifies the manifest identity, the subvolume lineage, and the read-only state,
+then returns the rootfs length. It runs on node-manager's diagnostic probe lane,
+not the filesystem permits that suspend and restore receive share. `NOT_FOUND`
+means the bundle is absent and `FAILED_PRECONDITION` that it is unusable. Any
+other status, including `UNIMPLEMENTED` from an older node-manager, proves
+nothing about the artifact.
+
+| Caller | Present | Absent | Unusable | No answer |
+| --- | --- | --- | --- | --- |
+| Suspend publication | Uses the capture response, without another call | — | — | — |
+| Backup preparation | Streams when volume-manager supports it; otherwise materializes this source first | Fails the attempt | Fails the attempt | Fails the attempt for retry |
+| Backup and reupload preconditions | Proceed | Terminal missing marker | Terminal missing marker | `Internal`, retried |
+| Artifact validation: publication recovery, quarantine adoption, cleanup completion, orphan inventory | Complete if the local sizes match | Missing artifact | Evidence of an unusable artifact | Pending: retried; never quarantined or pruned |
+
+Synchronous validation never waits on node-manager. Its async callers inspect
+first and pass the answers in:
+- startup recovery, for interrupted publications;
+- quarantine adoption and cleanup completion, under their artifact fences;
+- each periodic recovery and orphan-inventory batch, for exactly the rows or
+  directories that batch will validate.
+
+Answers are not cached across batches. Background inspections run two at a
+time, with a two-second deadline and a ten-second budget per batch. Periodic
+recovery remembers when it last tried each source and starts every batch with
+the sources tried least recently, so slow sources cannot keep the rest waiting. `snapshot.retained_source.inspection`
+counts outcomes by `outcome` and, when unanswered, gRPC `code`.
+`snapshot.retained_source.pending` and
+`snapshot.retained_source.pending_oldest_age_seconds` track sources that periodic
+recovery could not resolve, from their first unresolved pass until an answer. A
+persistent `unimplemented` or `permission_denied` code indicates a version or
+socket-identity mismatch, not a missing artifact.
 
 ### Isolated btrfs transfer measurement
 

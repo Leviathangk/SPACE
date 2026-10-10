@@ -227,11 +227,20 @@ pub(crate) const SNAPSHOT_METADATA_FILENAME: &str = "snapshot.json";
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SnapshotMetadataWriteError {
-    #[error("stat {artifact} failed: {source}")]
+    #[error("stat {path} failed: {source}")]
     StatArtifact {
-        artifact: &'static str,
+        path: PathBuf,
         #[source]
         source: std::io::Error,
+    },
+    #[error(transparent)]
+    ResolveRootfs(#[from] crate::retained_source::RootfsResolveError),
+    #[error(
+        "retained send source {source_id} in {artifact_dir} has no rootfs size from node-manager"
+    )]
+    UnsizedRetainedSource {
+        artifact_dir: PathBuf,
+        source_id: uuid::Uuid,
     },
     #[error("snapshot metadata serialization failed: {0}")]
     Serialize(#[from] serde_json::Error),
@@ -610,22 +619,6 @@ pub(crate) fn upload_artifacts_for_meta(meta: &SnapshotMeta) -> Vec<Artifact> {
     }
 }
 
-/// Resolve the local representation for presence and size checks. The
-/// privileged reader separately verifies descriptors and retained identity.
-pub(crate) fn local_artifact_path(snapshot_dir: &Path, artifact: &Artifact) -> PathBuf {
-    let path = snapshot_dir.join(artifact.local_name);
-    if artifact.kind == SnapshotArtifact::RootfsBtrfsSend
-        && !path.exists()
-        && snapshot_dir
-            .join("rootfs.btrfs-source/source.json")
-            .is_file()
-    {
-        snapshot_dir.join("rootfs.btrfs-source/source/rootfs.ext4")
-    } else {
-        path
-    }
-}
-
 /// Compute the snapshot's logical size from the on-disk VM artifacts and
 /// write the `snapshot.json` sidecar so it can be uploaded as a regular
 /// staged artifact alongside them.
@@ -638,12 +631,22 @@ pub(crate) fn local_artifact_path(snapshot_dir: &Path, artifact: &Artifact) -> P
 /// (rather than after the uploads finish) lets the metadata ride the same
 /// reflink-staged push path as the VM artifacts, so it never races the
 /// reclamation of `snapshot_dir`.
+///
+/// `meta.rootfs_send_source_id` names a retained source. When no send file
+/// exists, `retained_rootfs_bytes` is node-manager's length for that source.
 pub(crate) fn write_snapshot_metadata(
     meta: &SnapshotMeta,
     snapshot_dir: &Path,
     vm_artifacts: &[Artifact],
+    retained_rootfs_bytes: Option<u64>,
 ) -> Result<SnapshotMeta, SnapshotMetadataWriteError> {
-    write_snapshot_metadata_to(meta, snapshot_dir, vm_artifacts, snapshot_dir)
+    write_snapshot_metadata_to(
+        meta,
+        snapshot_dir,
+        vm_artifacts,
+        snapshot_dir,
+        retained_rootfs_bytes,
+    )
 }
 
 pub(crate) fn write_snapshot_metadata_to(
@@ -651,38 +654,40 @@ pub(crate) fn write_snapshot_metadata_to(
     artifact_dir: &Path,
     vm_artifacts: &[Artifact],
     metadata_dir: &Path,
+    retained_rootfs_bytes: Option<u64>,
 ) -> Result<SnapshotMeta, SnapshotMetadataWriteError> {
+    let btrfs_send = format_from_meta(meta) == SuspendSnapshotFormat::BtrfsSend;
+    let rootfs_send_source_id = meta.rootfs_send_source_id.filter(|_| btrfs_send);
+    let stat = |path: PathBuf| {
+        std::fs::metadata(&path)
+            .map(|metadata| metadata.len())
+            .map_err(|source| SnapshotMetadataWriteError::StatArtifact { path, source })
+    };
     let mut size_bytes: u64 = 0;
     for artifact in vm_artifacts {
-        let path = local_artifact_path(artifact_dir, artifact);
-        let len = std::fs::metadata(&path)
-            .map_err(|source| SnapshotMetadataWriteError::StatArtifact {
-                artifact: artifact.local_name,
-                source,
-            })?
-            .len();
+        let len = if artifact.kind == SnapshotArtifact::RootfsBtrfsSend {
+            match crate::retained_source::RootfsArtifact::resolve(
+                &meta.sandbox_id,
+                artifact_dir,
+                rootfs_send_source_id,
+            )? {
+                Some(crate::retained_source::RootfsArtifact::SendFile { path }) => stat(path)?,
+                Some(crate::retained_source::RootfsArtifact::RetainedSource(source)) => {
+                    retained_rootfs_bytes.ok_or(
+                        SnapshotMetadataWriteError::UnsizedRetainedSource {
+                            artifact_dir: source.artifact_dir,
+                            source_id: source.source_id,
+                        },
+                    )?
+                }
+                None => stat(artifact_dir.join(artifact.local_name))?,
+            }
+        } else {
+            stat(artifact_dir.join(artifact.local_name))?
+        };
         size_bytes = size_bytes.saturating_add(len);
     }
 
-    #[derive(serde::Deserialize)]
-    struct SourceIdentity {
-        source_id: uuid::Uuid,
-    }
-    let rootfs_send_source_id = if format_from_meta(meta) == SuspendSnapshotFormat::BtrfsSend {
-        let path = artifact_dir.join("rootfs.btrfs-source/source.json");
-        match std::fs::read(path) {
-            Ok(bytes) => Some(serde_json::from_slice::<SourceIdentity>(&bytes)?.source_id),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(source) => {
-                return Err(SnapshotMetadataWriteError::StatArtifact {
-                    artifact: "rootfs.btrfs-source",
-                    source,
-                });
-            }
-        }
-    } else {
-        None
-    };
     let meta_final = SnapshotMeta {
         size_bytes,
         rootfs_send_source_id,
@@ -693,6 +698,17 @@ pub(crate) fn write_snapshot_metadata_to(
     std::fs::write(metadata_dir.join(SNAPSHOT_METADATA_FILENAME), &meta_json)
         .map_err(SnapshotMetadataWriteError::WriteMetadata)?;
     Ok(meta_final)
+}
+
+/// A retained source that a backup will upload, as node-manager just
+/// reported it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetainedUpload {
+    /// The retained rootfs image length, for local accounting.
+    pub rootfs_bytes: u64,
+    /// Volume-manager streams the source. Otherwise the worker materializes
+    /// `rootfs.btrfs-send` from it before uploading the file.
+    pub stream: bool,
 }
 
 impl Artifact {
@@ -754,6 +770,9 @@ pub(crate) fn artifact_kind_from_meta(meta: &SnapshotMeta) -> ArtifactKind {
 ///
 /// The caller persists the returned intent in the durable `"snapshot_upload"`
 /// worker before any remote side effect or runtime teardown.
+///
+/// A btrfs-send rootfs without a send file must be a retained source that
+/// the caller has just inspected, passed as `retained`.
 pub fn prepare_suspend_snapshot(
     meta: &SnapshotMeta,
     snapshot_id: &str,
@@ -761,6 +780,7 @@ pub fn prepare_suspend_snapshot(
     config: &SnapshotUploadConfig,
     artifact_kind: ArtifactKind,
     format: SuspendSnapshotFormat,
+    retained: Option<RetainedUpload>,
 ) -> Result<SnapshotUploadJobs, String> {
     let sandbox_id = &meta.sandbox_id;
     let vm_artifacts = if meta.encrypted {
@@ -769,11 +789,33 @@ pub fn prepare_suspend_snapshot(
         artifact_files_for_kind(artifact_kind, format)
     };
 
+    let mut retained_rootfs = false;
     for artifact in &vm_artifacts {
-        if !local_artifact_path(snapshot_dir, artifact).is_file() {
+        let present = if artifact.kind == SnapshotArtifact::RootfsBtrfsSend {
+            match crate::retained_source::RootfsArtifact::resolve_meta(meta, snapshot_dir)
+                .map_err(|error| error.to_string())?
+            {
+                Some(crate::retained_source::RootfsArtifact::SendFile { path }) => path.is_file(),
+                Some(crate::retained_source::RootfsArtifact::RetainedSource(source)) => {
+                    if retained.is_none() {
+                        return Err(format!(
+                            "retained send source {} in {} was not inspected before upload",
+                            source.source_id,
+                            source.artifact_dir.display()
+                        ));
+                    }
+                    retained_rootfs = true;
+                    true
+                }
+                None => false,
+            }
+        } else {
+            snapshot_dir.join(artifact.local_name).is_file()
+        };
+        if !present {
             return Err(format!(
                 "required snapshot artifact missing: {}",
-                artifact.local_name
+                snapshot_dir.join(artifact.local_name).display()
             ));
         }
     }
@@ -783,10 +825,8 @@ pub fn prepare_suspend_snapshot(
     // through to the durable worker payload.
     let deferred_metadata = !meta.encrypted
         && format == SuspendSnapshotFormat::BtrfsSend
-        && !snapshot_dir.join(ROOTFS_BTRFS_SEND_FILENAME).exists()
-        && snapshot_dir
-            .join("rootfs.btrfs-source/source.json")
-            .is_file();
+        && retained_rootfs
+        && retained.is_some_and(|retained| retained.stream);
     let metadata_staging_dir = if artifact_kind == ArtifactKind::Disk || deferred_metadata {
         Some(
             snapshot_dir
@@ -802,8 +842,14 @@ pub fn prepare_suspend_snapshot(
         .as_deref()
         .unwrap_or(snapshot_dir)
         .to_path_buf();
-    let meta_final = write_snapshot_metadata_to(meta, snapshot_dir, &vm_artifacts, &metadata_dir)
-        .map_err(|error| error.to_string())?;
+    let meta_final = write_snapshot_metadata_to(
+        meta,
+        snapshot_dir,
+        &vm_artifacts,
+        &metadata_dir,
+        retained.map(|retained| retained.rootfs_bytes),
+    )
+    .map_err(|error| error.to_string())?;
 
     Ok(SnapshotUploadJobs {
         meta: meta_final,
@@ -851,6 +897,7 @@ pub async fn submit_prepared_snapshot(
                 format_from_meta(&prepared.meta),
             ),
             metadata_dir,
+            None,
         )
         .map_err(|error| error.to_string())?;
     }

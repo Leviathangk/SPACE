@@ -188,7 +188,7 @@ async fn pool_clone_restart_preserves_disposal_ownership() {
     let service = SandboxManagerService::new(rusqlite::Connection::open(database).unwrap());
     let cache = tempfile::tempdir().unwrap();
     service
-        .recover_prelaunch_startup_states_in(cache.path())
+        .recover_prelaunch_startup_states_in(cache.path(), &Default::default())
         .unwrap();
     let targets = SandboxManagerService::recover_required_cleanup_targets(
         &service.db,
