@@ -1,6 +1,8 @@
 mod stream_push;
 use stream_push::StreamPushConfig;
-pub use stream_push::{SnapshotUploadMode, StreamingPushBudget};
+pub use stream_push::{
+    DEFAULT_STREAM_PUSH_BUFFER_BUDGET_BYTES, SnapshotUploadMode, StreamingPushBudget,
+};
 
 use pplx_space_common_core::types::JobId;
 

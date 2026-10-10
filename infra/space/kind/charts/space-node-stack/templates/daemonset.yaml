@@ -223,6 +223,12 @@ spec:
               value: {{ . | quote }}
             {{- end }}
             {{- end }}
+            {{- with .Values.streamPushBufferBudgetBytes }}
+            # Volume-manager streaming upload part budget, sized to the pod's
+            # memory limit (values.yaml).
+            - name: SPACE_VOLUME_STREAM_PUSH_BUFFER_BUDGET_BYTES
+              value: {{ . | quote }}
+            {{- end }}
             {{- with .Values.clusterDeletedEvictionQuiescenceSecs }}
             - name: SPACE_SBX_CLUSTER_DELETED_QUIESCENCE_SECS
               value: {{ . | quote }}

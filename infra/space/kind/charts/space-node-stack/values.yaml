@@ -244,6 +244,13 @@ templateCache:
   gcGraceSecs: "60"
   prefetchLatestN: "1"
 
+# Volume-manager's streaming snapshot uploads. The service default is a 1 GiB
+# part budget sized for production pods. Every Kind node service shares this
+# pod's 2Gi memory limit (`resources`), so smoke clusters stream with two 64 MiB
+# parts. "0" uploads through temporary files instead; see
+# docs/snapshot-upload-streaming.md.
+streamPushBufferBudgetBytes: "134217728"
+
 # Keep cluster-deletion cleanup on the normal reconciler, with a short local
 # grace period in disposable Kind clusters. The worker default is 600 seconds.
 clusterDeletedEvictionQuiescenceSecs: "10"

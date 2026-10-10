@@ -12,9 +12,16 @@ both mode and aggregate retained-part memory. It is read once at service startup
 
 | Value | Behavior |
 | --- | --- |
-| Unset or `0` | File uploads; no streaming producers or part buffers. |
-| `1073741824` | Enable eligible streaming uploads with a shared 1 GiB part budget. |
+| Unset | Enable eligible streaming uploads with the default shared 1 GiB part budget. |
+| `0` | File uploads; no streaming producers or part buffers. |
 | Other positive values | Enable streaming with that budget; must be whole MiB and at least 64 MiB. Invalid values fail startup. |
+
+Streaming needs no other setting, but the deployment must provide two things.
+The snapshot bucket needs an abort-incomplete-multipart lifecycle rule, because
+a process that dies mid-upload leaves its parts behind; file uploads larger than
+one part need the same rule. The service memory limit must leave room for the
+part budget and the per-producer buffers described below. A smaller node sets a
+smaller budget, or `0`.
 
 The service parses this into `SnapshotUploadMode::File` or a validated streaming
 budget. There is no separate boolean that can contradict the budget. Clones
@@ -28,10 +35,11 @@ Encoded objects smaller than one part use a single PUT after producer success.
 
 Small/metadata objects, legacy unstaged jobs, envelope-encrypted SPACEAEA
 artifacts, unsupported object stores, and inputs too large for the fixed part
-size retain the file path. File mode remains supported for memory-constrained
-deployments and rollback. Smaller positive budgets impose more backpressure;
-an in-flight streaming upload never spills to a temporary file when the budget
-fills. Changing modes requires restart and the existing drain/cancel handoff.
+size retain the file path. File mode remains supported, with `0`, for
+memory-constrained deployments and rollback. Smaller positive budgets impose
+more backpressure; an in-flight streaming upload never spills to a temporary
+file when the budget fills. Changing modes requires restart and the existing
+drain/cancel handoff.
 
 ## Memory and scheduling
 
