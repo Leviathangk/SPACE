@@ -844,10 +844,16 @@ impl KubernetesSubstrate {
     /// pod without an IP is removed: its sandbox start never succeeded, so it
     /// holds no runtime. The delete is preconditioned on the UID and
     /// resourceVersion just read, so a pod that changes in between is left
-    /// alone. A pod left behind is the orphaned-restore-pod GC's, where it's
-    /// enabled.
+    /// alone. A pod left behind falls to the age-based sweeps: the
+    /// orphaned-restore-pod GC for a restore pod and the stuck-
+    /// `ContainerCreating` GC for any other, each where it's enabled.
     async fn delete_unstarted_retired_pod(&self, sandbox_id: SandboxId, pod_name: &str) {
         let Ok(name) = PodName::parse(pod_name) else {
+            tracing::warn!(
+                sandbox_id = %sandbox_id,
+                pod_name,
+                "retired execution's pod name is invalid; leaving it"
+            );
             return;
         };
         let pod = match fetch_sandbox_pod_uncached(&self.k8s, pod_name).await {
@@ -874,19 +880,19 @@ impl KubernetesSubstrate {
             );
             return;
         }
-        let Some(pod_uid) = pod.uid().and_then(|uid| PodUid::parse(uid).ok()) else {
+        let (Some(pod_uid), Some(resource_version)) = (
+            pod.uid().and_then(|uid| PodUid::parse(uid).ok()),
+            pod.resource_version()
+                .and_then(|version| PodResourceVersion::parse(version).ok()),
+        ) else {
             tracing::warn!(
                 sandbox_id = %sandbox_id,
                 pod_name,
-                "retired execution's pod has no UID; leaving it"
+                "retired execution's pod has no UID or resourceVersion; leaving it"
             );
             return;
         };
-        let resource_version = pod
-            .resource_version()
-            .and_then(|version| PodResourceVersion::parse(version).ok());
-        match delete_sandbox_pod_fenced(&self.k8s, &name, &pod_uid, resource_version.as_ref()).await
-        {
+        match delete_sandbox_pod_fenced(&self.k8s, &name, &pod_uid, Some(&resource_version)).await {
             Ok(FencedPodDeleteOutcome::Deleted | FencedPodDeleteOutcome::NotFound) => {
                 tracing::info!(
                     sandbox_id = %sandbox_id,
