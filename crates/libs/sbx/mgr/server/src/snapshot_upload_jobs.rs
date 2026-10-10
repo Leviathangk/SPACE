@@ -79,6 +79,9 @@ pub(crate) fn build_worker(
     let executor = SnapshotUploadExecutor {
         db: std::sync::Arc::clone(&db),
         drain_state,
+        retained_source_inspector: std::sync::Arc::new(
+            crate::retained_source::NodeManagerSourceInspector,
+        ),
     };
     BackgroundWorker::new(db, executor, config)
 }
@@ -103,6 +106,9 @@ pub fn refund_interrupted_running_attempts(conn: &rusqlite::Connection) -> rusql
 pub struct SnapshotUploadExecutor {
     db: std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,
     drain_state: std::sync::Arc<crate::service::drain::DrainState>,
+    /// Sizes a retained source before its stream is reclaimed, so the local
+    /// sidecar can switch to counting the image the artifact keeps.
+    retained_source_inspector: std::sync::Arc<dyn crate::retained_source::RetainedSourceInspector>,
 }
 
 #[async_trait::async_trait]
@@ -345,7 +351,8 @@ impl JobExecutor for SnapshotUploadExecutor {
             );
         }
 
-        Ok(self.complete_ready_backup(&payload, vm_total_bytes))
+        let reclaim_image = self.retained_image_for_reclaim(&payload).await;
+        Ok(self.complete_ready_backup(&payload, vm_total_bytes, reclaim_image))
     }
 
     async fn retries_exhausted(&self, job: &Job, message: &str) {
@@ -364,7 +371,12 @@ impl SnapshotUploadExecutor {
     /// READY must return success without another await: optional local work
     /// cannot consume the execution deadline and turn the final attempt into a
     /// failed job that would lose its protected marker-repair evidence.
-    fn complete_ready_backup(&self, payload: &SnapshotUploadJobs, bytes: u64) -> i64 {
+    fn complete_ready_backup(
+        &self,
+        payload: &SnapshotUploadJobs,
+        bytes: u64,
+        reclaim_image: Option<u64>,
+    ) -> i64 {
         if payload.meta.local_artifact_id.is_some() {
             // The blocking writer owns its drain lease independently of this
             // handle. Failure or panic leaves completed-job repair evidence;
@@ -373,9 +385,39 @@ impl SnapshotUploadExecutor {
                 std::sync::Arc::clone(&self.db),
                 &self.drain_state,
                 payload,
+                reclaim_image,
             ));
         }
         i64::try_from(bytes).unwrap_or(i64::MAX)
+    }
+
+    /// Node-manager's current length for the retained source whose stream a
+    /// reclaim would remove. Asked before the READY return, never under the
+    /// database lock. `None` keeps the stream.
+    async fn retained_image_for_reclaim(&self, payload: &SnapshotUploadJobs) -> Option<u64> {
+        let source_id = payload.meta.rootfs_send_source_id?;
+        if !stream_reclaim_applies(&payload.meta) {
+            return None;
+        }
+        let source = crate::retained_source::RetainedSource {
+            sandbox_id: payload.meta.sandbox_id.clone(),
+            artifact_dir: payload.snapshot_dir.clone(),
+            source_id,
+        };
+        match self.retained_source_inspector.inspect(&source).await {
+            crate::retained_source::RetainedSourceCheck::Present { rootfs_bytes } => {
+                Some(rootfs_bytes)
+            }
+            check => {
+                tracing::info!(
+                    sandbox_id = %payload.meta.sandbox_id,
+                    source_id = %source_id,
+                    %check,
+                    "rootfs stream reclaim deferred: retained source not verified"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -383,6 +425,7 @@ pub(crate) fn spawn_backup_bookkeeping(
     db: std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,
     drain_state: &std::sync::Arc<crate::service::drain::DrainState>,
     payload: &SnapshotUploadJobs,
+    reclaim_image: Option<u64>,
 ) -> Option<tokio::task::JoinHandle<rusqlite::Result<()>>> {
     // Admission is capped before spawning, so returning the upload worker's
     // slot cannot accumulate unbounded queued writers. Refusal defers repair.
@@ -410,8 +453,12 @@ pub(crate) fn spawn_backup_bookkeeping(
         // through queuing, the SQLite wait, and the writer's last mutation.
         let _writer = writer;
         let conn = db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let result =
-            stamp_backup_completed_and_reclaim_stream(&conn, &payload, &payload.snapshot_id);
+        let result = stamp_backup_completed_and_reclaim_stream(
+            &conn,
+            &payload,
+            &payload.snapshot_id,
+            reclaim_image,
+        );
         if let Err(error) = &result {
             if stream_reclaim_applies(&payload.meta) {
                 pplx_space_metrics::snapshot::stream_reclaim_skipped("db_error");
@@ -568,10 +615,17 @@ fn stream_reclaim_applies(meta: &SnapshotMeta) -> bool {
 /// never propagated; only DB errors surface to the caller's
 /// best-effort warn. Worst case of any skip: the stream lingers until
 /// the next suspend rewrites the directory or eviction removes it.
+/// `reclaim_image` is node-manager's length for the artifact's retained
+/// source, when it has one. A retained artifact counts its stream in the
+/// local sidecar while the stream exists; before the stream goes, the sidecar
+/// is rewritten to count the image, which is what remains. Validation accepts
+/// either accounting while both are present, so no ordering here can strand
+/// the artifact.
 fn stamp_backup_completed_and_reclaim_stream(
     conn: &rusqlite::Connection,
     payload: &SnapshotUploadJobs,
     backup_attempt_id: &str,
+    reclaim_image: Option<u64>,
 ) -> Result<(), rusqlite::Error> {
     let Some(local_artifact_id) = payload.meta.local_artifact_id else {
         return Ok(());
@@ -599,6 +653,26 @@ fn stamp_backup_completed_and_reclaim_stream(
 
     let stream_path = payload.snapshot_dir.join(ROOTFS_BTRFS_SEND_FILENAME);
     let bytes = std::fs::metadata(&stream_path).map(|m| m.len());
+    if payload.meta.rootfs_send_source_id.is_some() {
+        let Some(image) = reclaim_image else {
+            pplx_space_metrics::snapshot::stream_reclaim_skipped("source_unverified");
+            return Ok(());
+        };
+        if let Ok(stream_len) = bytes
+            && let Err(error) =
+                rewrite_sidecar_for_reclaim(&payload.snapshot_dir, stream_len, image)
+        {
+            pplx_space_metrics::snapshot::stream_reclaim_skipped("sidecar_rewrite_failed");
+            tracing::warn!(
+                sandbox_id,
+                backup_attempt_id,
+                local_artifact_id = %local_artifact_id,
+                %error,
+                "rootfs stream kept: local sidecar could not switch to the retained image",
+            );
+            return Ok(());
+        }
+    }
     match bytes.and_then(|bytes| std::fs::remove_file(&stream_path).map(|()| bytes)) {
         Ok(bytes) => {
             pplx_space_metrics::snapshot::stream_reclaimed(bytes);
@@ -1333,6 +1407,28 @@ pub(crate) async fn run_maintenance(
             }
         }
     }
+}
+
+/// Switch the local sidecar from counting the stream to counting the retained
+/// image, atomically, before the stream is unlinked.
+fn rewrite_sidecar_for_reclaim(
+    snapshot_dir: &std::path::Path,
+    stream_len: u64,
+    image_len: u64,
+) -> std::io::Result<()> {
+    let path = snapshot_dir.join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME);
+    let mut meta: SnapshotMeta = serde_json::from_slice(&std::fs::read(&path)?)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let Some(rest) = meta.size_bytes.checked_sub(stream_len) else {
+        // Already counting the image, or not this stream: leave it.
+        return Ok(());
+    };
+    meta.size_bytes = rest.saturating_add(image_len);
+    let bytes = serde_json::to_vec_pretty(&meta)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let temporary = snapshot_dir.join(".snapshot.json.reclaim");
+    std::fs::write(&temporary, bytes)?;
+    std::fs::rename(&temporary, &path)
 }
 
 #[cfg(test)]

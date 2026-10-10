@@ -10899,6 +10899,7 @@ pub(crate) mod service_tests {
                 Arc::clone(&service.db),
                 &service.drain_state,
                 &payloads[0],
+                None,
             )
             .unwrap();
             drop(bookkeeping);
@@ -10918,6 +10919,7 @@ pub(crate) mod service_tests {
                 Arc::clone(&service.db),
                 &service.drain_state,
                 &payloads[1],
+                None,
             )
             .is_none(),
             "draining must defer optional local bookkeeping"
@@ -14533,7 +14535,12 @@ pub(crate) mod service_tests {
         // rename fail. Startup must preserve the complete staged capture.
         let sandbox_dir = cache.path().join(&id);
         std::fs::create_dir_all(canonical_suspend_snapshot_dir(&sandbox_dir)).unwrap();
-        let obstruction = sandbox_dir.join(format!(".snapshot-retired-{artifact_id}"));
+        let obstruction =
+            crate::service::suspend_snapshot_publication::retired_suspend_snapshot_dir(
+                &sandbox_dir,
+                artifact_id,
+            );
+        std::fs::create_dir_all(obstruction.parent().unwrap()).unwrap();
         std::fs::write(&obstruction, b"transient obstruction").unwrap();
         let deferred = service
             .recover_prelaunch_startup_states_in(cache.path(), &Default::default())

@@ -344,3 +344,132 @@ fn retained_sources_are_discovered_from_canonical_and_staged_metadata() {
     expected.sort();
     assert_eq!(found, expected);
 }
+
+fn retired_entries(sandbox_dir: &Path) -> Vec<LocalArtifactId> {
+    let prefix = crate::service::recovery::staging_cleanup::RETIRED_PREFIX;
+    let mut ids: Vec<_> = std::fs::read_dir(suspend_snapshot_staging_parent_dir(sandbox_dir))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter_map(|name| {
+            name.strip_prefix(prefix).map(|id| {
+                id.parse::<LocalArtifactId>()
+                    .expect("the sweep parses this suffix")
+            })
+        })
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[test]
+fn publication_retires_the_superseded_snapshot_for_the_staging_sweep() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sandbox_dir = tmp.path();
+    let snapshot_dir = canonical_suspend_snapshot_dir(sandbox_dir);
+    let old_id = LocalArtifactId::new();
+    let new_id = LocalArtifactId::new();
+    write_full_suspend_artifact(&snapshot_dir, TEST_SANDBOX_ID, old_id, b"old-artifact");
+    let staging_dir = suspend_snapshot_staging_dir(sandbox_dir, new_id);
+    write_full_suspend_artifact(&staging_dir, TEST_SANDBOX_ID, new_id, b"new-artifact");
+
+    publish_suspend_snapshot_dir(&staging_dir, &snapshot_dir, new_id, &Default::default()).unwrap();
+
+    assert_eq!(
+        std::fs::read(snapshot_dir.join("vmstate")).unwrap(),
+        b"new-artifact"
+    );
+    // The old snapshot is renamed into the sweep's lane, never deleted here:
+    // it can hold read-only subvolumes only node-manager can remove. The hold
+    // it waited in during publication is gone.
+    assert!(!retired_suspend_snapshot_dir(sandbox_dir, new_id).exists());
+    let garbage = retired_entries(sandbox_dir);
+    assert_eq!(garbage.len(), 1);
+    let garbage_dir = suspend_snapshot_staging_parent_dir(sandbox_dir).join(format!(
+        "{}{}",
+        crate::service::recovery::staging_cleanup::RETIRED_PREFIX,
+        garbage[0]
+    ));
+    assert_eq!(
+        std::fs::read(garbage_dir.join("vmstate")).unwrap(),
+        b"old-artifact"
+    );
+
+    // A duplicate staging of the published artifact is retired the same way.
+    write_full_suspend_artifact(&staging_dir, TEST_SANDBOX_ID, new_id, b"new-artifact");
+    publish_suspend_snapshot_dir(&staging_dir, &snapshot_dir, new_id, &Default::default()).unwrap();
+    assert!(!staging_dir.exists());
+    assert_eq!(retired_entries(sandbox_dir).len(), 2);
+}
+
+/// The hold is outside the sweep's lane, so a crash between the two renames
+/// cannot lose the snapshot the sweep would otherwise collect. A retry either
+/// restores it or, once the replacement is canonical, releases it.
+#[test]
+fn publication_resumes_an_interrupted_replacement_from_its_hold() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sandbox_dir = tmp.path();
+    let snapshot_dir = canonical_suspend_snapshot_dir(sandbox_dir);
+    let (old_id, new_id) = (LocalArtifactId::new(), LocalArtifactId::new());
+    let hold = retired_suspend_snapshot_dir(sandbox_dir, new_id);
+    let staging_dir = suspend_snapshot_staging_dir(sandbox_dir, new_id);
+
+    // Crashed after retiring the old snapshot, before publishing the new one.
+    write_full_suspend_artifact(&hold, TEST_SANDBOX_ID, old_id, b"old-artifact");
+    write_full_suspend_artifact(&staging_dir, TEST_SANDBOX_ID, new_id, b"new-artifact");
+    publish_suspend_snapshot_dir(&staging_dir, &snapshot_dir, new_id, &Default::default()).unwrap();
+    assert_eq!(
+        std::fs::read(snapshot_dir.join("vmstate")).unwrap(),
+        b"new-artifact"
+    );
+    assert!(!hold.exists());
+    assert_eq!(retired_entries(sandbox_dir).len(), 1);
+
+    // Crashed after publishing, before releasing the hold.
+    write_full_suspend_artifact(&hold, TEST_SANDBOX_ID, old_id, b"old-artifact");
+    publish_suspend_snapshot_dir(&staging_dir, &snapshot_dir, new_id, &Default::default()).unwrap();
+    assert!(!hold.exists());
+    assert_eq!(retired_entries(sandbox_dir).len(), 2);
+
+    // A hold beside a canonical snapshot of another artifact is not ours to
+    // resolve either way.
+    let other = LocalArtifactId::new();
+    write_full_suspend_artifact(&snapshot_dir, TEST_SANDBOX_ID, other, b"other");
+    write_full_suspend_artifact(&hold, TEST_SANDBOX_ID, old_id, b"old-artifact");
+    assert!(matches!(
+        publish_suspend_snapshot_dir(&staging_dir, &snapshot_dir, new_id, &Default::default()),
+        Err(SuspendSnapshotPublicationError::RetiredResidue { .. })
+    ));
+    assert!(hold.exists());
+}
+
+#[test]
+fn a_retained_artifact_stays_complete_across_stream_reclaim() {
+    let tmp = tempfile::tempdir().unwrap();
+    let snapshot_dir = tmp.path().join("snapshot");
+    let source_id = uuid::Uuid::now_v7();
+    let _bundle = write_deferred_suspend_artifact(
+        &snapshot_dir,
+        TEST_SANDBOX_ID,
+        LocalArtifactId::new(),
+        source_id,
+        100,
+    );
+    // A materialized stream beside the retained source: its length differs
+    // from the image and never enters the local accounting.
+    let stream = snapshot_dir.join(crate::snapshot_upload::ROOTFS_BTRFS_SEND_FILENAME);
+    std::fs::write(&stream, vec![0u8; 37]).unwrap();
+    let mut verdicts = RetainedSourceVerdicts::default();
+    verdicts.record(
+        retained(&snapshot_dir, source_id),
+        RetainedSourceCheck::Present { rootfs_bytes: 100 },
+    );
+
+    validate_complete_suspend_snapshot_dir(&snapshot_dir, &verdicts).unwrap();
+    // Reclaim after a durable backup removes only the stream.
+    std::fs::remove_file(&stream).unwrap();
+    validate_complete_suspend_snapshot_dir(&snapshot_dir, &verdicts).unwrap();
+    // Node-manager, not the file, still decides.
+    let error =
+        validate_complete_suspend_snapshot_dir(&snapshot_dir, &Default::default()).unwrap_err();
+    assert!(error.is_pending());
+}

@@ -2337,7 +2337,7 @@ pub(super) enum CleanupRecoveryAuthority {
 }
 
 mod orphan_dispatch;
-mod staging_cleanup;
+pub(in crate::service) mod staging_cleanup;
 
 #[cfg(test)]
 mod tests;
