@@ -22,6 +22,18 @@ const ALLOWED: &[UdsPeerPrincipal] = &[
         pplx_space_common_core::host::linux::identities::user_names::SPACE_VOLMGR,
     ),
 ];
+/// Capabilities disclose nothing about any source. Sandbox-manager reads them
+/// to decide whether to defer a send; lease operations stay volume-manager's.
+const CAPABILITIES_ALLOWED: &[UdsPeerPrincipal] = &[
+    UdsPeerPrincipal::Root,
+    UdsPeerPrincipal::Role(LocalRole::Admin),
+    UdsPeerPrincipal::Service(
+        pplx_space_common_core::host::linux::identities::user_names::SPACE_VOLMGR,
+    ),
+    UdsPeerPrincipal::Service(
+        pplx_space_common_core::host::linux::identities::user_names::SPACE_SBXMGR,
+    ),
+];
 type Body = Pin<Box<dyn tokio_stream::Stream<Item = Result<BtrfsSendChunk, Status>> + Send>>;
 
 fn lease_id(raw: &str) -> Result<Uuid, Status> {
@@ -45,9 +57,10 @@ impl NodeManagerService {
         &self,
         request: Request<GetBtrfsSendCapabilitiesRequest>,
     ) -> Result<Response<GetBtrfsSendCapabilitiesResponse>, Status> {
-        self.authorize_peer(&request, "GetBtrfsSendCapabilities", ALLOWED)?;
+        self.authorize_peer(&request, "GetBtrfsSendCapabilities", CAPABILITIES_ALLOWED)?;
         Ok(Response::new(GetBtrfsSendCapabilitiesResponse {
             supported: cfg!(target_os = "linux"),
+            inspect_send_source: cfg!(target_os = "linux"),
         }))
     }
 

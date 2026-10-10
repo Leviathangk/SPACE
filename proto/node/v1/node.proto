@@ -218,6 +218,15 @@ service NodeManager {
   rpc BtrfsMaterializeRootfsSend(BtrfsMaterializeRootfsSendRequest)
       returns (BtrfsEncodeRootfsSendResponse);
 
+  // Read-only check that a retained source bundle still exists and matches
+  // the expected identity, lineage, and read-only state. NOT_FOUND: the bundle
+  // is absent. FAILED_PRECONDITION: it exists but is unusable. Any other
+  // status, including UNIMPLEMENTED and RESOURCE_EXHAUSTED, proves nothing
+  // about the artifact. The bundle stays owned by its artifact; callers that
+  // act on the result must hold their own artifact fence.
+  rpc BtrfsInspectSendSource(BtrfsInspectSendSourceRequest)
+      returns (BtrfsInspectSendSourceResponse);
+
   // Volume-manager owns an independent private copy before accepting a job.
   rpc GetBtrfsSendCapabilities(GetBtrfsSendCapabilitiesRequest) returns (GetBtrfsSendCapabilitiesResponse);
   rpc BtrfsStageSendSource(BtrfsStageSendSourceRequest) returns (BtrfsSendLease);
@@ -1057,6 +1066,10 @@ message BtrfsEncodeRootfsSendResponse {
   // caller can record / log it without having to stat the file.
   uint64 stream_bytes = 1;
   optional string source_id = 2;
+  // Length of the retained source's rootfs image, present with source_id.
+  // Callers cannot read the retained bundle, and a deferred capture has no
+  // stream to measure. This is never a send-stream length.
+  optional uint64 rootfs_bytes = 3;
 }
 
 message BtrfsEncodeSnapshotRootfsSendRequest {
@@ -1077,12 +1090,25 @@ message BtrfsEncodeSnapshotRootfsSendRequest {
 message BtrfsEncodeSnapshotRootfsSendResponse {
   uint64 stream_bytes = 1;
   optional string source_id = 2;
+  // As in BtrfsEncodeRootfsSendResponse.
+  optional uint64 rootfs_bytes = 3;
 }
 
 message BtrfsMaterializeRootfsSendRequest {
   string sandbox_id = 1;
   string artifact_dir = 2;
   string source_id = 3;
+}
+
+message BtrfsInspectSendSourceRequest {
+  string sandbox_id = 1;
+  // Restricted to this sandbox's snapshot roots, as for materialization.
+  string artifact_dir = 2;
+  string source_id = 3;
+}
+message BtrfsInspectSendSourceResponse {
+  // Length of the retained rootfs image, not of any send stream.
+  uint64 rootfs_bytes = 1;
 }
 
 // A canonical instance belongs to an execution; restore staging belongs to a
@@ -1205,4 +1231,9 @@ message BtrfsListSendSourcesRequest {}
 message BtrfsListSendSourcesResponse { repeated string lease_ids = 1; }
 
 message GetBtrfsSendCapabilitiesRequest {}
-message GetBtrfsSendCapabilitiesResponse { bool supported = 1; }
+message GetBtrfsSendCapabilitiesResponse {
+  bool supported = 1;
+  // BtrfsInspectSendSource and the encode responses' rootfs_bytes are
+  // available. Sandbox-manager defers a send only when both are.
+  bool inspect_send_source = 2;
+}

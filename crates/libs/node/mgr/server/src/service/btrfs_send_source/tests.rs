@@ -20,10 +20,62 @@ fn source_identity_is_required_before_touching_retained_subvolumes() {
         )
         .unwrap();
         let artifact = trusted_paths::open_directory(&root).unwrap();
-        assert!(
-            matches!(SendSource::open(&artifact, expected), Err(error) if error.message() == "send source identity changed")
+        assert!(matches!(
+            SendSource::open(&artifact, expected),
+            Err(SourceError::IdentityChanged)
+        ));
+        assert_eq!(
+            inspect(&root, expected).unwrap_err().code(),
+            tonic::Code::FailedPrecondition
         );
     }
+}
+
+#[test]
+fn inspection_reports_absence_only_for_a_missing_artifact_bundle_or_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let expected = Uuid::now_v7();
+    let code = |path: &Path| inspect(path, expected).unwrap_err().code();
+    assert_eq!(code(&root.join("missing")), tonic::Code::NotFound);
+    assert_eq!(code(&root), tonic::Code::NotFound);
+    std::fs::create_dir(root.join(DIRECTORY)).unwrap();
+    assert_eq!(code(&root), tonic::Code::NotFound);
+    std::fs::write(root.join(DIRECTORY).join(MANIFEST), b"{").unwrap();
+    assert_eq!(code(&root), tonic::Code::FailedPrecondition);
+    std::fs::write(root.join(DIRECTORY).join(MANIFEST), vec![b' '; 4097]).unwrap();
+    assert_eq!(code(&root), tonic::Code::FailedPrecondition);
+    // A matching manifest without its subvolumes is a broken bundle.
+    let manifest = Manifest {
+        version: 1,
+        source_id: expected,
+        source_uuid: Uuid::now_v7(),
+        parent_uuid: Uuid::now_v7(),
+        received_uuid: Uuid::now_v7(),
+    };
+    std::fs::write(
+        root.join(DIRECTORY).join(MANIFEST),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(code(&root), tonic::Code::FailedPrecondition);
+}
+
+#[test]
+fn inspection_status_keeps_io_failures_out_of_artifact_evidence() {
+    let io = SourceError::Io(io::Error::from_raw_os_error(libc::EACCES));
+    assert_eq!(io.inspection_status().code(), tonic::Code::Internal);
+    assert_eq!(
+        SourceError::io(
+            io::ErrorKind::NotFound.into(),
+            SourceError::RootfsNotRegular
+        )
+        .inspection_status()
+        .code(),
+        tonic::Code::FailedPrecondition
+    );
+    // Staging, reading, and materialization keep their contract.
+    assert_eq!(Status::from(io).code(), tonic::Code::FailedPrecondition);
 }
 
 #[cfg(target_os = "linux")]
@@ -53,6 +105,17 @@ fn retained_source_regenerates_after_producer_deletion_and_receives_on_same_file
     artifact_fs::remove_at(&directory, "instance".as_ref()).unwrap();
     artifact_fs::remove_at(&directory, "template".as_ref()).unwrap();
     drop((template, instance));
+    // Capture writes a version 1 manifest; inspection reads the retained
+    // image length without the producer or template.
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(snapshot.join(DIRECTORY).join(MANIFEST)).unwrap())
+            .unwrap();
+    assert_eq!(manifest["version"], 1);
+    assert_eq!(inspect(&snapshot, id).unwrap(), expected.len() as u64);
+    assert_eq!(
+        inspect(&snapshot, Uuid::now_v7()).unwrap_err().code(),
+        tonic::Code::FailedPrecondition
+    );
     let mut lengths = Vec::new();
     // Reopen all persisted state for every attempt; no in-memory pin survives.
     for _ in 0..2 {
@@ -88,6 +151,24 @@ fn retained_source_regenerates_after_producer_deletion_and_receives_on_same_file
         tonic::Code::Cancelled
     );
     assert!(!snapshot.join("rootfs.btrfs-send").exists());
+    // A replaced source subvolume is unusable, not absent.
+    let bundle = trusted_paths::open_directory(&snapshot.join(DIRECTORY)).unwrap();
+    artifact_fs::remove_at(&bundle, "source".as_ref()).unwrap();
+    btrfs::create(&bundle, "source".as_ref()).unwrap();
+    assert_eq!(
+        inspect(&snapshot, id).unwrap_err().code(),
+        tonic::Code::FailedPrecondition
+    );
+    artifact_fs::remove_at(&bundle, "source".as_ref()).unwrap();
+    assert_eq!(
+        inspect(&snapshot, id).unwrap_err().code(),
+        tonic::Code::FailedPrecondition
+    );
+    drop(bundle);
     // Existing recursive artifact deletion reclaims nested RO subvolumes.
     artifact_fs::remove_at(&directory, "snapshot".as_ref()).unwrap();
+    assert_eq!(
+        inspect(&snapshot, id).unwrap_err().code(),
+        tonic::Code::NotFound
+    );
 }
