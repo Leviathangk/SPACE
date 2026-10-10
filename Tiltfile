@@ -73,8 +73,30 @@ DATADOG_MODE = TELEMETRY_CONFIG["backend"]
 TELEMETRY_MODE = TELEMETRY_CONFIG["mode"]
 TELEMETRY_SET = TELEMETRY_CONFIG["helm_set"]
 watch_file("infra/space/kind/charts/space-kind-telemetry")
-if TELEMETRY_MODE == "otel":
-    print("OTLP uses the Collectors, not the Agent; install infra/space/kind/metrics/local.sh up and infra/space/kind/traces/local.sh up before selecting otel mode.")
+INSTALL_OBSERVABILITY = TELEMETRY_CONFIG["install_observability"]
+if TELEMETRY_MODE == "otel" and not INSTALL_OBSERVABILITY:
+    print("otel mode with SPACE_KIND_OBSERVABILITY=off: point the telemetry chart's endpoints at your own receiver, or exports will have nowhere to go.")
+
+# install-shim.sh resolves the metrics and traces Collector Services and exits 2
+# when they are absent, so the backends are a dependency of the shim on this
+# path exactly as they are in bootstrap.sh. Without this, defaulting to otel
+# fails the shim and blocks rust-artifacts and the sandbox stack.
+if INSTALL_OBSERVABILITY and not MINIMAL:
+    local_resource(
+        "install-observability-backends",
+        cmd = "SPACE_KIND_CLUSTER={} bash infra/space/kind/scripts/install-observability.sh".format(KIND_CLUSTER),
+        deps = ["infra/space/kind/scripts/install-observability.sh", "infra/space/observability/charts"],
+        # Each install runs `helm dependency build` on its chart
+        # (release_init, infra/space/kind/lib/release.sh), which rewrites the
+        # vendored charts/<chart>/charts/*.tgz and stages tmpcharts-* beside
+        # them. Watching that output reran this resource after every run, so
+        # Tilt never went idle and the smoke bring-up's wait for it never ended.
+        ignore = [
+            "infra/space/observability/charts/*/charts",
+            "infra/space/observability/charts/*/tmpcharts-*",
+        ],
+        labels = ["bootstrap"],
+    )
 
 # ── Image builds ──────────────────────────────────────────────────────────
 #
@@ -357,6 +379,7 @@ if not MINIMAL:
             TELEMETRY_MODE,
         ),
         deps = [TELEMETRY_SCRIPT, "infra/space/kind/scripts/install-shim.sh"] + ([OBSERVABILITY_CONFIG] if OBSERVABILITY_CONFIG else []),
+        resource_deps = ["install-observability-backends"] if INSTALL_OBSERVABILITY else [],
         labels = ["bootstrap"],
     )
 

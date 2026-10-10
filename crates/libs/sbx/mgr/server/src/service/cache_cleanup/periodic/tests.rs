@@ -20,11 +20,11 @@ async fn periodic_inventory_progresses_in_pages_without_treating_other_pages_as_
     let shutdown = CancellationToken::new();
     let paths = SandboxInventoryPaths::new(cache.path(), runtime.path());
     service
-        .reconcile_periodic_inventory_in(&mut scan, paths, &shutdown)
+        .reconcile_periodic_inventory_in(&mut scan, paths, &shutdown, &Default::default())
         .unwrap();
     assert!(crate::db::sandbox_exists(&service.db_conn().unwrap(), &stale.to_string()).unwrap());
     service
-        .reconcile_periodic_inventory_in(&mut scan, paths, &shutdown)
+        .reconcile_periodic_inventory_in(&mut scan, paths, &shutdown, &Default::default())
         .unwrap();
     assert!(!crate::db::sandbox_exists(&service.db_conn().unwrap(), &stale.to_string()).unwrap());
     for id in ids {

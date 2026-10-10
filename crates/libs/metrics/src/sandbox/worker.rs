@@ -1480,6 +1480,102 @@ pub fn sandbox_health_transition(status: SandboxHealthStatus) {
     );
 }
 
+/// Result of the bare `CONNECT` handshake the sandbox manager sends to a VM's
+/// spaced-guest vsock port once per degrading health transition. It separates
+/// a guest kernel that still services vsock (`accepted`, `refused`) from one
+/// that does not (`timeout`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SandboxRawVsockCheckOutcome {
+    /// Firecracker relayed the guest kernel's acceptance (`OK <port>`).
+    Accepted,
+    /// The connection closed before an acknowledgement: the guest kernel
+    /// reset it, so nothing accepts on the port or its backlog is full.
+    Refused,
+    /// Firecracker answered with something other than an acknowledgement.
+    UnexpectedReply,
+    /// No answer within the check's deadline.
+    Timeout,
+    /// The VM's host-side vsock socket could not be connected.
+    HostSocketUnavailable,
+    /// The sandbox has no recorded vsock socket to check.
+    NotAttempted,
+}
+
+impl SandboxRawVsockCheckOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Refused => "refused",
+            Self::UnexpectedReply => "unexpected_reply",
+            Self::Timeout => "timeout",
+            Self::HostSocketUnavailable => "host_socket_unavailable",
+            Self::NotAttempted => "not_attempted",
+        }
+    }
+}
+
+impl fmt::Display for SandboxRawVsockCheckOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One raw vsock check run for a sandbox whose composed or guest health just
+/// degraded, tagged only by its outcome. Per-sandbox detail is in the
+/// sandbox manager's health-transition log line, never in tags.
+pub fn sandbox_health_raw_vsock_check(outcome: SandboxRawVsockCheckOutcome) {
+    counter(
+        "sandbox.health.raw_vsock_check",
+        1,
+        &[tag("outcome", outcome.as_str())],
+    );
+}
+
+/// What became of the evidence report a degrading health transition asks the
+/// sandbox manager for. Each such transition counts exactly once: when its
+/// report is merged or dropped at admission, or when an admitted report is
+/// logged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SandboxHealthEvidenceOutcome {
+    /// The sandbox already had a report waiting for a collector, which now
+    /// also covers this transition.
+    Merged,
+    /// The evidence queue was full; only the transition line was logged.
+    Dropped,
+    /// Collected in full before the collection deadline.
+    Complete,
+    /// The collection deadline expired; what was gathered was logged.
+    Partial,
+}
+
+impl SandboxHealthEvidenceOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Merged => "merged",
+            Self::Dropped => "dropped",
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+        }
+    }
+}
+
+impl fmt::Display for SandboxHealthEvidenceOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One degrading health transition's evidence report, tagged only by its
+/// outcome. A rising `dropped` or `partial` share means evidence is being
+/// shed under correlated failures or slow host reads.
+pub fn sandbox_health_evidence_report(outcome: SandboxHealthEvidenceOutcome) {
+    counter(
+        "sandbox.health.evidence_report",
+        1,
+        &[tag("outcome", outcome.as_str())],
+    );
+}
+
 /// `gateway_sha` value for a gateway running a binary that reports no sha, and
 /// for one that has not answered a stats probe yet.
 pub const NET_GATEWAY_SHA_UNKNOWN: &str = "unknown";

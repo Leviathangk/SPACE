@@ -599,8 +599,10 @@ fn sidecarless_format_from_artifacts(
     if probe(crate::snapshot_upload::ROOTFS_FULL_FILENAME)? {
         return Ok(pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat::Full);
     }
+    // The bundle's own entry, not its contents: a retained-only artifact is
+    // still a btrfs-send artifact, whose rootfs the presence check reports.
     if probe(crate::snapshot_upload::ROOTFS_BTRFS_SEND_FILENAME)?
-        || probe("rootfs.btrfs-source/source.json")?
+        || probe(crate::retained_source::BUNDLE_DIRECTORY)?
     {
         return Ok(pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat::BtrfsSend);
     }
@@ -673,25 +675,138 @@ fn artifact_backup_lookup_error(status: Status, full_current_instance: bool) -> 
     }
 }
 
-fn require_artifact_backup_files(
+/// Presence of a btrfs-send rootfs for a backup precondition. A retained
+/// source is verified by node-manager, never by reading its bundle.
+enum BtrfsSendRootfsPresence {
+    Present,
+    Missing { path: std::path::PathBuf },
+    Unusable { detail: String },
+    Unverified { detail: String },
+}
+
+async fn btrfs_send_rootfs_presence(
+    inspector: &dyn crate::retained_source::RetainedSourceInspector,
+    sandbox_id: &str,
+    artifact_dir: &std::path::Path,
+    source_id: Option<uuid::Uuid>,
+) -> BtrfsSendRootfsPresence {
+    use crate::retained_source::{RetainedSourceCheck, RootfsArtifact};
+    let source = match RootfsArtifact::resolve(sandbox_id, artifact_dir, source_id) {
+        Ok(Some(RootfsArtifact::SendFile { .. })) => return BtrfsSendRootfsPresence::Present,
+        Ok(Some(RootfsArtifact::RetainedSource(source))) => source,
+        Ok(None) => {
+            return BtrfsSendRootfsPresence::Missing {
+                path: artifact_dir.join(crate::snapshot_upload::ROOTFS_BTRFS_SEND_FILENAME),
+            };
+        }
+        Err(error) => {
+            return BtrfsSendRootfsPresence::Unverified {
+                detail: error.to_string(),
+            };
+        }
+    };
+    match inspector.inspect(&source).await {
+        RetainedSourceCheck::Present { .. } => BtrfsSendRootfsPresence::Present,
+        RetainedSourceCheck::Absent => BtrfsSendRootfsPresence::Missing {
+            path: artifact_dir.join(crate::retained_source::BUNDLE_DIRECTORY),
+        },
+        RetainedSourceCheck::Invalid { reason } => BtrfsSendRootfsPresence::Unusable {
+            detail: format!(
+                "retained send source {} in {} is unusable: {reason}",
+                source.source_id,
+                artifact_dir.display()
+            ),
+        },
+        RetainedSourceCheck::Unavailable { reason } => BtrfsSendRootfsPresence::Unverified {
+            detail: format!(
+                "could not verify retained send source {} in {}: {reason}",
+                source.source_id,
+                artifact_dir.display()
+            ),
+        },
+    }
+}
+
+/// The persisted retained-source identity of a full artifact, if any.
+fn sidecar_rootfs_send_source_id(snapshot_dir: &str) -> Result<Option<uuid::Uuid>, Status> {
+    let path =
+        std::path::Path::new(snapshot_dir).join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(Status::internal(format!(
+                "failed to read snapshot metadata at {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    serde_json::from_slice::<crate::snapshot_upload::SnapshotMeta>(&bytes)
+        .map(|meta| meta.rootfs_send_source_id)
+        .map_err(|error| {
+            Status::internal(format!(
+                "snapshot metadata present but unparseable at {}: {error}",
+                path.display()
+            ))
+        })
+}
+
+async fn require_artifact_backup_files(
+    inspector: &dyn crate::retained_source::RetainedSourceInspector,
+    sandbox_id: &str,
     local_path: &str,
     kind: pplx_space_common_core::types::ArtifactKind,
     format: crate::proto::SuspendSnapshotFormat,
     full_current_instance: bool,
 ) -> Result<(), Status> {
+    let reason = if full_current_instance {
+        pplx_space_common_core::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER
+    } else {
+        "local file is missing"
+    };
     for file in crate::snapshot_upload::artifact_files_for_kind(kind, format) {
-        let path =
-            crate::snapshot_upload::local_artifact_path(std::path::Path::new(local_path), &file)
-                .to_string_lossy()
-                .into_owned();
+        if file.kind == pplx_space_common_core::types::SnapshotArtifact::RootfsBtrfsSend {
+            // Disk artifacts never retain a source: they have no sidecar.
+            let source_id = match kind {
+                pplx_space_common_core::types::ArtifactKind::Full => {
+                    sidecar_rootfs_send_source_id(local_path)?
+                }
+                pplx_space_common_core::types::ArtifactKind::Disk => None,
+            };
+            match btrfs_send_rootfs_presence(
+                inspector,
+                sandbox_id,
+                std::path::Path::new(local_path),
+                source_id,
+            )
+            .await
+            {
+                BtrfsSendRootfsPresence::Present => continue,
+                BtrfsSendRootfsPresence::Missing { path } => {
+                    return Err(Status::failed_precondition(format!(
+                        "cannot back up artifact: {reason} at {}",
+                        path.display()
+                    )));
+                }
+                BtrfsSendRootfsPresence::Unusable { detail } => {
+                    return Err(Status::failed_precondition(format!(
+                        "cannot back up artifact: {reason}: {detail}"
+                    )));
+                }
+                BtrfsSendRootfsPresence::Unverified { detail } => {
+                    return Err(Status::internal(format!(
+                        "cannot back up artifact: {detail}"
+                    )));
+                }
+            }
+        }
+        let path = std::path::Path::new(local_path)
+            .join(file.local_name)
+            .to_string_lossy()
+            .into_owned();
         if !std::path::Path::new(&path).try_exists().map_err(|error| {
             Status::internal(format!("failed to stat artifact at {path}: {error}"))
         })? {
-            let reason = if full_current_instance {
-                pplx_space_common_core::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER
-            } else {
-                "local file is missing"
-            };
             return Err(Status::failed_precondition(format!(
                 "cannot back up artifact: {reason} at {path}"
             )));
@@ -1077,6 +1192,7 @@ impl SandboxManagerService {
         sandbox_dir: &std::path::Path,
         current_staging_dir: &std::path::Path,
         reason: &str,
+        verdicts: &crate::retained_source::RetainedSourceVerdicts,
     ) -> SuspendSnapshotStagingDisposition {
         let runtime_live = (self.sandbox_runtime_live)(sandbox_id);
         if runtime_live {
@@ -1133,6 +1249,7 @@ impl SandboxManagerService {
             sandbox_dir,
             row.current_local_artifact_id,
             false,
+            verdicts,
         ) {
             Ok(decision) => decision,
             Err(error) => {
@@ -1194,6 +1311,7 @@ impl SandboxManagerService {
                     decision,
                     SuspendSnapshotPublicationRecoveryOrigin::LivePublishFailure,
                     teardown_generation,
+                    verdicts,
                 ) {
                     Ok(record) => {
                         if record.outcome.changed() {
@@ -3869,6 +3987,7 @@ impl SandboxManagerService {
             //   partial. If the runtime is still live, the failure handler
             //   rolls the DB row back to `paused` so a later suspend can
             //   start with a fresh staging directory.
+            let mut captured_rootfs = None;
             if !encrypted
                 && published_format
                     == pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat::BtrfsSend
@@ -3878,7 +3997,8 @@ impl SandboxManagerService {
                     .encode_rootfs_as_btrfs_send(&sandbox, &staging_dir_string)
                     .await;
                 match encode_result {
-                    Ok(_) => {
+                    Ok(captured) => {
+                        captured_rootfs = Some(captured);
                         pplx_space_metrics::snapshot::create_step(
                             create_kind,
                             create_codec,
@@ -3974,14 +4094,42 @@ impl SandboxManagerService {
             metadata.artifact_kind = Some(pplx_space_common_core::types::ArtifactKind::Full);
             metadata.artifact_origin = Some(pplx_space_common_core::types::ArtifactOrigin::Suspend);
             metadata.encrypted = encrypted;
+            // The capture response is the only identity and size source: the
+            // retained bundle is not readable by this service.
+            metadata.rootfs_send_source_id =
+                captured_rootfs.and_then(crate::btrfs_via_nodemgr::CapturedRootfs::source_id);
+            let mut verdicts = crate::retained_source::RetainedSourceVerdicts::default();
+            let mut retained_rootfs_bytes = None;
+            if let Some(crate::btrfs_via_nodemgr::CapturedRootfs::Deferred {
+                source_id,
+                rootfs_bytes,
+            }) = captured_rootfs
+            {
+                retained_rootfs_bytes = Some(rootfs_bytes);
+                // This attempt owns the source through its publication rename,
+                // so node-manager's capture-time answer covers both names.
+                for artifact_dir in [&staging_dir, &snapshot_dir] {
+                    verdicts.record(
+                        crate::retained_source::RetainedSource {
+                            sandbox_id: sandbox.id.clone(),
+                            artifact_dir: artifact_dir.clone(),
+                            source_id,
+                        },
+                        crate::retained_source::RetainedSourceCheck::Present { rootfs_bytes },
+                    );
+                }
+            }
             let vm_artifacts = if encrypted {
                 crate::snapshot_upload::encrypted_vm_artifacts()
             } else {
                 crate::snapshot_upload::vm_artifacts_for_format(published_format)
             };
-            if let Err(error) =
-                crate::snapshot_upload::write_snapshot_metadata(&metadata, &staging_dir, &vm_artifacts)
-            {
+            if let Err(error) = crate::snapshot_upload::write_snapshot_metadata(
+                &metadata,
+                &staging_dir,
+                &vm_artifacts,
+                retained_rootfs_bytes,
+            ) {
                 let reason = format!("local artifact metadata creation failed: {error}");
                 self.record_suspend_snapshot_publication_failure_after_begin(&sandbox.id, &reason);
                 pplx_space_metrics::snapshot::create_failed(
@@ -4001,9 +4149,12 @@ impl SandboxManagerService {
                 );
                 return Err(Status::internal(reason));
             }
-            if let Err(error) =
-                publish_suspend_snapshot_dir(&staging_dir, &snapshot_dir, local_artifact_id)
-            {
+            if let Err(error) = publish_suspend_snapshot_dir(
+                &staging_dir,
+                &snapshot_dir,
+                local_artifact_id,
+                &verdicts,
+            ) {
                 let reason = format!("local artifact publication failed: {error}");
                 // A live rollback here leaves `monitoring_guard` to re-arm the
                 // watchdog on return.
@@ -4012,6 +4163,7 @@ impl SandboxManagerService {
                     &sandbox_dir,
                     &staging_dir,
                     &reason,
+                    &verdicts,
                 ) == SuspendSnapshotStagingDisposition::Preserve
                 {
                     staging_guard.disarm();
@@ -4615,11 +4767,14 @@ impl SandboxManagerService {
                             .to_string_lossy()
                             .into_owned();
                         require_artifact_backup_files(
+                            self.retained_source_inspector.as_ref(),
+                            &sandbox.id,
                             &local_path,
                             expected_kind,
                             reupload_format_from_sidecar(&local_path)?,
                             full_current_instance,
-                        )?;
+                        )
+                        .await?;
                         pre_adoption_upload_config = Some(reupload_resolution_to_config(
                             self.resolve_org_snapshot_upload_config(&sandbox.id).await,
                             self.snapshot_upload_config.is_some(),
@@ -4795,11 +4950,14 @@ impl SandboxManagerService {
 
         let format = artifact_backup_format(&artifact)?;
         require_artifact_backup_files(
+            self.retained_source_inspector.as_ref(),
+            &artifact.sandbox_id,
             &artifact.local_path,
             artifact.artifact_kind,
             format,
             full_current_instance,
-        )?;
+        )
+        .await?;
 
         let parsed_upload_config = match pre_adoption_upload_config {
             Some(config) => config,
@@ -4981,13 +5139,52 @@ impl SandboxManagerService {
         // artifacts must be present, or the inner submit surfaces a
         // missing-file as `Status::internal` (without the terminal marker
         // the reconciler classifies on).
+        let missing = |path: &str| {
+            // The marker substring is the classifier signal the
+            // cluster controller's promote handler keys off (see
+            // `pplx_space_common_core::node_drain_signals`). Both
+            // sides must reference the constant — a reworded
+            // literal here would silently flip the consumer from
+            // "terminal, mark sandbox failed" to "retry forever".
+            Status::failed_precondition(format!(
+                "cannot reupload snapshot: {marker} at {path} \
+                 — the local snapshot has already been pruned; the sandbox cannot \
+                 be promoted from this node",
+                marker =
+                    pplx_space_common_core::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER,
+            ))
+        };
         for artifact in &artifact_set {
-            let path = crate::snapshot_upload::local_artifact_path(
-                std::path::Path::new(&snapshot_dir),
-                artifact,
-            )
-            .to_string_lossy()
-            .into_owned();
+            if artifact.kind == pplx_space_common_core::types::SnapshotArtifact::RootfsBtrfsSend {
+                match btrfs_send_rootfs_presence(
+                    self.retained_source_inspector.as_ref(),
+                    &sandbox.id,
+                    std::path::Path::new(&snapshot_dir),
+                    sidecar_rootfs_send_source_id(&snapshot_dir)?,
+                )
+                .await
+                {
+                    BtrfsSendRootfsPresence::Present => continue,
+                    BtrfsSendRootfsPresence::Missing { path } => {
+                        return Err(missing(&path.to_string_lossy()));
+                    }
+                    BtrfsSendRootfsPresence::Unusable { detail } => {
+                        return Err(Status::failed_precondition(format!(
+                            "cannot reupload snapshot: {marker}: {detail}",
+                            marker = pplx_space_common_core::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER,
+                        )));
+                    }
+                    BtrfsSendRootfsPresence::Unverified { detail } => {
+                        return Err(Status::internal(format!(
+                            "cannot reupload snapshot: {detail}"
+                        )));
+                    }
+                }
+            }
+            let path = std::path::Path::new(&snapshot_dir)
+                .join(artifact.local_name)
+                .to_string_lossy()
+                .into_owned();
             // `try_exists` distinguishes "stat says no" (Ok(false), genuine
             // missing artifact, terminal) from "stat itself failed" (Err,
             // transient permission/IO/mount issue). Only Ok(false) maps to
@@ -4995,20 +5192,7 @@ impl SandboxManagerService {
             // reconciler retries instead of escalating to mark-as-failed.
             match std::path::Path::new(&path).try_exists() {
                 Ok(true) => {}
-                Ok(false) => {
-                    // The marker substring is the classifier signal the
-                    // cluster controller's promote handler keys off (see
-                    // `pplx_space_common_core::node_drain_signals`). Both
-                    // sides must reference the constant — a reworded
-                    // literal here would silently flip the consumer from
-                    // "terminal, mark sandbox failed" to "retry forever".
-                    return Err(Status::failed_precondition(format!(
-                        "cannot reupload snapshot: {marker} at {path} \
-                         — the local snapshot has already been pruned; the sandbox cannot \
-                         be promoted from this node",
-                        marker = pplx_space_common_core::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER,
-                    )));
-                }
+                Ok(false) => return Err(missing(&path)),
                 Err(err) => {
                     return Err(Status::internal(format!(
                         "cannot reupload snapshot: failed to stat artifact at {path}: {err}",
@@ -5216,7 +5400,7 @@ impl SandboxManagerService {
         &self,
         sandbox: &crate::db::SandboxRow,
         snapshot_dir: &str,
-    ) -> Result<u64, Status> {
+    ) -> Result<crate::btrfs_via_nodemgr::CapturedRootfs, Status> {
         let content_hash = sandbox.template_hash.as_deref().ok_or_else(|| {
             Status::failed_precondition(
                 "btrfs-send codec requires sandbox.template_hash to be set; \
@@ -5224,7 +5408,7 @@ impl SandboxManagerService {
             )
         })?;
 
-        let stream_bytes = crate::btrfs_via_nodemgr::encode_rootfs_send(
+        let captured = crate::btrfs_via_nodemgr::encode_rootfs_send(
             &sandbox.id,
             &sandbox.template,
             content_hash,
@@ -5242,10 +5426,46 @@ impl SandboxManagerService {
             sandbox_id = %sandbox.id,
             template = %sandbox.template,
             content_hash,
-            stream_bytes,
+            stream_bytes = captured.stream_bytes(),
+            deferred = matches!(captured, crate::btrfs_via_nodemgr::CapturedRootfs::Deferred { .. }),
             "btrfs-send codec: rootfs encoded as btrfs send -p stream (via nodemgr)"
         );
-        Ok(stream_bytes)
+        Ok(captured)
+    }
+
+    /// Node-manager's current answer for a retained rootfs about to be backed
+    /// up. Only a present source proceeds; streaming is chosen per backup, so
+    /// a retained source still uploads after volume-manager loses streaming.
+    async fn inspect_retained_upload(
+        &self,
+        meta: &crate::snapshot_upload::SnapshotMeta,
+        snapshot_dir: &std::path::Path,
+        format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
+    ) -> Result<Option<crate::snapshot_upload::RetainedUpload>, String> {
+        use crate::retained_source::{RetainedSourceCheck, RootfsArtifact};
+        if meta.encrypted
+            || format != pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat::BtrfsSend
+        {
+            return Ok(None);
+        }
+        let Some(RootfsArtifact::RetainedSource(source)) =
+            RootfsArtifact::resolve_meta(meta, snapshot_dir).map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        match self.retained_source_inspector.inspect(&source).await {
+            RetainedSourceCheck::Present { rootfs_bytes } => {
+                Ok(Some(crate::snapshot_upload::RetainedUpload {
+                    rootfs_bytes,
+                    stream: crate::btrfs_via_nodemgr::volume_manager_streams_btrfs_send().await,
+                }))
+            }
+            check => Err(format!(
+                "retained send source {} in {} cannot be backed up: {check}",
+                source.source_id,
+                snapshot_dir.display()
+            )),
+        }
     }
 
     async fn submit_artifact_backup(
@@ -5324,6 +5544,9 @@ impl SandboxManagerService {
         // vol-mgr submission, ClusterApi.BeginArtifactBackup, or runtime
         // teardown so cancellation at any later point has an owner that can
         // resume the complete pipeline.
+        let retained = self
+            .inspect_retained_upload(&meta, std::path::Path::new(snapshot_dir), format)
+            .await?;
         let mut jobs = crate::snapshot_upload::prepare_suspend_snapshot(
             &meta,
             &snapshot_id,
@@ -5331,6 +5554,7 @@ impl SandboxManagerService {
             config,
             artifact_kind,
             format,
+            retained,
         )
         .map_err(|error| format!("prepare snapshot upload intent failed: {error}"))?;
         let mut storage_uri = jobs.storage_uri.clone();

@@ -30,6 +30,7 @@ use tokio::task::JoinSet;
 use tracing::{Instrument, debug, info, warn};
 
 use pplx_space_common_core::types::{MULTIPART_CONCURRENCY, MULTIPART_PART_SIZE};
+use pplx_space_s3_http_client::{DEFAULT_POOL_IDLE_TIMEOUT, s3_http_client};
 
 mod attempts;
 mod content_md5;
@@ -41,7 +42,7 @@ mod timeouts;
 mod upload;
 
 use attempts::{AttemptObserver, AttemptTarget};
-use timeouts::S3Timeouts;
+use timeouts::{S3Timeouts, read_secs};
 
 pub use download::FinishingWrite;
 use download::{ReorderWindow, SequentialWriter, open_scratch};
@@ -417,6 +418,12 @@ const DOWNLOAD_CHUNK_SIZE_ENV: &str = "SPACE_OBJECT_STORE_DOWNLOAD_CHUNK_SIZE_BY
 /// no longer scales with the pull-slot count.
 const DOWNLOAD_BUFFER_BUDGET_ENV: &str = "SPACE_OBJECT_STORE_DOWNLOAD_BUFFER_BUDGET_BYTES";
 
+/// Env var that overrides how long an idle pooled connection stays eligible
+/// for reuse, in whole seconds. Accepted range is `1..=90`; 90 s is hyper's
+/// default, which lets S3 close a connection before the pool drops it. Keep
+/// it below the endpoint's idle close.
+const POOL_IDLE_TIMEOUT_ENV: &str = "SPACE_OBJECT_STORE_POOL_IDLE_TIMEOUT_SECS";
+
 const MULTIPART_PART_SIZE_MIN: usize = 8 * 1024 * 1024;
 const MULTIPART_PART_SIZE_MAX: usize = 5 * 1024 * 1024 * 1024;
 const MULTIPART_CONCURRENCY_MIN: usize = 1;
@@ -428,6 +435,11 @@ const DOWNLOAD_CHUNK_SIZE_MAX: usize = 256 * 1024 * 1024;
 const DEFAULT_DOWNLOAD_BUFFER_BUDGET: usize = 2 * 1024 * 1024 * 1024;
 const DOWNLOAD_BUFFER_BUDGET_MIN: usize = 256 * 1024 * 1024;
 const DOWNLOAD_BUFFER_BUDGET_MAX: usize = 8 * 1024 * 1024 * 1024;
+
+/// Bounds on `SPACE_OBJECT_STORE_POOL_IDLE_TIMEOUT_SECS`; unset, it is
+/// [`DEFAULT_POOL_IDLE_TIMEOUT`].
+const POOL_IDLE_TIMEOUT_SECS_MIN: u64 = 1;
+const POOL_IDLE_TIMEOUT_SECS_MAX: u64 = 90;
 
 /// Upload stalled-stream grace period. Equal to the SDK's effective default
 /// (aws-smithy-runtime's default stalled-stream plugin sets 5 s; the 20 s
@@ -570,6 +582,15 @@ fn resolve_download_buffer_budget<F: FnOnce(&str) -> Option<String>>(read: F) ->
         .unwrap_or(DEFAULT_DOWNLOAD_BUFFER_BUDGET)
 }
 
+fn resolve_pool_idle_timeout<F: FnOnce(&str) -> Option<String>>(read: F) -> Duration {
+    read_secs(
+        read,
+        POOL_IDLE_TIMEOUT_ENV,
+        POOL_IDLE_TIMEOUT_SECS_MIN..=POOL_IDLE_TIMEOUT_SECS_MAX,
+    )
+    .unwrap_or(DEFAULT_POOL_IDLE_TIMEOUT)
+}
+
 /// Telemetry-safe endpoint label: host and optional port only, so a custom
 /// endpoint URL carrying userinfo or other sensitive components never
 /// reaches exported spans.
@@ -703,7 +724,11 @@ where
     );
 }
 
-fn s3_base_config(timeouts: S3Timeouts, observer: AttemptObserver) -> aws_sdk_s3::config::Builder {
+fn s3_base_config(
+    timeouts: S3Timeouts,
+    pool_idle_timeout: Duration,
+    observer: AttemptObserver,
+) -> aws_sdk_s3::config::Builder {
     let placeholder_creds = Credentials::new(
         "placeholder",
         "placeholder",
@@ -715,6 +740,7 @@ fn s3_base_config(timeouts: S3Timeouts, observer: AttemptObserver) -> aws_sdk_s3
         .behavior_version(BehaviorVersion::latest())
         .region(Region::new("us-east-1"))
         .credentials_provider(placeholder_creds)
+        .http_client(s3_http_client(pool_idle_timeout))
         // aws-sdk-s3 1.79+ defaults to `WhenSupported`, which can add
         // opportunistic CRC trailers to ordinary PUT bodies via streaming
         // chunked encoding. SPACE snapshot uploads have seen those requests
@@ -760,25 +786,36 @@ impl S3ObjectStore {
     /// - `SPACE_OBJECT_STORE_{REQUEST,BODY_UPLOAD,SERVER_SIDE}_ATTEMPT_TIMEOUT_SECS`:
     ///   5..=21600, defaults 10, 60, and 30. Bound each attempt of an
     ///   operation in that class; see `timeouts` for which operations each
-    ///   class holds and the measurements behind the defaults. The
+    ///   class holds and the reasoning behind the defaults. The
     ///   body-upload default fits one 256 MiB part, so raise it with the part
     ///   size.
     /// - `SPACE_OBJECT_STORE_{REQUEST,BODY_UPLOAD,SERVER_SIDE}_OPERATION_TIMEOUT_SECS`:
     ///   5..=86400, default three attempt timeouts plus 5 s of retry backoff
     ///   (35, 185, and 95). Bound an operation across all of its retries.
+    /// - `SPACE_OBJECT_STORE_POOL_IDLE_TIMEOUT_SECS`: 1..=90, default 3. How
+    ///   long an idle pooled connection stays eligible for reuse; keep it
+    ///   below the endpoint's idle close (S3: 6 s).
     pub fn new() -> Self {
         let timeouts = S3Timeouts::from_env();
+        let pool_idle_timeout = resolve_pool_idle_timeout(|name| std::env::var(name).ok());
         let attempts = AttemptObserver::logging();
         Self::with_base_config(
-            s3_base_config(timeouts, attempts.clone()).build(),
+            s3_base_config(timeouts, pool_idle_timeout, attempts.clone()).build(),
             timeouts,
+            pool_idle_timeout,
             attempts,
         )
     }
 
     /// `attempts` must be the observer `conf` carries, so body-read failures
-    /// the SDK never sees reach the same reporter as its own attempts.
-    fn with_base_config(conf: Config, timeouts: S3Timeouts, attempts: AttemptObserver) -> Self {
+    /// the SDK never sees reach the same reporter as its own attempts, and
+    /// `pool_idle_timeout` the one its HTTP client was built with.
+    fn with_base_config(
+        conf: Config,
+        timeouts: S3Timeouts,
+        pool_idle_timeout: Duration,
+        attempts: AttemptObserver,
+    ) -> Self {
         let multipart_part_size = resolve_multipart_part_size(|name| std::env::var(name).ok());
         let multipart_concurrency = resolve_multipart_concurrency(|name| std::env::var(name).ok());
         let download_reader_concurrency =
@@ -801,6 +838,7 @@ impl S3ObjectStore {
             body_upload_operation_timeout_secs = timeouts.body_upload.operation.as_secs(),
             server_side_attempt_timeout_secs = timeouts.server_side.attempt.as_secs(),
             server_side_operation_timeout_secs = timeouts.server_side.operation.as_secs(),
+            pool_idle_timeout_secs = pool_idle_timeout.as_secs(),
             "object-store: transfer tuning"
         );
         Self {
