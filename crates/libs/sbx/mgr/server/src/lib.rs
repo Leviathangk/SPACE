@@ -18,6 +18,7 @@ mod lifecycle_metrics;
 pub mod local_artifacts;
 mod node_state_sync;
 pub mod restore_operation;
+pub(crate) mod retained_source;
 pub(crate) mod rootfs_encryption;
 pub(crate) mod route_activation_claims;
 pub mod run;

@@ -358,7 +358,10 @@ impl SandboxManagerService {
     ) -> Result<Vec<crate::db::StartupRecoveryRecord>, StartupRecoveryError> {
         let mut records = self.recover_interrupted_pauses().await?;
         records.extend(self.recover_interrupted_resident_operations().await?);
-        records.extend(self.recover_prelaunch_startup_states_in(Path::new(CACHE_DIR))?);
+        let verdicts = self
+            .suspending_retained_source_verdicts(Path::new(CACHE_DIR))
+            .await?;
+        records.extend(self.recover_prelaunch_startup_states_in(Path::new(CACHE_DIR), &verdicts)?);
         let db_records = {
             let db = self.startup_recovery_db()?;
             crate::db::recover_interrupted_startup_states(&db)?
@@ -529,9 +532,86 @@ impl SandboxManagerService {
         })
     }
 
+    /// Node-manager's answers, then the blocking validation that consumes them.
+    /// The caller holds the cleanup fence across both, so no cleanup owner can
+    /// replace the artifact in between. Each node-manager call has its own
+    /// deadline; the blocking validation is not cancellable.
+    async fn inspect_canonical_artifact_for_adoption(
+        &self,
+        cache_dir: std::path::PathBuf,
+        sandbox_id: SandboxId,
+    ) -> Result<
+        Result<
+            suspend_snapshot_publication::ValidatedSuspendSnapshotArtifact,
+            suspend_snapshot_publication::CanonicalSuspendSnapshotRecoveryError,
+        >,
+        tokio::task::JoinError,
+    > {
+        let verdicts = self
+            .inspect_retained_sources_in(vec![cache_dir.join(sandbox_id.to_string())])
+            .await;
+        tokio::task::spawn_blocking(move || {
+            suspend_snapshot_publication::validate_canonical_suspend_snapshot_for_recovery(
+                &cache_dir, sandbox_id, &verdicts,
+            )
+        })
+        .await
+    }
+
+    /// Startup classifies interrupted publications synchronously, so inspect
+    /// their retained sources first. No other owner runs before startup
+    /// recovery finishes; classification still rechecks each identity.
+    async fn suspending_retained_source_verdicts(
+        &self,
+        cache_dir: &Path,
+    ) -> Result<crate::retained_source::RetainedSourceVerdicts, StartupRecoveryError> {
+        let sandbox_dirs = {
+            let db = self.startup_recovery_db()?;
+            crate::db::list_sandboxes_for_recovery(&db)?
+        }
+        .into_iter()
+        .filter(|row| row.state == SandboxState::Suspending)
+        .map(|row| cache_dir.join(row.id))
+        .collect();
+        Ok(self.inspect_retained_sources_in(sandbox_dirs).await)
+    }
+
+    /// Node-manager verdicts for the retained sources that suspend artifacts
+    /// in `sandbox_dirs` name. Callers hold their artifact fences across this
+    /// and the validation that consumes it.
+    pub(super) async fn inspect_retained_sources_in(
+        &self,
+        sandbox_dirs: Vec<std::path::PathBuf>,
+    ) -> crate::retained_source::RetainedSourceVerdicts {
+        let sources = match tokio::task::spawn_blocking(move || {
+            sandbox_dirs
+                .iter()
+                .flat_map(|sandbox_dir| {
+                    suspend_snapshot_publication::retained_sources_in_sandbox_dir(sandbox_dir)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        {
+            Ok(sources) => sources,
+            Err(error) => {
+                tracing::warn!(%error, "retained source discovery task failed");
+                Vec::new()
+            }
+        };
+        crate::retained_source::inspect_in_background(
+            self.retained_source_inspector.as_ref(),
+            sources,
+            crate::retained_source::BACKGROUND_INSPECTION_BUDGET,
+            &mut None,
+        )
+        .await
+    }
+
     pub(super) fn recover_prelaunch_startup_states_in(
         &self,
         cache_dir: &Path,
+        verdicts: &crate::retained_source::RetainedSourceVerdicts,
     ) -> Result<Vec<crate::db::StartupRecoveryRecord>, StartupRecoveryError> {
         let rows = {
             let db = self.startup_recovery_db()?;
@@ -553,6 +633,7 @@ impl SandboxManagerService {
                         cache_dir,
                         row,
                         SuspendSnapshotPublicationRecoveryOrigin::StartupRecovery,
+                        verdicts,
                     ) {
                         Ok(record) => records.push(record),
                         Err(error) => {
@@ -586,6 +667,7 @@ impl SandboxManagerService {
         cache_dir: &Path,
         rows: Vec<crate::db::SandboxRow>,
         shutdown: &CancellationToken,
+        verdicts: &crate::retained_source::RetainedSourceVerdicts,
     ) -> Result<(), StartupRecoveryError> {
         for row in rows.into_iter().filter(|row| {
             row.state == SandboxState::Suspending && row.current_local_artifact_id.is_none()
@@ -621,6 +703,7 @@ impl SandboxManagerService {
                     cache_dir,
                     row,
                     SuspendSnapshotPublicationRecoveryOrigin::PeriodicRecovery,
+                    verdicts,
                 )?;
                 Ok(())
             })();
@@ -636,6 +719,7 @@ impl SandboxManagerService {
         cache_dir: &Path,
         row: crate::db::SandboxRow,
         origin: SuspendSnapshotPublicationRecoveryOrigin,
+        verdicts: &crate::retained_source::RetainedSourceVerdicts,
     ) -> Result<crate::db::StartupRecoveryRecord, StartupRecoveryError> {
         let teardown_status = {
             let db = self.startup_recovery_db()?;
@@ -666,6 +750,7 @@ impl SandboxManagerService {
             &sandbox_dir,
             row.current_local_artifact_id,
             runtime_live,
+            verdicts,
         )?;
         self.apply_suspend_snapshot_publication_recovery_decision(
             row,
@@ -673,6 +758,7 @@ impl SandboxManagerService {
             decision,
             origin,
             teardown_generation,
+            verdicts,
         )
     }
 
@@ -683,6 +769,7 @@ impl SandboxManagerService {
         decision: SuspendSnapshotPublicationDecision,
         origin: SuspendSnapshotPublicationRecoveryOrigin,
         teardown_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+        verdicts: &crate::retained_source::RetainedSourceVerdicts,
     ) -> Result<crate::db::StartupRecoveryRecord, StartupRecoveryError> {
         match decision {
             SuspendSnapshotPublicationDecision::CanonicalReady(artifact) => {
@@ -708,6 +795,7 @@ impl SandboxManagerService {
                     &staged.staging_dir,
                     &snapshot_dir,
                     staged.local_artifact_id,
+                    verdicts,
                 ) {
                     tracing::warn!(
                         sandbox_id = %row.id,
@@ -1436,18 +1524,13 @@ impl SandboxManagerService {
                 continue;
             };
             probe(RecoveryPassWindow::CleanupFenceHeld);
-            let cache_dir = cache_dir.to_path_buf();
             // Deliberately not timed out either. `spawn_blocking` cannot be
             // cancelled, so returning early here meant dropping
             // `operation_fence` while the inspection was still walking the
             // snapshot directory — releasing the cleanup lock under a live
             // reader and letting a cleanup owner delete the tree beneath it.
-            let inspected = tokio::task::spawn_blocking(move || {
-                    super::suspend_snapshot_publication::validate_canonical_suspend_snapshot_for_recovery(
-                        &cache_dir,
-                        sandbox_id,
-                    )
-                })
+            let inspected = self
+                .inspect_canonical_artifact_for_adoption(cache_dir.to_path_buf(), sandbox_id)
                 .await;
             probe(RecoveryPassWindow::ArtifactInspected);
             let artifact = match inspected {
@@ -2061,6 +2144,12 @@ impl SandboxManagerService {
             let mut inventory_scan = super::cache_cleanup::PeriodicInventoryScan::default();
             let mut quarantine_scan = crate::db::PeriodicQuarantineRecoveryScan::default();
             let mut transfer_scan = crate::db::inventory::RestoreTransferScopeScan::default();
+            // Retained sources the previous pass could not resolve. Each pass
+            // inspects them first, so its synchronous validation never waits
+            // on node-manager.
+            let mut retained_unresolved = Vec::new();
+            let mut retained_cursor = None;
+            let mut retained_pending = crate::retained_source::PendingRetainedSources::default();
             loop {
             tokio::select! {
                 _ = shutdown_token.cancelled() => {
@@ -2102,19 +2191,29 @@ impl SandboxManagerService {
             let (publications, residents) = candidates.into_iter()
                 .partition(|row| row.state == SandboxState::Suspending);
             service.recover_periodic_resident_operations(residents, &shutdown_token).await;
+            let verdicts = std::sync::Arc::new(
+                crate::retained_source::inspect_in_background(
+                    service.retained_source_inspector.as_ref(),
+                    std::mem::take(&mut retained_unresolved),
+                    crate::retained_source::BACKGROUND_INSPECTION_BUDGET,
+                    &mut retained_cursor,
+                )
+                .await,
+            );
             let reconcile_service = service.clone();
             let reconcile_shutdown = shutdown_token.clone();
             let blocking_writer = state_writer.clone();
+            let blocking_verdicts = verdicts.clone();
             let inventory_result = tokio::task::spawn_blocking(move || {
                 let _state_writer = blocking_writer;
                 if let Err(error) = reconcile_service.recover_deferred_suspend_publications_in(
-                    Path::new(CACHE_DIR), publications, &reconcile_shutdown,
+                    Path::new(CACHE_DIR), publications, &reconcile_shutdown, &blocking_verdicts,
                 ) {
                     tracing::warn!(%error, "periodic suspend publication recovery failed; will retry");
                 }
                 let mut paths = Vec::new();
                 if !reconcile_shutdown.is_cancelled() {
-                    if let Err(error) = reconcile_service.reconcile_periodic_inventory(&mut inventory_scan, &reconcile_shutdown) {
+                    if let Err(error) = reconcile_service.reconcile_periodic_inventory(&mut inventory_scan, &reconcile_shutdown, &blocking_verdicts) {
                         tracing::warn!(%error, "periodic inventory reconciliation failed; will retry");
                     }
                     if !reconcile_shutdown.is_cancelled() {
@@ -2127,6 +2226,8 @@ impl SandboxManagerService {
                 (inventory_scan, staging_scan, paths)
             })
             .await;
+            retained_unresolved = verdicts.take_unresolved();
+            retained_pending.observe(&retained_unresolved, std::time::Instant::now());
             match inventory_result {
                 Ok((inventory, staging, paths)) => {
                     inventory_scan = inventory;

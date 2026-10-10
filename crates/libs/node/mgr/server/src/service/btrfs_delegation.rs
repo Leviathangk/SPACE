@@ -401,20 +401,29 @@ impl Drop for SubvolumeCleanupGuard {
 }
 
 impl NodeManagerService {
+    /// Returns the retained source identity and its rootfs image length, read
+    /// back through the same verification later inspections use.
     async fn retain_send_source(
         &self,
         retain: bool,
         artifact: &Path,
         parent: &Path,
         source: &Path,
-    ) -> Result<Option<uuid::Uuid>, Status> {
+    ) -> Result<Option<(uuid::Uuid, u64)>, Status> {
         if !retain {
             return Ok(None);
         }
         let (artifact, parent, source) =
             (artifact.to_owned(), parent.to_owned(), source.to_owned());
         self.off_runtime("retain immutable send source", move || {
-            super::btrfs_send_source::capture(&artifact, &parent, &source).map(Some)
+            let id = super::btrfs_send_source::capture(&artifact, &parent, &source)?;
+            // Not FailedPrecondition, which callers read as an ineligible
+            // source and answer with a Full fallback beside this bundle.
+            let rootfs_bytes =
+                super::btrfs_send_source::inspect(&artifact, id).map_err(|status| {
+                    Status::internal(format!("verify retained send source: {}", status.message()))
+                })?;
+            Ok(Some((id, rootfs_bytes)))
         })
         .await
     }
@@ -639,7 +648,7 @@ impl NodeManagerService {
             .await?;
         }
 
-        let source_id = self
+        let retained = self
             .retain_send_source(
                 req.retain_source,
                 &snapshot_dir,
@@ -648,7 +657,7 @@ impl NodeManagerService {
             )
             .await?;
         let stream_path = rootfs_btrfs_send_path(&snapshot_dir);
-        let encode_result = if req.defer_send && source_id.is_some() {
+        let encode_result = if req.defer_send && retained.is_some() {
             Ok(0)
         } else {
             self.encode_pinned_stream(&send_parent.path, &instance_ro_path, &stream_path)
@@ -704,7 +713,8 @@ impl NodeManagerService {
         );
         Ok(Response::new(BtrfsEncodeRootfsSendResponse {
             stream_bytes,
-            source_id: source_id.map(|id| id.to_string()),
+            source_id: retained.map(|(id, _)| id.to_string()),
+            rootfs_bytes: retained.map(|(_, bytes)| bytes),
         }))
     }
 
@@ -799,7 +809,7 @@ impl NodeManagerService {
         }
         let mut wire_source_cleanup =
             SubvolumeCleanupGuard::new(wire_source.clone(), "delete named snapshot wire clone");
-        let source_id = self
+        let retained = self
             .retain_send_source(
                 req.retain_source,
                 &destination,
@@ -808,7 +818,7 @@ impl NodeManagerService {
             )
             .await?;
         let stream_path = rootfs_btrfs_send_path(&destination);
-        let send_result = if req.defer_send && source_id.is_some() {
+        let send_result = if req.defer_send && retained.is_some() {
             Ok(0)
         } else {
             self.encode_pinned_stream(&send_parent.path, &wire_source, &stream_path)
@@ -839,7 +849,8 @@ impl NodeManagerService {
         );
         Ok(Response::new(BtrfsEncodeSnapshotRootfsSendResponse {
             stream_bytes,
-            source_id: source_id.map(|id| id.to_string()),
+            source_id: retained.map(|(id, _)| id.to_string()),
+            rootfs_bytes: retained.map(|(_, bytes)| bytes),
         }))
     }
 

@@ -164,11 +164,13 @@ impl SandboxManagerService {
         &self,
         scan: &mut PeriodicInventoryScan,
         shutdown: &CancellationToken,
+        retained_sources: &crate::retained_source::RetainedSourceVerdicts,
     ) -> Result<(), Status> {
         self.reconcile_periodic_inventory_in(
             scan,
             SandboxInventoryPaths::new(Path::new(CACHE_DIR), Path::new(RUN_DIR)),
             shutdown,
+            retained_sources,
         )
     }
 
@@ -177,6 +179,7 @@ impl SandboxManagerService {
         scan: &mut PeriodicInventoryScan,
         paths: SandboxInventoryPaths<'_>,
         shutdown: &CancellationToken,
+        retained_sources: &crate::retained_source::RetainedSourceVerdicts,
     ) -> Result<(), Status> {
         let discovery = scan.discover(self, paths, shutdown)?;
         if shutdown.is_cancelled() {
@@ -194,7 +197,8 @@ impl SandboxManagerService {
                     |id: SandboxId| self.auto_lifecycle.try_staging_guard(&id.to_string()),
                     &observe_execution,
                 )
-                .with_retirement(|id: &str| self.try_registration_retirement(id)),
+                .with_retirement(|id: &str| self.try_registration_retirement(id))
+                .with_retained_sources(retained_sources),
             )
             .map_err(|error| {
                 if matches!(error, InventoryError::DatabaseMutexPoisoned) {

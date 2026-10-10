@@ -48,6 +48,7 @@ impl NodeManagerService {
         self.authorize_peer(&request, "GetBtrfsSendCapabilities", ALLOWED)?;
         Ok(Response::new(GetBtrfsSendCapabilitiesResponse {
             supported: cfg!(target_os = "linux"),
+            inspect_send_source: cfg!(target_os = "linux"),
         }))
     }
 
