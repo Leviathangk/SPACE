@@ -146,9 +146,12 @@ async fn staging_cleanup_rediscovery_survives_rollback_failed_deletion_and_resta
             .unwrap();
         assert_eq!(sweep(&service, cache.path()), expected);
         assert!(
-            suspend_snapshot_publication::find_complete_suspend_snapshot_staging_dir(&root)
-                .unwrap()
-                .is_none(),
+            suspend_snapshot_publication::find_complete_suspend_snapshot_staging_dir(
+                &root,
+                &Default::default()
+            )
+            .unwrap()
+            .is_none(),
             "later recovery must never adopt an artifact pending deletion"
         );
     }
@@ -173,10 +176,13 @@ async fn staging_cleanup_rediscovery_survives_rollback_failed_deletion_and_resta
         .unwrap();
     assert_eq!(sweep(&service, cache.path()), expected);
     assert_eq!(
-        suspend_snapshot_publication::find_complete_suspend_snapshot_staging_dir(&root)
-            .unwrap()
-            .unwrap()
-            .local_artifact_id,
+        suspend_snapshot_publication::find_complete_suspend_snapshot_staging_dir(
+            &root,
+            &Default::default()
+        )
+        .unwrap()
+        .unwrap()
+        .local_artifact_id,
         fresh_id
     );
     for path in &expected {

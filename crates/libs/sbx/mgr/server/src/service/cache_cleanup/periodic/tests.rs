@@ -19,12 +19,18 @@ async fn periodic_inventory_progresses_in_pages_without_treating_other_pages_as_
     let mut scan = PeriodicInventoryScan::default();
     let shutdown = CancellationToken::new();
     let paths = SandboxInventoryPaths::new(cache.path(), runtime.path());
+    let batch = service
+        .discover_periodic_inventory_in(&mut scan, paths, &shutdown)
+        .unwrap();
     service
-        .reconcile_periodic_inventory_in(&mut scan, paths, &shutdown)
+        .reconcile_periodic_inventory_batch(batch, &Default::default())
         .unwrap();
     assert!(crate::db::sandbox_exists(&service.db_conn().unwrap(), &stale.to_string()).unwrap());
+    let batch = service
+        .discover_periodic_inventory_in(&mut scan, paths, &shutdown)
+        .unwrap();
     service
-        .reconcile_periodic_inventory_in(&mut scan, paths, &shutdown)
+        .reconcile_periodic_inventory_batch(batch, &Default::default())
         .unwrap();
     assert!(!crate::db::sandbox_exists(&service.db_conn().unwrap(), &stale.to_string()).unwrap());
     for id in ids {
@@ -84,5 +90,29 @@ fn directory_discovery_bounds_each_batch_and_wraps_without_retaining_names() {
     assert_eq!(
         scan.next_batch(dir.path()).unwrap().len(),
         DIRECTORY_BATCH_SIZE
+    );
+}
+
+#[tokio::test]
+async fn periodic_inventory_names_only_rowless_cache_directories_for_inspection() {
+    let cache = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let conn = crate::db::test_conn();
+    let (owned, orphan) = (SandboxId::new(), SandboxId::new());
+    for id in [owned, orphan] {
+        std::fs::create_dir(cache.path().join(id.to_string())).unwrap();
+    }
+    insert_test_sandbox(&conn, &owned.to_string(), SandboxState::Suspended);
+    let service = SandboxManagerService::new(conn);
+    let batch = service
+        .discover_periodic_inventory_in(
+            &mut PeriodicInventoryScan::default(),
+            SandboxInventoryPaths::new(cache.path(), runtime.path()),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    assert_eq!(
+        batch.orphan_candidates,
+        vec![cache.path().join(orphan.to_string())]
     );
 }

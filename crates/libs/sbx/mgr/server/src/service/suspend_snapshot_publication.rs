@@ -5,6 +5,9 @@ use pplx_space_common_core::types::{
     LocalArtifactId, RuntimeKind, SandboxId, SandboxOwner, SandboxRuntimeLabel, TemplateName,
 };
 
+use crate::retained_source::{
+    RetainedSource, RetainedSourceCheck, RetainedSourceVerdicts, RootfsArtifact,
+};
 use crate::snapshot_restore::RecoveredSandboxRowFieldsError;
 use crate::state::SandboxState;
 
@@ -191,17 +194,48 @@ pub enum SuspendSnapshotValidationError {
         declared_runtime: RuntimeKind,
         execution_runtime: RuntimeKind,
     },
+    #[error("retained send source {source_id} in {snapshot_dir} is unusable: {reason}")]
+    RetainedSourceInvalid {
+        snapshot_dir: String,
+        source_id: uuid::Uuid,
+        reason: String,
+    },
+    #[error("retained send source {source_id} in {snapshot_dir} is not yet verified: {reason}")]
+    RetainedSourcePending {
+        snapshot_dir: String,
+        source_id: uuid::Uuid,
+        reason: String,
+    },
 }
 
 impl SuspendSnapshotValidationError {
+    /// Whether the failure proves the artifact unusable, rather than merely
+    /// unverified. Exhaustive so that a new variant must choose.
     pub(super) fn is_unsafe_evidence(&self) -> bool {
         match self {
             Self::ReadMetadata { source, .. } | Self::StatArtifact { source, .. } => {
                 source.kind() == std::io::ErrorKind::NotFound
             }
-            Self::HostArchitecture(_) => false,
-            _ => true,
+            Self::HostArchitecture(_) | Self::RetainedSourcePending { .. } => false,
+            Self::ParseMetadata { .. }
+            | Self::SandboxIdentityMismatch { .. }
+            | Self::MissingArtifactIdentity { .. }
+            | Self::ArtifactShapeMismatch { .. }
+            | Self::InvalidRecoveredRowFields { .. }
+            | Self::MissingArtifact { .. }
+            | Self::ArtifactNotRegular { .. }
+            | Self::ArtifactSizeOverflow
+            | Self::ArtifactSizeMismatch { .. }
+            | Self::InvalidExecutionMetadata { .. }
+            | Self::RuntimeMismatch { .. }
+            | Self::RetainedSourceInvalid { .. } => true,
         }
+    }
+
+    /// Awaiting node-manager. Classification must retry rather than read the
+    /// artifact as missing.
+    pub(super) fn is_pending(&self) -> bool {
+        matches!(self, Self::RetainedSourcePending { .. })
     }
 }
 
@@ -387,8 +421,12 @@ pub(super) fn validate_suspend_snapshot_metadata(
     })
 }
 
+/// Local structural validation. A retained send source takes its verdict from
+/// `verdicts`, gathered beforehand by the async caller; without one the
+/// artifact is pending, not incomplete.
 pub(super) fn validate_suspend_snapshot_artifact_files(
     snapshot: &ValidatedSuspendSnapshotMetadata,
+    verdicts: &RetainedSourceVerdicts,
 ) -> Result<(), SuspendSnapshotValidationError> {
     let metadata = &snapshot.metadata;
     let artifacts = if metadata.encrypted {
@@ -400,7 +438,22 @@ pub(super) fn validate_suspend_snapshot_artifact_files(
     };
     let mut actual_bytes = 0_u64;
     for artifact in artifacts {
-        let path = crate::snapshot_upload::local_artifact_path(&snapshot.snapshot_dir, &artifact);
+        if artifact.kind == pplx_space_common_core::types::SnapshotArtifact::RootfsBtrfsSend
+            && let Some(RootfsArtifact::RetainedSource(source)) =
+                RootfsArtifact::resolve_meta(metadata, &snapshot.snapshot_dir).map_err(|error| {
+                    SuspendSnapshotValidationError::StatArtifact {
+                        path: error.path,
+                        source: error.source,
+                    }
+                })?
+        {
+            let rootfs_bytes = retained_rootfs_bytes(&snapshot.snapshot_dir, &source, verdicts)?;
+            actual_bytes = actual_bytes
+                .checked_add(rootfs_bytes)
+                .ok_or(SuspendSnapshotValidationError::ArtifactSizeOverflow)?;
+            continue;
+        }
+        let path = snapshot.snapshot_dir.join(artifact.local_name);
         let file = match std::fs::symlink_metadata(&path) {
             Ok(file) => file,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
@@ -431,12 +484,75 @@ pub(super) fn validate_suspend_snapshot_artifact_files(
     Ok(())
 }
 
+fn retained_rootfs_bytes(
+    snapshot_dir: &Path,
+    source: &RetainedSource,
+    verdicts: &RetainedSourceVerdicts,
+) -> Result<u64, SuspendSnapshotValidationError> {
+    match verdicts.check(source) {
+        RetainedSourceCheck::Present { rootfs_bytes } => Ok(rootfs_bytes),
+        RetainedSourceCheck::Absent => Err(SuspendSnapshotValidationError::MissingArtifact {
+            snapshot_dir: path_label(snapshot_dir),
+            artifact: crate::retained_source::BUNDLE_DIRECTORY,
+        }),
+        RetainedSourceCheck::Invalid { reason } => {
+            Err(SuspendSnapshotValidationError::RetainedSourceInvalid {
+                snapshot_dir: path_label(snapshot_dir),
+                source_id: source.source_id,
+                reason,
+            })
+        }
+        RetainedSourceCheck::Unavailable { reason } => {
+            Err(SuspendSnapshotValidationError::RetainedSourcePending {
+                snapshot_dir: path_label(snapshot_dir),
+                source_id: source.source_id,
+                reason,
+            })
+        }
+    }
+}
+
+/// Retained sources named by the canonical and staged suspend artifacts in
+/// `sandbox_dir`, for an async caller to inspect before validating. Unreadable
+/// metadata is skipped here; validation reports it.
+pub(super) fn retained_sources_in_sandbox_dir(sandbox_dir: &Path) -> Vec<RetainedSource> {
+    let mut directories = vec![canonical_suspend_snapshot_dir(sandbox_dir)];
+    if let Ok(entries) = std::fs::read_dir(suspend_snapshot_staging_parent_dir(sandbox_dir)) {
+        directories.extend(
+            entries
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with(SUSPEND_STAGING_PREFIX))
+                }),
+        );
+    }
+    directories
+        .into_iter()
+        .filter_map(|directory| {
+            let metadata = suspended_snapshot_dir_metadata(&directory).ok()?;
+            if metadata.encrypted
+                || crate::snapshot_upload::format_from_meta(&metadata)
+                    != pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat::BtrfsSend
+            {
+                return None;
+            }
+            match RootfsArtifact::resolve_meta(&metadata, &directory) {
+                Ok(Some(RootfsArtifact::RetainedSource(source))) => Some(source),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
 pub(super) fn validate_recoverable_suspend_snapshot_dir(
     snapshot_dir: &Path,
     expected_sandbox_id: Option<SandboxId>,
+    verdicts: &RetainedSourceVerdicts,
 ) -> Result<ValidatedSuspendSnapshotArtifact, SuspendSnapshotValidationError> {
     let metadata = validate_suspend_snapshot_metadata(snapshot_dir, expected_sandbox_id)?;
-    validate_suspend_snapshot_artifact_files(&metadata)?;
+    validate_suspend_snapshot_artifact_files(&metadata, verdicts)?;
     Ok(metadata.into_artifact())
 }
 
@@ -446,6 +562,7 @@ pub(super) fn validate_recoverable_suspend_snapshot_dir(
 pub(super) fn validate_canonical_suspend_snapshot_for_recovery(
     cache_dir: &Path,
     sandbox_id: SandboxId,
+    verdicts: &RetainedSourceVerdicts,
 ) -> Result<ValidatedSuspendSnapshotArtifact, CanonicalSuspendSnapshotRecoveryError> {
     let sandbox_dir = cache_dir.join(sandbox_id.to_string());
     if let Some(staging_dir) = find_suspend_snapshot_staging_residue(&sandbox_dir)? {
@@ -457,20 +574,23 @@ pub(super) fn validate_canonical_suspend_snapshot_for_recovery(
     Ok(validate_recoverable_suspend_snapshot_dir(
         &snapshot_dir,
         Some(sandbox_id),
+        verdicts,
     )?)
 }
 
 pub(super) fn validate_complete_suspend_snapshot_dir(
     snapshot_dir: &Path,
+    verdicts: &RetainedSourceVerdicts,
 ) -> Result<LocalArtifactId, SuspendSnapshotValidationError> {
-    Ok(validate_recoverable_suspend_snapshot_dir(snapshot_dir, None)?.local_artifact_id)
+    Ok(validate_recoverable_suspend_snapshot_dir(snapshot_dir, None, verdicts)?.local_artifact_id)
 }
 
 pub(super) fn ensure_complete_suspend_snapshot_dir(
     snapshot_dir: &Path,
     local_artifact_id: LocalArtifactId,
+    verdicts: &RetainedSourceVerdicts,
 ) -> Result<(), SuspendSnapshotPublicationError> {
-    let actual = validate_complete_suspend_snapshot_dir(snapshot_dir)?;
+    let actual = validate_complete_suspend_snapshot_dir(snapshot_dir, verdicts)?;
     if actual != local_artifact_id {
         return Err(SuspendSnapshotPublicationError::ArtifactIdMismatch {
             snapshot_dir: path_label(snapshot_dir),
@@ -484,6 +604,7 @@ pub(super) fn publish_suspend_snapshot_dir(
     staging_dir: &Path,
     snapshot_dir: &Path,
     local_artifact_id: LocalArtifactId,
+    verdicts: &RetainedSourceVerdicts,
 ) -> Result<(), SuspendSnapshotPublicationError> {
     let parent =
         snapshot_dir
@@ -499,10 +620,10 @@ pub(super) fn publish_suspend_snapshot_dir(
     })?;
 
     if snapshot_dir.exists() {
-        match validate_complete_suspend_snapshot_dir(snapshot_dir) {
+        match validate_complete_suspend_snapshot_dir(snapshot_dir, verdicts) {
             Ok(existing_artifact_id) if existing_artifact_id == local_artifact_id => {
                 if staging_dir.exists() {
-                    ensure_complete_suspend_snapshot_dir(staging_dir, local_artifact_id)?;
+                    ensure_complete_suspend_snapshot_dir(staging_dir, local_artifact_id, verdicts)?;
                     std::fs::remove_dir_all(staging_dir).map_err(|source| {
                         SuspendSnapshotPublicationError::RemoveDuplicateStaged {
                             staging_dir: path_label(staging_dir),
@@ -521,7 +642,7 @@ pub(super) fn publish_suspend_snapshot_dir(
             staging_dir: path_label(staging_dir),
         });
     }
-    ensure_complete_suspend_snapshot_dir(staging_dir, local_artifact_id)?;
+    ensure_complete_suspend_snapshot_dir(staging_dir, local_artifact_id, verdicts)?;
 
     let retired_dir = parent.join(format!(".snapshot-retired-{local_artifact_id}"));
     let _ = std::fs::remove_dir_all(&retired_dir);
@@ -564,6 +685,7 @@ pub(super) fn publish_suspend_snapshot_dir(
 
 pub(super) fn find_complete_suspend_snapshot_staging_dir(
     sandbox_dir: &Path,
+    verdicts: &RetainedSourceVerdicts,
 ) -> Result<Option<StagedSuspendSnapshotArtifact>, SuspendSnapshotPublicationError> {
     let staging_parent = suspend_snapshot_staging_parent_dir(sandbox_dir);
     let entries = match std::fs::read_dir(&staging_parent) {
@@ -586,13 +708,16 @@ pub(super) fn find_complete_suspend_snapshot_staging_dir(
         .collect::<Vec<_>>();
     paths.sort();
     for path in paths {
-        match validate_complete_suspend_snapshot_dir(&path) {
+        match validate_complete_suspend_snapshot_dir(&path, verdicts) {
             Ok(local_artifact_id) => {
                 return Ok(Some(StagedSuspendSnapshotArtifact {
                     local_artifact_id,
                     staging_dir: path,
                 }));
             }
+            // Skipping an unverified staging generation could pick a sibling
+            // or conclude that no usable artifact exists.
+            Err(error) if error.is_pending() => return Err(error.into()),
             Err(error) => {
                 tracing::warn!(
                     staging_dir = %path.display(),
@@ -639,10 +764,13 @@ pub(super) fn find_suspend_snapshot_staging_residue(
     Ok(None)
 }
 
+/// An unverified retained source is an error, not a decision: the caller
+/// retries once node-manager answers.
 pub(super) fn classify_suspend_snapshot_publication(
     sandbox_dir: &Path,
     expected_canonical_artifact_id: Option<LocalArtifactId>,
     runtime_live: bool,
+    verdicts: &RetainedSourceVerdicts,
 ) -> Result<SuspendSnapshotPublicationDecision, SuspendSnapshotPublicationError> {
     if runtime_live {
         return Ok(SuspendSnapshotPublicationDecision::RuntimeLiveWithoutUsableArtifact);
@@ -652,7 +780,7 @@ pub(super) fn classify_suspend_snapshot_publication(
     if snapshot_dir.exists()
         && let Some(expected) = expected_canonical_artifact_id
     {
-        match validate_complete_suspend_snapshot_dir(&snapshot_dir) {
+        match validate_complete_suspend_snapshot_dir(&snapshot_dir, verdicts) {
             Ok(local_artifact_id) if expected == local_artifact_id => {
                 return Ok(SuspendSnapshotPublicationDecision::CanonicalReady(
                     CanonicalSuspendSnapshotArtifact {
@@ -669,6 +797,7 @@ pub(super) fn classify_suspend_snapshot_publication(
                     "refusing interrupted suspend recovery with mismatched canonical artifact"
                 );
             }
+            Err(error) if error.is_pending() => return Err(error.into()),
             Err(error) => {
                 tracing::warn!(
                     snapshot_dir = %snapshot_dir.display(),
@@ -679,12 +808,12 @@ pub(super) fn classify_suspend_snapshot_publication(
         }
     }
 
-    if let Some(staged) = find_complete_suspend_snapshot_staging_dir(sandbox_dir)? {
+    if let Some(staged) = find_complete_suspend_snapshot_staging_dir(sandbox_dir, verdicts)? {
         return Ok(SuspendSnapshotPublicationDecision::StagedComplete(staged));
     }
 
     if expected_canonical_artifact_id.is_none() && snapshot_dir.exists() {
-        match validate_complete_suspend_snapshot_dir(&snapshot_dir) {
+        match validate_complete_suspend_snapshot_dir(&snapshot_dir, verdicts) {
             Ok(local_artifact_id) => {
                 return Ok(SuspendSnapshotPublicationDecision::CanonicalReady(
                     CanonicalSuspendSnapshotArtifact {
@@ -693,6 +822,7 @@ pub(super) fn classify_suspend_snapshot_publication(
                     },
                 ));
             }
+            Err(error) if error.is_pending() => return Err(error.into()),
             Err(error) => {
                 tracing::warn!(
                     snapshot_dir = %snapshot_dir.display(),
@@ -742,6 +872,53 @@ pub(super) fn write_full_suspend_artifact(
     )
     .unwrap();
     execution.into_execution()
+}
+
+/// Makes a retained bundle untraversable, as the sandbox jail's ownership does
+/// for sandbox-manager, and restores access on drop for cleanup.
+#[cfg(test)]
+pub(super) struct InaccessibleBundle(PathBuf);
+
+#[cfg(test)]
+impl InaccessibleBundle {
+    fn new(snapshot_dir: &Path) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let bundle = snapshot_dir.join(crate::retained_source::BUNDLE_DIRECTORY);
+        std::fs::create_dir_all(bundle.join("source")).unwrap();
+        std::fs::write(bundle.join("source/rootfs.ext4"), b"jail-owned rootfs").unwrap();
+        std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o000)).unwrap();
+        Self(bundle)
+    }
+}
+
+#[cfg(test)]
+impl Drop for InaccessibleBundle {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o750));
+    }
+}
+
+/// A deferred suspend artifact: VM state, a retained source this process
+/// cannot read, and no `rootfs.btrfs-send`.
+#[cfg(test)]
+pub(super) fn write_deferred_suspend_artifact(
+    snapshot_dir: &Path,
+    sandbox_id: &str,
+    local_artifact_id: LocalArtifactId,
+    source_id: uuid::Uuid,
+    rootfs_bytes: u64,
+) -> InaccessibleBundle {
+    write_full_suspend_artifact(snapshot_dir, sandbox_id, local_artifact_id, b"state");
+    std::fs::remove_file(snapshot_dir.join("rootfs.ext4")).unwrap();
+    let path = snapshot_dir.join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME);
+    let mut meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    meta["rootfs_diff_format"] = crate::snapshot_upload::ROOTFS_DIFF_FORMAT_BTRFS_SEND_V1.into();
+    meta["rootfs_send_source_id"] = source_id.to_string().into();
+    meta["size_bytes"] = (2 * b"state".len() as u64 + rootfs_bytes).into();
+    std::fs::write(&path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+    InaccessibleBundle::new(snapshot_dir)
 }
 
 #[cfg(test)]

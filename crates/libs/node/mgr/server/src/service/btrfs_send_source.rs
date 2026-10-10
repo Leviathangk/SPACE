@@ -2,7 +2,8 @@
 //! independent of template GC; per-attempt wire clones avoid exporting an UUID
 //! that a same-filesystem receive could still find in the retained source.
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use pplx_space_common_svc::{LocalRole, UdsPeerPrincipal};
@@ -11,10 +12,14 @@ use uuid::Uuid;
 
 use super::{NodeManagerService, artifact_fs, trusted_paths};
 use crate::btrfs;
-use crate::proto::{BtrfsEncodeRootfsSendResponse, BtrfsMaterializeRootfsSendRequest};
+use crate::proto::{
+    BtrfsEncodeRootfsSendResponse, BtrfsInspectSendSourceRequest, BtrfsInspectSendSourceResponse,
+    BtrfsMaterializeRootfsSendRequest,
+};
 
 pub(super) const DIRECTORY: &str = "rootfs.btrfs-source";
 const MANIFEST: &str = "source.json";
+const ROOTFS: &str = "rootfs.ext4";
 const ALLOWED: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Role(LocalRole::Admin),
@@ -127,6 +132,63 @@ fn subvolume_uuid(file: &File) -> Result<Uuid, Status> {
         .ok_or_else(|| Status::failed_precondition("send source has no subvolume identity"))
 }
 
+/// Why a retained source cannot be opened. Only `NotFound` and the verified
+/// mismatches are evidence about the artifact; `Io` is not.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum SourceError {
+    #[error("retained send source is absent")]
+    NotFound,
+    #[error("send source manifest is not a singly linked regular file")]
+    ManifestNotRegular,
+    #[error("oversized send source manifest")]
+    ManifestOversized,
+    #[error("malformed send source manifest")]
+    ManifestMalformed(#[source] serde_json::Error),
+    #[error("send source identity changed")]
+    IdentityChanged,
+    #[error("retained send source or parent changed")]
+    LineageMismatch,
+    #[error("retained send source or parent is writable")]
+    NotReadOnly,
+    #[error("retained rootfs is missing or not a regular file")]
+    RootfsNotRegular,
+    #[error("artifact filesystem operation: {0}")]
+    Io(#[from] io::Error),
+}
+
+impl SourceError {
+    /// A definite absence becomes `absent`; every other failure stays I/O.
+    fn io(error: io::Error, absent: Self) -> Self {
+        if error.kind() == io::ErrorKind::NotFound {
+            absent
+        } else {
+            Self::Io(error)
+        }
+    }
+
+    /// The inspection contract: absent, unusable, or unknown.
+    fn inspection_status(&self) -> Status {
+        match self {
+            Self::NotFound => Status::not_found(self.to_string()),
+            Self::ManifestNotRegular
+            | Self::ManifestOversized
+            | Self::ManifestMalformed(_)
+            | Self::IdentityChanged
+            | Self::LineageMismatch
+            | Self::NotReadOnly
+            | Self::RootfsNotRegular => Status::failed_precondition(self.to_string()),
+            Self::Io(_) => Status::internal(self.to_string()),
+        }
+    }
+}
+
+/// Staging, reading, and materialization cannot use any failed source.
+impl From<SourceError> for Status {
+    fn from(error: SourceError) -> Self {
+        Status::failed_precondition(error.to_string())
+    }
+}
+
 pub(super) struct SendSource {
     bundle: File,
     pub(super) parent: File,
@@ -134,46 +196,64 @@ pub(super) struct SendSource {
 }
 
 impl SendSource {
-    pub(super) fn open(artifact: &File, expected: Uuid) -> Result<Self, Status> {
-        let bundle =
-            artifact_fs::directory(artifact, DIRECTORY.as_ref()).map_err(artifact_fs::error)?;
+    pub(super) fn open(artifact: &File, expected: Uuid) -> Result<Self, SourceError> {
+        let bundle = artifact_fs::directory(artifact, DIRECTORY.as_ref())
+            .map_err(|error| SourceError::io(error, SourceError::NotFound))?;
+        let manifest = open_file(&bundle, MANIFEST)
+            .map_err(|error| SourceError::io(error, SourceError::NotFound))?;
+        let metadata = manifest.metadata()?;
+        if !metadata.is_file() || metadata.nlink() > 1 {
+            return Err(SourceError::ManifestNotRegular);
+        }
         let mut bytes = Vec::new();
-        trusted_paths::open_regular_file(&bundle, MANIFEST.as_ref())?
-            .take(4097)
-            .read_to_end(&mut bytes)
-            .map_err(artifact_fs::error)?;
+        manifest.take(4097).read_to_end(&mut bytes)?;
         if bytes.len() > 4096 {
-            return Err(Status::failed_precondition(
-                "oversized send source manifest",
-            ));
+            return Err(SourceError::ManifestOversized);
         }
-        let manifest: Manifest = serde_json::from_slice(&bytes).map_err(artifact_fs::error)?;
+        let manifest: Manifest =
+            serde_json::from_slice(&bytes).map_err(SourceError::ManifestMalformed)?;
         if manifest.version != 1 || manifest.source_id != expected {
-            return Err(Status::failed_precondition("send source identity changed"));
+            return Err(SourceError::IdentityChanged);
         }
-        let parent =
-            artifact_fs::directory(&bundle, "parent".as_ref()).map_err(artifact_fs::error)?;
-        let source =
-            artifact_fs::directory(&bundle, "source".as_ref()).map_err(artifact_fs::error)?;
-        if subvolume_uuid(&parent)? != manifest.parent_uuid
-            || subvolume_uuid(&source)? != manifest.source_uuid
-            || btrfs::info(&parent)
-                .map_err(artifact_fs::error)?
-                .1
-                .received_uuid
-                != Some(manifest.received_uuid)
-            || !btrfs::is_readonly(&parent).map_err(artifact_fs::error)?
-            || !btrfs::is_readonly(&source).map_err(artifact_fs::error)?
+        let subvolume = |name: &str| {
+            let directory = artifact_fs::directory(&bundle, name.as_ref())
+                .map_err(|error| SourceError::io(error, SourceError::LineageMismatch))?;
+            if !btrfs::is_subvolume(&directory)? {
+                return Err(SourceError::LineageMismatch);
+            }
+            let (_, info) = btrfs::info(&directory)?;
+            Ok((directory, info))
+        };
+        let (parent, parent_info) = subvolume("parent")?;
+        let (source, source_info) = subvolume("source")?;
+        if parent_info.uuid != Some(manifest.parent_uuid)
+            || source_info.uuid != Some(manifest.source_uuid)
+            || parent_info.received_uuid != Some(manifest.received_uuid)
         {
-            return Err(Status::failed_precondition(
-                "retained send source or parent changed",
-            ));
+            return Err(SourceError::LineageMismatch);
+        }
+        if !btrfs::is_readonly(&parent)? || !btrfs::is_readonly(&source)? {
+            return Err(SourceError::NotReadOnly);
         }
         Ok(Self {
             bundle,
             parent,
             source,
         })
+    }
+
+    /// Length of the retained rootfs image. A send stream has its own length.
+    pub(super) fn rootfs_bytes(&self) -> Result<u64, SourceError> {
+        let metadata = nix::sys::stat::fstatat(
+            &self.source,
+            ROOTFS,
+            nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+        )
+        .map_err(|error| SourceError::io(error.into(), SourceError::RootfsNotRegular))?;
+        if metadata.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(SourceError::RootfsNotRegular);
+        }
+        u64::try_from(metadata.st_size).map_err(|_| SourceError::RootfsNotRegular)
     }
 
     pub(super) fn send(&self, output: &File) -> Result<(), Status> {
@@ -202,6 +282,37 @@ impl SendSource {
         }
         result
     }
+}
+
+fn open_file(directory: &File, name: &str) -> io::Result<File> {
+    nix::fcntl::openat(
+        directory,
+        name,
+        nix::fcntl::OFlag::O_RDONLY
+            | nix::fcntl::OFlag::O_NOFOLLOW
+            | nix::fcntl::OFlag::O_NONBLOCK
+            | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(Into::into)
+}
+
+/// Inspect a retained source in place. A missing artifact, bundle, or manifest
+/// is reported absent: capture writes and syncs the manifest last, before it
+/// reports the identity, so a bundle without one never held a source. An
+/// unreadable path proves nothing.
+pub(super) fn inspect(artifact: &Path, expected: Uuid) -> Result<u64, Status> {
+    let directory = trusted_paths::open_directory(artifact).map_err(|status| {
+        if status.code() == tonic::Code::NotFound {
+            SourceError::NotFound.inspection_status()
+        } else {
+            Status::internal(format!("open send source artifact: {}", status.message()))
+        }
+    })?;
+    SendSource::open(&directory, expected)
+        .and_then(|source| source.rootfs_bytes())
+        .map_err(|error| error.inspection_status())
 }
 
 pub(super) fn materialize(
@@ -258,9 +369,45 @@ impl NodeManagerService {
             Ok(Response::new(BtrfsEncodeRootfsSendResponse {
                 stream_bytes,
                 source_id: Some(source_id.to_string()),
+                rootfs_bytes: None,
             }))
         })
         .await
+    }
+
+    pub(super) async fn btrfs_inspect_send_source(
+        &self,
+        request: Request<BtrfsInspectSendSourceRequest>,
+    ) -> Result<Response<BtrfsInspectSendSourceResponse>, Status> {
+        self.authorize_peer(&request, "BtrfsInspectSendSource", ALLOWED)?;
+        let req = request.into_inner();
+        super::validation::validate_sandbox_id(&req.sandbox_id)?;
+        let artifact = crate::runtime_paths::validate_create_snapshot_dest(
+            &req.sandbox_id,
+            &req.artifact_dir,
+        )?;
+        let source_id = req
+            .source_id
+            .parse::<Uuid>()
+            .map_err(|_| Status::invalid_argument("invalid send source identity"))?;
+        // Read-only opens and info ioctls: their own small lane, neither the
+        // filesystem permits that suspend and restore receive share nor the
+        // diagnostic lane. The closure owns admission, so an abandoned call
+        // still counts until its filesystem work returns.
+        let permit = self
+            .send_source_inspection_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("send source inspections busy; retry"))?;
+        let rootfs_bytes = self
+            .off_runtime("inspect retained send source", move || {
+                let _permit = permit;
+                inspect(&artifact, source_id)
+            })
+            .await?;
+        Ok(Response::new(BtrfsInspectSendSourceResponse {
+            rootfs_bytes,
+        }))
     }
 }
 

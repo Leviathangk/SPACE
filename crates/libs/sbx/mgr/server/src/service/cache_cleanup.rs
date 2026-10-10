@@ -343,9 +343,12 @@ pub(super) enum CanonicalSuspendArtifactInspection {
     },
 }
 
+/// An unverified retained source is an error, so the orphan waits for a later
+/// pass instead of being classified.
 pub(super) fn inspect_canonical_suspend_artifact(
     cache_dir: &Path,
     sandbox_id: SandboxId,
+    verdicts: &crate::retained_source::RetainedSourceVerdicts,
 ) -> Result<CanonicalSuspendArtifactInspection, OrphanedSandboxRowMaterializationError> {
     let sandbox_id_string = sandbox_id.to_string();
     let sandbox_dir = cache_dir.join(&sandbox_id_string);
@@ -374,8 +377,9 @@ pub(super) fn inspect_canonical_suspend_artifact(
         }
         Err(error) => return Err(error.into()),
     };
-    match super::suspend_snapshot_publication::validate_suspend_snapshot_artifact_files(&metadata)
-    {
+    match super::suspend_snapshot_publication::validate_suspend_snapshot_artifact_files(
+        &metadata, verdicts,
+    ) {
         Ok(()) => match inspect_remote_restore_provenance(&snapshot_dir, sandbox_id)? {
             RemoteRestoreProvenanceInspection::Confirmed(restore_source) => {
                 Ok(CanonicalSuspendArtifactInspection::InterruptedRestore {
@@ -760,6 +764,9 @@ pub(super) struct InventoryOwnershipGuards<
     try_restore_staging_guard: StagingGuard,
     try_retirement: Retirement,
     observe_execution: &'a dyn Fn(SandboxId) -> Result<Option<ExecutionFence>, Status>,
+    /// Node-manager verdicts gathered before this pass. Without them, orphans
+    /// with retained sources wait for a pass that has them.
+    retained_sources: Option<&'a crate::retained_source::RetainedSourceVerdicts>,
 }
 
 impl<'a, CleanupGuard, StagingGuard> InventoryOwnershipGuards<'a, CleanupGuard, StagingGuard> {
@@ -773,6 +780,7 @@ impl<'a, CleanupGuard, StagingGuard> InventoryOwnershipGuards<'a, CleanupGuard, 
             try_restore_staging_guard,
             try_retirement: |_| Some(|| {}),
             observe_execution,
+            retained_sources: None,
         }
     }
 
@@ -785,7 +793,20 @@ impl<'a, CleanupGuard, StagingGuard> InventoryOwnershipGuards<'a, CleanupGuard, 
             try_restore_staging_guard: self.try_restore_staging_guard,
             try_retirement,
             observe_execution: self.observe_execution,
+            retained_sources: self.retained_sources,
         }
+    }
+}
+
+impl<'a, CleanupGuard, StagingGuard, Retirement>
+    InventoryOwnershipGuards<'a, CleanupGuard, StagingGuard, Retirement>
+{
+    pub(super) fn with_retained_sources(
+        mut self,
+        verdicts: &'a crate::retained_source::RetainedSourceVerdicts,
+    ) -> Self {
+        self.retained_sources = Some(verdicts);
+        self
     }
 }
 
@@ -1137,8 +1158,30 @@ where
         let has_live_runtime = observed_presence.has_live_runtime;
         let rootfs_size = rootfs_size_mb(paths.cache_dir, &sandbox_id.to_string());
         let cache_inspection = if has_cache_root && !has_live_runtime {
-            match inspect_canonical_suspend_artifact(paths.cache_dir, *sandbox_id) {
+            match inspect_canonical_suspend_artifact(
+                paths.cache_dir,
+                *sandbox_id,
+                guards.retained_sources.unwrap_or(&Default::default()),
+            ) {
                 Ok(inspection) => Some(inspection),
+                // Startup and cleanup reconciles carry no verdicts; periodic
+                // inventory inspects this orphan before its own pass.
+                Err(OrphanedSandboxRowMaterializationError::Validation(error))
+                    if error.is_pending() =>
+                {
+                    inventory_reconcile(
+                        InventoryReconcileOperation::OrphanMaterialization,
+                        InventoryReconcileOutcome::Deferred,
+                        InventoryReconcileReason::RetainedSourcePending,
+                    );
+                    tracing::debug!(
+                        source = %source,
+                        sandbox_id = %sandbox_id,
+                        %error,
+                        "deferring orphan materialization until its retained source is inspected"
+                    );
+                    continue;
+                }
                 Err(error) => {
                     inventory_reconcile(
                         InventoryReconcileOperation::OrphanMaterialization,
