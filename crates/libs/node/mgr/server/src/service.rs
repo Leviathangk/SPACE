@@ -163,6 +163,10 @@ const RESERVED_EXPOSE_PORTS: &[(u16, &str)] = &[
 ];
 
 const MAX_BLOCKING_PROBES: usize = 4;
+/// Retained-source inspections keep their slot until a stuck filesystem call
+/// returns, even after the caller's deadline. A separate pool keeps them from
+/// exhausting the diagnostic lane that orphan evidence and size probes use.
+const MAX_SEND_SOURCE_INSPECTIONS: usize = 4;
 
 #[derive(Clone)]
 pub struct NodeManagerService {
@@ -183,6 +187,7 @@ pub struct NodeManagerService {
     /// Shared drain ownership for detached mutations and lifecycle permits.
     device_op_tasks: tokio_util::task::TaskTracker,
     blocking_probe_slots: std::sync::Arc<tokio::sync::Semaphore>,
+    send_source_inspection_slots: std::sync::Arc<tokio::sync::Semaphore>,
     runtime_supervisor: crate::runtime_supervisor_client::RuntimeSupervisorLazyClient,
     runtime_inventory: std::sync::Arc<ArcSwapOption<RuntimeInventory>>,
     runtime_inventory_refresh_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
@@ -339,6 +344,9 @@ impl NodeManagerService {
             artifact_work: None,
             blocking_probe_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 MAX_BLOCKING_PROBES,
+            )),
+            send_source_inspection_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                MAX_SEND_SOURCE_INSPECTIONS,
             )),
             runtime_supervisor: crate::runtime_supervisor_client::RuntimeSupervisorLazyClient::new(
             ),

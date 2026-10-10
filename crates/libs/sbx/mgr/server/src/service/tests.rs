@@ -257,7 +257,7 @@ pub(crate) mod service_tests {
     use crate::service::recovery::SuspendSnapshotPublicationRecoveryOrigin;
     use crate::service::suspend_snapshot_publication::{
         SuspendSnapshotPublicationDecision, canonical_suspend_snapshot_dir,
-        suspend_snapshot_staging_dir, write_full_suspend_artifact,
+        suspend_snapshot_staging_dir, write_deferred_suspend_artifact, write_full_suspend_artifact,
     };
     use pplx_space_common_core::host::linux::identities::{user_names, users};
     use pplx_space_common_core::types::{
@@ -5681,6 +5681,87 @@ pub(crate) mod service_tests {
     }
 
     #[test]
+    fn reconcile_inventory_defers_an_unverified_deferred_orphan_and_recovers_a_verified_one() {
+        let conn = crate::db::test_conn();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let run_dir = tempfile::tempdir().unwrap();
+        let sandbox_id = SandboxId::new();
+        let sandbox_id_string = sandbox_id.to_string();
+        let local_artifact_id = LocalArtifactId::new();
+        let source_id = uuid::Uuid::now_v7();
+        let snapshot_dir =
+            canonical_suspend_snapshot_dir(&cache_dir.path().join(&sandbox_id_string));
+        let _bundle = write_deferred_suspend_artifact(
+            &snapshot_dir,
+            &sandbox_id_string,
+            local_artifact_id,
+            source_id,
+            64,
+        );
+        let reconcile = |verdicts: &crate::retained_source::RetainedSourceVerdicts| {
+            reconcile_sandbox_inventory_ids(
+                &conn,
+                SandboxInventoryPaths::new(cache_dir.path(), run_dir.path()),
+                vec![sandbox_id],
+                Vec::new(),
+                Vec::new(),
+                ReconcileSource::Test,
+                InventoryOwnershipGuards::new(
+                    inventory_cleanup_guard_for_test,
+                    |_: SandboxId| Some(()),
+                    &inventory_execution_for_test,
+                )
+                .with_retained_sources(verdicts),
+            )
+            .unwrap()
+        };
+
+        // Startup and cleanup reconciles carry no verdicts: a wait, not a
+        // failed inspection.
+        let metric_capture = pplx_space_metrics::test_capture::capture_counters_guard();
+        let report = reconcile(&Default::default());
+        let counters = metric_capture.finish();
+        assert!(report.changed_ids().is_empty());
+        assert!(
+            crate::db::get_sandbox(&conn, &sandbox_id_string)
+                .unwrap()
+                .is_none()
+        );
+        let reasons = counters
+            .iter()
+            .filter(|counter| counter.name == "sandbox.worker.inventory_reconcile")
+            .flat_map(|counter| counter.tags.iter())
+            .filter(|tag| tag.starts_with("reason:"))
+            .collect::<Vec<_>>();
+        assert!(
+            reasons
+                .iter()
+                .any(|tag| *tag == "reason:retained_source_pending")
+        );
+        assert!(
+            !reasons
+                .iter()
+                .any(|tag| *tag == "reason:filesystem_inspection_failed")
+        );
+
+        let mut verdicts = crate::retained_source::RetainedSourceVerdicts::default();
+        verdicts.record(
+            crate::retained_source::RetainedSource {
+                sandbox_id: sandbox_id_string.clone(),
+                artifact_dir: snapshot_dir.clone(),
+                source_id,
+            },
+            crate::retained_source::RetainedSourceCheck::Present { rootfs_bytes: 64 },
+        );
+        assert_eq!(reconcile(&verdicts).changed_ids(), vec![sandbox_id]);
+        let row = crate::db::get_sandbox(&conn, &sandbox_id_string)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, SandboxState::Suspended);
+        assert_eq!(row.current_local_artifact_id, Some(local_artifact_id));
+    }
+
+    #[test]
     fn reconcile_inventory_skips_orphan_removed_after_inventory_snapshot() {
         let conn = crate::db::test_conn();
         let cache_dir = tempfile::tempdir().unwrap();
@@ -6611,7 +6692,7 @@ pub(crate) mod service_tests {
             let service = service_for_teardown_test(conn);
             let cache = tempfile::tempdir().unwrap();
             service
-                .recover_prelaunch_startup_states_in(cache.path())
+                .recover_prelaunch_startup_states_in(cache.path(), &Default::default())
                 .unwrap();
             assert_eq!(
                 service.lookup_sandbox(&id).unwrap().state,
@@ -12906,6 +12987,7 @@ pub(crate) mod service_tests {
             &sandbox_dir,
             &staging_dir,
             "publish failed",
+            &Default::default(),
         );
 
         assert_eq!(disposition, SuspendSnapshotStagingDisposition::Cleanup);
@@ -12964,6 +13046,7 @@ pub(crate) mod service_tests {
             &sandbox_dir,
             &staging_dir,
             "publish failed",
+            &Default::default(),
         );
 
         assert_eq!(disposition, SuspendSnapshotStagingDisposition::Cleanup);
@@ -13763,7 +13846,7 @@ pub(crate) mod service_tests {
 
         let service = SandboxManagerService::new(conn);
         let records = service
-            .recover_prelaunch_startup_states_in(cache_dir.path())
+            .recover_prelaunch_startup_states_in(cache_dir.path(), &Default::default())
             .unwrap();
 
         assert_eq!(records.len(), 1);
@@ -13788,7 +13871,7 @@ pub(crate) mod service_tests {
 
         let service = SandboxManagerService::new(conn);
         let records = service
-            .recover_prelaunch_startup_states_in(cache_dir.path())
+            .recover_prelaunch_startup_states_in(cache_dir.path(), &Default::default())
             .unwrap();
 
         assert_eq!(records.len(), 1);
@@ -13816,7 +13899,7 @@ pub(crate) mod service_tests {
 
         let service = SandboxManagerService::new(conn);
         let records = service
-            .recover_prelaunch_startup_states_in(cache_dir.path())
+            .recover_prelaunch_startup_states_in(cache_dir.path(), &Default::default())
             .unwrap();
 
         assert_eq!(records.len(), 1);
@@ -14422,6 +14505,7 @@ pub(crate) mod service_tests {
                 cache.path(),
                 vec![service.lookup_sandbox(&id).unwrap()],
                 &CancellationToken::new(),
+                &Default::default(),
             )
             .unwrap();
         assert!(staging.exists());
@@ -14437,7 +14521,7 @@ pub(crate) mod service_tests {
         let obstruction = sandbox_dir.join(format!(".snapshot-retired-{artifact_id}"));
         std::fs::write(&obstruction, b"transient obstruction").unwrap();
         let deferred = service
-            .recover_prelaunch_startup_states_in(cache.path())
+            .recover_prelaunch_startup_states_in(cache.path(), &Default::default())
             .unwrap();
         assert_eq!(
             deferred[0].outcome,
@@ -14451,6 +14535,7 @@ pub(crate) mod service_tests {
             &sandbox_dir,
             &staging,
             "publication temporarily unavailable",
+            &Default::default(),
         );
         assert_eq!(disposition, SuspendSnapshotStagingDisposition::Preserve);
         assert_eq!(
@@ -14466,6 +14551,7 @@ pub(crate) mod service_tests {
                 cache.path(),
                 vec![service.lookup_sandbox(&id).unwrap()],
                 &shutdown,
+                &Default::default(),
             )
             .unwrap();
         assert!(staging.exists(), "shutdown must not admit a publication");
@@ -14474,6 +14560,7 @@ pub(crate) mod service_tests {
                 cache.path(),
                 vec![service.lookup_sandbox(&id).unwrap()],
                 &CancellationToken::new(),
+                &Default::default(),
             )
             .unwrap();
         let row = service.lookup_sandbox(&id).unwrap();
@@ -14484,6 +14571,114 @@ pub(crate) mod service_tests {
             Some(CleanupCompletion::MarkSuspended)
         );
         assert!(!staging.exists());
+    }
+
+    #[tokio::test]
+    async fn periodic_suspend_recovery_follows_node_manager_for_a_deferred_capture() {
+        use crate::retained_source::{FakeInspector, RetainedSourceCheck};
+        for (answer, expected_state) in [
+            (
+                RetainedSourceCheck::Unavailable {
+                    reason: "node-manager restarting".to_owned(),
+                },
+                SandboxState::Suspending,
+            ),
+            (
+                RetainedSourceCheck::Present { rootfs_bytes: 64 },
+                SandboxState::CleanupRequired,
+            ),
+            (RetainedSourceCheck::Absent, SandboxState::Quarantined),
+        ] {
+            let conn = crate::db::test_conn();
+            let id = SandboxId::new().to_string();
+            insert_suspending_resuspend(&conn, &id);
+            let cache = tempfile::tempdir().unwrap();
+            let artifact_id = LocalArtifactId::new();
+            let source_id = uuid::Uuid::now_v7();
+            let staging = suspend_snapshot_staging_dir(&cache.path().join(&id), artifact_id);
+            let _bundle =
+                write_deferred_suspend_artifact(&staging, &id, artifact_id, source_id, 64);
+            let inspector = Arc::new(FakeInspector::new(answer.clone()));
+            let service = service_with_runtime_liveness(conn, false)
+                .with_retained_source_inspector(inspector.clone());
+
+            let verdicts = service
+                .recover_deferred_suspend_publication_batch(
+                    cache.path(),
+                    vec![service.lookup_sandbox(&id).unwrap()],
+                    &CancellationToken::new(),
+                    &mut Default::default(),
+                    (),
+                )
+                .await;
+            let calls = inspector.calls();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].source_id, source_id);
+            let row = service.lookup_sandbox(&id).unwrap();
+            assert_eq!(row.state, expected_state, "{answer}");
+            match answer {
+                RetainedSourceCheck::Present { .. } => {
+                    assert_eq!(row.current_local_artifact_id, Some(artifact_id));
+                    assert!(!staging.exists());
+                }
+                // Evidence stays in place for retry or an operator.
+                RetainedSourceCheck::Unavailable { .. } => {
+                    assert!(staging.exists());
+                    assert_eq!(verdicts.take_unresolved().len(), 1);
+                }
+                _ => assert!(staging.exists()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn paged_periodic_recovery_resolves_each_deferred_capture_in_its_own_pass() {
+        use crate::retained_source::{FakeInspector, RetainedSourceCheck};
+        let conn = crate::db::test_conn();
+        let cache = tempfile::tempdir().unwrap();
+        let mut ids = Vec::new();
+        let mut bundles = Vec::new();
+        // More than one discovery page of eight candidates.
+        for _ in 0..9 {
+            let id = SandboxId::new().to_string();
+            insert_suspending_resuspend(&conn, &id);
+            let artifact_id = LocalArtifactId::new();
+            let staging = suspend_snapshot_staging_dir(&cache.path().join(&id), artifact_id);
+            bundles.push(write_deferred_suspend_artifact(
+                &staging,
+                &id,
+                artifact_id,
+                uuid::Uuid::now_v7(),
+                64,
+            ));
+            ids.push(id);
+        }
+        let service =
+            service_with_runtime_liveness(conn, false).with_retained_source_inspector(Arc::new(
+                FakeInspector::new(RetainedSourceCheck::Present { rootfs_bytes: 64 }),
+            ));
+        let mut scan = crate::db::PeriodicLifecycleRecoveryScan::default();
+        for _ in 0..2 {
+            let rows = crate::db::periodic_lifecycle_recovery_batch(
+                &service.db.lock().unwrap(),
+                &mut scan,
+            )
+            .unwrap();
+            service
+                .recover_deferred_suspend_publication_batch(
+                    cache.path(),
+                    rows,
+                    &CancellationToken::new(),
+                    &mut Default::default(),
+                    (),
+                )
+                .await;
+        }
+        let remaining: Vec<_> = ids
+            .iter()
+            .filter(|id| service.lookup_sandbox(id).unwrap().state == SandboxState::Suspending)
+            .collect();
+        assert!(remaining.is_empty(), "{remaining:?}");
     }
 
     #[tokio::test]
@@ -14512,6 +14707,7 @@ pub(crate) mod service_tests {
                     cache.path(),
                     rows,
                     &CancellationToken::new(),
+                    &Default::default(),
                 )
                 .unwrap();
         }
@@ -14630,7 +14826,7 @@ pub(crate) mod service_tests {
 
         let service = service_with_runtime_liveness(conn, false);
         let records = service
-            .recover_prelaunch_startup_states_in(cache_dir.path())
+            .recover_prelaunch_startup_states_in(cache_dir.path(), &Default::default())
             .unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].previous_state, SandboxState::Suspending);
@@ -14707,6 +14903,7 @@ pub(crate) mod service_tests {
                 SuspendSnapshotPublicationDecision::RuntimeGoneWithoutUsableArtifact,
                 SuspendSnapshotPublicationRecoveryOrigin::StartupRecovery,
                 None,
+                &Default::default(),
             )
             .unwrap();
 
@@ -14744,7 +14941,7 @@ pub(crate) mod service_tests {
 
         let service = service_with_runtime_liveness(conn, false);
         let records = service
-            .recover_prelaunch_startup_states_in(cache_dir.path())
+            .recover_prelaunch_startup_states_in(cache_dir.path(), &Default::default())
             .unwrap();
 
         assert_eq!(records.len(), 1);
@@ -14777,7 +14974,7 @@ pub(crate) mod service_tests {
 
         let service = service_with_runtime_liveness(conn, false);
         let records = service
-            .recover_prelaunch_startup_states_in(cache_dir.path())
+            .recover_prelaunch_startup_states_in(cache_dir.path(), &Default::default())
             .unwrap();
 
         assert_eq!(records.len(), 1);
@@ -14819,7 +15016,7 @@ pub(crate) mod service_tests {
 
         let service = service_with_runtime_liveness(conn, false);
         let records = service
-            .recover_prelaunch_startup_states_in(cache_dir.path())
+            .recover_prelaunch_startup_states_in(cache_dir.path(), &Default::default())
             .unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].previous_state, SandboxState::Suspending);
@@ -15041,7 +15238,7 @@ pub(crate) mod service_tests {
 
         let service = service_with_runtime_liveness(conn, true);
         let records = service
-            .recover_prelaunch_startup_states_in(cache_dir.path())
+            .recover_prelaunch_startup_states_in(cache_dir.path(), &Default::default())
             .unwrap();
 
         assert_eq!(records.len(), 1);
