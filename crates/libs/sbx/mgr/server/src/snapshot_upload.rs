@@ -619,6 +619,17 @@ pub(crate) fn upload_artifacts_for_meta(meta: &SnapshotMeta) -> Vec<Artifact> {
     }
 }
 
+/// Which reader a `snapshot.json` is written for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MetadataDestination {
+    /// The artifact directory's own sidecar: keeps the retained source
+    /// identity, which recovery on this node needs.
+    Local,
+    /// A copy staged for upload: omits the node-local identity, which no
+    /// other node can resolve.
+    Remote,
+}
+
 /// Compute the snapshot's logical size from the on-disk VM artifacts and
 /// write the `snapshot.json` sidecar so it can be uploaded as a regular
 /// staged artifact alongside them.
@@ -632,8 +643,9 @@ pub(crate) fn upload_artifacts_for_meta(meta: &SnapshotMeta) -> Vec<Artifact> {
 /// reflink-staged push path as the VM artifacts, so it never races the
 /// reclamation of `snapshot_dir`.
 ///
-/// `meta.rootfs_send_source_id` names a retained source. When no send file
-/// exists, `retained_rootfs_bytes` is node-manager's length for that source.
+/// A stream file counts its own length. Without one, `meta.rootfs_send_source_id`
+/// names a retained source and `retained_rootfs_bytes` is node-manager's
+/// length for it.
 pub(crate) fn write_snapshot_metadata(
     meta: &SnapshotMeta,
     snapshot_dir: &Path,
@@ -645,15 +657,19 @@ pub(crate) fn write_snapshot_metadata(
         snapshot_dir,
         vm_artifacts,
         snapshot_dir,
+        MetadataDestination::Local,
         retained_rootfs_bytes,
     )
 }
 
+/// Returns the metadata as the artifact's owner holds it; the file written
+/// for [`MetadataDestination::Remote`] differs only by the omitted identity.
 pub(crate) fn write_snapshot_metadata_to(
     meta: &SnapshotMeta,
     artifact_dir: &Path,
     vm_artifacts: &[Artifact],
     metadata_dir: &Path,
+    destination: MetadataDestination,
     retained_rootfs_bytes: Option<u64>,
 ) -> Result<SnapshotMeta, SnapshotMetadataWriteError> {
     let btrfs_send = format_from_meta(meta) == SuspendSnapshotFormat::BtrfsSend;
@@ -665,6 +681,7 @@ pub(crate) fn write_snapshot_metadata_to(
     };
     let mut size_bytes: u64 = 0;
     for artifact in vm_artifacts {
+        let path = artifact_dir.join(artifact.local_name);
         let len = if artifact.kind == SnapshotArtifact::RootfsBtrfsSend {
             match crate::retained_source::RootfsArtifact::resolve(
                 &meta.sandbox_id,
@@ -672,6 +689,8 @@ pub(crate) fn write_snapshot_metadata_to(
                 rootfs_send_source_id,
             )? {
                 Some(crate::retained_source::RootfsArtifact::SendFile { path }) => stat(path)?,
+                // A deferred upload has no stream yet; its remote metadata is
+                // rewritten from the transfer total once the stream is known.
                 Some(crate::retained_source::RootfsArtifact::RetainedSource(source)) => {
                     retained_rootfs_bytes.ok_or(
                         SnapshotMetadataWriteError::UnsizedRetainedSource {
@@ -680,10 +699,10 @@ pub(crate) fn write_snapshot_metadata_to(
                         },
                     )?
                 }
-                None => stat(artifact_dir.join(artifact.local_name))?,
+                None => stat(path)?,
             }
         } else {
-            stat(artifact_dir.join(artifact.local_name))?
+            stat(path)?
         };
         size_bytes = size_bytes.saturating_add(len);
     }
@@ -693,7 +712,14 @@ pub(crate) fn write_snapshot_metadata_to(
         rootfs_send_source_id,
         ..meta.clone()
     };
-    let meta_json = serde_json::to_string_pretty(&meta_final)?;
+    let written = match destination {
+        MetadataDestination::Local => meta_final.clone(),
+        MetadataDestination::Remote => SnapshotMeta {
+            rootfs_send_source_id: None,
+            ..meta_final.clone()
+        },
+    };
+    let meta_json = serde_json::to_string_pretty(&written)?;
     std::fs::create_dir_all(metadata_dir).map_err(SnapshotMetadataWriteError::CreateMetadataDir)?;
     std::fs::write(metadata_dir.join(SNAPSHOT_METADATA_FILENAME), &meta_json)
         .map_err(SnapshotMetadataWriteError::WriteMetadata)?;
@@ -820,33 +846,42 @@ pub fn prepare_suspend_snapshot(
         }
     }
 
-    // Size and write `snapshot.json` now so it uploads as a regular staged
-    // artifact below; `meta_final` carries the computed `size_bytes`
-    // through to the durable worker payload.
+    // A stream file already on disk uploads as a file with a known length.
+    // Only a retained source without one streams from node-manager.
     let deferred_metadata = !meta.encrypted
         && format == SuspendSnapshotFormat::BtrfsSend
         && retained_rootfs
         && retained.is_some_and(|retained| retained.stream);
-    let metadata_staging_dir = if artifact_kind == ArtifactKind::Disk || deferred_metadata {
-        Some(
-            snapshot_dir
-                .parent()
-                .unwrap_or(snapshot_dir)
-                .join(format!(".artifact-metadata-{snapshot_id}")),
-        )
-    } else {
-        None
-    };
+    // Size and write `snapshot.json` now so it uploads as a regular staged
+    // artifact below; `meta_final` carries the computed `size_bytes`
+    // through to the durable worker payload. An artifact with a retained
+    // source keeps that identity in its own sidecar, so the uploaded copy
+    // is always staged separately.
+    let retained_identity = !meta.encrypted
+        && format == SuspendSnapshotFormat::BtrfsSend
+        && meta.rootfs_send_source_id.is_some();
+    let metadata_staging_dir =
+        if artifact_kind == ArtifactKind::Disk || deferred_metadata || retained_identity {
+            Some(
+                snapshot_dir
+                    .parent()
+                    .unwrap_or(snapshot_dir)
+                    .join(format!(".artifact-metadata-{snapshot_id}")),
+            )
+        } else {
+            None
+        };
     let metadata_staging_guard = MetadataStagingDirGuard::new(metadata_staging_dir.clone());
-    let metadata_dir = metadata_staging_dir
-        .as_deref()
-        .unwrap_or(snapshot_dir)
-        .to_path_buf();
+    let (metadata_dir, destination) = match metadata_staging_dir.as_deref() {
+        Some(staging) => (staging.to_path_buf(), MetadataDestination::Remote),
+        None => (snapshot_dir.to_path_buf(), MetadataDestination::Local),
+    };
     let meta_final = write_snapshot_metadata_to(
         meta,
         snapshot_dir,
         &vm_artifacts,
         &metadata_dir,
+        destination,
         retained.map(|retained| retained.rootfs_bytes),
     )
     .map_err(|error| error.to_string())?;
@@ -874,21 +909,26 @@ pub async fn submit_prepared_snapshot(
     let mut prepared = prepared.clone();
     if !prepared.deferred_metadata
         && let Some(source_id) = prepared.meta.rootfs_send_source_id
-        && !tokio::fs::try_exists(prepared.snapshot_dir.join(ROOTFS_BTRFS_SEND_FILENAME))
+    {
+        if !tokio::fs::try_exists(prepared.snapshot_dir.join(ROOTFS_BTRFS_SEND_FILENAME))
             .await
             .map_err(|error| format!("stat rootfs send: {error}"))?
-    {
-        crate::btrfs_via_nodemgr::materialize_rootfs_send(
-            &prepared.meta.sandbox_id,
-            &prepared.snapshot_dir,
-            source_id,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        let metadata_dir = prepared
-            .metadata_staging_dir
-            .as_deref()
-            .unwrap_or(&prepared.snapshot_dir);
+        {
+            crate::btrfs_via_nodemgr::materialize_rootfs_send(
+                &prepared.meta.sandbox_id,
+                &prepared.snapshot_dir,
+                source_id,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        }
+        // The stream exists now, whether this attempt or an interrupted one
+        // materialized it: the uploaded metadata must count it, so rewrite
+        // unconditionally rather than only after materializing.
+        let (metadata_dir, destination) = match prepared.metadata_staging_dir.as_deref() {
+            Some(staging) => (staging, MetadataDestination::Remote),
+            None => (prepared.snapshot_dir.as_path(), MetadataDestination::Local),
+        };
         prepared.meta = write_snapshot_metadata_to(
             &prepared.meta,
             &prepared.snapshot_dir,
@@ -897,6 +937,7 @@ pub async fn submit_prepared_snapshot(
                 format_from_meta(&prepared.meta),
             ),
             metadata_dir,
+            destination,
             None,
         )
         .map_err(|error| error.to_string())?;

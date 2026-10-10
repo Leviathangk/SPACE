@@ -211,7 +211,9 @@ any retained local artifacts needed by old readers using `BtrfsMaterializeRootfs
 Sandbox-manager binaries that predate source inspection read the bundle directly
 and fail on every deferred artifact. Rolling back to one also requires their
 local `size_bytes` to describe the materialized stream, so reconcile that
-metadata after materializing.
+metadata after materializing. Binaries from before the reclaim rewrite count
+the stream of a retained artifact and read a reclaimed, image-counting sidecar
+as a size mismatch; roll forward rather than back once reclaim has run.
 Do not downgrade node-manager while source-aware volume jobs remain. Source cleanup
 continues while streaming is disabled. Normal artifact retirement reclaims the
 original bundle; the upload lease has independent terminal cleanup.
@@ -221,12 +223,39 @@ original bundle; the upload lease has independent terminal cleanup.
 The bundle's source subvolume keeps the sandbox jail's ownership, which
 sandbox-manager cannot traverse, so node-manager is the bundle's only reader.
 Sandbox-manager learns the source identity, and for a deferred capture the
-retained rootfs length, from the capture response, and persists the identity as `snapshot.json`
-`rootfs_send_source_id`. It never opens the bundle or its manifest. A local
-artifact's btrfs-send rootfs is its `rootfs.btrfs-send` file when present.
-Otherwise, a persisted identity names a retained source. For a deferred capture,
-the local `size_bytes` counts the retained rootfs length; a stream length is a
-different quantity and is never substituted for it.
+retained rootfs length, from the capture response, and persists the identity as
+`snapshot.json` `rootfs_send_source_id`. It never opens the bundle or its
+manifest. A local artifact's btrfs-send rootfs is its `rootfs.btrfs-send` file
+while that exists; without one, the persisted identity names the retained
+source. The artifact's own `snapshot.json` counts whichever of the two it has:
+the stream while present, the retained image after reclaim removes it. Reclaim
+runs in the backup's bookkeeping task, after the upload job has recorded its
+outcome: it asks node-manager for the image length, rewrites the sidecar, then
+unlinks the stream. The rewrite recomputes the total from the remaining VM
+files plus the verified image, so an interrupted or repeated reclaim converges
+on one value. Validation accepts either accounting while both exist, and
+recovery inspects a source whenever validation needs its length, including an
+artifact whose sidecar already counts the image beside a stream, so neither
+order nor a crash between the two steps strands the artifact. The copy staged for upload
+counts the stream restorers will find and omits the node-local identity, which
+no other node can resolve; restore and fork projection drop one if an older
+upload carried it.
+
+When a new suspend replaces a published snapshot, sandbox-manager cannot delete
+the old one: deferred capture leaves read-only subvolumes inside it. Publication
+moves it to a `snapshots/.suspend-retired-<new artifact>` hold, publishes the
+replacement, then renames the hold into the staging sweep's
+`snapshots/.suspend-gc-pending-*` lane, which the periodic sweep deletes through
+node-manager. The hold is outside that lane, so a publication interrupted
+between its renames keeps its rollback candidate: a retry restores the hold when
+no canonical snapshot exists, and releases it once the replacement is canonical.
+The sweep handles holds only under the sandbox's lifecycle guards. It releases
+a hold once any canonical snapshot exists, including after a later publication
+replaced the artifact that displaced it. Without a canonical snapshot, a hold
+whose publication may still be in flight stays as the rollback candidate; once
+the sandbox is back in a stable state, the sweep restores the hold to the
+canonical path if the suspended row still pins its artifact and otherwise
+releases it.
 
 `BtrfsInspectSendSource` is node-manager's read-only check of one source. It
 verifies the manifest identity, the subvolume lineage, and the read-only state,

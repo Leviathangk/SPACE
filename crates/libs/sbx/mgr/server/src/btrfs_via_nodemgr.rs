@@ -81,7 +81,8 @@ pub(crate) enum CapturedRootfs {
 impl CapturedRootfs {
     /// Capability probes are advisory, so validate what node-manager actually
     /// did. A deferral without the retained size fails rather than becoming a
-    /// zero-sized artifact.
+    /// zero-sized artifact. A materialized capture needs no size, so an older
+    /// node-manager's response stays valid.
     fn from_response(
         rpc: &'static str,
         defer_requested: bool,
