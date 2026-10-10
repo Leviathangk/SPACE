@@ -377,9 +377,7 @@ pub(super) fn inspect_canonical_suspend_artifact(
         }
         Err(error) => return Err(error.into()),
     };
-    match super::suspend_snapshot_publication::validate_suspend_snapshot_artifact_files(
-        &metadata, verdicts,
-    ) {
+    match metadata.validate_artifact_files(verdicts) {
         Ok(()) => match inspect_remote_restore_provenance(&snapshot_dir, sandbox_id)? {
             RemoteRestoreProvenanceInspection::Confirmed(restore_source) => {
                 Ok(CanonicalSuspendArtifactInspection::InterruptedRestore {

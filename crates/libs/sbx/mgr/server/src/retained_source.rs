@@ -39,16 +39,17 @@ pub(crate) struct RetainedSource {
 /// The btrfs-send rootfs of a local artifact.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RootfsArtifact {
-    /// A materialized `rootfs.btrfs-send` stream.
+    /// A materialized `rootfs.btrfs-send` stream. A retained source, if any,
+    /// regenerates it after reclaim and sizes the artifact once it is gone.
     SendFile { path: PathBuf },
-    /// Deferred capture: no stream exists, only node-manager's source.
+    /// No stream file: a persisted identity names the retained source.
     RetainedSource(RetainedSource),
 }
 
 impl RootfsArtifact {
-    /// A stream file wins. Otherwise the persisted identity names a retained
-    /// source. Without either, the btrfs-send rootfs is missing. Reads no
-    /// path under the bundle.
+    /// A stream file is the rootfs while it exists. Otherwise a persisted
+    /// identity names a retained source, and without either the btrfs-send
+    /// rootfs is missing. Reads no path under the bundle.
     pub(crate) fn resolve(
         sandbox_id: &str,
         artifact_dir: &Path,

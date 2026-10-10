@@ -31,7 +31,8 @@ fn capture_response_proves_deferral_only_with_identity_size_and_no_stream() {
             source_id: None
         }
     );
-    // A retained source without deferral needs no size.
+    // A materialized capture with a retained source needs no size: older
+    // node-managers never send one, and the stream file sizes the artifact.
     assert_eq!(
         CapturedRootfs::from_response(RPC, false, 9, source, None).unwrap(),
         CapturedRootfs::Stream {
