@@ -244,7 +244,9 @@ impl TransferExecutor {
 /// the extras keep backing exactly those workers. Lending the primary
 /// therefore frees one permit to queued codec work, as it did
 /// single-threaded, and the producer reacquires only that one before
-/// encoding resumes.
+/// encoding resumes. Admission counts the lent primary as taken, not spare,
+/// so a later pass cannot hold it idle as an extra while this producer waits
+/// to resume.
 ///
 /// The cost is idle capacity. Streaming is the default upload path, and
 /// when object storage drains parts slower than zstd fills them a producer

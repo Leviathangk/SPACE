@@ -23,6 +23,7 @@
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -105,6 +106,9 @@ pub struct CodecAdmission {
     reserve: Arc<Semaphore>,
     reserved: usize,
     compress_max_threads: CompressMaxThreads,
+    /// Slots whose permit is lent and that will reacquire one before they run
+    /// again. Their permits sit in the pools but are not spare.
+    lent: Arc<AtomicUsize>,
 }
 
 impl CodecAdmission {
@@ -119,6 +123,7 @@ impl CodecAdmission {
             reserve: Arc::new(Semaphore::new(reserve)),
             reserved: reserve,
             compress_max_threads: CompressMaxThreads::SINGLE,
+            lent: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -165,19 +170,17 @@ impl CodecAdmission {
         Ok(CodecSlot {
             admission: self.clone(),
             priority,
-            permit: Some(permit),
+            state: SlotState::Held { _permit: permit },
         })
     }
 
     /// Admit one upload compression pass on `path`: a primary permit as
     /// [`Self::acquire_slot`] takes it, then up to `compress_max_threads - 1`
-    /// extras without waiting. Extras come only from the shared pool, so the
-    /// reserve stays whole for protected restores, and one idle shared permit
-    /// is left for the next pass to arrive. Tokio hands released permits
-    /// straight to queued waiters, so a pool with a backlog has no idle
-    /// permits and a contended pass runs single-threaded. The idle check and
-    /// the grab are not atomic; a concurrent admission can occasionally leave
-    /// the pool without its spare permit, which is still within its total.
+    /// extras without waiting (see [`Self::try_acquire_extras`]). Extras come
+    /// only from the shared pool, so the reserve stays whole for protected
+    /// restores. Tokio hands released permits straight to queued waiters, so
+    /// a pool with a backlog has no idle permits and a contended pass runs
+    /// single-threaded.
     pub async fn acquire_compress(
         &self,
         priority: CodecPriority,
@@ -185,11 +188,7 @@ impl CodecAdmission {
     ) -> Result<CompressGrant, CodecAdmissionClosed> {
         let primary = self.acquire_slot(priority).await?;
         let wanted = extra_permits_wanted(path, self.compress_max_threads);
-        let spare = self.shared.available_permits().saturating_sub(1);
-        let grant = wanted.min(u32::try_from(spare).unwrap_or(u32::MAX));
-        let extras = (grant > 0)
-            .then(|| Arc::clone(&self.shared).try_acquire_many_owned(grant).ok())
-            .flatten();
+        let extras = self.try_acquire_extras(wanted);
         // The primary backs the calling thread; each extra backs a worker.
         let workers = extras.as_ref().map_or(0, |extras| {
             u32::try_from(extras.num_permits()).expect("extras fit the requested u32")
@@ -199,6 +198,43 @@ impl CodecAdmission {
             _extras: extras,
             workers,
         })
+    }
+
+    /// Up to `wanted` shared permits, taken only if the pool keeps one idle
+    /// permit for the next pass to arrive plus one for every lent slot,
+    /// which reacquires before it runs again. A lent permit sits in the pool
+    /// but is not spare: extras taken from it would idle beside a producer
+    /// that is only waiting to resume.
+    ///
+    /// There is no check-then-act window: each attempt takes the extras and
+    /// the permits to keep idle in one `try_acquire_many`, from the largest
+    /// grant down, then returns the kept surplus at once. Concurrent
+    /// admissions therefore cannot both count the same idle permit. The lent
+    /// count is read before that attempt and may change while it runs. A
+    /// slot that reacquires decrements the count only after its permit is
+    /// taken, so a stale count only keeps more idle. A slot lent meanwhile
+    /// increments the count before releasing its permit, so a lend that
+    /// released a permit this attempt could take shows up in the second read,
+    /// and one extra is returned per new lend. Either way the error is fewer
+    /// extras, never more. While the surplus is held, a concurrent admission
+    /// sees fewer idle permits and also takes fewer. Lent slots are counted
+    /// whichever pool their permit came from; a lent reserve permit returns
+    /// to the reserve, so counting it here also only keeps more idle.
+    fn try_acquire_extras(&self, wanted: u32) -> Option<OwnedSemaphorePermit> {
+        let lent = self.lent.load(Ordering::SeqCst);
+        let keep_idle = u32::try_from(lent).ok()?.checked_add(1)?;
+        for extras in (1..=wanted).rev() {
+            let Ok(mut taken) =
+                Arc::clone(&self.shared).try_acquire_many_owned(extras.checked_add(keep_idle)?)
+            else {
+                continue;
+            };
+            let newly_lent = self.lent.load(Ordering::SeqCst).saturating_sub(lent);
+            let extras = usize::try_from(extras).ok()?.saturating_sub(newly_lent);
+            // Dropping `taken` returns the permits kept idle.
+            return (extras > 0).then(|| taken.split(extras)).flatten();
+        }
+        None
     }
 
     /// One shared permit if it is free right now, without queueing. Opportunistic
@@ -233,25 +269,55 @@ pub struct CodecPermit {
 pub struct CodecSlot {
     admission: CodecAdmission,
     priority: CodecPriority,
-    /// `None` while lent.
-    permit: Option<CodecPermit>,
+    state: SlotState,
+}
+
+enum SlotState {
+    Held { _permit: CodecPermit },
+    Lent { _counted: LentSlot },
+}
+
+/// Counts one lent slot in [`CodecAdmission`] for as long as it lives.
+struct LentSlot(Arc<AtomicUsize>);
+
+impl LentSlot {
+    fn new(lent: &Arc<AtomicUsize>) -> Self {
+        lent.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(lent))
+    }
+}
+
+impl Drop for LentSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl CodecSlot {
-    /// Release the permit to queued work. Idempotent.
+    /// Release the permit to queued work. Idempotent. The slot counts as lent
+    /// before the permit is released, so extras are never granted from it.
     pub fn lend(&mut self) {
-        self.permit = None;
+        if let SlotState::Held { .. } = self.state {
+            // The new state is built, counting the lend, before the old one,
+            // holding the permit, drops.
+            self.state = SlotState::Lent {
+                _counted: LentSlot::new(&self.admission.lent),
+            };
+        }
     }
 
     pub fn is_lent(&self) -> bool {
-        self.permit.is_none()
+        matches!(self.state, SlotState::Lent { .. })
     }
 
     /// Take a permit again if lent, queueing FIFO behind passes already
-    /// waiting. Cancel-safe: a cancelled reacquire leaves the slot lent.
+    /// waiting. Cancel-safe: a cancelled reacquire leaves the slot lent. The
+    /// slot stops counting as lent only once it holds its permit again.
     pub async fn reacquire(&mut self) -> Result<(), CodecAdmissionClosed> {
-        if self.permit.is_none() {
-            self.permit = Some(self.admission.acquire(self.priority).await?);
+        if let SlotState::Lent { .. } = self.state {
+            self.state = SlotState::Held {
+                _permit: self.admission.acquire(self.priority).await?,
+            };
         }
         Ok(())
     }

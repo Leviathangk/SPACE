@@ -319,3 +319,99 @@ async fn encrypted_passes_take_a_single_permit() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_lent_primary_is_never_counted_as_spare() {
+    let admission = CodecAdmission::new(8, 0).with_compress_max_threads(max_threads(4));
+    let mut producer = admission
+        .acquire_compress(CodecPriority::Normal, CompressPath::Streaming)
+        .await
+        .unwrap();
+    assert_eq!(producer.workers(), 3);
+    assert_eq!(admission.shared_available(), 4);
+    // Backpressure: the producer lends its primary and will take it back.
+    producer.lend();
+    assert_eq!(admission.shared_available(), 5);
+
+    // The next pass may not take the lent permit, nor the one spare.
+    let next = admission
+        .acquire_compress(CodecPriority::Normal, CompressPath::File)
+        .await
+        .unwrap();
+    assert_eq!(next.workers(), 2);
+    assert_eq!(admission.shared_available(), 2);
+    // So the producer resumes at once, and the spare still admits a pass.
+    poll(pin!(producer.reacquire())).unwrap().unwrap();
+    let last = poll(pin!(
+        admission.acquire_compress(CodecPriority::Normal, CompressPath::File)
+    ))
+    .expect("the spare permit admits the next pass without queueing")
+    .unwrap();
+    assert_eq!(last.workers(), 0);
+    drop((producer, next, last));
+    assert_eq!(admission.shared_available(), 8);
+    assert_eq!(admission.lent.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn simultaneous_admissions_keep_the_spare() {
+    // Both primaries are admitted before either pass looks for extras, so
+    // only one extra fits beside the spare: [1, 0], never [1, 1].
+    let admission = CodecAdmission::new(4, 0).with_compress_max_threads(max_threads(4));
+    let held: Vec<_> = (0..4)
+        .map(|_| admission.try_acquire_shared().unwrap())
+        .collect();
+    let mut first = pin!(admission.acquire_compress(CodecPriority::Normal, CompressPath::File));
+    let mut second = pin!(admission.acquire_compress(CodecPriority::Normal, CompressPath::File));
+    assert!(poll(first.as_mut()).is_none());
+    assert!(poll(second.as_mut()).is_none());
+    drop(held);
+    let first = poll(first.as_mut()).unwrap().unwrap();
+    let second = poll(second.as_mut()).unwrap().unwrap();
+    assert_eq!((first.workers(), second.workers()), (1, 0));
+    assert_eq!(admission.shared_available(), 1);
+}
+
+#[test]
+fn parallel_admissions_keep_the_spare() {
+    // The same race with the extras step on two OS threads at once. The
+    // grab is atomic, so every round leaves the spare idle.
+    let admission = CodecAdmission::new(4, 0).with_compress_max_threads(max_threads(4));
+    let barrier = std::sync::Barrier::new(2);
+    for _ in 0..2_000 {
+        let held: Vec<_> = (0..4)
+            .map(|_| admission.try_acquire_shared().unwrap())
+            .collect();
+        let mut waiters: Vec<_> = (0..2)
+            .map(|_| {
+                Box::pin(admission.acquire_compress(CodecPriority::Normal, CompressPath::File))
+            })
+            .collect();
+        for waiter in &mut waiters {
+            assert!(poll(waiter.as_mut()).is_none());
+        }
+        drop(held);
+        let grants: Vec<_> = std::thread::scope(|scope| {
+            let threads: Vec<_> = waiters
+                .into_iter()
+                .map(|mut waiter| {
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        poll(waiter.as_mut()).unwrap().unwrap()
+                    })
+                })
+                .collect();
+            threads.into_iter().map(|t| t.join().unwrap()).collect()
+        });
+        assert_eq!(
+            admission.shared_available(),
+            1,
+            "workers {:?}",
+            grants
+                .iter()
+                .map(CompressGrant::workers)
+                .collect::<Vec<_>>()
+        );
+    }
+}
