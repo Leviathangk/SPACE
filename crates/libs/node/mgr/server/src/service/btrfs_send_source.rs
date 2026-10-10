@@ -315,6 +315,13 @@ pub(super) fn inspect(artifact: &Path, expected: Uuid) -> Result<u64, Status> {
         .map_err(|error| error.inspection_status())
 }
 
+/// Remove a bundle this artifact no longer claims, with the pinned-directory
+/// deletion capture itself uses on failure.
+pub(super) fn discard(artifact: &Path) -> Result<(), Status> {
+    let directory = trusted_paths::open_directory(artifact)?;
+    artifact_fs::remove_at(&directory, DIRECTORY.as_ref()).map(|_| ())
+}
+
 pub(super) fn materialize(
     artifact: &Path,
     expected: Uuid,

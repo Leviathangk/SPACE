@@ -56,11 +56,21 @@ fn resolution_names_the_retained_source_from_identity_without_entering_its_bundl
         RootfsArtifact::resolve(SANDBOX_ID, artifact_dir, None).unwrap(),
         None
     );
-    // A stream file wins over the retained source it regenerates from.
+    assert!(!send_file_present(artifact_dir).unwrap());
+    // A stream file beside a retained source is an upload cache: the identity
+    // still names the rootfs. Without an identity, the file is the rootfs.
     let stream = artifact_dir.join(ROOTFS_BTRFS_SEND_FILENAME);
     std::fs::write(&stream, b"stream").unwrap();
+    assert!(send_file_present(artifact_dir).unwrap());
     assert_eq!(
         RootfsArtifact::resolve(SANDBOX_ID, artifact_dir, Some(source_id)).unwrap(),
+        Some(RootfsArtifact::RetainedSource(source(
+            artifact_dir,
+            source_id
+        )))
+    );
+    assert_eq!(
+        RootfsArtifact::resolve(SANDBOX_ID, artifact_dir, None).unwrap(),
         Some(RootfsArtifact::SendFile { path: stream })
     );
     restore_access(artifact_dir);

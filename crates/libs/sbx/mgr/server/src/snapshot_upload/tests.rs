@@ -119,6 +119,21 @@ impl DeferredArtifact {
 }
 
 impl DeferredArtifact {
+    /// A materialized stream beside the retained source.
+    fn with_stream(self, stream: &[u8]) -> Self {
+        std::fs::write(self.dir.join(ROOTFS_BTRFS_SEND_FILENAME), stream).unwrap();
+        self
+    }
+
+    fn staged_metadata(prepared: &SnapshotUploadJobs) -> serde_json::Value {
+        let path = prepared
+            .metadata_staging_dir
+            .as_ref()
+            .expect("retained artifacts stage their uploaded metadata separately")
+            .join(SNAPSHOT_METADATA_FILENAME);
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
     fn remove_artifact_dir(&self) {
         self.restore_access();
         std::fs::remove_dir_all(&self.dir).unwrap();
@@ -180,13 +195,54 @@ fn retained_source_without_streaming_prepares_for_materialization() {
         }))
         .unwrap();
     // The worker regenerates rootfs.btrfs-send from this exact source and
-    // uploads the file.
+    // uploads the file. The payload keeps the identity it needs for that;
+    // the staged copy, rewritten after materialization, never carries it.
     assert!(!prepared.deferred_metadata);
     assert_eq!(
         prepared.meta.rootfs_send_source_id,
         Some(artifact.source_id)
     );
-    assert!(prepared.metadata_staging_dir.is_none());
+    let staged = DeferredArtifact::staged_metadata(&prepared);
+    assert!(staged.get("rootfs_send_source_id").is_none(), "{staged}");
+    cleanup_metadata_staging_dir(&prepared);
+}
+
+#[test]
+fn retained_artifact_with_a_stream_uploads_the_file_and_strips_its_identity_remotely() {
+    let artifact = DeferredArtifact::new().with_stream(&[0u8; 333]);
+    let prepared = artifact
+        .prepare(Some(RetainedUpload {
+            rootfs_bytes: 1000,
+            stream: true,
+        }))
+        .unwrap();
+    // A stream already on disk has a known length: no deferral.
+    assert!(!prepared.deferred_metadata);
+    assert_eq!(
+        prepared.meta.rootfs_send_source_id,
+        Some(artifact.source_id)
+    );
+    let vm = (b"memory".len() + b"state".len()) as u64;
+    let staged = DeferredArtifact::staged_metadata(&prepared);
+    assert_eq!(staged["size_bytes"], 333 + vm);
+    assert!(staged.get("rootfs_send_source_id").is_none(), "{staged}");
+    // The artifact's own sidecar still counts the retained image and keeps
+    // the identity: the stream is a cache that reclaim may remove.
+    let local = write_snapshot_metadata(
+        &artifact.meta(),
+        &artifact.dir,
+        &vm_artifacts_for_format(SuspendSnapshotFormat::BtrfsSend),
+        Some(1000),
+    )
+    .unwrap();
+    assert_eq!(local.size_bytes, 1000 + vm);
+    let written: SnapshotMeta = serde_json::from_slice(
+        &std::fs::read(artifact.dir.join(SNAPSHOT_METADATA_FILENAME)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(written.rootfs_send_source_id, Some(artifact.source_id));
+    assert_eq!(written.size_bytes, 1000 + vm);
+    cleanup_metadata_staging_dir(&prepared);
 }
 
 #[test]

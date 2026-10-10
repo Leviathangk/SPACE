@@ -1762,8 +1762,17 @@ async fn restore_pull_metadata_from_source_for_identity(
     let meta_path = snapshot_dir.join("snapshot.json");
     let meta_bytes = std::fs::read(&meta_path)
         .map_err(|e| RestoreError::Other(format!("read {}: {e}", meta_path.display())))?;
-    let meta: crate::snapshot_upload::SnapshotMeta = serde_json::from_slice(&meta_bytes)
+    let mut meta: crate::snapshot_upload::SnapshotMeta = serde_json::from_slice(&meta_bytes)
         .map_err(|e| RestoreError::Other(format!("parse {}: {e}", meta_path.display())))?;
+    // A retained source identity is node-local. Uploads no longer carry one,
+    // but a restored artifact never has the bundle it would name, and its
+    // local sidecar must describe the pulled stream.
+    if meta.rootfs_send_source_id.take().is_some() {
+        let bytes = serde_json::to_vec_pretty(&meta)
+            .map_err(|e| RestoreError::Other(format!("serialize {}: {e}", meta_path.display())))?;
+        std::fs::write(&meta_path, bytes)
+            .map_err(|e| RestoreError::Other(format!("rewrite {}: {e}", meta_path.display())))?;
+    }
     validate_restore_metadata_identity(&meta, sandbox_id, expected_source_sandbox_id)?;
     let codec = codec_from_meta(&meta).map_err(|error| RestoreError::Other(error.to_string()))?;
     tracing::info!(

@@ -39,33 +39,34 @@ pub(crate) struct RetainedSource {
 /// The btrfs-send rootfs of a local artifact.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RootfsArtifact {
-    /// A materialized `rootfs.btrfs-send` stream.
+    /// A materialized `rootfs.btrfs-send` stream, with no retained source.
     SendFile { path: PathBuf },
-    /// Deferred capture: no stream exists, only node-manager's source.
+    /// A retained source names the rootfs. A `rootfs.btrfs-send` file may also
+    /// exist as an upload cache; it is never the artifact's identity or size.
     RetainedSource(RetainedSource),
 }
 
 impl RootfsArtifact {
-    /// A stream file wins. Otherwise the persisted identity names a retained
-    /// source. Without either, the btrfs-send rootfs is missing. Reads no
-    /// path under the bundle.
+    /// A persisted identity names a retained source, whether or not a stream
+    /// file is also present. Without one, the stream file is the rootfs.
+    /// Without either, the btrfs-send rootfs is missing. Reads no path under
+    /// the bundle.
     pub(crate) fn resolve(
         sandbox_id: &str,
         artifact_dir: &Path,
         source_id: Option<uuid::Uuid>,
     ) -> Result<Option<Self>, RootfsResolveError> {
+        if let Some(source_id) = source_id {
+            return Ok(Some(Self::RetainedSource(RetainedSource {
+                sandbox_id: sandbox_id.to_owned(),
+                artifact_dir: artifact_dir.to_owned(),
+                source_id,
+            })));
+        }
         let path = artifact_dir.join(ROOTFS_BTRFS_SEND_FILENAME);
         match std::fs::symlink_metadata(&path) {
             Ok(_) => Ok(Some(Self::SendFile { path })),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Ok(source_id.map(|source_id| {
-                    Self::RetainedSource(RetainedSource {
-                        sandbox_id: sandbox_id.to_owned(),
-                        artifact_dir: artifact_dir.to_owned(),
-                        source_id,
-                    })
-                }))
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(source) => Err(RootfsResolveError { path, source }),
         }
     }
@@ -75,6 +76,17 @@ impl RootfsArtifact {
         artifact_dir: &Path,
     ) -> Result<Option<Self>, RootfsResolveError> {
         Self::resolve(&meta.sandbox_id, artifact_dir, meta.rootfs_send_source_id)
+    }
+}
+
+/// Whether a `rootfs.btrfs-send` file exists in `artifact_dir`. For a retained
+/// artifact this decides only how an upload proceeds.
+pub(crate) fn send_file_present(artifact_dir: &Path) -> Result<bool, RootfsResolveError> {
+    let path = artifact_dir.join(ROOTFS_BTRFS_SEND_FILENAME);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => Ok(metadata.is_file()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(RootfsResolveError { path, source }),
     }
 }
 
