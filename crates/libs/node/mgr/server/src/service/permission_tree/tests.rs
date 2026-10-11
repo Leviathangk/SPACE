@@ -15,7 +15,8 @@ fn owned_walk_prunes_snapshots_and_never_mutates_link_targets() {
         std::fs::write(path, b"content").unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
-    symlink(&outside, root.join("link")).unwrap();
+    let link = root.join("rootfs.btrfs-source");
+    symlink(&outside, &link).unwrap();
     let fifo = root.join("fifo");
     nix::unistd::mkfifo(&fifo, Mode::from_bits_truncate(0o600)).unwrap();
     let special = vec![fifo];
@@ -43,7 +44,7 @@ fn owned_walk_prunes_snapshots_and_never_mutates_link_targets() {
         &root.join("snapshots/kept"),
         &file,
         &kept,
-        &root.join("link"),
+        &link,
     ]
     .into_iter()
     .chain(special.iter())
@@ -57,11 +58,12 @@ fn owned_walk_prunes_snapshots_and_never_mutates_link_targets() {
         )
         .unwrap();
     }
-    rewrite(&root, true, Some(old_uid), uid, gid).unwrap();
     assert_eq!(
-        std::fs::symlink_metadata(root.join("link")).unwrap().uid(),
-        uid
+        crate::cache_ownership::first_path_owned_by_uid(&link, old_uid).unwrap(),
+        Some(link.clone())
     );
+    rewrite(&root, true, Some(old_uid), uid, gid).unwrap();
+    assert_eq!(std::fs::symlink_metadata(&link).unwrap().uid(), uid);
     assert_eq!(std::fs::metadata(&file).unwrap().uid(), uid);
     assert_eq!(std::fs::metadata(&file).unwrap().mode() & 0o7777, 0o660);
     for path in &special {
@@ -79,6 +81,45 @@ fn owned_walk_prunes_snapshots_and_never_mutates_link_targets() {
     }
     rewrite(&root.join("snapshots/kept"), false, None, uid, gid).unwrap();
     assert_eq!(std::fs::metadata(&kept).unwrap().mode() & 0o7777, 0o660);
+    // A private-looking name alone cannot shelter sandbox-owned files from
+    // retirement: writable, wrong-owner, and wrong-group directories are ordinary cache.
+    let cache_gid = if uid == 0 {
+        pplx_space_common_core::host::linux::identities::gids::SPACE_CACHE_RW
+    } else {
+        gid
+    };
+    for (name, owner, group, mode) in [
+        ("writable", uid, cache_gid, 0o770),
+        ("wrong-owner", old_uid, cache_gid, 0o750),
+        ("wrong-group", uid, gid, 0o750),
+    ] {
+        let bundle = root.join(name).join("rootfs.btrfs-source");
+        std::fs::create_dir_all(&bundle).unwrap();
+        nix::unistd::chown(
+            &bundle,
+            Some(Uid::from_raw(owner)),
+            Some(Gid::from_raw(group)),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(mode)).unwrap();
+        let data = bundle.join("data");
+        std::fs::write(&data, b"retired slot").unwrap();
+        nix::unistd::chown(
+            &data,
+            Some(Uid::from_raw(old_uid)),
+            Some(Gid::from_raw(gid)),
+        )
+        .unwrap();
+        assert!(
+            crate::cache_ownership::first_path_owned_by_uid(&bundle, old_uid)
+                .unwrap()
+                .is_some()
+        );
+        rewrite(bundle.parent().unwrap(), false, Some(old_uid), uid, gid).unwrap();
+        let metadata = std::fs::metadata(&data).unwrap();
+        assert_eq!(metadata.uid(), uid);
+        assert_eq!(metadata.mode() & 0o7777, 0o660);
+    }
     std::fs::hard_link(&outside, root.join("hardlink")).unwrap();
     rewrite(&root, true, None, uid, gid).unwrap_err();
     assert_eq!(std::fs::metadata(&outside).unwrap().mode() & 0o7777, 0o600);
