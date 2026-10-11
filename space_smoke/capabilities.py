@@ -1758,6 +1758,35 @@ class BackupQueued:
 
 
 @dataclass(frozen=True)
+class BtrfsSendCapture:
+    """One btrfs-send capture, from sandbox-manager's encode line.
+
+    `deferred` is true when the capture retained its source for a streamed
+    upload instead of writing `rootfs.btrfs-send`; `stream_bytes` is then 0.
+    """
+
+    node_name: str
+    sandbox_id: str
+    stream_bytes: int
+    deferred: bool
+
+
+@dataclass(frozen=True)
+class CompletedTransfer:
+    """One volume-manager transfer job that completed, from its log line.
+
+    `kind` is the job kind: `push_btrfs_send` streams a rootfs from a retained
+    btrfs source, while a materialized send file uploads under another kind
+    with the same `local_path`.
+    """
+
+    node_name: str
+    kind: str
+    local_path: str
+    bytes: int
+
+
+@dataclass(frozen=True)
 class SnapshotRowFacts:
     """The immutable facts of one cluster `snapshots` row, in row order."""
 
@@ -1825,6 +1854,22 @@ class SuspendCodecControl(CrossNodeRestoreControl, Protocol):
 
     def other_sandbox_worker_node(self, excluding_node: str) -> str:
         """A sandbox-pool kube node other than `excluding_node`, or a configuration error."""
+        ...
+
+    def btrfs_send_captures(
+        self, sandbox_id: str, node_name: str, *, since_time: str
+    ) -> list[BtrfsSendCapture]:
+        """sandbox-manager's btrfs-send encode lines for the sandbox on `node_name` since `since_time`."""
+        ...
+
+    def sandbox_canonical_snapshot_entries(self, node_name: str, sandbox_id: str) -> tuple[str, ...]:
+        """Entries of the sandbox's canonical suspend snapshot directory on `node_name`."""
+        ...
+
+    def completed_transfers(
+        self, sandbox_id: str, node_name: str, *, since_time: str
+    ) -> list[CompletedTransfer]:
+        """volume-manager's completed transfer jobs under the sandbox's cache directory on `node_name` since `since_time`."""
         ...
 
     def backup_queued_events(self, sandbox_id: str, *, since_time: str) -> list[BackupQueued]:

@@ -675,7 +675,7 @@ kind cluster: space-local (kind-cluster.yaml.tmpl — 6 nodes)
 │   ├── one pod per node-service DaemonSet (release `space`):
 │   │   ├── space-node-manager        → host supervisor (root, privileged)
 │   │   ├── space-runtime-manager     (read-only list)  (space-rtmgr)
-│   │   ├── space-volume-manager      → object store    (space-sbxmgr)
+│   │   ├── space-volume-manager      → object store    (space-volmgr)
 │   │   ├── space-credential-manager                    (space-sbxmgr)
 │   │   ├── space-template-manager                      (space-tmplmgr)
 │   │   ├── space-sandbox-manager                       (space-sbxmgr)
@@ -754,7 +754,7 @@ reflector use) and `app.kubernetes.io/part-of=space-node`.
 | node-manager | root | privileged, hostNetwork, hostPID; `/space/cache` and `/var/run/netns` Bidirectional; `/sys/fs/cgroup`, `/space/bin`, `/space/etc`, `/space/vendor`, `/dev/kvm`; projected token for the credential-manager authority | mounts jail rootfs and late snapshot-memory binds that must reach the host jailer, netns binds the host jailer and sidecar launcher open, loop and device-mapper devices, cgroup limits, root-namespace veth/nft/ip_forward, pidfds on host processes (`crates/libs/node/mgr/server`); init container `node-manager-init.sh` writes the node's systemd unit via `nsenter --target 1` |
 | runtime-supervisor | root | host systemd unit, no pod | `scripts/k8s/node-manager-init.sh`, `node-manager-runtime-supervisor.sh` |
 | runtime-manager | space-rtmgr + space-rtmgrclients | non-root, no capabilities, read-only rootfs; `/space/vendor`, `/space/bin`, `/space/cache` read-only | lists runtimes and kernels |
-| volume-manager | space-sbxmgr + SPACE_VOLUME_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs; `/space/cache` HostToContainer | file transfers only (`crates/libs/vol/mgr/server`); keeps the legacy identity `docs/installation.md` describes |
+| volume-manager | space-volmgr + SPACE_VOLUME_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs; `/space/cache` HostToContainer | file transfers only (`crates/libs/vol/mgr/server`); the separate identity `docs/installation.md` describes: node-manager's btrfs send-lease RPCs authorize it and credential-manager serves it on the volume socket |
 | credential-manager | space-sbxmgr + SPACE_CREDENTIAL_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs; `/space/run` only; projected token for the authority | the node credential agent (`--role=agent`): sockets only, forwarding to `space-credmgr-authority`; no database, KEK or AWS credential; its peer-process check (`SPACE_UDS_PEER_PROCESS_CHECK`) is off, so no host PID namespace |
 | template-manager | space-tmplmgr + SPACE_TEMPLATE_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs, hostNetwork; `/space/cache` HostToContainer | btrfs work delegated to node-manager (`btrfs_via_nodemgr.rs`); host network because its template-release reads are scoped by source address (below) |
 | sandbox-manager | space-sbxmgr + SPACE_SANDBOX_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs, hostPID, hostNetwork; `/space/cache` HostToContainer, `/space/etc` read-only | gateway callers are authorized by their host pid, and Firecracker pids go to the node's shim (`service/gateway_identity.rs`, `network_runtime.rs`); host network for its node-bound ClusterApi RPCs |
@@ -785,8 +785,8 @@ the pod network; node-api reaches it through the node-local
 `space-builder-build-manager` Service, named as its TLS leaf.
 
 Services whose `/space/run` directory the node image does not bake (volume-manager,
-node-ctl, runtime-manager) create it in a `prepare-run-dir` init container with
-only CHOWN and FOWNER; build-manager, which does not migrate its SQLite database
+node-ctl, runtime-manager, and credential-manager's volume-socket directory)
+create it in a `prepare-run-dir` init container with only CHOWN and FOWNER; build-manager, which does not migrate its SQLite database
 itself, applies its schema in a `migrate-sqlite` init container. Every other
 service migrates its own store after taking its service mutex.
 
@@ -805,9 +805,12 @@ service socket and build-manager on its gRPC health service.
 (`/space/run/<service>/service.mutex`) roll with `maxSurge: 1, maxUnavailable: 0`:
 the successor starts beside the predecessor, reports ready while passive, and
 takes over, sockets replaced by rename, when the predecessor drains and releases
-the lock. That covers node-manager, volume-manager, credential-manager,
-template-manager, sandbox-manager and node-ctl. runtime-manager, node-api and
-build-manager delete first. runtime-manager holds no mutex, so a successor would
+the lock. That covers node-manager, credential-manager, template-manager,
+sandbox-manager and node-ctl. volume-manager, runtime-manager, node-api and
+build-manager delete first: volume-manager because this chart runs the separate
+`space-volmgr` identity, and a successor under a different identity can never
+take a predecessor's lock, which is also why a cluster whose earlier release
+ran the legacy identity must be recreated rather than upgraded in place. runtime-manager holds no mutex, so a successor would
 take its socket by rename at once, beside a predecessor its probes can no longer
 reach, and its kernel installer empties shared staging on open, which is only
 safe when nothing in staging is live. node-api's declared port is a host port the

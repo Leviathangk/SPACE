@@ -447,9 +447,11 @@ SPACE_KIND_CLUSTER=space-local \
 
 The worker image provides a separate `space-volmgr` account (UID/GID 964) and
 credential-client group `space-volcredclients` (GID 965). The Kind
-volume-manager DaemonSet continues to run volume-manager as `space-sbxmgr`
-(UID 950), using the standard credential socket. Adding these accounts does not change the running identity
-or migrate retained files.
+volume-manager DaemonSet runs volume-manager as `space-volmgr` with
+credential-manager's volume socket, the production shape; node-manager's btrfs
+send-lease RPCs authorize only that identity, so deferred btrfs-send capture
+depends on it. Adding these accounts to an existing direct node does not change
+the running identity or migrate retained files.
 
 Credential-manager supports an optional `--volume-socket
 /space/run/volume-credentials/credmgr.sock` listener. It admits only the

@@ -903,6 +903,17 @@ impl NodeManagerService {
             .and_then(|path| path.components().next())
             .and_then(|part| part.as_os_str().to_str())
             .filter(|id| id.parse::<SandboxId>().is_ok());
+        // Deletion capacity is bounded where the work runs, and taken before
+        // any sandbox ownership so a queued deletion never holds a healthy
+        // sandbox's artifact lock while it waits. A caller that stops waiting
+        // releases nothing here: the slot is held by the blocking closure
+        // until the filesystem work is done.
+        let permit = self
+            .cache_artifact_delete_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Status::unavailable("cache artifact deletion lane closed"))?;
         let guard = match sandbox_id {
             Some(id) => Some(self.lock_sandbox_artifacts(id).await?),
             None => None,
@@ -914,6 +925,7 @@ impl NodeManagerService {
             .transpose()?;
 
         self.off_runtime("delete cache artifact", move || {
+            let _permit = permit;
             let _guard = guard;
             let _claim = claim;
             if !std::path::Path::new(&local_path).exists() {
