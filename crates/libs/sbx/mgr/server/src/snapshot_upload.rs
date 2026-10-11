@@ -721,8 +721,16 @@ pub(crate) fn write_snapshot_metadata_to(
     };
     let meta_json = serde_json::to_string_pretty(&written)?;
     std::fs::create_dir_all(metadata_dir).map_err(SnapshotMetadataWriteError::CreateMetadataDir)?;
-    std::fs::write(metadata_dir.join(SNAPSHOT_METADATA_FILENAME), &meta_json)
-        .map_err(SnapshotMetadataWriteError::WriteMetadata)?;
+    // Restores may leave a sidecar owned by volume-manager. Directory write
+    // permission lets us replace it without writing another service's inode;
+    // readers keep a complete old or new document even across a crash.
+    replace_file_durably(
+        metadata_dir,
+        ".snapshot.json.upload",
+        SNAPSHOT_METADATA_FILENAME,
+        meta_json.as_bytes(),
+    )
+    .map_err(SnapshotMetadataWriteError::WriteMetadata)?;
     Ok(meta_final)
 }
 
@@ -736,9 +744,12 @@ pub(crate) fn replace_file_durably(
     bytes: &[u8],
 ) -> std::io::Result<()> {
     use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt;
     let temporary = dir.join(temporary_name);
     let mut file = std::fs::File::create(&temporary)?;
     file.write_all(bytes)?;
+    // Volume-manager reads metadata published by sandbox-manager.
+    file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
     file.sync_all()?;
     drop(file);
     std::fs::rename(&temporary, dir.join(final_name))?;

@@ -381,7 +381,18 @@ fn write_snapshot_metadata_sizes_from_local_artifacts_at_submit_time() {
     std::fs::write(dir.join("rootfs.ext4"), vec![0u8; 30]).unwrap();
 
     let meta = fixture_meta(None);
+    let metadata_path = dir.join(SNAPSHOT_METADATA_FILENAME);
+    std::fs::write(&metadata_path, b"previous metadata").unwrap();
+    // Restored metadata can be readable but not writable by this service.
+    // A reader that already opened it must retain the previous complete bytes.
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&metadata_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let mut previous = std::fs::File::open(&metadata_path).unwrap();
     let out = write_snapshot_metadata(&meta, dir, &vm, None).unwrap();
+    let mut previous_bytes = Vec::new();
+    previous.read_to_end(&mut previous_bytes).unwrap();
+    assert_eq!(previous_bytes, b"previous metadata");
     assert_eq!(out.size_bytes, 60, "size is the sum of local VM artifacts");
 
     let written = std::fs::read_to_string(dir.join(SNAPSHOT_METADATA_FILENAME)).unwrap();
