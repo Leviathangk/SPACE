@@ -312,6 +312,7 @@ type TeardownSuspendDrivers = Arc<dashmap::DashMap<SandboxId, tokio::sync::Owned
 enum TeardownSuspendDriverAdmission {
     Started,
     Existing,
+    Deferred,
     Saturated,
 }
 
@@ -320,6 +321,7 @@ impl TeardownSuspendDriverAdmission {
         match self {
             Self::Started => "started",
             Self::Existing => "existing",
+            Self::Deferred => "deferred",
             Self::Saturated => "saturated",
         }
     }

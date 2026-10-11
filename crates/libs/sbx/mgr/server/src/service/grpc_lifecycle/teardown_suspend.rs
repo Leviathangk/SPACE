@@ -476,6 +476,22 @@ impl SandboxManagerService {
         execution_generation: pplx_space_common_core::types::ExecutionGeneration,
         event_trigger: SandboxEventTrigger,
     ) -> TeardownSuspendDriverAdmission {
+        let due = self.db_conn().and_then(|db| {
+            crate::db::teardown_suspend_retry_due(
+                &db,
+                &sandbox_id.to_string(),
+                execution_generation,
+            )
+            .map_err(|error| Status::internal(format!("read teardown retry deadline: {error}")))
+        });
+        match due {
+            Ok(true) => {}
+            Ok(false) => return TeardownSuspendDriverAdmission::Deferred,
+            Err(error) => {
+                tracing::warn!(%sandbox_id, %error, "cannot read teardown retry deadline");
+                return TeardownSuspendDriverAdmission::Deferred;
+            }
+        }
         let dashmap::mapref::entry::Entry::Vacant(entry) =
             self.teardown_suspend_drivers.entry(sandbox_id)
         else {
@@ -559,6 +575,19 @@ impl SandboxManagerService {
             ) {
                 tracing::warn!(%sandbox_id, %execution_generation, %record_error,
                     "failed to persist teardown suspend driver failure; caller polling will retry");
+            }
+            if let Err(error) = self.db_conn().and_then(|db| {
+                crate::db::defer_teardown_suspend_retry(
+                    &db,
+                    &sandbox_id.to_string(),
+                    execution_generation,
+                    error.message(),
+                )
+                .map_err(|error| {
+                    Status::internal(format!("persist teardown retry deadline: {error}"))
+                })
+            }) {
+                tracing::warn!(%sandbox_id, %error, "cannot persist teardown retry deadline");
             }
         }
         result
@@ -815,11 +844,9 @@ impl SandboxManagerService {
     /// Record that a teardown suspend's durable backup is over, on the row
     /// the shim keeps polling.
     ///
-    /// A permanent job failure ends the artifact's upload for good:
-    /// [`teardown_backup_failure_requires_new_attempt`] refuses a fresh
-    /// attempt for it, so every later poll rejoins the same terminal job.
-    /// The suspend therefore can never publish, the row can never leave
-    /// `suspending`, and nothing on this node distinguishes it from a suspend
+    /// A permanently refused upload remains blocked unless its unstaged
+    /// intent is explicitly reauthorized. While blocked, nothing on this node
+    /// distinguishes it from a suspend
     /// still uploading — a distinction the cluster-deleted eviction needs
     /// before it may reclaim anything. The marker supplies exactly that
     /// terminality proof and nothing else; whether the sandbox is *gone*
@@ -863,6 +890,85 @@ impl SandboxManagerService {
         }
     }
 
+    /// Revalidate a prepared intent that was refused before volume staging.
+    /// Only a server acknowledgement of an open attempt permits a new local
+    /// job; old servers, terminal remote attempts and staged transfers stay
+    /// blocked for explicit recovery. The driver paces probes durably.
+    pub(super) async fn retry_unstaged_teardown_backup(
+        &self,
+        backup: &TeardownSuspendBackup<'_>,
+        failed: &pplx_space_common_jobs::Job,
+    ) -> Result<Option<JobId>, Status> {
+        if !failed.is_terminal()
+            || !matches!(
+                failed.failure,
+                Some(pplx_space_common_jobs::JobFailure::Permanent { .. })
+            )
+        {
+            return Ok(None);
+        }
+        // Historical payloads without exact artifact evidence cannot be
+        // automatically reopened. Keep their original terminal diagnosis.
+        let Ok(payload) = failed.payload_as::<crate::snapshot_upload::SnapshotUploadJobs>() else {
+            return Ok(None);
+        };
+        if !payload.job_ids.is_empty()
+            || !crate::snapshot_upload_jobs::prepared_upload_requires_begin(&payload)
+            || payload.meta.sandbox_id != backup.artifact.sandbox_id
+            || payload.meta.local_artifact_id != Some(backup.artifact.local_artifact_id)
+            || payload.meta.artifact_kind != Some(backup.artifact.artifact_kind)
+            || payload.meta.artifact_origin != Some(ArtifactOrigin::Suspend)
+            || payload.snapshot_dir != std::path::Path::new(&backup.artifact.local_path)
+        {
+            return Ok(None);
+        }
+        if !matches!(crate::snapshot_upload_jobs::begin_prepared_upload(&payload).await,
+            Ok(registration) if registration.accepts_unstaged_retry)
+        {
+            return Ok(None);
+        }
+        {
+            let db = self.db_conn()?;
+            if !crate::db::reopen_teardown_suspend_backup(
+                &db,
+                &backup.artifact.sandbox_id,
+                backup.execution_generation,
+                backup.artifact.local_artifact_id,
+            )
+            .map_err(|error| Status::internal(format!("reopen teardown backup: {error}")))?
+            {
+                return Err(Status::aborted(
+                    "teardown no longer owns the backup artifact",
+                ));
+            }
+        }
+        let format = crate::snapshot_upload::format_from_meta(&payload.meta);
+        let retained = self
+            .inspect_retained_upload(&payload.meta, &payload.snapshot_dir, format)
+            .await
+            .map_err(|error| Status::internal(format!("inspect retry artifact: {error}")))?;
+        let prepared = crate::snapshot_upload::prepare_suspend_snapshot(
+            &payload.meta,
+            &payload.snapshot_id,
+            &payload.snapshot_dir,
+            &payload.config,
+            backup.artifact.artifact_kind,
+            format,
+            retained,
+        )
+        .map_err(Status::internal)?;
+        let submitted = self.snapshot_upload_worker.submit_json(
+            crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
+            &prepared,
+            Some(&backup.artifact.sandbox_id),
+            Some(&backup.artifact.local_artifact_id.to_string()),
+        );
+        if submitted.is_err() {
+            crate::snapshot_upload::cleanup_metadata_staging_dir(&prepared);
+        }
+        submitted.map(Some)
+    }
+
     pub(super) async fn ensure_teardown_suspend_backup(
         &self,
         sandbox: &crate::db::SandboxRow,
@@ -888,7 +994,11 @@ impl SandboxManagerService {
                     if !job.is_terminal()
                         || !teardown_backup_failure_requires_new_attempt(job.failure) =>
                 {
-                    job.job_id
+                    // Preserve terminal history. A repaired source can reopen
+                    // an unstaged intent only after the server reauthorizes it.
+                    self.retry_unstaged_teardown_backup(&backup, &job)
+                        .await?
+                        .unwrap_or(job.job_id)
                 }
                 _ => match self
                     .enqueue_suspend_artifact_backup(
