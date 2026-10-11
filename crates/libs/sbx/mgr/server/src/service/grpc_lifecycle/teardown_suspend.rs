@@ -868,73 +868,85 @@ impl SandboxManagerService {
         sandbox: &crate::db::SandboxRow,
         backup: TeardownSuspendBackup<'_>,
     ) -> Result<(), Status> {
-        let artifact_dedup_key = backup.artifact.local_artifact_id.to_string();
-        let persisted_job = self.snapshot_upload_worker.find_job_by_dedup_key(
-            crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
-            &artifact_dedup_key,
-        )?;
-        let job_id = match persisted_job {
-            Some(job)
-                if !job.is_terminal()
-                    || !teardown_backup_failure_requires_new_attempt(job.failure) =>
-            {
-                job.job_id
-            }
-            _ => match self
-                .enqueue_suspend_artifact_backup(
-                    sandbox,
-                    backup.artifact.local_artifact_id,
-                    &backup.artifact.local_path,
-                    backup.format,
-                    Some(&artifact_dedup_key),
-                )
-                .await
-                .map_err(|error| {
-                    teardown_artifact_backup_status(error, backup.artifact.local_artifact_id)
-                })? {
-                SubmitSuspendSnapshotOutcome::Enqueued { job_id, .. } => job_id,
-                SubmitSuspendSnapshotOutcome::NoUploadConfig => {
-                    return Err(Status::failed_precondition(
-                        "generation suspend requires a configured snapshot upload destination",
-                    ));
+        // Restored artifacts can already be durable even though this node has
+        // no completion marker. Prove the exact identity before rewriting its
+        // metadata or joining a historical failed upload. Lookup failure is
+        // not durability evidence; the normal upload fence still applies.
+        let already_durable = matches!(
+            self.existing_ready_artifact_backup_response(backup.artifact)
+                .await,
+            Ok(Some(_))
+        );
+        if !already_durable {
+            let artifact_dedup_key = backup.artifact.local_artifact_id.to_string();
+            let persisted_job = self.snapshot_upload_worker.find_job_by_dedup_key(
+                crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
+                &artifact_dedup_key,
+            )?;
+            let job_id = match persisted_job {
+                Some(job)
+                    if !job.is_terminal()
+                        || !teardown_backup_failure_requires_new_attempt(job.failure) =>
+                {
+                    job.job_id
                 }
-            },
-        };
-        let job = self
-            .snapshot_upload_worker
-            .wait_for_job(&job_id, self.snapshot_upload_worker.worst_case_runtime())
-            .await?;
-        if !job.is_terminal() || job.failure.is_some() {
-            if matches!(
-                job.failure,
-                Some(pplx_space_common_jobs::JobFailure::Permanent { .. })
-            ) {
-                self.record_teardown_suspend_backup_permanent_failure(
-                    &sandbox.id,
-                    backup.artifact.local_artifact_id,
+                _ => match self
+                    .enqueue_suspend_artifact_backup(
+                        sandbox,
+                        backup.artifact.local_artifact_id,
+                        &backup.artifact.local_path,
+                        backup.format,
+                        Some(&artifact_dedup_key),
+                    )
+                    .await
+                    .map_err(|error| {
+                        teardown_artifact_backup_status(error, backup.artifact.local_artifact_id)
+                    })? {
+                    SubmitSuspendSnapshotOutcome::Enqueued { job_id, .. } => job_id,
+                    SubmitSuspendSnapshotOutcome::NoUploadConfig => {
+                        return Err(Status::failed_precondition(
+                            "generation suspend requires a configured snapshot upload destination",
+                        ));
+                    }
+                },
+            };
+            let job = self
+                .snapshot_upload_worker
+                .wait_for_job(&job_id, self.snapshot_upload_worker.worst_case_runtime())
+                .await?;
+            if !job.is_terminal() || job.failure.is_some() {
+                if matches!(
+                    job.failure,
+                    Some(pplx_space_common_jobs::JobFailure::Permanent { .. })
+                ) {
+                    self.record_teardown_suspend_backup_permanent_failure(
+                        &sandbox.id,
+                        backup.artifact.local_artifact_id,
+                    );
+                }
+                let mut error = Status::internal(
+                    job.error
+                        .unwrap_or_else(|| "durable suspend backup failed".to_string()),
                 );
+                if matches!(
+                    job.failure,
+                    Some(pplx_space_common_jobs::JobFailure::Permanent { .. })
+                ) {
+                    error =
+                        teardown_backup_failure_status(error, backup.artifact.local_artifact_id);
+                }
+                return Err(error);
             }
-            let mut error = Status::internal(
-                job.error
-                    .unwrap_or_else(|| "durable suspend backup failed".to_string()),
-            );
-            if matches!(
-                job.failure,
-                Some(pplx_space_common_jobs::JobFailure::Permanent { .. })
-            ) {
-                error = teardown_backup_failure_status(error, backup.artifact.local_artifact_id);
+            {
+                let db = self.db_conn()?;
+                crate::db::mark_local_artifact_backup_completed(
+                    &db,
+                    &backup.artifact.local_artifact_id.to_string(),
+                )
+                .map_err(|error| {
+                    Status::internal(format!("persist durable suspend completion: {error}"))
+                })?;
             }
-            return Err(error);
-        }
-        {
-            let db = self.db_conn()?;
-            crate::db::mark_local_artifact_backup_completed(
-                &db,
-                &backup.artifact.local_artifact_id.to_string(),
-            )
-            .map_err(|error| {
-                Status::internal(format!("persist durable suspend completion: {error}"))
-            })?;
         }
 
         let still_owned = {

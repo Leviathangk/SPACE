@@ -1,0 +1,141 @@
+use super::*;
+use pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat;
+
+use pplx_space_node_api_client::proto::{
+    GetArtifactBackupLocationRequest, GetArtifactBackupLocationResponse,
+};
+
+#[derive(Clone)]
+struct ReadyBackup;
+
+impl tonic::server::NamedService for ReadyBackup {
+    const NAME: &'static str = "space.node.api.v1.ClusterApi";
+}
+
+impl tonic::server::UnaryService<GetArtifactBackupLocationRequest> for ReadyBackup {
+    type Response = GetArtifactBackupLocationResponse;
+    type Future = std::future::Ready<Result<Response<Self::Response>, Status>>;
+
+    fn call(&mut self, request: Request<GetArtifactBackupLocationRequest>) -> Self::Future {
+        let request = request.into_inner();
+        std::future::ready(Ok(Response::new(GetArtifactBackupLocationResponse {
+            local_artifact_id: request.local_artifact_id,
+            artifact_kind: request.artifact_kind,
+            backup_attempt_id: uuid::Uuid::now_v7().to_string(),
+            ..Default::default()
+        })))
+    }
+}
+
+impl<B> tower::Service<http::Request<B>> for ReadyBackup
+where
+    B: http_body::Body + Send + 'static,
+    B::Error: Into<tonic::codegen::StdError> + Send + 'static,
+{
+    type Response = http::Response<tonic::body::Body>;
+    type Error = std::convert::Infallible;
+    type Future = futures_util::future::BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        assert!(request.uri().path().ends_with("/GetArtifactBackupLocation"));
+        Box::pin(async move {
+            let mut grpc = tonic::server::Grpc::new(tonic_prost::ProstCodec::default());
+            Ok(grpc.unary(ReadyBackup, request).await)
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn teardown_reuses_exact_remote_backup_without_touching_local_files_or_jobs() {
+    use crate::service::tests::service_tests::insert_stranded_teardown_suspend_sandbox;
+    use pplx_space_common_core::types::ExecutionGeneration;
+    use std::ffi::OsStr;
+
+    // The parent serves while the isolated child exercises environment-based
+    // client wiring. A second runtime thread keeps the server making progress.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let stop = tokio_util::sync::CancellationToken::new();
+    let server = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(ReadyBackup)
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                stop.clone().cancelled_owned(),
+            ),
+    );
+    let token = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(token.path(), "synthetic-backup-test-token").unwrap();
+    let child = pplx_space_test_env::enter_test_process(&[
+        ("SPACE_INTERNAL_RPC_INSECURE_DEV", Some(OsStr::new("1"))),
+        (
+            pplx_space_node_api_client::cluster::CLUSTER_API_ENDPOINT_ENV,
+            Some(OsStr::new(&endpoint)),
+        ),
+        (
+            pplx_space_common_svc::bearer_token::SPACE_CLUSTER_API_TOKEN_PATH_ENV,
+            Some(token.path().as_os_str()),
+        ),
+    ]);
+    if child {
+        for superseded in [false, true] {
+            let conn = crate::db::test_conn();
+            let sandbox_id = SandboxId::new();
+            let generation = ExecutionGeneration::new(7).unwrap();
+            let artifact_id =
+                insert_stranded_teardown_suspend_sandbox(&conn, sandbox_id, generation);
+            let row = crate::db::get_sandbox(&conn, &sandbox_id.to_string())
+                .unwrap()
+                .unwrap();
+            let artifact = crate::db::get_local_artifact(&conn, artifact_id)
+                .unwrap()
+                .unwrap();
+            let service = SandboxManagerService::new(conn);
+            let result = service
+                .ensure_teardown_suspend_backup(
+                    &row,
+                    super::TeardownSuspendBackup {
+                        execution_generation: if superseded {
+                            ExecutionGeneration::new(6).unwrap()
+                        } else {
+                            generation
+                        },
+                        artifact: &artifact,
+                        format: SuspendSnapshotFormat::Full,
+                    },
+                )
+                .await;
+            if superseded {
+                assert_eq!(result.unwrap_err().code(), tonic::Code::Aborted);
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "{result:?}; lookup: {:?}",
+                    service
+                        .existing_ready_artifact_backup_response(&artifact)
+                        .await
+                );
+            }
+            let db = service.db.lock().unwrap();
+            let status = crate::db::teardown_suspend_status(&db, &sandbox_id.to_string())
+                .unwrap()
+                .unwrap();
+            assert!(status.backup_completed);
+            assert!(
+                pplx_space_common_jobs::db::list_jobs(&db, Some(&sandbox_id.to_string()), None, 0)
+                    .unwrap()
+                    .iter()
+                    .all(|job| job.kind != crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND)
+            );
+        }
+    }
+    stop.cancel();
+    server.await.unwrap().unwrap();
+}
