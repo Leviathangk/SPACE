@@ -12,12 +12,13 @@ use uuid::Uuid;
 
 use super::{NodeManagerService, artifact_fs, trusted_paths};
 use crate::btrfs;
+use crate::cache_ownership::{RETAINED_SOURCE_GID, RETAINED_SOURCE_MODE};
 use crate::proto::{
     BtrfsEncodeRootfsSendResponse, BtrfsInspectSendSourceRequest, BtrfsInspectSendSourceResponse,
     BtrfsMaterializeRootfsSendRequest,
 };
 
-pub(super) const DIRECTORY: &str = "rootfs.btrfs-source";
+pub(super) use crate::cache_ownership::RETAINED_SOURCE_BUNDLE as DIRECTORY;
 const MANIFEST: &str = "source.json";
 const ROOTFS: &str = "rootfs.ext4";
 const ALLOWED: &[UdsPeerPrincipal] = &[
@@ -62,16 +63,12 @@ pub(super) fn capture_open(
     nix::sys::stat::mkdirat(
         artifact,
         DIRECTORY,
-        nix::sys::stat::Mode::from_bits_truncate(0o750),
+        nix::sys::stat::Mode::from_bits_truncate(RETAINED_SOURCE_MODE as libc::mode_t),
     )
     .map_err(artifact_fs::error)?;
     let bundle =
         artifact_fs::directory(artifact, DIRECTORY.as_ref()).map_err(artifact_fs::error)?;
-    trusted_paths::set_permissions(
-        &bundle,
-        Some(pplx_space_common_core::host::linux::identities::gids::SPACE_CACHE_RW),
-        0o750,
-    )?;
+    trusted_paths::set_permissions(&bundle, Some(RETAINED_SOURCE_GID), RETAINED_SOURCE_MODE)?;
     let result = (|| {
         // Templates use a deterministic received UUID and stransid=0. Preserve
         // that remote identity on the private, byte-identical parent before
@@ -106,11 +103,7 @@ pub(super) fn capture_open(
             .map_err(artifact_fs::error)?,
         );
         file.write_all(&bytes).map_err(artifact_fs::error)?;
-        trusted_paths::set_permissions(
-            &file,
-            Some(pplx_space_common_core::host::linux::identities::gids::SPACE_CACHE_RW),
-            0o640,
-        )?;
+        trusted_paths::set_permissions(&file, Some(RETAINED_SOURCE_GID), 0o640)?;
         file.sync_all().map_err(artifact_fs::error)?;
         bundle.sync_all().map_err(artifact_fs::error)?;
         artifact.sync_all().map_err(artifact_fs::error)?;
