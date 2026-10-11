@@ -476,6 +476,22 @@ impl SandboxManagerService {
         execution_generation: pplx_space_common_core::types::ExecutionGeneration,
         event_trigger: SandboxEventTrigger,
     ) -> TeardownSuspendDriverAdmission {
+        let due = self.db_conn().and_then(|db| {
+            crate::db::teardown_suspend_retry_due(
+                &db,
+                &sandbox_id.to_string(),
+                execution_generation,
+            )
+            .map_err(|error| Status::internal(format!("read teardown retry deadline: {error}")))
+        });
+        match due {
+            Ok(true) => {}
+            Ok(false) => return TeardownSuspendDriverAdmission::Deferred,
+            Err(error) => {
+                tracing::warn!(%sandbox_id, %error, "cannot read teardown retry deadline");
+                return TeardownSuspendDriverAdmission::Deferred;
+            }
+        }
         let dashmap::mapref::entry::Entry::Vacant(entry) =
             self.teardown_suspend_drivers.entry(sandbox_id)
         else {
@@ -559,6 +575,19 @@ impl SandboxManagerService {
             ) {
                 tracing::warn!(%sandbox_id, %execution_generation, %record_error,
                     "failed to persist teardown suspend driver failure; caller polling will retry");
+            }
+            if let Err(error) = self.db_conn().and_then(|db| {
+                crate::db::defer_teardown_suspend_retry(
+                    &db,
+                    &sandbox_id.to_string(),
+                    execution_generation,
+                    error.message(),
+                )
+                .map_err(|error| {
+                    Status::internal(format!("persist teardown retry deadline: {error}"))
+                })
+            }) {
+                tracing::warn!(%sandbox_id, %error, "cannot persist teardown retry deadline");
             }
         }
         result
@@ -873,6 +902,19 @@ impl SandboxManagerService {
             crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
             &artifact_dedup_key,
         )?;
+        // An active local upload still owns its completion. Only probe before
+        // enqueueing or joining a terminal job: a restored artifact can already
+        // be durable without a local completion marker. A failed probe leaves
+        // the ordinary upload path responsible for durability.
+        if persisted_job.as_ref().is_none_or(|job| job.is_terminal())
+            && matches!(
+                self.existing_ready_artifact_backup_response(backup.artifact)
+                    .await,
+                Ok(Some(_))
+            )
+        {
+            return self.verify_teardown_suspend_backup_ownership(sandbox, &backup);
+        }
         let job_id = match persisted_job {
             Some(job)
                 if !job.is_terminal()
@@ -936,7 +978,14 @@ impl SandboxManagerService {
                 Status::internal(format!("persist durable suspend completion: {error}"))
             })?;
         }
+        self.verify_teardown_suspend_backup_ownership(sandbox, &backup)
+    }
 
+    fn verify_teardown_suspend_backup_ownership(
+        &self,
+        sandbox: &crate::db::SandboxRow,
+        backup: &TeardownSuspendBackup<'_>,
+    ) -> Result<(), Status> {
         let still_owned = {
             let db = self.db_conn()?;
             crate::db::teardown_suspend_status(&db, &sandbox.id)
