@@ -325,79 +325,6 @@ pub(super) fn network_policy_status_for(
     })
 }
 
-/// Best-effort `sandboxes.lifecycle` write that refuses to overwrite a
-/// terminal state. Called from the lifecycle action dispatcher after a
-/// substrate operation succeeds (e.g. `pause`, `stop`, `checkpoint`) to
-/// stamp the user-facing result lifecycle onto the row.
-///
-/// The terminal-state exclusion is the safety contract with the
-/// transient-lifecycle sweeper: if the sweeper landed on `pausing`/
-/// `stopping`/etc. while the substrate call was in flight and flipped
-/// the row to `failed` (with the backing execution torn down), a
-/// post-substrate "stamp `paused` / `stopped`" write would resurrect
-/// the row as live while the pod is gone. CAS-guarding on `lifecycle
-/// NOT IN ('failed', 'quarantined', 'deleted', 'cleanup_required')` keeps the swept
-/// terminal state.
-///
-/// The `maybe_` prefix is preserved: the helper has always been
-/// best-effort (the original shape silently swallowed DB errors); a
-/// race-loss now also silently leaves the swept state in place rather
-/// than 5xx-ing. Long-running paths that *should* surface a CAS-loss
-/// (Restore, Wake) carry their own dedicated CAS upstream of this
-/// helper.
-pub(super) async fn maybe_update_sandbox_lifecycle(pool: &PgPool, id: SandboxId, lifecycle: &str) {
-    if let Err(err) = sqlx::query(sql!(
-        "UPDATE sandboxes
-            SET lifecycle = $1
-          WHERE id = $2
-            AND lifecycle NOT IN ('failed', 'quarantined', 'deleted', 'cleanup_required')"
-    ))
-    .bind(lifecycle)
-    .bind(id)
-    .execute(pool)
-    .await
-    {
-        tracing::warn!(
-            sandbox_id = %id,
-            lifecycle,
-            error = %err,
-            "best-effort sandbox lifecycle update failed"
-        );
-    }
-}
-
-/// Best-effort `(lifecycle, placement)` write that refuses to overwrite
-/// a terminal state. Same terminal-state guard as
-/// [`maybe_update_sandbox_lifecycle`]; see that function's doc for the
-/// transient-lifecycle-sweeper safety contract.
-pub(super) async fn maybe_update_sandbox_state(
-    pool: &PgPool,
-    id: SandboxId,
-    lifecycle: &str,
-    placement: &str,
-) {
-    if let Err(err) = sqlx::query(sql!(
-        "UPDATE sandboxes
-            SET lifecycle = $1, placement = $2
-          WHERE id = $3
-            AND lifecycle NOT IN ('failed', 'quarantined', 'deleted', 'cleanup_required')"
-    ))
-    .bind(lifecycle)
-    .bind(placement)
-    .bind(id)
-    .execute(pool)
-    .await
-    {
-        tracing::warn!(
-            sandbox_id = %id,
-            lifecycle,
-            placement,
-            error = %err,
-            "best-effort sandbox state update failed"
-        );
-    }
-}
-
 pub(super) async fn fetch_sandbox_observed_states(
     pool: &PgPool,
     ids: &[SandboxId],
@@ -766,11 +693,13 @@ pub async fn fetch_sandbox(pool: &PgPool, id: SandboxId) -> Result<Option<Sandbo
 }
 
 /// Marks a pooled sandbox as started/on-node after its wake completes and
-/// returns the freshly-joined response row in the same round-trip. The
-/// lifecycle guard matches the non-pooled wake/restore completion writers:
-/// if a supervisor moved the row into an inert lifecycle while wake was in
-/// flight, this helper must surface the CAS miss rather than resurrecting it
-/// as started.
+/// returns the freshly-joined response row in the same round-trip. The guard
+/// refuses only the terminal lifecycles (`failed`, `quarantined`, `deleted`,
+/// `cleanup_required`, compared raw): if a supervisor moved the row into one
+/// of them while wake was in flight, this helper surfaces the CAS miss rather
+/// than resurrecting it as started. It is narrower than the wake completion
+/// CAS (`complete_wake_lifecycle`) and the post-result precedence in the
+/// lifecycle controller, which also keep `deleting` and suspend claims.
 pub async fn update_and_fetch_post_wake_sandbox(
     pool: &PgPool,
     id: SandboxId,

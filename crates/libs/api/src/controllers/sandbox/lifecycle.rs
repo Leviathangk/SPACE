@@ -426,6 +426,336 @@ async fn complete_wake_lifecycle(
     Ok(WakeLifecycleCompletion::Lost)
 }
 
+/// Whether a completed action's post-result write must leave the lifecycle
+/// it found (`found`, compared after `LOWER(TRIM(..))`) in place instead of
+/// writing the action's result (`status`).
+///
+/// Each cell follows from what can still happen on the runtime after this
+/// action succeeded, and from who else writes the value:
+///
+/// - R1: a value only a newer control-plane intent writes is kept when that
+///   intent can still complete on the runtime after this result.
+/// - R2: a newer intent this result made impossible on the runtime loses;
+///   keeping its claim would strand the row in a transient state.
+/// - R3: a value node publication also writes as an observation is replaced.
+///   The next publication corrects a wrong replacement; nothing corrects a
+///   wrong refusal.
+/// - R4: terminal states are kept, and Kubernetes keeps the
+///   [`PublishedSuspendFence::Enforced`] rule of `complete_wake_lifecycle`.
+///
+/// | found                        | started (start, resume) | paused   | stopped (stop, kill) | suspended |
+/// |------------------------------|-------------------------|----------|----------------------|-----------|
+/// | `failed`, `quarantined`, `deleted`, `cleanup_required` | keep R4 | keep R4 | keep R4 | keep R4 |
+/// | `deleting`                   | keep R1                 | keep R1  | keep R1              | keep R1   |
+/// | `suspending`                 | keep R1                 | keep R1  | write R2             | write (own) |
+/// | `suspended`                  | Kubernetes: keep R4; direct: write R3 | write R3 | write R3 | write (own) |
+/// | `restoring`                  | write (own)             | write    | write (own)          | keep R1   |
+/// | `stopped`                    | write R3                | write R3 | write (own)          | write R3  |
+/// | `stopping`                   | write (base)            | write (base) | write (own)      | write (base) |
+/// | any other value              | write                   | write    | write                | write     |
+///
+/// Evidence for the cells that are not self-explanatory:
+///
+/// - `deleting`: only `begin_delete_against_active_fork` writes it, before
+///   any teardown, and both delete compensations are CASes on `deleting`.
+///   The delete usually completes. When its teardown defers (a suspend in
+///   flight, or a retained filesystem that is the only copy) or its
+///   finalization fails, the compensation restores the lifecycle the delete
+///   replaced, which predates this action: the action's result is then lost,
+///   and publication does not correct a `paused` or `stopped` that is wrong.
+///   A retried DELETE heals it; closing the gap needs a row generation.
+/// - `suspending` under start, resume or pause: written only by the
+///   Kubernetes suspend claim (`claim_suspend_execution`) and the node-drain
+///   claim (`claim_evacuation_suspend`), both from `started`/`paused`; the
+///   runtime allows Started/Paused -> Suspending, so the suspend can still
+///   complete, and its commit expects to find `suspending`.
+/// - `suspending` under stop or kill: kill succeeds only from Started or
+///   Paused with an unchanged execution, and a stop that took the node's
+///   cleanup lock leaves a node-local suspend unable to write Suspended (its
+///   completion is refused as superseded). The Kubernetes claim is never
+///   reverted on failure and publication does not promote `suspending`, so
+///   keeping it would leave the row for the transient sweeper to fail. A
+///   drain claim's marker is cleared by the `sandboxes` trigger when the row
+///   leaves `suspending`, and the drain's commit and revert are guarded on
+///   `suspending`.
+/// - `suspended`: node publication writes it
+///   (`project_node_published_suspended_sandboxes`, ready suspend
+///   snapshots, activation rollback receipts). On Kubernetes a successful
+///   start or resume of a `suspended` row went through `restoring` (start
+///   claims it; resume answers 503 for a dormant row and claims it only when
+///   it wakes a row that just finished suspending), so `suspended` at write
+///   time is a newer suspend, a reverted restore, or a publication, which the
+///   wake completion fences the same way.
+/// - `restoring`: written only by restore claims (and a sweeper undo). On
+///   Kubernetes a start, or a stop whose `runtime_client` woke a row that
+///   just finished suspending, claims it itself. A direct start never claims
+///   it, so there `restoring` is another restore's lease, which the write
+///   clears as before; keeping it would let that restore's lease release
+///   (`release_direct_restore_lease`) write `suspended` over the started
+///   resident. A pause's overwrite is converged to `started` by the wake's
+///   own completion. A suspend never claims it,
+///   and a wake that claimed it after the suspend finalized can still
+///   restore; overwriting would clear its restore lease (trigger) and make its
+///   completion report a superseded wake while its restore pod runs.
+/// - `stopped`: node publication converges rows to `stopped`, but a node's
+///   plain `started` report never moves a `stopped` row (only a start's
+///   activation-completion receipt can, and a resume has none), so a wrongly
+///   kept `stopped` would never be corrected.
+/// - `stopping`: nothing writes it ahead of a stop (only compensations restore
+///   an earlier value), so these cells keep the base behavior.
+fn post_result_keeps(
+    status: SandboxLifecycleStatus,
+    found: &str,
+    published_suspend_fence: PublishedSuspendFence,
+) -> bool {
+    let found = found.trim().to_ascii_lowercase();
+    let Ok(found) = found.parse::<SandboxLifecycle>() else {
+        return matches!(found.as_str(), "deleted" | "cleanup_required");
+    };
+    match found {
+        SandboxLifecycle::Failed | SandboxLifecycle::Quarantined | SandboxLifecycle::Deleting => {
+            true
+        }
+        SandboxLifecycle::Suspending => match status {
+            SandboxLifecycleStatus::Started | SandboxLifecycleStatus::Paused => true,
+            SandboxLifecycleStatus::Stopped | SandboxLifecycleStatus::Suspended => false,
+            SandboxLifecycleStatus::Unknown => true,
+        },
+        SandboxLifecycle::Suspended => match status {
+            SandboxLifecycleStatus::Started => {
+                published_suspend_fence == PublishedSuspendFence::Enforced
+            }
+            SandboxLifecycleStatus::Paused
+            | SandboxLifecycleStatus::Stopped
+            | SandboxLifecycleStatus::Suspended => false,
+            SandboxLifecycleStatus::Unknown => true,
+        },
+        SandboxLifecycle::Restoring => match status {
+            SandboxLifecycleStatus::Suspended => true,
+            SandboxLifecycleStatus::Started
+            | SandboxLifecycleStatus::Paused
+            | SandboxLifecycleStatus::Stopped => false,
+            SandboxLifecycleStatus::Unknown => true,
+        },
+        SandboxLifecycle::Created
+        | SandboxLifecycle::Creating
+        | SandboxLifecycle::Starting
+        | SandboxLifecycle::Started
+        | SandboxLifecycle::Pausing
+        | SandboxLifecycle::Paused
+        | SandboxLifecycle::Resuming
+        | SandboxLifecycle::Checkpointing
+        | SandboxLifecycle::Stopping
+        | SandboxLifecycle::Stopped => false,
+    }
+}
+
+/// Outcome of a completed action's post-result lifecycle write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PostResultLifecycle {
+    /// The result lifecycle was written.
+    Recorded,
+    /// A newer intent owns the row (`None`: the row is gone). As with
+    /// [`WakeLifecycleCompletion::SupersededBySuspend`], the runtime action
+    /// succeeded and is linearizable before that intent.
+    Superseded { lifecycle: Option<String> },
+    /// The row already held this terminal lifecycle when the action was
+    /// admitted (e.g. a stop issued against a `failed` sandbox).
+    AlreadyRefused { lifecycle: String },
+}
+
+/// Decide and write the post-result lifecycle under the row lock, so the
+/// outcome describes exactly the lifecycle the decision saw. The row can
+/// still have left and returned to the admitted lifecycle between admission
+/// and this lock; that window is inherent without a row generation.
+async fn record_post_result_lifecycle(
+    pool: &PgPool,
+    id: SandboxId,
+    status: SandboxLifecycleStatus,
+    placement: Option<&str>,
+    admitted: &str,
+    published_suspend_fence: PublishedSuspendFence,
+) -> Result<PostResultLifecycle, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    let found = sqlx::query_scalar::<_, String>(sql!(
+        "SELECT lifecycle FROM sandboxes WHERE id = $1 FOR NO KEY UPDATE"
+    ))
+    .bind(id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    let Some(found) = found else {
+        return Ok(PostResultLifecycle::Superseded { lifecycle: None });
+    };
+    if post_result_keeps(status, &found, published_suspend_fence) {
+        let normalized = found.trim().to_ascii_lowercase();
+        let admitted_terminal = normalized == admitted.trim().to_ascii_lowercase()
+            && matches!(
+                normalized.as_str(),
+                "failed" | "quarantined" | "deleted" | "cleanup_required"
+            );
+        let retargets_drain_restore = normalized == "suspending"
+            && matches!(
+                status,
+                SandboxLifecycleStatus::Started | SandboxLifecycleStatus::Paused
+            );
+        if retargets_drain_restore {
+            // A node-drain claim restores the sandbox to the lifecycle it held
+            // when claimed. The runtime ran this action before the suspend
+            // (Resuming/Pausing -> Suspending is not a runtime transition), so
+            // the restore must land on the action's result instead. An HTTP
+            // suspend claim has no restore target and is left alone.
+            if let Err(error) = retarget_drain_restore(transaction, id, status).await {
+                tracing::warn!(
+                    sandbox_id = %id,
+                    result = status.as_str(),
+                    %error,
+                    "failed to retarget a kept node-drain suspend claim to the action's result"
+                );
+            }
+        } else {
+            // Dropping the uncommitted transaction rolls it back; the decision
+            // is made, so a rollback error must not change the outcome.
+            drop(transaction);
+        }
+        return Ok(if admitted_terminal {
+            PostResultLifecycle::AlreadyRefused { lifecycle: found }
+        } else {
+            PostResultLifecycle::Superseded {
+                lifecycle: Some(found),
+            }
+        });
+    }
+    match placement {
+        Some(placement) => {
+            sqlx::query(sql!(
+                "UPDATE sandboxes SET lifecycle = $2, placement = $3 WHERE id = $1"
+            ))
+            .bind(id)
+            .bind(status.as_str())
+            .bind(placement)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        None => {
+            sqlx::query(sql!("UPDATE sandboxes SET lifecycle = $2 WHERE id = $1"))
+                .bind(id)
+                .bind(status.as_str())
+                .execute(&mut *transaction)
+                .await?;
+        }
+    }
+    transaction.commit().await?;
+    Ok(PostResultLifecycle::Recorded)
+}
+
+/// Point a kept node-drain suspend claim's restore at `status`, in the
+/// decision's transaction, and commit it.
+async fn retarget_drain_restore(
+    mut transaction: sqlx::Transaction<'_, sqlx::Postgres>,
+    id: SandboxId,
+    status: SandboxLifecycleStatus,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET evacuation_restore_target = $2
+          WHERE id = $1
+            AND evacuation_restore_target IS NOT NULL"
+    ))
+    .bind(id)
+    .bind(status.as_str())
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await
+}
+
+/// [`record_post_result_lifecycle`], best-effort: the runtime call already
+/// succeeded, so a database error is logged and the action still succeeds.
+async fn record_post_result_lifecycle_best_effort(
+    pool: &PgPool,
+    id: SandboxId,
+    status: SandboxLifecycleStatus,
+    placement: Option<&str>,
+    admitted: &str,
+    published_suspend_fence: PublishedSuspendFence,
+) -> PostResultLifecycle {
+    match record_post_result_lifecycle(
+        pool,
+        id,
+        status,
+        placement,
+        admitted,
+        published_suspend_fence,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            match placement {
+                Some(placement) => tracing::warn!(
+                    sandbox_id = %id,
+                    lifecycle = status.as_str(),
+                    placement,
+                    error = %error,
+                    "best-effort sandbox state update failed"
+                ),
+                None => tracing::warn!(
+                    sandbox_id = %id,
+                    lifecycle = status.as_str(),
+                    error = %error,
+                    "best-effort sandbox lifecycle update failed"
+                ),
+            }
+            PostResultLifecycle::Recorded
+        }
+    }
+}
+
+/// Record that a completed action's result was not written. The action
+/// still succeeds, exactly as a wake superseded by a suspend does, so its
+/// `*_completed` event closes the timeline its `*_requested` event opened;
+/// the outcome details carry the kept lifecycle, the unrecorded result, and
+/// why the result was not written.
+fn report_unrecorded_post_result(
+    sandbox_id: SandboxId,
+    action: SandboxAction,
+    status: SandboxLifecycleStatus,
+    outcome: &PostResultLifecycle,
+) {
+    let (kept, reason) = match outcome {
+        PostResultLifecycle::Recorded => return,
+        PostResultLifecycle::AlreadyRefused { lifecycle } => {
+            tracing::info!(
+                %sandbox_id,
+                action = action.as_str(),
+                result = status.as_str(),
+                lifecycle = lifecycle.as_str(),
+                "completed sandbox action kept the terminal lifecycle it was admitted from"
+            );
+            (lifecycle.as_str(), "admitted_from_refused")
+        }
+        PostResultLifecycle::Superseded { lifecycle } => {
+            let found = lifecycle.as_deref().unwrap_or("deleted");
+            tracing::info!(
+                %sandbox_id,
+                action = action.as_str(),
+                result = status.as_str(),
+                lifecycle = found,
+                "completed sandbox action left a newer lifecycle in place"
+            );
+            (found, "post_action_superseded")
+        }
+    };
+    emit_api_sandbox_event(
+        sandbox_id,
+        action.completed_event(),
+        action,
+        SandboxEventDetails::default()
+            .reason(reason)
+            .lifecycle_state(kept)
+            .target_state(status.as_str()),
+    );
+}
+
 /// Every sandbox action verb the controller cares about. Routes parse incoming
 /// HTTP action strings into this enum once via `FromStr`; the controller then
 /// dispatches on variants instead of stringly-typed `match action` arms.
@@ -1633,11 +1963,41 @@ impl SandboxController {
                     if !execution.completion.should_finalize_lifecycle() {
                         return Ok(body);
                     }
-                    maybe_update_sandbox_state(pool, id, "started", "on_node").await;
+                    let status = SandboxLifecycleStatus::Started;
+                    let recorded = record_post_result_lifecycle_best_effort(
+                        pool,
+                        id,
+                        status,
+                        Some("on_node"),
+                        sandbox.lifecycle.as_str(),
+                        PublishedSuspendFence::for_substrate(&self.substrate),
+                    )
+                    .await;
+                    // The completion names this exact activation attempt, so it
+                    // is released whether or not the result was recorded.
                     self.substrate
                         .complete_activation_lease(typed_id, execution.lease_completion)
                         .await;
-                    Ok((Some(SandboxLifecycleStatus::Started), body))
+                    // The runtime activation succeeded whether or not its result
+                    // lifecycle survives.
+                    record_dormant_activation_if_needed(sandbox, metric_identity, action);
+                    if recorded != PostResultLifecycle::Recorded {
+                        report_unrecorded_post_result(typed_id, action, status, &recorded);
+                        return Ok(body);
+                    }
+                    // Same shape as the Wake arm: finish the post-result work
+                    // here and return `(None, body)`, so the result is decided
+                    // and written once rather than again by the post-result
+                    // block, against whatever landed in between.
+                    self.reconcile_open_sandbox_port_exposures_best_effort(pool, id)
+                        .await;
+                    emit_api_sandbox_event(
+                        typed_id,
+                        action.completed_event(),
+                        action,
+                        SandboxEventDetails::default().with_to_state(status.as_str()),
+                    );
+                    Ok((None, body))
                 }
                 SandboxAction::Wake | SandboxAction::ImplicitWake(_) => {
                     let reconnect_initial_lifecycle = sandbox.lifecycle.as_str();
@@ -2129,9 +2489,25 @@ impl SandboxController {
             }
         };
         if let Some(status) = status {
-            maybe_update_sandbox_lifecycle(pool, id, status.as_str()).await;
+            let recorded = record_post_result_lifecycle_best_effort(
+                pool,
+                id,
+                status,
+                None,
+                sandbox.lifecycle.as_str(),
+                PublishedSuspendFence::for_substrate(&self.substrate),
+            )
+            .await;
             if status == SandboxLifecycleStatus::Started {
+                // The runtime activation succeeded whether or not its result
+                // lifecycle survives.
                 record_dormant_activation_if_needed(sandbox, metric_identity, action);
+            }
+            if recorded != PostResultLifecycle::Recorded {
+                report_unrecorded_post_result(typed_id, action, status, &recorded);
+                return Ok(body);
+            }
+            if status == SandboxLifecycleStatus::Started {
                 self.reconcile_open_sandbox_port_exposures_best_effort(pool, id)
                     .await;
             }

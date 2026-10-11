@@ -950,3 +950,221 @@ async fn resume_uses_resolved_runtime_without_async_observation() -> TestResult 
     }
     Ok(())
 }
+
+/// On Kubernetes a successful start or resume of a `suspended` row went
+/// through `restoring` (start claims it; resume answers 503 for a dormant row
+/// and claims it only when it wakes a row that just finished suspending), so
+/// `suspended` at post-result time is a newer suspend, a reverted restore or
+/// a node publication, whether or not the action was admitted from it, and
+/// the `started` result is refused, as in the wake completion. Direct leaves
+/// the row `suspended` during a resident start, and node publication also
+/// writes `suspended`, so there the result is written. Results other than
+/// `started` are written over `suspended` on either substrate. The direct arm
+/// is swept through `action` in the characterization tests; Kubernetes
+/// cannot be reached there, so this pins the decision at the write itself.
+#[tokio::test(flavor = "current_thread")]
+async fn post_result_write_over_an_admitted_suspend_follows_the_published_suspend_fence()
+-> TestResult {
+    let db = pg_test_db_with_max_connections(3).await?;
+    let kept = || PostResultLifecycle::Superseded {
+        lifecycle: Some("suspended".to_owned()),
+    };
+    for (status, fence, admitted, expected, lifecycle) in [
+        (
+            SandboxLifecycleStatus::Started,
+            PublishedSuspendFence::Enforced,
+            "suspended",
+            kept(),
+            "suspended",
+        ),
+        (
+            SandboxLifecycleStatus::Started,
+            PublishedSuspendFence::Enforced,
+            "paused",
+            kept(),
+            "suspended",
+        ),
+        (
+            SandboxLifecycleStatus::Started,
+            PublishedSuspendFence::DirectRestoreBaseline,
+            "suspended",
+            PostResultLifecycle::Recorded,
+            "started",
+        ),
+        (
+            SandboxLifecycleStatus::Started,
+            PublishedSuspendFence::DirectRestoreBaseline,
+            "paused",
+            PostResultLifecycle::Recorded,
+            "started",
+        ),
+        (
+            SandboxLifecycleStatus::Paused,
+            PublishedSuspendFence::Enforced,
+            "started",
+            PostResultLifecycle::Recorded,
+            "paused",
+        ),
+        (
+            SandboxLifecycleStatus::Stopped,
+            PublishedSuspendFence::Enforced,
+            "suspended",
+            PostResultLifecycle::Recorded,
+            "stopped",
+        ),
+    ] {
+        let sandbox_id = SandboxId::new();
+        sqlx::query(sql!(
+            "INSERT INTO sandboxes (
+                 id, user_id, org_id, managed_by, lifecycle, placement,
+                 network_policy_generation
+             ) VALUES (
+                 $1,
+                 '00000000-0000-0000-0000-000000000010',
+                 '00000000-0000-0000-0000-000000000001',
+                 'space', 'suspended', 'unplaced', 1
+             )"
+        ))
+        .bind(sandbox_id)
+        .execute(&db.pool)
+        .await?;
+
+        let outcome =
+            record_post_result_lifecycle(&db.pool, sandbox_id, status, None, admitted, fence)
+                .await?;
+
+        assert_eq!(
+            outcome, expected,
+            "{status:?} under {fence:?} admitted from {admitted}"
+        );
+        let stored: String =
+            sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
+                .bind(sandbox_id)
+                .fetch_one(&db.pool)
+                .await?;
+        assert_eq!(stored, lifecycle, "{status:?} under {fence:?}");
+    }
+    Ok(())
+}
+
+/// A refused post-result write is classified from the lifecycle the decision
+/// saw, not from a later read. Here the row is `deleting` when a start
+/// admitted from `stopped` completes, and the delete's compensation restores
+/// `stopped` right after any write statement that matched nothing. A later
+/// read would report `stopped` as the lifecycle that won, hiding that the
+/// result lost to a delete (and a terminal value read back equal to the
+/// admitted one would be misreported as already refused at admission).
+///
+/// The compensation is modeled by a statement trigger on `sandboxes` that
+/// fires once, only for this test's row.
+#[tokio::test(flavor = "current_thread")]
+async fn post_result_refusal_is_classified_from_the_value_the_decision_saw() -> TestResult {
+    let db = pg_test_db_with_max_connections(3).await?;
+    let sandbox_id = SandboxId::new();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (
+             id, user_id, org_id, managed_by, lifecycle, placement,
+             network_policy_generation
+         ) VALUES (
+             $1,
+             '00000000-0000-0000-0000-000000000010',
+             '00000000-0000-0000-0000-000000000001',
+             'space', 'deleting', 'on_node', 1
+         )"
+    ))
+    .bind(sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE FUNCTION test_compensate_after_unmatched_write() RETURNS trigger
+         LANGUAGE plpgsql AS $$
+         BEGIN
+             IF NOT EXISTS (SELECT 1 FROM changed) THEN
+                 UPDATE sandboxes SET lifecycle = 'stopped'
+                  WHERE id = '{sandbox_id}' AND lifecycle = 'deleting';
+             END IF;
+             RETURN NULL;
+         END $$"
+    )))
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "CREATE TRIGGER test_compensate_after_unmatched_write
+         AFTER UPDATE ON sandboxes REFERENCING NEW TABLE AS changed
+         FOR EACH STATEMENT EXECUTE FUNCTION test_compensate_after_unmatched_write()"
+    ))
+    .execute(&db.pool)
+    .await?;
+
+    let outcome = record_post_result_lifecycle(
+        &db.pool,
+        sandbox_id,
+        SandboxLifecycleStatus::Started,
+        Some("on_node"),
+        "stopped",
+        PublishedSuspendFence::DirectRestoreBaseline,
+    )
+    .await?;
+
+    assert_eq!(
+        outcome,
+        PostResultLifecycle::Superseded {
+            lifecycle: Some("deleting".to_owned())
+        }
+    );
+    Ok(())
+}
+
+/// The post-result decision locks the row `FOR NO KEY UPDATE`, the lock the
+/// bare `UPDATE` it replaced took, so it does not wait behind the
+/// `FOR KEY SHARE` lock that every foreign-key insert into a child table
+/// takes on the row; a node publication transaction can hold one for its
+/// whole duration.
+#[tokio::test(flavor = "current_thread")]
+async fn post_result_write_does_not_wait_for_a_key_share_lock() -> TestResult {
+    let db = pg_test_db_with_max_connections(3).await?;
+    let sandbox_id = SandboxId::new();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (
+             id, user_id, org_id, managed_by, lifecycle, placement,
+             network_policy_generation
+         ) VALUES (
+             $1,
+             '00000000-0000-0000-0000-000000000010',
+             '00000000-0000-0000-0000-000000000001',
+             'space', 'paused', 'on_node', 1
+         )"
+    ))
+    .bind(sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    let mut child_insert = db.pool.begin().await?;
+    sqlx::query(sql!("SELECT 1 FROM sandboxes WHERE id = $1 FOR KEY SHARE"))
+        .bind(sandbox_id)
+        .execute(&mut *child_insert)
+        .await?;
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        record_post_result_lifecycle(
+            &db.pool,
+            sandbox_id,
+            SandboxLifecycleStatus::Started,
+            None,
+            "paused",
+            PublishedSuspendFence::DirectRestoreBaseline,
+        ),
+    )
+    .await
+    .map_err(|_| "the post-result write waited behind a FOR KEY SHARE lock")??;
+    child_insert.rollback().await?;
+
+    assert_eq!(outcome, PostResultLifecycle::Recorded);
+    let lifecycle: String =
+        sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
+            .bind(sandbox_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(lifecycle, "started");
+    Ok(())
+}

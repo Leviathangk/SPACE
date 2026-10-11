@@ -149,6 +149,9 @@ async fn claim_evacuation_suspend(
     Ok(claimed.rows_affected() == 1)
 }
 
+/// Revert a claim whose suspend failed before commit. The claim's restore
+/// target is authoritative over `pre_lifecycle`: a pause or resume that
+/// finished on the node while the claim was held retargets it to its result.
 async fn revert_evacuation_suspend_claim(
     pool: &PgPool,
     sandbox_id: SandboxId,
@@ -156,7 +159,7 @@ async fn revert_evacuation_suspend_claim(
 ) -> Result<bool, sqlx::Error> {
     let reverted = sqlx::query(sql!(
         "UPDATE sandboxes s
-            SET lifecycle = $2,
+            SET lifecycle = COALESCE(s.evacuation_restore_target, $2),
                 evacuation_restore_target = NULL
           WHERE s.id = $1
             AND s.lifecycle = 'suspending'
@@ -2905,12 +2908,12 @@ impl NodeDrainSink for SubstrateSink {
             .as_ref()
             .map_or_else(|| "none".to_string(), |artifact| artifact.id.to_string());
 
-        // 3. Commit the suspend in the lifecycle column. `suspend_execution`
-        //    on the K8s substrate touches `sandbox_k8s_executions` +
-        //    placement but NOT `sandboxes.lifecycle`; the HTTP path does
-        //    that via `maybe_update_sandbox_lifecycle`. Guarded so we
-        //    don't stomp a concurrent change that somehow slipped past
-        //    the `'suspending'` claim.
+        // 3. Commit the suspend in the lifecycle column. On the K8s
+        //    substrate `suspend_execution` has already finalized the claim
+        //    to `suspended` (`finish_suspended_execution`), so this matches
+        //    nothing; the direct substrate does not write the lifecycle.
+        //    Guarded so we don't stomp a lifecycle that replaced the
+        //    `'suspending'` claim, such as a stop that won over it.
         if let Err(err) = sqlx::query(sql!(
             "UPDATE sandboxes SET lifecycle = 'suspended'
              WHERE id = $1 AND lifecycle = 'suspending'"

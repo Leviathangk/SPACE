@@ -91,6 +91,14 @@ context. Keep event names domain-level: prefer `pause_requested` or
 | `port_exposure_remove_started`, `port_exposure_remove_completed`, `port_exposure_remove_failed` | Remove node-local port exposure state. | Captures guest allow-rule and ingress DNAT removal, including release-time cleanup of all DNAT rules for a sandbox vpeer. |
 | `sandbox_process_launch_completed`, `sandbox_process_launch_failed`, `sandbox_process_pid_persist_failed` | Runtime process launch and PID persistence. | Shows sidecar/runtime launch success, launch/setup failure, and partial-success PID persistence ambiguity. |
 
+A `start_completed`, `resume_completed`, `pause_completed`, `stop_completed`,
+`kill_completed` or `suspend_completed` event whose result lifecycle was not
+recorded, because a newer intent owned the sandbox row when the result was
+written, carries no `to_state`. It carries the kept `lifecycle_state`, the
+unrecorded result in `target_state`, and a `reason`: `post_action_superseded`,
+or `admitted_from_refused` for a terminal lifecycle the row already held when
+the action was admitted.
+
 ## Emission Guidance
 
 - Emit from the code path that requests, completes, fails, reconciles, or

@@ -565,6 +565,48 @@ async fn registered_inventory_does_not_require_cluster_singleton() -> TestResult
     Ok(())
 }
 
+/// Node publication converges a row to `stopped` when its node reports the
+/// sandbox stopped, but a node report of `started` (without an activation
+/// receipt) never moves a `stopped` row. The API's post-result lifecycle
+/// write relies on this asymmetry: a completed start or resume that writes
+/// `started` over a `stopped` the runtime really holds is corrected by the
+/// next publication, while refusing the write would leave a running sandbox
+/// recorded as `stopped` with nothing to correct it.
+#[tokio::test(flavor = "current_thread")]
+async fn node_publication_converges_to_stopped_but_not_back_on_a_started_report() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    insert_ready_worker_node(&db.pool, node_id).await?;
+    for (stored, published, expected) in [
+        ("started", "stopped", "stopped"),
+        ("paused", "stopped", "stopped"),
+        ("stopped", "started", "stopped"),
+    ] {
+        let sandbox_id = SandboxId::new();
+        insert_active_sandbox_with_managed_by(&db.pool, sandbox_id, node_id, stored, "space")
+            .await?;
+
+        let mut conn = db.pool.acquire().await?;
+        publish_sandbox_states(
+            &mut conn,
+            node_id,
+            &[published_sandbox_state(sandbox_id, published)],
+        )
+        .await?;
+        drop(conn);
+
+        let lifecycle: String =
+            sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
+                .bind(sandbox_id)
+                .fetch_one(&db.pool)
+                .await?;
+        assert_eq!(lifecycle, expected, "{stored} published as {published}");
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn publishing_suspended_node_state_finalizes_driver_crashed_suspend() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {

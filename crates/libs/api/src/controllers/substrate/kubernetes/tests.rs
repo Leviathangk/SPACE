@@ -3198,6 +3198,261 @@ mod kubernetes_tests {
         Ok(())
     }
 
+    /// A Kubernetes sandbox row in `lifecycle`, assigned to a worker node whose
+    /// node-api is the sim worker behind the proxy port; the mocked API server
+    /// reports every sandbox pod running at `127.0.0.1`.
+    async fn kubernetes_sandbox_on_sim_worker(
+        pool: &PgPool,
+        lifecycle: &str,
+    ) -> Result<(SandboxController, SimWorkerHarness, SandboxId), BoxError> {
+        let sandbox_id = SandboxId::new();
+        insert_test_sandbox_row(pool, sandbox_id, lifecycle).await?;
+        let active_node_id = test_worker_node_id();
+        sqlx::query(
+            "INSERT INTO nodes (id, address, role, managed_by, state)
+             VALUES ($1, '10.0.0.10', 'worker', 'k8s', 'ready')
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(active_node_id)
+        .execute(pool)
+        .await?;
+        sqlx::query("UPDATE sandboxes SET active_node_id = $2 WHERE id = $1")
+            .bind(sandbox_id)
+            .bind(active_node_id)
+            .execute(pool)
+            .await?;
+        let sim_worker = start_sim_worker().await?;
+        let controller = SandboxController::new(Substrate::Kubernetes(Box::new(
+            substrate_with_store_client_and_proxy_port(
+                pool.clone(),
+                running_pod_kubernetes_client(Arc::new(Mutex::new(Vec::new())), "127.0.0.1"),
+                sim_worker.port(),
+            ),
+        )))
+        .with_route_ed25519_authority(Some(test_route_ed25519_authority()));
+        Ok((controller, sim_worker, sandbox_id))
+    }
+
+    /// [`kubernetes_sandbox_on_sim_worker`], paused, with an execution created
+    /// by a real wake through the substrate.
+    async fn paused_kubernetes_sandbox_with_execution(
+        pool: &PgPool,
+    ) -> Result<(SandboxController, SimWorkerHarness, SandboxId), BoxError> {
+        let (controller, sim_worker, sandbox_id) =
+            kubernetes_sandbox_on_sim_worker(pool, "paused").await?;
+        let sandbox = fetch_sandbox(pool, sandbox_id)
+            .await?
+            .expect("inserted sandbox must be visible");
+        controller
+            .action(
+                pool,
+                sandbox_id,
+                Some(&sandbox),
+                SandboxApiMetricIdentity::native("wake"),
+                SandboxAction::Wake,
+                None,
+            )
+            .await?;
+        sim_worker
+            .state()
+            .set_status(&sandbox_id.to_string(), "paused")
+            .await?;
+        sqlx::query("UPDATE sandboxes SET lifecycle = 'paused' WHERE id = $1")
+            .bind(sandbox_id)
+            .execute(pool)
+            .await?;
+        Ok((controller, sim_worker, sandbox_id))
+    }
+
+    /// Runs `action` while an uncommitted write holds `lifecycle = landed` on
+    /// the row, and commits it once the action's post-result decision waits on
+    /// the row lock: unlocked reads before the decision still see the admitted
+    /// lifecycle, and the decision sees `landed`. Only for actions that take
+    /// no other lock on the row before their post-result write.
+    async fn complete_with_lifecycle_landing<T>(
+        pool: &PgPool,
+        sandbox_id: SandboxId,
+        landed: &str,
+        action: impl std::future::Future<Output = T>,
+    ) -> Result<T, BoxError> {
+        let mut landing = pool.begin().await?;
+        sqlx::query("UPDATE sandboxes SET lifecycle = $2 WHERE id = $1")
+            .bind(sandbox_id)
+            .bind(landed)
+            .execute(&mut *landing)
+            .await?;
+        let commit_when_decision_waits = async {
+            for _ in 0..1_000 {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM pg_stat_activity
+                          WHERE datname = current_database()
+                            AND pid <> pg_backend_pid()
+                            AND wait_event_type = 'Lock'
+                            AND query LIKE '%SELECT lifecycle FROM sandboxes WHERE id = $1 FOR %'
+                     )",
+                )
+                .fetch_one(pool)
+                .await?;
+                if waiting {
+                    landing.commit().await?;
+                    return Ok::<(), BoxError>(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err("the post-result decision never waited on the row lock".into())
+        };
+        let (result, landed) = tokio::join!(action, commit_when_decision_waits);
+        landed?;
+        Ok(result)
+    }
+
+    /// Kubernetes keeps the `PublishedSuspendFence::Enforced` rule for a
+    /// started result: a resume that finds `suspended` at its write leaves it,
+    /// because on this substrate a started result never legitimately follows
+    /// a `suspended` row without passing through `restoring`. The control
+    /// cell, with nothing landing, writes `started`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn kubernetes_resume_keeps_a_suspended_found_at_its_write() -> Result<(), BoxError> {
+        if !crate::test_support::enter_sim_worker_process_with_owned_token_files() {
+            return Ok(());
+        }
+        // The landing write and its lock probe each hold a connection.
+        let db = pplx_space_db_test_fixtures::pg_test_db_with_max_connections(6).await?;
+        let pool = db.pool.clone();
+        for landed in [None, Some("suspended")] {
+            let (controller, _sim_worker, sandbox_id) =
+                paused_kubernetes_sandbox_with_execution(&pool).await?;
+            let sandbox = fetch_sandbox(&pool, sandbox_id)
+                .await?
+                .expect("sandbox must be visible");
+            let resume = controller.action(
+                &pool,
+                sandbox_id,
+                Some(&sandbox),
+                SandboxApiMetricIdentity::native("resume"),
+                SandboxAction::Resume,
+                None,
+            );
+            let body = match landed {
+                None => resume.await?,
+                Some(landed) => {
+                    complete_with_lifecycle_landing(&pool, sandbox_id, landed, resume).await??
+                }
+            };
+
+            assert_eq!(body["ok"], true, "{landed:?}");
+            let lifecycle: String =
+                sqlx::query_scalar("SELECT lifecycle FROM sandboxes WHERE id = $1")
+                    .bind(sandbox_id)
+                    .fetch_one(&pool)
+                    .await?;
+            assert_eq!(lifecycle, landed.unwrap_or("started"), "{landed:?}");
+        }
+        Ok(())
+    }
+
+    /// A Kubernetes start whose result is superseded still releases the
+    /// activation attempt it holds: the completion names that exact attempt,
+    /// so leaving it would block the next activation until the lease expires.
+    ///
+    /// The start locks the row itself before its node call, so `deleting`
+    /// lands from a statement trigger on its last write before returning: the
+    /// activation-completion `UPDATE` of `sandbox_k8s_executions` (it matches
+    /// no row here, because the row is not yet at the attempt's target state,
+    /// and statement triggers fire anyway). The trigger, scoped to this test's
+    /// database and sandbox, also records whether the attempt was still held.
+    #[tokio::test(flavor = "current_thread")]
+    async fn kubernetes_start_releases_its_activation_when_superseded() -> Result<(), BoxError> {
+        if !crate::test_support::enter_sim_worker_process_with_owned_token_files() {
+            return Ok(());
+        }
+        let db = pplx_space_db_test_fixtures::pg_test_db_with_max_connections(4).await?;
+        let pool = db.pool.clone();
+        // A cold start: no execution yet, so the start creates one and owns
+        // its activation attempt.
+        let (controller, _sim_worker, sandbox_id) =
+            kubernetes_sandbox_on_sim_worker(&pool, "created").await?;
+        sqlx::query(
+            "CREATE TABLE test_superseded_start (sandbox_id UUID PRIMARY KEY, attempt_held BOOLEAN)",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query("INSERT INTO test_superseded_start (sandbox_id) VALUES ($1)")
+            .bind(sandbox_id)
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            "CREATE FUNCTION test_delete_before_start_result() RETURNS trigger
+             LANGUAGE plpgsql AS $$
+             BEGIN
+                 IF current_query() LIKE '%LOWER(TRIM(sandbox.lifecycle)) = execution.activation_attempt_target_state%' THEN
+                     UPDATE test_superseded_start t
+                        SET attempt_held = EXISTS (
+                            SELECT 1 FROM sandbox_k8s_executions e
+                             WHERE e.sandbox_id = t.sandbox_id
+                               AND e.active
+                               AND e.activation_attempt_id IS NOT NULL
+                        )
+                      WHERE t.attempt_held IS NULL;
+                     UPDATE sandboxes s SET lifecycle = 'deleting'
+                       FROM test_superseded_start t
+                      WHERE s.id = t.sandbox_id;
+                 END IF;
+                 RETURN NULL;
+             END $$",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "CREATE TRIGGER test_delete_before_start_result
+             AFTER UPDATE ON sandbox_k8s_executions
+             FOR EACH STATEMENT EXECUTE FUNCTION test_delete_before_start_result()",
+        )
+        .execute(&pool)
+        .await?;
+        let sandbox = fetch_sandbox(&pool, sandbox_id)
+            .await?
+            .expect("sandbox must be visible");
+
+        let body = controller
+            .action(
+                &pool,
+                sandbox_id,
+                Some(&sandbox),
+                SandboxApiMetricIdentity::native("start"),
+                SandboxAction::Start,
+                None,
+            )
+            .await?;
+
+        assert_eq!(body["ok"], true);
+        let attempt_held: Option<bool> =
+            sqlx::query_scalar("SELECT attempt_held FROM test_superseded_start")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            attempt_held,
+            Some(true),
+            "the start must still hold its activation attempt when its result is superseded"
+        );
+        let (lifecycle, attempt_released): (String, bool) = sqlx::query_as(
+            "SELECT s.lifecycle, e.activation_attempt_id IS NULL
+               FROM sandboxes s
+               JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id AND e.active
+              WHERE s.id = $1",
+        )
+        .bind(sandbox_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(lifecycle, "deleting");
+        assert!(
+            attempt_released,
+            "a superseded start must release its activation"
+        );
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn concurrent_started_wakes_with_existing_execution_wait_for_one_pod_create()
     -> Result<(), BoxError> {

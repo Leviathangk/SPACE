@@ -345,6 +345,100 @@ async fn evacuation_reverts_claim_when_suspend_fails_before_commit()
     Ok(())
 }
 
+/// A pause that finishes on the node while the drain's suspend claim is held
+/// keeps the claim and retargets its restore to `paused` (the API's
+/// post-result write). If the drain's suspend then fails before commit, the
+/// revert must land on that retargeted lifecycle, not on the one the drain
+/// read when it claimed: the runtime is paused.
+#[tokio::test(flavor = "current_thread")]
+async fn evacuation_revert_lands_on_a_retargeted_claim()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state, drain_phase, drain_mode)
+         VALUES ($1, '10.0.0.99'::inet, 'worker', 'k8s', 'registered', 'draining', 'forced')"
+    ))
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (
+             id, user_id, org_id, lifecycle, placement, managed_by,
+             active_node_id, target_node_id, network_policy_generation
+         ) VALUES (
+             $1,
+             '00000000-0000-0000-0000-000000000010',
+             '00000000-0000-0000-0000-000000000001',
+             'started', 'on_node', 'k8s', $2, $2, 1
+         )"
+    ))
+    .bind(sandbox_id)
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_k8s_executions (
+             sandbox_id, generation, pod_name, pod_namespace, pod_uid, state, active
+         ) VALUES ($1, 1, $2, 'space', 'pod-uid', 'running', TRUE)"
+    ))
+    .bind(sandbox_id)
+    .bind(format!("space-sbx-{sandbox_id}-g1"))
+    .execute(&db.pool)
+    .await?;
+    let retargeted_claims = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let retargeted_for_fake = Arc::clone(&retargeted_claims);
+    let suspend_pool = db.pool.clone();
+    let sink = SubstrateSink::with_suspend_execution(db.pool.clone(), move |requested_id| {
+        let suspend_pool = suspend_pool.clone();
+        let retargeted_claims = Arc::clone(&retargeted_for_fake);
+        async move {
+            let retargeted = sqlx::query(sql!(
+                "UPDATE sandboxes
+                    SET evacuation_restore_target = 'paused'
+                  WHERE id = $1
+                    AND lifecycle = 'suspending'
+                    AND evacuation_restore_target = 'started'"
+            ))
+            .bind(requested_id)
+            .execute(&suspend_pool)
+            .await
+            .map_err(|error| SubstrateError::Failed {
+                message: error.to_string(),
+            })?;
+            retargeted_claims.fetch_add(
+                usize::try_from(retargeted.rows_affected()).unwrap_or(0),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            Err(SubstrateError::Unavailable {
+                message: "worker response was lost before artifact commit".to_string(),
+            })
+        }
+    });
+
+    NodeDrainSink::evacuate_sandbox(&sink, sandbox_id, node_id, SandboxLifecycle::Started)
+        .await
+        .expect_err("a pre-commit suspend failure must remain retryable");
+
+    assert_eq!(
+        retargeted_claims.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the drain must hold its claim when the pause retargets it"
+    );
+    let (lifecycle, marker): (String, Option<String>) = sqlx::query_as(sql!(
+        "SELECT lifecycle, evacuation_restore_target FROM sandboxes WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(lifecycle, "paused");
+    assert_eq!(marker, None);
+    Ok(())
+}
+
 /// The failed-on-node classifier keys on `SUSPEND_SANDBOX_FAILED_MARKER`
 /// being a substring of the suspend error. Pin both ends: the message
 /// sbx-mgr renders for the `failed` state (and the adapter-wrapped form

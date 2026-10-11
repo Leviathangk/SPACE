@@ -543,23 +543,174 @@ async fn wake_completion_outcome_maps_to_the_wake_response() -> TestResult {
     Ok(())
 }
 
+/// The terminal sandbox events (anything but `*_requested`) emitted for each
+/// sandbox while installed as the thread's default subscriber.
+#[derive(Clone, Default)]
+struct TerminalEventCapture {
+    events: std::sync::Arc<std::sync::Mutex<Vec<(String, TerminalEvent)>>>,
+}
+
+/// The fields of a terminal sandbox event that describe its outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TerminalEvent {
+    event_type: String,
+    reason: Option<String>,
+    lifecycle_state: Option<String>,
+    to_state: Option<String>,
+    target_state: Option<String>,
+}
+
+impl TerminalEventCapture {
+    fn take_for(&self, sandbox_id: SandboxId) -> Vec<TerminalEvent> {
+        let sandbox_id = sandbox_id.to_string();
+        let mut events = self.events.lock().unwrap();
+        let (taken, kept): (Vec<_>, Vec<_>) = events
+            .drain(..)
+            .partition(|(event_sandbox, _)| *event_sandbox == sandbox_id);
+        *events = kept;
+        taken.into_iter().map(|(_, event)| event).collect()
+    }
+}
+
+impl<S> tracing_subscriber::Layer<S> for TerminalEventCapture
+where
+    S: tracing::Subscriber,
+{
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        use pplx_space_observability::test_capture::{RecordingVisitor, field_value};
+        let mut visitor = RecordingVisitor::default();
+        event.record(&mut visitor);
+        let fields = visitor.into_fields();
+        let (Some("space.sandbox"), Some(event_type), Some(sandbox_id)) = (
+            field_value(&fields, "event_stream"),
+            field_value(&fields, "event_type"),
+            field_value(&fields, "sandbox_id"),
+        ) else {
+            return;
+        };
+        if event_type.ends_with("_requested") {
+            return;
+        }
+        let detail = |name| field_value(&fields, name).map(str::to_owned);
+        self.events.lock().unwrap().push((
+            sandbox_id.to_owned(),
+            TerminalEvent {
+                event_type: event_type.to_owned(),
+                reason: detail("reason"),
+                lifecycle_state: detail("lifecycle_state"),
+                to_state: detail("to_state"),
+                target_state: detail("target_state"),
+            },
+        ));
+    }
+}
+
+/// Whether a completed action's post-result write replaces the lifecycle it
+/// finds, on the direct substrate, stated independently of the controller.
+/// Every outcome reports the action's success; only the row differs.
+///
+/// - R1: a value only a newer control-plane intent writes, where that intent
+///   can still complete on the runtime after this action's result, is kept.
+/// - R2: a newer intent this action's result made impossible on the runtime
+///   loses to the result.
+/// - R3: a value node publication also writes as an observation is replaced;
+///   the next publication corrects a wrong replacement, nothing corrects a
+///   wrong refusal.
+/// - R4: terminal states are kept, as before.
+fn post_result_keeps(action: SandboxAction, found: &str) -> bool {
+    let starts = matches!(action, SandboxAction::Start | SandboxAction::Resume);
+    let pauses = action == SandboxAction::Pause;
+    let suspends = action == SandboxAction::Suspend;
+    match found
+        .trim()
+        .to_ascii_lowercase()
+        .parse::<SandboxLifecycle>()
+    {
+        // `deleted` and `cleanup_required` are terminal (R4); any other
+        // unknown value is written over.
+        Err(_) => matches!(
+            found.trim().to_ascii_lowercase().as_str(),
+            "deleted" | "cleanup_required"
+        ),
+        Ok(lifecycle) => match lifecycle {
+            SandboxLifecycle::Failed | SandboxLifecycle::Quarantined => true,
+            // R1: a committed delete can still complete, and its
+            // compensation expects `deleting` (when the delete defers or fails,
+            // that compensation restores the lifecycle the delete replaced).
+            SandboxLifecycle::Deleting => true,
+            // R1 for start, resume and pause: the suspend can still run after
+            // them. R2 for stop and kill: a successful stop leaves no suspend
+            // able to complete. A suspend completes its own claim.
+            SandboxLifecycle::Suspending => starts || pauses,
+            // R1: a wake's restore claim that landed after the suspend's
+            // runtime call can still restore. A start or stop may have claimed
+            // `restoring` itself, and a pause's overwrite is converged to
+            // `started` by the wake's own completion.
+            SandboxLifecycle::Restoring => suspends,
+            // R3: node publication writes both (direct has no Kubernetes
+            // suspend fence).
+            SandboxLifecycle::Stopped | SandboxLifecycle::Suspended => false,
+            // No writer claims `stopping` ahead of a stop; base behavior.
+            SandboxLifecycle::Stopping => false,
+            SandboxLifecycle::Created
+            | SandboxLifecycle::Creating
+            | SandboxLifecycle::Starting
+            | SandboxLifecycle::Started
+            | SandboxLifecycle::Pausing
+            | SandboxLifecycle::Paused
+            | SandboxLifecycle::Resuming
+            | SandboxLifecycle::Checkpointing => false,
+        },
+    }
+}
+
 /// Every runtime action that reports a resulting lifecycle (start, resume,
-/// pause, stop, kill, suspend) writes it through the terminal-state guard:
-/// a terminal lifecycle that landed while the runtime call was in flight is
-/// kept, together with the placement, while the action itself still reports
-/// success. Only start also writes the placement (`on_node`), so the row is
-/// seeded `unplaced` with its active node still assigned.
+/// pause, stop, kill, suspend) writes it with a decision taken on the locked
+/// row, swept over every stored lifecycle (the variants, the non-variant
+/// values, and unnormalized spellings) in two positions:
+///
+/// - landed while the runtime call was in flight, after the handler read
+///   the row in the action's usual starting lifecycle;
+/// - already stored when the action was admitted.
+///
+/// The action succeeds either way, as it always has: a kept lifecycle belongs
+/// to a newer intent. A kept lifecycle keeps the placement too; only start
+/// writes the placement (`on_node`), so the row is seeded `unplaced` with its
+/// active node still assigned.
+///
+/// Every cell ends the action's sandbox event timeline with its
+/// `*_completed` event: a written result carries `to_state`; a kept one
+/// carries the kept `lifecycle_state`, the unrecorded `target_state`, and why
+/// it was kept (`admitted_from_refused` for a terminal lifecycle the row
+/// already held at admission, `post_action_superseded` otherwise).
 #[tokio::test(flavor = "current_thread")]
-async fn completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight() -> TestResult {
-    if !crate::test_support::enter_sim_worker_process() {
+async fn completed_actions_keep_a_conflicting_lifecycle_that_landed_mid_flight() -> TestResult {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    if !crate::test_support::enter_sim_worker_process_with_owned_token_files() {
         return Ok(());
     }
+    let capture = TerminalEventCapture::default();
+    let _subscriber =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
     let db = pg_test_db_with_max_connections(4).await?;
     let pool = &db.pool;
     let controller = direct_controller(pool);
     let (worker, node_id) = start_sim_worker(pool).await?;
 
-    for (action, prior, resident, completed) in [
+    let stored_lifecycles = SandboxLifecycle::all()
+        .iter()
+        .map(|lifecycle| lifecycle.as_str())
+        .chain(NON_VARIANT_LIFECYCLES)
+        // Unnormalized spellings, and a value that is no lifecycle at all.
+        .chain([" Deleting ", "SUSPENDING", "Stopped ", "hibernated"])
+        .collect::<Vec<_>>();
+    let mut mismatches = Vec::new();
+    for (action, usual, resident, completed) in [
         (SandboxAction::Start, "stopped", "stopped", "started"),
         (SandboxAction::Resume, "paused", "paused", "started"),
         (SandboxAction::Pause, "started", "running", "paused"),
@@ -572,18 +723,17 @@ async fn completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight() ->
         } else {
             "unplaced"
         };
-        // Only the lifecycles both guard families treat as terminal. The
-        // cross-intent lifecycles `deleting`, `stopping`, `suspending` and
-        // `suspended` are deliberately excluded: this post-result write
-        // currently replaces them with the action's own lifecycle, which is
-        // an open bug and is not encoded here.
-        let terminal = ["failed", "quarantined"]
-            .into_iter()
-            .chain(NON_VARIANT_LIFECYCLES)
-            .map(Some);
-        for landed in [None].into_iter().chain(terminal) {
+        // (admitted, landed mid-flight). The `None` row is the accepting
+        // control: nothing moved, and the result is written.
+        let landed = std::iter::once((usual, None))
+            .chain(stored_lifecycles.iter().map(|&found| (usual, Some(found))));
+        let admitted_from = stored_lifecycles
+            .iter()
+            .filter(|found| found.trim() == **found && found.to_ascii_lowercase() == **found)
+            .map(|&admitted| (admitted, None));
+        for (admitted, landed) in landed.chain(admitted_from) {
             let sandbox_id = SandboxId::new();
-            insert_sandbox(pool, sandbox_id, prior, "space").await?;
+            insert_sandbox(pool, sandbox_id, admitted, "space").await?;
             place_on_node(pool, sandbox_id, node_id).await?;
             set_placement(pool, sandbox_id, "unplaced").await?;
             insert_resident(worker.state(), sandbox_id, resident).await?;
@@ -591,29 +741,411 @@ async fn completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight() ->
             if let Some(lifecycle) = landed {
                 set_lifecycle(pool, sandbox_id, lifecycle).await?;
             }
+            let found = landed.unwrap_or(admitted);
+
+            let result =
+                run_action(&controller, pool, sandbox_id, Some(&sandbox), action, None).await;
+
+            let observed_response = match result {
+                Ok(body)
+                    if body
+                        == serde_json::json!({
+                            "ok": true,
+                            "action": action.as_str(),
+                            "sandbox_id": sandbox_id.to_string(),
+                        }) =>
+                {
+                    "ok".to_owned()
+                }
+                Ok(body) => format!("unexpected body {body}"),
+                Err(error) => format!("{}: {error}", error.status()),
+            };
+            let observed = (
+                observed_response,
+                row(pool, sandbox_id).await?,
+                capture.take_for(sandbox_id),
+            );
+            let completed_event = action
+                .completed_event()
+                .expect("runtime actions have a completed event")
+                .to_string();
+            let (expected_row, expected_event) = if post_result_keeps(action, found) {
+                let normalized = found.trim().to_ascii_lowercase();
+                let admitted_terminal = normalized == admitted
+                    && matches!(
+                        normalized.as_str(),
+                        "failed" | "quarantined" | "deleted" | "cleanup_required"
+                    );
+                (
+                    Row::new(found, "unplaced"),
+                    TerminalEvent {
+                        event_type: completed_event,
+                        reason: Some(
+                            if admitted_terminal {
+                                "admitted_from_refused"
+                            } else {
+                                "post_action_superseded"
+                            }
+                            .to_owned(),
+                        ),
+                        lifecycle_state: Some(found.to_owned()),
+                        to_state: None,
+                        target_state: Some(completed.to_owned()),
+                    },
+                )
+            } else {
+                (
+                    Row::new(completed, completed_placement),
+                    TerminalEvent {
+                        event_type: completed_event,
+                        reason: None,
+                        lifecycle_state: None,
+                        to_state: Some(completed.to_owned()),
+                        target_state: None,
+                    },
+                )
+            };
+            let expected = ("ok", Some(expected_row), vec![expected_event]);
+            if (observed.0.as_str(), &observed.1, &observed.2)
+                != (expected.0, &expected.1, &expected.2)
+            {
+                mismatches.push(format!(
+                    "{action:?} admitted from {admitted:?}, found {found:?}: \
+                     expected {expected:?}, observed {observed:?}"
+                ));
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    Ok(())
+}
+
+/// A DELETE that persists its intent while a runtime action is in flight
+/// wins over that action's result. The action still reports its success,
+/// `deleting` and the placement stay as the delete left them, and the
+/// delete's own compensation, which expects `deleting`, still restores the
+/// lifecycle it replaced.
+#[tokio::test(flavor = "current_thread")]
+async fn completed_actions_never_clear_a_delete_intent_that_landed_mid_flight() -> TestResult {
+    if !crate::test_support::enter_sim_worker_process_with_owned_token_files() {
+        return Ok(());
+    }
+    let db = pg_test_db_with_max_connections(4).await?;
+    let pool = &db.pool;
+    let controller = direct_controller(pool);
+    let (worker, node_id) = start_sim_worker(pool).await?;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct Outcome {
+        action: SandboxAction,
+        response: Result<(), StatusCode>,
+        after_action: Option<Row>,
+        compensation: Result<(), StatusCode>,
+        after_compensation: Option<Row>,
+    }
+
+    let mut observed = Vec::new();
+    let mut expected = Vec::new();
+    for (action, prior, resident) in [
+        (SandboxAction::Start, "stopped", "stopped"),
+        (SandboxAction::Resume, "paused", "paused"),
+        (SandboxAction::Pause, "started", "running"),
+        (SandboxAction::Stop, "started", "running"),
+        (SandboxAction::Kill, "started", "running"),
+        (SandboxAction::Suspend, "started", "running"),
+    ] {
+        let sandbox_id = SandboxId::new();
+        insert_sandbox(pool, sandbox_id, prior, "space").await?;
+        place_on_node(pool, sandbox_id, node_id).await?;
+        set_placement(pool, sandbox_id, "unplaced").await?;
+        insert_resident(worker.state(), sandbox_id, resident).await?;
+        let sandbox = tracked(pool, sandbox_id).await?;
+        let replaced = begin_delete_against_active_fork(pool, sandbox_id)
+            .await?
+            .expect("sandbox row exists");
+
+        let response = run_action(&controller, pool, sandbox_id, Some(&sandbox), action, None)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.status());
+        let after_action = row(pool, sandbox_id).await?;
+        let compensation = restore_lifecycle_after_failed_delete(pool, sandbox_id, replaced)
+            .await
+            .map_err(|error| error.status());
+        observed.push(Outcome {
+            action,
+            response,
+            after_action,
+            compensation,
+            after_compensation: row(pool, sandbox_id).await?,
+        });
+        expected.push(Outcome {
+            action,
+            response: Ok(()),
+            after_action: Some(Row::new("deleting", "unplaced")),
+            compensation: Ok(()),
+            after_compensation: Some(Row::new(prior, "unplaced")),
+        });
+    }
+    assert_eq!(observed, expected);
+    Ok(())
+}
+
+/// A pause or resume that completes while a node-drain suspend claims the
+/// row keeps the claim, and retargets the drain's later restore to the
+/// action's result: the runtime ran the action before the suspend
+/// (Resuming/Pausing -> Suspending is not a runtime transition), so restoring
+/// to the claim's pre-action lifecycle would undo the user's action. An HTTP
+/// suspend claim carries no restore target and is left without one. The
+/// action was admitted before the drain began, so its node is not draining
+/// here; the post-result write does not consult drain state.
+#[tokio::test(flavor = "current_thread")]
+async fn pause_and_resume_retarget_a_drain_claim_they_keep() -> TestResult {
+    if !crate::test_support::enter_sim_worker_process_with_owned_token_files() {
+        return Ok(());
+    }
+    let db = pg_test_db_with_max_connections(4).await?;
+    let pool = &db.pool;
+    let controller = direct_controller(pool);
+    let (worker, node_id) = start_sim_worker(pool).await?;
+
+    for (action, prior, resident, claimed_target, expected_target) in [
+        (
+            SandboxAction::Pause,
+            "started",
+            "running",
+            Some("started"),
+            Some("paused"),
+        ),
+        (
+            SandboxAction::Resume,
+            "paused",
+            "paused",
+            Some("paused"),
+            Some("started"),
+        ),
+        (SandboxAction::Pause, "started", "running", None, None),
+        (SandboxAction::Resume, "paused", "paused", None, None),
+    ] {
+        let sandbox_id = SandboxId::new();
+        insert_sandbox(pool, sandbox_id, prior, "space").await?;
+        place_on_node(pool, sandbox_id, node_id).await?;
+        insert_resident(worker.state(), sandbox_id, resident).await?;
+        let sandbox = tracked(pool, sandbox_id).await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes
+                SET lifecycle = 'suspending', evacuation_restore_target = $2
+              WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .bind(claimed_target)
+        .execute(pool)
+        .await?;
+
+        let body = run_action(&controller, pool, sandbox_id, Some(&sandbox), action, None).await?;
+
+        assert_eq!(body["ok"], true, "{action:?} over {claimed_target:?}");
+        let stored: (String, Option<String>) = sqlx::query_as(sql!(
+            "SELECT lifecycle, evacuation_restore_target FROM sandboxes WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(pool)
+        .await?;
+        assert_eq!(
+            stored,
+            ("suspending".to_owned(), expected_target.map(str::to_owned)),
+            "{action:?} over {claimed_target:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A successful stop or kill leaves no suspend able to complete on the
+/// runtime, so its `stopped` replaces a suspend claim instead of stranding
+/// it. The Kubernetes HTTP suspend never reverts its claim when its node call
+/// fails, and node publication does not promote `suspending`, so a refused
+/// write would leave the row `suspending` until the transient sweeper fails
+/// it. For a node-drain claim, leaving `suspending` also clears the drain's
+/// `evacuation_restore_target` marker (and its restore backoff), exactly as
+/// the drain's own revert would; the drain's later commit and revert are both
+/// guarded on `suspending` and become no-ops.
+#[tokio::test(flavor = "current_thread")]
+async fn stop_and_kill_replace_a_suspend_claim_they_made_impossible() -> TestResult {
+    if !crate::test_support::enter_sim_worker_process_with_owned_token_files() {
+        return Ok(());
+    }
+    let db = pg_test_db_with_max_connections(4).await?;
+    let pool = &db.pool;
+    let controller = direct_controller(pool);
+    let (worker, healthy_node) = start_sim_worker(pool).await?;
+    let (draining_worker, draining_node) = start_sim_worker(pool).await?;
+    set_drain_phase(pool, draining_node, "draining").await?;
+
+    for action in [SandboxAction::Stop, SandboxAction::Kill] {
+        for (claim, node_id, state, evacuation_target) in [
+            ("http suspend", healthy_node, worker.state(), None),
+            (
+                "node-drain suspend",
+                draining_node,
+                draining_worker.state(),
+                Some("started"),
+            ),
+        ] {
+            let sandbox_id = SandboxId::new();
+            insert_sandbox(pool, sandbox_id, "started", "space").await?;
+            place_on_node(pool, sandbox_id, node_id).await?;
+            insert_resident(state, sandbox_id, "running").await?;
+            let sandbox = tracked(pool, sandbox_id).await?;
+            sqlx::query(sql!(
+                "UPDATE sandboxes
+                    SET lifecycle = 'suspending',
+                        evacuation_restore_target = $2,
+                        restore_attempt_count = CASE WHEN $2::TEXT IS NULL THEN 0 ELSE 2 END
+                  WHERE id = $1"
+            ))
+            .bind(sandbox_id)
+            .bind(evacuation_target)
+            .execute(pool)
+            .await?;
 
             let body =
                 run_action(&controller, pool, sandbox_id, Some(&sandbox), action, None).await?;
 
+            assert_eq!(body["ok"], true, "{action:?} over {claim}");
+            let stored: (String, Option<String>, i32) = sqlx::query_as(sql!(
+                "SELECT lifecycle, evacuation_restore_target, restore_attempt_count
+                   FROM sandboxes WHERE id = $1"
+            ))
+            .bind(sandbox_id)
+            .fetch_one(pool)
+            .await?;
             assert_eq!(
-                body,
-                serde_json::json!({
-                    "ok": true,
-                    "action": action.as_str(),
-                    "sandbox_id": sandbox_id.to_string(),
-                }),
-            );
-            let expected = match landed {
-                None => Row::new(completed, completed_placement),
-                Some(lifecycle) => Row::new(lifecycle, "unplaced"),
-            };
-            assert_eq!(
-                row(pool, sandbox_id).await?,
-                Some(expected),
-                "{action:?} with {landed:?}"
+                stored,
+                ("stopped".to_owned(), None, 0),
+                "{action:?} over {claim}"
             );
         }
     }
+    Ok(())
+}
+
+/// A native start operation whose lifecycle write finds a `stopped` written
+/// while its runtime call was in flight overwrites it, and the lifecycle
+/// operation executor reports success without asking for a retry, so no
+/// second node start is issued. `stopped` is a value node publication also
+/// writes, so the start's `started` stands: publication converges a running
+/// row the node reports stopped
+/// (`node_publication_converges_to_stopped_but_not_back_on_a_started_report`
+/// in the internal API), while a plain `started` report never corrects a
+/// `stopped` row whose sandbox runs.
+///
+/// This drives `SandboxLifecycleOperationExecutor::execute` directly; the
+/// loop stands in for the dispatcher's re-execution of a retried operation.
+/// The `stopped` is written by a trigger on the start's route-identity
+/// receipt, which the direct substrate persists after the node start returns
+/// and before the lifecycle write; it changes only the database row, fires
+/// for this test's sandbox only, and counts the node starts that completed.
+#[tokio::test(flavor = "current_thread")]
+async fn native_start_overwrites_a_stopped_written_mid_flight_without_a_retry() -> TestResult {
+    use crate::public_operations::{ApiProduct, ClaimedPublicOperation};
+    use crate::public_sandbox_operations::{
+        SandboxLifecycleOperationExecutor, SandboxLifecycleOperationPayload,
+    };
+    use pplx_space_public_api::{
+        OperationId, OperationKind, OperationState, PublicSandboxId, SandboxLifecycleAction,
+    };
+
+    if !crate::test_support::enter_sim_worker_process_with_owned_token_files() {
+        return Ok(());
+    }
+    let db = pg_test_db_with_max_connections(4).await?;
+    let pool = &db.pool;
+    let (worker, node_id) = start_sim_worker(pool).await?;
+    let sandbox_id = SandboxId::new();
+    insert_sandbox(pool, sandbox_id, "created", "space").await?;
+    place_on_node(pool, sandbox_id, node_id).await?;
+    insert_resident(worker.state(), sandbox_id, "creating").await?;
+    sqlx::query(sql!(
+        "CREATE TABLE test_completed_node_starts (sandbox_id UUID PRIMARY KEY, starts INT NOT NULL)"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO test_completed_node_starts (sandbox_id, starts) VALUES ($1, 0)"
+    ))
+    .bind(sandbox_id)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "CREATE FUNCTION test_stop_after_first_node_start() RETURNS trigger
+         LANGUAGE plpgsql AS $$
+         DECLARE completed INT;
+         BEGIN
+             UPDATE test_completed_node_starts
+                SET starts = starts + 1
+              WHERE sandbox_id = NEW.sandbox_id
+             RETURNING starts INTO completed;
+             IF completed = 1 THEN
+                 UPDATE sandboxes SET lifecycle = 'stopped' WHERE id = NEW.sandbox_id;
+             END IF;
+             RETURN NEW;
+         END $$"
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "CREATE TRIGGER test_stop_after_first_node_start
+         AFTER INSERT OR UPDATE ON sandbox_direct_route_identities
+         FOR EACH ROW EXECUTE FUNCTION test_stop_after_first_node_start()"
+    ))
+    .execute(pool)
+    .await?;
+
+    let operation = ClaimedPublicOperation {
+        id: OperationId::new(),
+        org_id: "00000000-0000-0000-0000-000000000001".parse()?,
+        actor_user_id: Some("00000000-0000-0000-0000-000000000010".parse()?),
+        api_product: ApiProduct::Native,
+        kind: OperationKind::StartSandbox,
+        target_type: None,
+        target_id: Some(PublicSandboxId::from(sandbox_id).to_string()),
+        payload: SandboxLifecycleOperationPayload {
+            sandbox_id: PublicSandboxId::from(sandbox_id),
+            action: SandboxLifecycleAction::Start,
+            rollback: None,
+        }
+        .into_json(),
+        attempts: 1,
+        claim_generation: 1,
+    };
+    let executor = SandboxLifecycleOperationExecutor::new(pool.clone(), direct_controller(pool));
+
+    // Re-run the operation while it asks for a retry, as the dispatcher would;
+    // before a retry the simulated resident is stopped too.
+    let mut result = executor.execute(&operation).await;
+    let mut executions = 1;
+    while result.retry_after.is_some() && executions < 3 {
+        worker
+            .state()
+            .set_status(&sandbox_id.to_string(), "stopped")
+            .await?;
+        result = executor.execute(&operation).await;
+        executions += 1;
+    }
+
+    assert_eq!(executions, 1, "the operation was retried: {result:?}");
+    assert_eq!(result.state, OperationState::Succeeded, "{result:?}");
+    let completed_node_starts: i32 = sqlx::query_scalar(sql!(
+        "SELECT starts FROM test_completed_node_starts WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(completed_node_starts, 1);
+    assert_eq!(
+        row(pool, sandbox_id).await?,
+        Some(Row::new("started", "on_node"))
+    );
     Ok(())
 }
 
