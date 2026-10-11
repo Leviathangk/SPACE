@@ -17,7 +17,7 @@ use crate::proto::{
     BtrfsMaterializeRootfsSendRequest,
 };
 
-pub(super) const DIRECTORY: &str = "rootfs.btrfs-source";
+pub(super) use crate::cache_ownership::RETAINED_SOURCE_BUNDLE as DIRECTORY;
 const MANIFEST: &str = "source.json";
 const ROOTFS: &str = "rootfs.ext4";
 const ALLOWED: &[UdsPeerPrincipal] = &[
