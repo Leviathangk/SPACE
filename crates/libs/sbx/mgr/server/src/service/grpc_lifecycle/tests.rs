@@ -1505,3 +1505,50 @@ async fn teardown_suspend_pause_failure_recovery_allows_same_generation_retry() 
         );
     }
 }
+
+#[test]
+fn encrypted_backup_admission_requires_the_published_container_files() {
+    use pplx_space_common_core::types::ArtifactKind;
+    for format in [
+        SuspendSnapshotFormat::Full,
+        SuspendSnapshotFormat::BtrfsSend,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().to_str().unwrap();
+        let metadata = serde_json::json!({
+            "version": 1,
+            "sandbox_id": "01900000-0000-7000-8000-000000000001",
+            "size_bytes": 0,
+            "created_at": "2026-01-01T00:00:00Z",
+            "source": {"runtime": "fc", "template_id": "seed"},
+            "encrypted": true,
+        });
+        let sidecar = directory.path().join("snapshot.json");
+        std::fs::write(&sidecar, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        for file in ["snapshot.luks", "cow.luks"] {
+            std::fs::write(directory.path().join(file), b"encrypted capture").unwrap();
+        }
+        for full_current_instance in [false, true] {
+            require_artifact_backup_files(path, ArtifactKind::Full, format, full_current_instance)
+                .unwrap();
+            for file in ["snapshot.luks", "cow.luks"] {
+                let file_path = directory.path().join(file);
+                std::fs::remove_file(&file_path).unwrap();
+                let error = require_artifact_backup_files(
+                    path,
+                    ArtifactKind::Full,
+                    format,
+                    full_current_instance,
+                )
+                .unwrap_err();
+                assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+                assert!(error.message().contains(file));
+                std::fs::write(file_path, b"encrypted capture").unwrap();
+            }
+        }
+        std::fs::write(&sidecar, b"{").unwrap();
+        let error =
+            require_artifact_backup_files(path, ArtifactKind::Full, format, false).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Internal);
+    }
+}
