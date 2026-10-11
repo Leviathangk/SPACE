@@ -681,16 +681,21 @@ enum UnusableDestination {
 /// leaves no catalog evidence that a later import would have to reconcile.
 #[test]
 fn snapshot_publication_refuses_an_unusable_destination_without_cataloging_it() {
-    for (unusable, expected) in [
-        (
-            UnusableDestination::NotASnapshotName,
-            ErrorKind::InvalidInput,
-        ),
-        #[cfg(target_os = "linux")]
+    #[cfg(target_os = "linux")]
+    let platform_cases = [
         (UnusableDestination::Unprobeable, ErrorKind::InvalidFilename),
-        #[cfg(target_os = "linux")]
         (UnusableDestination::NotUtf8, ErrorKind::InvalidInput),
-    ] {
+    ];
+    // macOS refuses these names before the publisher sees them. Chained rather
+    // than one literal, which clippy rejects as a loop when it has one element.
+    #[cfg(not(target_os = "linux"))]
+    let platform_cases: [(UnusableDestination, ErrorKind); 0] = [];
+    let cases = std::iter::once((
+        UnusableDestination::NotASnapshotName,
+        ErrorKind::InvalidInput,
+    ))
+    .chain(platform_cases);
+    for (unusable, expected) in cases {
         let mut fixture = import_fixture(SandboxState::Stopped);
         let snapshots = fixture.destination.parent().unwrap().to_owned();
         fixture.destination = match unusable {

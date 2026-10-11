@@ -55,6 +55,9 @@ pub(crate) async fn migrate_volume_manager_db(path: &Path) -> Result<(), SqliteE
 // Production leaves them unset and volume-manager uses credmgr as before.
 const STATIC_ACCESS_KEY_ID_ENV: &str = "SPACE_OBJECT_STORE_STATIC_ACCESS_KEY_ID";
 const STATIC_SECRET_ACCESS_KEY_ENV: &str = "SPACE_OBJECT_STORE_STATIC_SECRET_ACCESS_KEY";
+/// Session token for temporary static credentials (STS, SSO). Without it an
+/// `ASIA…` key is rejected by S3 as an unknown access key.
+const STATIC_SESSION_TOKEN_ENV: &str = "SPACE_OBJECT_STORE_STATIC_SESSION_TOKEN";
 pub const DEFAULT_PUSH_CONCURRENCY: usize = 8;
 pub const DEFAULT_PULL_CONCURRENCY: usize = 24;
 pub const DEFAULT_CODEC_CONCURRENCY: usize = 0;
@@ -164,10 +167,16 @@ fn build_static_credentials(
 
 /// Resolve static S3 credentials from the deployment environment, or `None`.
 fn static_credentials_from_env() -> Option<ObjectCredentials> {
+    static_credentials_from(|name| std::env::var(name).ok())
+}
+
+/// Static credentials from `lookup`, which answers for the three documented
+/// variables; the session token is optional and carried when present.
+fn static_credentials_from(lookup: impl Fn(&str) -> Option<String>) -> Option<ObjectCredentials> {
     build_static_credentials(
-        std::env::var(STATIC_ACCESS_KEY_ID_ENV).ok(),
-        std::env::var(STATIC_SECRET_ACCESS_KEY_ENV).ok(),
-        None,
+        lookup(STATIC_ACCESS_KEY_ID_ENV),
+        lookup(STATIC_SECRET_ACCESS_KEY_ENV),
+        lookup(STATIC_SESSION_TOKEN_ENV),
     )
 }
 

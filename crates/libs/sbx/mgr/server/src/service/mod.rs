@@ -414,6 +414,9 @@ pub struct SandboxManagerService {
     /// reattach path without a real `fc.pid` symlink on disk. Production uses
     /// [`is_sandbox_running`].
     sandbox_runtime_live: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    /// Node-manager's answers about retained btrfs send sources. Injected so
+    /// tests can drive recovery without a btrfs node-manager.
+    retained_source_inspector: Arc<dyn crate::retained_source::RetainedSourceInspector>,
     drain_state: Arc<DrainState>,
     /// Eppo client for capability rollout. Disabled (every flag
     /// resolves to its default) when `EPPO_SDK_KEY` is unset.
@@ -1099,6 +1102,15 @@ impl SandboxManagerService {
     }
 
     #[cfg(test)]
+    pub(crate) fn with_retained_source_inspector(
+        mut self,
+        inspector: Arc<dyn crate::retained_source::RetainedSourceInspector>,
+    ) -> Self {
+        self.retained_source_inspector = inspector;
+        self
+    }
+
+    #[cfg(test)]
     pub(super) fn update_runtime_fields(
         &self,
         sandbox_id: SandboxId,
@@ -1715,6 +1727,7 @@ impl SandboxManagerService {
             },
             snapshot_upload_worker,
             sandbox_runtime_live: options.sandbox_runtime_live,
+            retained_source_inspector: Arc::new(crate::retained_source::NodeManagerSourceInspector),
             drain_state,
             feature_flags,
             route_ed25519_verification_bundle: Arc::new(ArcSwapOption::from(

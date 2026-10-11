@@ -224,6 +224,8 @@ fn accepts_paths_strictly_inside_the_cache_root() {
     for suffix in [
         format!("{id}/snapshot"),
         format!("{id}/snapshots/name.gc-pending-x"),
+        // Sandbox-manager retires superseded snapshots here for the sweep.
+        format!("{id}/snapshots/.suspend-gc-pending-{id}"),
         format!(".fork-copies/{id}"),
     ] {
         validate_cache_artifact_path(&format!("{root}/{suffix}")).unwrap();

@@ -283,6 +283,9 @@ impl SandboxManagerService {
         // vol-mgr submission, ClusterApi.BeginArtifactBackup, or runtime
         // teardown so cancellation at any later point has an owner that can
         // resume the complete pipeline.
+        let retained = self
+            .inspect_retained_upload(&meta, std::path::Path::new(snapshot_dir), format)
+            .await?;
         let mut jobs = crate::snapshot_upload::prepare_suspend_snapshot(
             &meta,
             &snapshot_id,
@@ -290,6 +293,7 @@ impl SandboxManagerService {
             config,
             artifact_kind,
             format,
+            retained,
         )
         .map_err(|error| format!("prepare snapshot upload intent failed: {error}"))?;
         let mut storage_uri = jobs.storage_uri.clone();
