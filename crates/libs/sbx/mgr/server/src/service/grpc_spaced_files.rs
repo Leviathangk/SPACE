@@ -57,20 +57,19 @@ impl SandboxManagerService {
             .map_err(|e| Status::internal(format!("inspect failed: {e}")))?
             .into_inner();
 
-        // CPU time comes from the same jailer cgroup inspect reads `cpu_max` from.
-        // Stats stay available without it, but a failed read is logged: a
-        // silent zero is how a wrong cgroup path once went unnoticed.
-        let cpu_stat =
-            pplx_space_node_runtime_core::cgroup_paths::jailer_cgroup_path(id).join("cpu.stat");
-        let cpu_usage_usec = match tokio::fs::read_to_string(&cpu_stat).await {
-            Ok(content) => cpu_stat_usage_usec(&content).unwrap_or_else(|| {
-                tracing::warn!(sandbox_id = %id, path = %cpu_stat.display(), "cpu.stat has no usage_usec");
+        // CPU time comes from the cgroup inspect reads `cpu_max` from. Only
+        // node-manager can read it: sandbox-manager runs in its own cgroup
+        // namespace, without the host cgroup tree. A sandbox without a cgroup
+        // has no running VM to account for. An inspected cgroup without a
+        // usage line is logged: a silent zero is how a wrong cgroup path once
+        // went unnoticed.
+        let cpu_usage_usec = if inspect.cgroup_exists {
+            cpu_stat_usage_usec(&inspect.cgroup_cpu_stat).unwrap_or_else(|| {
+                tracing::warn!(sandbox_id = %id, "inspected cgroup has no cpu.stat usage_usec");
                 0
-            }),
-            Err(error) => {
-                tracing::warn!(sandbox_id = %id, path = %cpu_stat.display(), %error, "failed to read cpu.stat");
-                0
-            }
+            })
+        } else {
+            0
         };
         let health = self.watchdog.get_health(id).await;
         let network_tx_bytes = health
