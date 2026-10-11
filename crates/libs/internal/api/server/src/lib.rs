@@ -363,8 +363,6 @@ struct OriginNode {
 #[derive(FromRow)]
 struct SnapshotSandboxRow {
     org_id: OrgId,
-    active_node_id: Option<NodeId>,
-    target_node_id: Option<NodeId>,
     vcpu: Option<i32>,
     memory_mib: Option<i32>,
     template_id: Option<String>,
@@ -372,20 +370,6 @@ struct SnapshotSandboxRow {
 }
 
 impl SnapshotSandboxRow {
-    /// The node the snapshot is physically uploading **from**, recorded as
-    /// `snapshots.source_node_id`. For a fresh suspend the VM is still placed,
-    /// so `active_node_id` is the source. For a **reupload** of an
-    /// already-suspended sandbox, `active_node_id` is NULL (cleared at
-    /// suspend), but the on-disk artifacts and the reupload worker live on
-    /// `target_node_id` (preserved across suspend) — so fall back to it.
-    /// Without this, reupload snapshots get a NULL `source_node_id` and the
-    /// node-scoped in-flight-upload drain guard can't attribute them to the
-    /// node actually running the upload, letting that node be terminated
-    /// mid-reupload.
-    fn source_node_id(&self) -> Option<NodeId> {
-        self.active_node_id.or(self.target_node_id)
-    }
-
     fn new_snapshot(
         &self,
         id: SnapshotId,
@@ -408,7 +392,6 @@ impl SnapshotSandboxRow {
             .map(SnapshotContentHash::from_stored);
         Ok(
             snapshot_store::NewSnapshot::new(id, sandbox_id, kind, state, self.org_id, storage_uri)
-                .with_source_node_id(self.source_node_id())
                 .with_resources(self.vcpu, self.memory_mib)
                 .with_template(template_id, content_hash),
         )
@@ -594,7 +577,12 @@ impl ClusterApiService {
             .await?
             .ok_or_else(|| Status::not_found(format!("snapshot {snapshot_id} not found")))?;
         let source_node = self
-            .authorize_backup_source_node(attempt.source_node_id(), remote_addr, "backup attempt")
+            .authorize_backup_source_node(
+                &self.pool,
+                attempt.source_node_id(),
+                remote_addr,
+                "backup attempt",
+            )
             .await?;
 
         // For READY, persist the uploaded bytes and clear any
@@ -837,6 +825,15 @@ impl ClusterApiService {
         }
         let execution_metadata = snapshot_execution_metadata(req.execution.as_ref())?;
         let sandbox = self.lookup_snapshot_sandbox(sandbox_id).await?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| Status::internal(format!("begin tx: {e}")))?;
+        let source_node =
+            backup_admission::source_node(&mut tx, sandbox_id, local_artifact_id, artifact_kind)
+                .await
+                .map_err(|e| Status::internal(format!("backup source: {e}")))?;
         let snapshot = sandbox
             .new_snapshot(
                 snapshot_id,
@@ -845,13 +842,9 @@ impl ClusterApiService {
                 SnapshotState::Creating,
                 storage_uri,
             )?
+            .with_source_node_id(source_node)
             .with_artifact(artifact)
             .with_execution_metadata(execution_metadata);
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| Status::internal(format!("begin tx: {e}")))?;
 
         let persisted = snapshot_store::insert(&mut tx, &snapshot)
             .await
@@ -860,7 +853,15 @@ impl ClusterApiService {
         // that registered the attempt even after retirement or relocation,
         // and a read before the transaction could see a row retention
         // deletes before the insert. A refusal rolls the insert back.
+        // Begin can wait for placement/census reconciliation. Finalize cannot:
+        // its source is already immutable in the registered attempt.
+        if persisted.source_node_id().is_none() {
+            return Err(Status::unavailable(
+                "sandbox has no verified backup source yet",
+            ));
+        }
         self.authorize_backup_source_node(
+            &mut *tx,
             persisted.source_node_id(),
             remote_addr,
             "backup attempt",
@@ -1038,7 +1039,7 @@ impl ClusterApiService {
 
     /// Shared sandbox lookup for the artifact-backup write path. Fetches
     /// the org-scoped, capture-time fields that the `snapshots` row inherits
-    /// from the source sandbox (org_id, active_node_id, vcpu, memory_mib,
+    /// from the source sandbox (org_id, vcpu, memory_mib,
     /// template_id, content_hash).
     async fn lookup_snapshot_sandbox(
         &self,
@@ -1048,7 +1049,7 @@ impl ClusterApiService {
             // A primary-key fetch is sufficient: `snapshot_execution_metadata`
             // requires caller-supplied execution metadata, so no template or
             // runtime-guest lookup is needed here.
-            "SELECT org_id, active_node_id, target_node_id, vcpu, memory_mib,
+            "SELECT org_id, vcpu, memory_mib,
                     template_id, content_hash
              FROM sandboxes
              WHERE id = $1"
@@ -1219,6 +1220,49 @@ impl ClusterApiService {
         .map_err(|err| Status::internal(format!("query nodes: {err}")))
     }
 
+    async fn resolve_registered_origin_node(
+        executor: impl sqlx::PgExecutor<'_>,
+        node_id: NodeId,
+        role_hint: Option<SpaceNodeRole>,
+    ) -> Result<OriginNode, Status> {
+        let value = node_id.to_string();
+        let role_hint_str = role_hint.map(SpaceNodeRole::as_str);
+        let row = sqlx::query_as::<_, OriginNodeRow>(sql!(
+            "SELECT n.id,
+                host(n.address) AS address,
+                n.role
+         FROM nodes n
+         WHERE n.id = $1
+           AND ($2::TEXT IS NULL OR n.role = $2)
+           AND n.managed_by IN ('space', 'k8s')
+           AND COALESCE(n.state, 'registered') != 'deleted'
+         LIMIT 1"
+        ))
+        .bind(node_id.as_uuid())
+        .bind(role_hint_str)
+        .fetch_optional(executor)
+        .await
+        .map_err(|err| Status::internal(format!("resolve origin node: {err}")))?;
+        if let Some(row) = row {
+            let role = SpaceNodeRole::parse(&row.role).map_err(|error| {
+                Status::internal(format!(
+                    "registered node {} has unknown role {}: {error}",
+                    value, row.role
+                ))
+            })?;
+            return Ok(OriginNode {
+                id: row.id,
+                display_id: value.to_string(),
+                address: parse_origin_address(row.address.as_deref())?,
+                role,
+                bootstrapped: false,
+            });
+        }
+        Err(Status::not_found(format!(
+            "origin_node_id {value} is not registered"
+        )))
+    }
+
     async fn resolve_origin_node_id(
         &self,
         value: &str,
@@ -1226,42 +1270,8 @@ impl ClusterApiService {
         remote_addr: Option<std::net::SocketAddr>,
     ) -> Result<OriginNode, Status> {
         let value = trimmed_required(value, "origin_node_id")?;
-        let role_hint_str = role_hint.map(SpaceNodeRole::as_str);
         if let Ok(node_id) = value.parse::<NodeId>() {
-            let row = sqlx::query_as::<_, OriginNodeRow>(sql!(
-                "SELECT n.id,
-                        host(n.address) AS address,
-                        n.role
-                 FROM nodes n
-                 WHERE n.id = $1
-                   AND ($2::TEXT IS NULL OR n.role = $2)
-                   AND n.managed_by IN ('space', 'k8s')
-                   AND COALESCE(n.state, 'registered') != 'deleted'
-                 LIMIT 1"
-            ))
-            .bind(node_id.as_uuid())
-            .bind(role_hint_str)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|err| Status::internal(format!("resolve origin node: {err}")))?;
-            if let Some(row) = row {
-                let role = SpaceNodeRole::parse(&row.role).map_err(|error| {
-                    Status::internal(format!(
-                        "registered node {} has unknown role {}: {error}",
-                        value, row.role
-                    ))
-                })?;
-                return Ok(OriginNode {
-                    id: row.id,
-                    display_id: value.to_string(),
-                    address: parse_origin_address(row.address.as_deref())?,
-                    role,
-                    bootstrapped: false,
-                });
-            }
-            return Err(Status::not_found(format!(
-                "origin_node_id {value} is not registered"
-            )));
+            return Self::resolve_registered_origin_node(&self.pool, node_id, role_hint).await;
         }
 
         let Some(role_hint) = role_hint else {
@@ -1439,6 +1449,7 @@ impl ClusterApiService {
     /// name a node. No source node fails closed. Returns the admitted node.
     async fn authorize_backup_source_node(
         &self,
+        executor: impl sqlx::PgExecutor<'_>,
         source_node_id: Option<NodeId>,
         remote_addr: Option<std::net::SocketAddr>,
         subject: &str,
@@ -1448,9 +1459,7 @@ impl ClusterApiService {
                 "{subject} has no source node that may publish a backup for it"
             ))
         })?;
-        let origin = self
-            .resolve_origin_node_id(&node_id.to_string(), None, None)
-            .await?;
+        let origin = Self::resolve_registered_origin_node(executor, node_id, None).await?;
         validate_origin_remote_addr(&origin, remote_addr)?;
         Ok(node_id)
     }
@@ -1515,6 +1524,7 @@ fn normalize_ip(value: IpAddr) -> IpAddr {
 
 mod adapter;
 mod auto_lifecycle_delete_completions;
+mod backup_admission;
 mod metadata;
 mod node_local_backup_pending;
 mod publish;

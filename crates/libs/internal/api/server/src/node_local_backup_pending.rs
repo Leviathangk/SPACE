@@ -13,10 +13,10 @@
 //!
 //! The node-side producer of `pending_local_backups` ships alongside this, so
 //! the queue starts filling as soon as both are deployed — this is not a
-//! dormant path waiting on a flag. Nothing reads it: no consumer of
-//! `node_local_backup_pending` or of
-//! `node_status_snapshots.local_backup_inventory_reported_at` exists outside
-//! this module and its tests. The node-drain reader is a separate change and
+//! dormant path waiting on a flag. Backup admission uses a present artifact
+//! identity only as an additional restriction on authority established from
+//! execution history; it does not trust the mirror for ownership or durability.
+//! The node-drain reader is a separate change and
 //! is expected to carry its own default-off flag, but that reader and that
 //! flag are **not in this tree** — nothing here gates them, and this
 //! paragraph is not evidence that a cutover control exists. Writing early and

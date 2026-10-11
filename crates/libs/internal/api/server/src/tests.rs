@@ -3978,6 +3978,14 @@ async fn seed_suspend_snapshot_with_identity(
     let storage_uri = ExactStorageUri::parse(&storage_uri)
         .map_err(|e| tonic::Status::invalid_argument(format!("invalid storage_uri: {e}")))?;
     let execution_metadata = snapshot_execution_metadata(Some(&execution))?;
+    // Legacy test fixtures predate artifact identity and inherit current placement.
+    let source: Option<NodeId> = sqlx::query_scalar(sql!(
+        "SELECT COALESCE(active_node_id,target_node_id) FROM sandboxes WHERE id=$1"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(&service.pool)
+    .await
+    .map_err(|e| Status::internal(format!("seed source: {e}")))?;
     let snapshot = service
         .lookup_snapshot_sandbox(sandbox_id)
         .await?
@@ -3988,6 +3996,7 @@ async fn seed_suspend_snapshot_with_identity(
             SnapshotState::Creating,
             storage_uri,
         )?
+        .with_source_node_id(source)
         .with_execution_metadata(execution_metadata);
     let mut tx = service
         .pool
@@ -4414,8 +4423,8 @@ async fn begin_artifact_backup_admits_only_the_sandboxes_source_node() -> TestRe
         pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend,
     )
     .await
-    .expect_err("a sandbox with no node has no node that may publish for it");
-    assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
+    .expect_err("a sandbox with no node must wait for verified source evidence");
+    assert_eq!(err.code(), Code::Unavailable, "{err}");
     Ok(())
 }
 
@@ -4543,6 +4552,29 @@ async fn finalize_artifact_backup_admits_only_the_attempts_source_node() -> Test
         .expect_err("a node that did not open the attempt must not finalize it");
     assert_eq!(err.code(), Code::PermissionDenied, "{err}");
     assert_eq!(snapshot_state(pool, backup_attempt_id).await?, "creating");
+
+    // A registered attempt cannot acquire a missing source through later
+    // placement reconciliation; Finalize must retain its permanent refusal.
+    let source: Option<NodeId> =
+        sqlx::query_scalar(sql!("SELECT source_node_id FROM snapshots WHERE id=$1"))
+            .bind(backup_attempt_id)
+            .fetch_one(pool)
+            .await?;
+    sqlx::query(sql!("UPDATE snapshots SET source_node_id=NULL WHERE id=$1"))
+        .bind(backup_attempt_id)
+        .execute(pool)
+        .await?;
+    let missing =
+        finalize_artifact_backup_from_node(&fixture.service, source_ip, backup_attempt_id)
+            .await
+            .unwrap_err();
+    assert_eq!(missing.code(), Code::FailedPrecondition);
+    assert_eq!(snapshot_state(pool, backup_attempt_id).await?, "creating");
+    sqlx::query(sql!("UPDATE snapshots SET source_node_id=$2 WHERE id=$1"))
+        .bind(backup_attempt_id)
+        .bind(source)
+        .execute(pool)
+        .await?;
 
     finalize_artifact_backup_from_node(&fixture.service, source_ip, backup_attempt_id).await?;
     assert_eq!(snapshot_state(pool, backup_attempt_id).await?, "ready");
@@ -7181,5 +7213,161 @@ async fn node_template_and_policy_reads_follow_placement() -> TestResult {
         "retiring sandbox host: desired templates"
     );
     assert_eq!(active.sandboxes, vec![sandbox_id.to_string()]);
+    Ok(())
+}
+#[tokio::test(flavor = "current_thread")]
+async fn retired_backup_authority_requires_exact_inventory_and_last_execution() -> TestResult {
+    #[derive(Clone, Copy, Debug)]
+    enum Case {
+        Ready,
+        UnscheduledRetiredExecution,
+        MissingInventory,
+        WrongArtifact,
+        WrongKind,
+        MissingExecution,
+        OtherCaller,
+        NewerExecution,
+        ActiveExecution,
+        ActiveLease,
+        NewerArtifact,
+    }
+    for case in [
+        Case::Ready,
+        Case::UnscheduledRetiredExecution,
+        Case::MissingInventory,
+        Case::WrongArtifact,
+        Case::WrongKind,
+        Case::MissingExecution,
+        Case::OtherCaller,
+        Case::NewerExecution,
+        Case::ActiveExecution,
+        Case::ActiveLease,
+        Case::NewerArtifact,
+    ] {
+        let Some(fixture) = cluster_fixture().await? else {
+            return Ok(());
+        };
+        let pool = &fixture.service.pool;
+        let (sandbox_id, source_ip, other_ip) = seed_sandbox_on_source_node(pool).await?;
+        let source: NodeId =
+            sqlx::query_scalar(sql!("SELECT active_node_id FROM sandboxes WHERE id=$1"))
+                .bind(sandbox_id)
+                .fetch_one(pool)
+                .await?;
+        sqlx::query(sql!("INSERT INTO node_k8s (node_id,k8s_node_name,k8s_node_uid) VALUES ($1,'worker-source','source-uid')"))
+            .bind(source).execute(pool).await?;
+        let artifact = LocalArtifactId::new();
+        sqlx::query(sql!("UPDATE sandboxes SET active_node_id=NULL,target_node_id=NULL,placement='unplaced',lifecycle='suspended' WHERE id=$1"))
+            .bind(sandbox_id).execute(pool).await?;
+        if !matches!(case, Case::MissingInventory) {
+            sqlx::query(sql!("INSERT INTO node_local_backup_pending (node_id,sandbox_id,artifact_id,artifact_kind) VALUES ($1,$2,$3,$4)"))
+                .bind(source).bind(sandbox_id)
+                .bind(if matches!(case, Case::WrongArtifact) { LocalArtifactId::new() } else { artifact })
+                .bind(if matches!(case, Case::WrongKind) { "disk" } else { "full" })
+                .execute(pool).await?;
+        }
+        if !matches!(case, Case::MissingExecution) {
+            sqlx::query(sql!("INSERT INTO sandbox_k8s_executions (sandbox_id,generation,pod_name,pod_namespace,k8s_node_name,state,active) VALUES ($1,7,'retired-pod','sandboxes','worker-source','deleted',false)"))
+                .bind(sandbox_id).execute(pool).await?;
+        }
+        match case {
+            Case::NewerExecution | Case::ActiveExecution | Case::UnscheduledRetiredExecution => {
+                sqlx::query(sql!("INSERT INTO sandbox_k8s_executions (sandbox_id,generation,pod_name,pod_namespace,k8s_node_name,state,active) VALUES ($1,8,'newer-pod','sandboxes',$2,'creating',$3)"))
+                    .bind(sandbox_id).bind(if matches!(case, Case::NewerExecution) { Some("worker-other") } else { None })
+                    .bind(matches!(case, Case::ActiveExecution)).execute(pool).await?;
+            }
+            Case::ActiveLease => {
+                sqlx::query(sql!("UPDATE sandboxes SET lifecycle='restoring',restore_lease_token=$2,restore_lease_expires_at=NOW()+INTERVAL '5 minutes' WHERE id=$1"))
+                    .bind(sandbox_id).bind(Uuid::now_v7()).execute(pool).await?;
+            }
+            Case::NewerArtifact => {
+                sqlx::query(sql!("UPDATE sandboxes SET current_local_artifact_id=$2,current_local_artifact_kind='full',current_local_artifact_origin='suspend' WHERE id=$1"))
+                    .bind(sandbox_id).bind(LocalArtifactId::new()).execute(pool).await?;
+            }
+            Case::Ready
+            | Case::MissingInventory
+            | Case::WrongArtifact
+            | Case::WrongKind
+            | Case::MissingExecution
+            | Case::OtherCaller => {}
+        }
+        if matches!(case, Case::Ready) {
+            // Admission must keep retirement/activation writers behind the
+            // same sandbox lock until the backup attempt is bound.
+            let mut registration = pool.begin().await?;
+            assert_eq!(
+                backup_admission::source_node(
+                    &mut registration,
+                    sandbox_id,
+                    artifact,
+                    ArtifactKind::Full
+                )
+                .await?,
+                Some(source)
+            );
+            let mut activation = pool.begin().await?;
+            sqlx::query(sql!("SET LOCAL lock_timeout='50ms'"))
+                .execute(&mut *activation)
+                .await?;
+            let blocked = sqlx::query(sql!("UPDATE sandboxes SET target_node_id=$2 WHERE id=$1"))
+                .bind(sandbox_id)
+                .bind(source)
+                .execute(&mut *activation)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                blocked
+                    .as_database_error()
+                    .and_then(|error| error.code())
+                    .as_deref(),
+                Some("55P03")
+            );
+            activation.rollback().await?;
+            registration.rollback().await?;
+        }
+        let attempt = SnapshotId::new();
+        let result = begin_artifact_backup_from_node(
+            &fixture.service,
+            if matches!(case, Case::OtherCaller) {
+                other_ip
+            } else {
+                source_ip
+            },
+            sandbox_id,
+            artifact,
+            attempt,
+            pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+            pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend,
+        )
+        .await;
+        if matches!(case, Case::Ready | Case::UnscheduledRetiredExecution) {
+            result?;
+            assert_eq!(snapshot_state(pool, attempt).await?, "creating");
+            // Retirement and subsequent placement changes cannot steal a registered attempt.
+            place_sandbox_on_node_at(pool, sandbox_id, other_ip).await?;
+            begin_artifact_backup_from_node(
+                &fixture.service,
+                source_ip,
+                sandbox_id,
+                artifact,
+                attempt,
+                pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+                pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend,
+            )
+            .await?;
+        } else {
+            let error = result.expect_err(&format!("must refuse {case:?}"));
+            assert_eq!(
+                error.code(),
+                if matches!(case, Case::OtherCaller) {
+                    Code::PermissionDenied
+                } else {
+                    Code::Unavailable
+                },
+                "{case:?}: {error}"
+            );
+            assert_eq!(snapshot_row_count(pool, attempt).await?, 0, "{case:?}");
+        }
+    }
     Ok(())
 }
