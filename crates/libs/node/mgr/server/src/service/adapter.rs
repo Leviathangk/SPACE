@@ -455,6 +455,13 @@ impl NodeManager for NodeManagerService {
         NodeManagerService::btrfs_materialize_rootfs_send(self, request).await
     }
 
+    async fn btrfs_inspect_send_source(
+        &self,
+        request: Request<crate::proto::BtrfsInspectSendSourceRequest>,
+    ) -> Result<Response<crate::proto::BtrfsInspectSendSourceResponse>, Status> {
+        NodeManagerService::btrfs_inspect_send_source(self, request).await
+    }
+
     async fn get_btrfs_send_capabilities(
         &self,
         request: Request<crate::proto::GetBtrfsSendCapabilitiesRequest>,

@@ -453,10 +453,14 @@ fn current_instance_backup_preserves_scoped_drain_signals() {
     }
 }
 
-#[test]
-fn artifact_backup_file_proof_distinguishes_absence_from_io_failure() {
+#[tokio::test]
+async fn artifact_backup_file_proof_distinguishes_absence_from_io_failure() {
     use pplx_space_common_core::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER;
     use pplx_space_common_core::types::ArtifactKind;
+    let inspector = crate::retained_source::FakeInspector::new(
+        crate::retained_source::RetainedSourceCheck::Absent,
+    );
+    let sandbox_id = "01900000-0000-7000-8000-000000000001";
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().to_str().unwrap();
     let format = crate::proto::SuspendSnapshotFormat::Full;
@@ -464,12 +468,29 @@ fn artifact_backup_file_proof_distinguishes_absence_from_io_failure() {
     for file in &files {
         std::fs::write(directory.path().join(file.local_name), b"captured").unwrap();
     }
-    require_artifact_backup_files(path, ArtifactKind::Full, format, true).unwrap();
+    require_artifact_backup_files(
+        &inspector,
+        sandbox_id,
+        path,
+        ArtifactKind::Full,
+        format,
+        true,
+    )
+    .await
+    .unwrap();
     let first = directory.path().join(files[0].local_name);
     std::fs::remove_file(&first).unwrap();
     for full_current in [false, true] {
-        let missing = require_artifact_backup_files(path, ArtifactKind::Full, format, full_current)
-            .unwrap_err();
+        let missing = require_artifact_backup_files(
+            &inspector,
+            sandbox_id,
+            path,
+            ArtifactKind::Full,
+            format,
+            full_current,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(missing.code(), tonic::Code::FailedPrecondition);
         assert_eq!(
             missing.message().contains(REUPLOAD_ARTIFACT_MISSING_MARKER),
@@ -479,8 +500,16 @@ fn artifact_backup_file_proof_distinguishes_absence_from_io_failure() {
     // A symlink loop produces an actual stat error, independent of permissions
     // or whether the test runs as root. It must never be mistaken for absence.
     std::os::unix::fs::symlink(&first, &first).unwrap();
-    let inaccessible =
-        require_artifact_backup_files(path, ArtifactKind::Full, format, true).unwrap_err();
+    let inaccessible = require_artifact_backup_files(
+        &inspector,
+        sandbox_id,
+        path,
+        ArtifactKind::Full,
+        format,
+        true,
+    )
+    .await
+    .unwrap_err();
     assert_eq!(inaccessible.code(), tonic::Code::Internal);
     assert!(
         !inaccessible
@@ -515,21 +544,87 @@ fn disk_artifact_backup_uses_the_codec_witnessed_by_its_bytes() {
     );
     std::fs::remove_file(artifact_dir.join(crate::snapshot_upload::ROOTFS_BTRFS_SEND_FILENAME))
         .unwrap();
-    std::fs::create_dir_all(artifact_dir.join("rootfs.btrfs-source/source")).unwrap();
+    // A bundle left by an earlier binary still witnesses the codec. Its entry
+    // is enough; nothing inside it is read.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let bundle = artifact_dir.join(crate::retained_source::BUNDLE_DIRECTORY);
+        std::fs::create_dir(&bundle).unwrap();
+        std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(
+            artifact_backup_format(&artifact).unwrap(),
+            SuspendSnapshotFormat::BtrfsSend
+        );
+        std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o750)).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn retained_source_backup_precondition_follows_node_manager() {
+    use crate::retained_source::{FakeInspector, RetainedSourceCheck};
+    use pplx_space_common_core::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER;
+    use pplx_space_common_core::types::ArtifactKind;
+    let sandbox_id = "01900000-0000-7000-8000-000000000001";
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().to_str().unwrap();
+    std::fs::write(directory.path().join("vmstate"), b"state").unwrap();
+    std::fs::write(directory.path().join("memory"), b"memory").unwrap();
+    let source_id = uuid::Uuid::now_v7();
+    let meta = serde_json::json!({
+        "version": crate::snapshot_upload::SNAPSHOT_METADATA_VERSION,
+        "sandbox_id": sandbox_id,
+        "size_bytes": 12,
+        "created_at": "2026-05-25T00:00:00Z",
+        "source": {"runtime": "fc", "template_id": "seed"},
+        "rootfs_diff_format": crate::snapshot_upload::ROOTFS_DIFF_FORMAT_BTRFS_SEND_V1,
+        "rootfs_send_source_id": source_id,
+    });
     std::fs::write(
-        artifact_dir.join("rootfs.btrfs-source/source.json"),
-        b"retained identity",
+        directory
+            .path()
+            .join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME),
+        serde_json::to_vec(&meta).unwrap(),
     )
     .unwrap();
-    std::fs::write(
-        artifact_dir.join("rootfs.btrfs-source/source/rootfs.ext4"),
-        b"retained rootfs",
-    )
-    .unwrap();
-    assert_eq!(
-        artifact_backup_format(&artifact).unwrap(),
-        SuspendSnapshotFormat::BtrfsSend
-    );
+    let format = SuspendSnapshotFormat::BtrfsSend;
+    let inspector = FakeInspector::new(RetainedSourceCheck::Present { rootfs_bytes: 1 });
+    let require = |full_current| {
+        require_artifact_backup_files(
+            &inspector,
+            sandbox_id,
+            path,
+            ArtifactKind::Full,
+            format,
+            full_current,
+        )
+    };
+
+    require(true).await.unwrap();
+    let call = inspector.calls().pop().unwrap();
+    assert_eq!(call.source_id, source_id);
+    assert_eq!(call.artifact_dir, directory.path());
+
+    for check in [
+        RetainedSourceCheck::Absent,
+        RetainedSourceCheck::Invalid {
+            reason: "lineage changed".to_owned(),
+        },
+    ] {
+        inspector.answer(check);
+        let terminal = require(true).await.unwrap_err();
+        assert_eq!(terminal.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            terminal
+                .message()
+                .contains(REUPLOAD_ARTIFACT_MISSING_MARKER)
+        );
+    }
+    inspector.answer(RetainedSourceCheck::Unavailable {
+        reason: "unimplemented".to_owned(),
+    });
+    let retry = require(true).await.unwrap_err();
+    assert_eq!(retry.code(), tonic::Code::Internal);
+    assert!(!retry.message().contains(REUPLOAD_ARTIFACT_MISSING_MARKER));
 }
 
 fn insert_suspended_test_sandbox(conn: &rusqlite::Connection, sandbox_id: &str) {
@@ -902,7 +997,13 @@ async fn restore_consumer_cannot_observe_suspend_staging_before_publication() {
     });
     attempted_rx.await.unwrap();
 
-    publish_suspend_snapshot_dir(&staging_dir, &snapshot_dir, local_artifact_id).unwrap();
+    publish_suspend_snapshot_dir(
+        &staging_dir,
+        &snapshot_dir,
+        local_artifact_id,
+        &Default::default(),
+    )
+    .unwrap();
     drop(publication_guard);
 
     assert_eq!(consumer.await.unwrap(), b"published-state");
@@ -2374,6 +2475,7 @@ async fn suspend_publication_failure_after_staging_preserves_only_owned_evidence
             &sandbox_dir,
             &staging_dir,
             "publish failed",
+            &Default::default(),
         );
 
         assert_eq!(disposition, expected, "{case}");

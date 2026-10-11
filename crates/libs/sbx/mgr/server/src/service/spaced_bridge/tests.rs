@@ -470,3 +470,41 @@ async fn producer_panic_is_an_explicit_stream_error() {
     assert_eq!(error.message(), "route stream forwarding task failed");
     assert!(response.next().await.is_none());
 }
+
+use std::os::unix::fs::PermissionsExt;
+
+/// A consumed snapshot this service cannot delete, such as one holding
+/// read-only subvolumes, ends up in the staging sweep's lane; one it can
+/// delete is simply gone. Neither remains under its cleanup name.
+#[test]
+fn consumed_snapshot_is_removed_or_handed_to_the_sweep() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sandbox_dir = tmp.path().join("sandbox");
+    let cleanup_dir = sandbox_dir.join("snapshot.cleanup.test");
+    let bundle = cleanup_dir.join("rootfs.btrfs-source");
+    std::fs::create_dir_all(&bundle).unwrap();
+    std::fs::write(bundle.join("source.json"), b"{}").unwrap();
+    // Read-only directory: unlinking its entries fails for a normal user.
+    std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    remove_consumed_snapshot_dir("sandbox", &sandbox_dir, &cleanup_dir);
+
+    assert!(!cleanup_dir.exists());
+    let lane = crate::service::suspend_snapshot_publication::suspend_snapshot_staging_parent_dir(
+        &sandbox_dir,
+    );
+    let handed_off: Vec<_> = std::fs::read_dir(&lane)
+        .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
+        .unwrap_or_default();
+    for entry in &handed_off {
+        let name = entry.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with(crate::service::recovery::staging_cleanup::RETIRED_PREFIX));
+        assert!(entry.join("rootfs.btrfs-source/source.json").exists());
+        std::fs::set_permissions(
+            entry.join("rootfs.btrfs-source"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    assert!(handed_off.len() <= 1);
+}

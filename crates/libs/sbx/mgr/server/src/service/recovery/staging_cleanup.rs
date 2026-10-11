@@ -8,7 +8,10 @@ use std::path::PathBuf;
 
 const SCAN_ENTRIES: usize = 128;
 const DELETE_BATCH: usize = 8;
-const RETIRED_PREFIX: &str = ".suspend-gc-pending-";
+/// Entries under a sandbox's `snapshots/` with this prefix are logically
+/// deleted. The periodic sweep removes them through node-manager, which can
+/// delete nested subvolumes this service cannot.
+pub(in crate::service) const RETIRED_PREFIX: &str = ".suspend-gc-pending-";
 
 /// Two directory handles, independent of sandbox count. Keep enumeration across
 /// ticks so retained/busy entries and large snapshot inventories cannot hide the
@@ -131,6 +134,58 @@ impl SandboxManagerService {
                     .is_some_and(|id| id.parse::<LocalArtifactId>().is_ok())
                 {
                     paths.push(entry.path());
+                } else if guards.is_some()
+                    && name
+                        .strip_prefix(suspend_snapshot_publication::RETIRED_HOLD_PREFIX)
+                        .and_then(|id| id.parse::<LocalArtifactId>().ok())
+                        .is_some()
+                {
+                    // A hold is the canonical snapshot a publication moved
+                    // aside. Only the lifecycle guards make any observation
+                    // about it current: a publication retry restores the hold
+                    // to the canonical path and moves it aside again before
+                    // replacing it.
+                    let sandbox_dir = entry
+                        .path()
+                        .parent()
+                        .and_then(|p| p.parent().map(Path::to_path_buf));
+                    let Some(sandbox_dir) = sandbox_dir else {
+                        continue;
+                    };
+                    let canonical =
+                        suspend_snapshot_publication::canonical_suspend_snapshot_dir(&sandbox_dir);
+                    match self.hold_disposition(&id, &entry.path(), &canonical, may_retire) {
+                        Ok(HoldDisposition::Release) => {
+                            match suspend_snapshot_publication::release_retired_suspend_snapshot(
+                                &sandbox_dir,
+                                &entry.path(),
+                            ) {
+                                Ok(Some(released)) => paths.push(released),
+                                Ok(None) => {}
+                                Err(error) => {
+                                    tracing::warn!(sandbox_id = %id, %error, "cannot release retired snapshot; will retry")
+                                }
+                            }
+                        }
+                        Ok(HoldDisposition::Restore) => {
+                            match std::fs::rename(entry.path(), &canonical) {
+                                Ok(()) => {
+                                    tracing::warn!(sandbox_id = %id, "restored the held snapshot of a rolled-back publication")
+                                }
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(error) => {
+                                    tracing::warn!(sandbox_id = %id, %error, "cannot restore held snapshot; will retry")
+                                }
+                            }
+                        }
+                        Ok(HoldDisposition::Retain(reason)) => {
+                            tracing::warn!(sandbox_id = %id, hold = %entry.path().display(), reason, "retaining held snapshot")
+                        }
+                        Ok(HoldDisposition::InFlight) => {}
+                        Err(error) => {
+                            tracing::warn!(sandbox_id = %id, %error, "cannot establish held snapshot owner; retaining it")
+                        }
+                    }
                 } else if may_retire
                     && let Some(artifact) = name
                         .strip_prefix(suspend_snapshot_publication::SUSPEND_STAGING_PREFIX)
@@ -150,6 +205,94 @@ impl SandboxManagerService {
             }
         }
         Ok(paths)
+    }
+}
+
+/// The artifact a snapshot directory's sidecar names, read without validating
+/// the artifact. `None` is an absent, unreadable or unparsable sidecar:
+/// unknown identity, never evidence about ownership.
+fn sidecar_artifact_id(snapshot_dir: &Path) -> Option<LocalArtifactId> {
+    #[derive(serde::Deserialize)]
+    struct Identity {
+        local_artifact_id: Option<LocalArtifactId>,
+    }
+    let path = snapshot_dir.join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME);
+    serde_json::from_slice::<Identity>(&std::fs::read(path).ok()?)
+        .ok()?
+        .local_artifact_id
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HoldDisposition {
+    /// The suspended row pins the held artifact and nothing stands at the
+    /// canonical path: the hold is the snapshot a wake needs, moved aside by a
+    /// publication that never committed.
+    Restore,
+    /// Durably superseded: the canonical snapshot names a different artifact
+    /// that the suspended row pins, or the sandbox left the suspended state
+    /// with no canonical snapshot at all.
+    Release,
+    /// Not enough evidence either way. A readable canonical identity alone is
+    /// not: a restore writes metadata before the VM files, so the canonical
+    /// path may hold an incomplete copy of the very artifact in the hold.
+    Retain(&'static str),
+    /// No canonical snapshot and a lifecycle state that recovery still owns.
+    InFlight,
+}
+
+impl SandboxManagerService {
+    fn hold_disposition(
+        &self,
+        sandbox_id: &str,
+        hold: &Path,
+        canonical: &Path,
+        stable: bool,
+    ) -> Result<HoldDisposition, StartupRecoveryError> {
+        let held = sidecar_artifact_id(hold);
+        if let Some(canonical_id) = sidecar_artifact_id(canonical) {
+            let Some(held) = held else {
+                return Ok(HoldDisposition::Retain("hold identity unreadable"));
+            };
+            if held == canonical_id {
+                return Ok(HoldDisposition::Retain(
+                    "canonical snapshot names the held artifact",
+                ));
+            }
+            return Ok(if self.suspended_pinned_to(sandbox_id, canonical_id)? {
+                HoldDisposition::Release
+            } else {
+                HoldDisposition::Retain("canonical artifact is not the pinned one")
+            });
+        }
+        if canonical.exists() {
+            return Ok(HoldDisposition::Retain(
+                "canonical snapshot has no readable identity",
+            ));
+        }
+        if !stable {
+            return Ok(HoldDisposition::InFlight);
+        }
+        let Some(held) = held else {
+            return Ok(HoldDisposition::Retain("hold identity unreadable"));
+        };
+        Ok(if self.suspended_pinned_to(sandbox_id, held)? {
+            HoldDisposition::Restore
+        } else {
+            HoldDisposition::Release
+        })
+    }
+
+    fn suspended_pinned_to(
+        &self,
+        sandbox_id: &str,
+        artifact: LocalArtifactId,
+    ) -> Result<bool, StartupRecoveryError> {
+        let db = self.startup_recovery_db()?;
+        Ok(crate::db::sandbox_suspended_with_pinned_artifact(
+            &db,
+            sandbox_id,
+            &artifact.to_string(),
+        )?)
     }
 }
 

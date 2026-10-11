@@ -78,28 +78,13 @@ pub(super) async fn launch_spaced_host_via_node(
 }
 
 pub(super) fn cleanup_restored_snapshot_dir_async(sandbox_id: &str, snapshot_dir: &str) {
-    let cleanup_dir = format!(
-        "{CACHE_DIR}/{sandbox_id}/snapshot.cleanup.{}",
-        Uuid::now_v7()
-    );
+    let sandbox_dir = std::path::PathBuf::from(format!("{CACHE_DIR}/{sandbox_id}"));
+    let cleanup_dir = sandbox_dir.join(format!("snapshot.cleanup.{}", Uuid::now_v7()));
     match std::fs::rename(snapshot_dir, &cleanup_dir) {
         Ok(()) => {
             let sandbox_id = sandbox_id.to_string();
             tokio::task::spawn_blocking(move || {
-                let started = std::time::Instant::now();
-                match std::fs::remove_dir_all(&cleanup_dir) {
-                    Ok(()) => tracing::debug!(
-                        sandbox_id,
-                        elapsed_ms = started.elapsed().as_millis() as u64,
-                        "removed restored snapshot directory"
-                    ),
-                    Err(error) => tracing::warn!(
-                        sandbox_id,
-                        path = cleanup_dir,
-                        %error,
-                        "failed to remove restored snapshot directory"
-                    ),
-                }
+                remove_consumed_snapshot_dir(&sandbox_id, &sandbox_dir, &cleanup_dir)
             });
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -108,6 +93,48 @@ pub(super) fn cleanup_restored_snapshot_dir_async(sandbox_id: &str, snapshot_dir
             path = snapshot_dir,
             %error,
             "failed to move restored snapshot directory aside for cleanup"
+        ),
+    }
+}
+
+/// Remove a snapshot directory the wake has consumed. A deferred capture
+/// leaves read-only subvolumes inside it that this service cannot delete; such
+/// a directory moves into the staging sweep's lane, which deletes through
+/// node-manager, instead of lingering until sandbox deletion.
+pub(super) fn remove_consumed_snapshot_dir(
+    sandbox_id: &str,
+    sandbox_dir: &std::path::Path,
+    cleanup_dir: &std::path::Path,
+) {
+    let started = std::time::Instant::now();
+    let error = match std::fs::remove_dir_all(cleanup_dir) {
+        Ok(()) => {
+            tracing::debug!(
+                sandbox_id,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "removed restored snapshot directory"
+            );
+            return;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => error,
+    };
+    let lane =
+        super::suspend_snapshot_publication::suspend_snapshot_staging_parent_dir(sandbox_dir);
+    let garbage = super::suspend_snapshot_publication::garbage_suspend_snapshot_dir(sandbox_dir);
+    match std::fs::create_dir_all(&lane).and_then(|()| std::fs::rename(cleanup_dir, &garbage)) {
+        Ok(()) => tracing::info!(
+            sandbox_id,
+            path = %garbage.display(),
+            %error,
+            "restored snapshot directory handed to the staging sweep for deletion through node-manager"
+        ),
+        Err(handoff) => tracing::warn!(
+            sandbox_id,
+            path = %cleanup_dir.display(),
+            %error,
+            %handoff,
+            "failed to remove restored snapshot directory"
         ),
     }
 }
