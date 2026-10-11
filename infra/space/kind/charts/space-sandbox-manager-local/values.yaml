@@ -20,6 +20,14 @@ snapshots:
   region: us-east-1
   endpoint: http://object-store:8333
 
+# Deferred btrfs-send capture (SPACE_SNAPSHOT_STREAM_BTRFS_SEND): a suspend
+# retains its source as read-only btrfs snapshots and volume-manager streams
+# the upload from them instead of the node writing `rootfs.btrfs-send`. Kind
+# runs it so CI exercises the production shape: volume-manager's own
+# identity, node-manager's lease RPCs and source inspection
+# (docs/snapshot-upload-streaming.md).
+snapshotStreamBtrfsSend: true
+
 # Enables sandbox-manager's network-credential reconciliation; the node's
 # credential-manager resolves references through its AWS SDK chain.
 networkCredentials:

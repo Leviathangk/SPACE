@@ -8,7 +8,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from enum import StrEnum
 from http.client import IncompleteRead
 from pathlib import PurePosixPath
@@ -41,6 +41,8 @@ from space_smoke.capabilities import (
     SnapshotReaperConfig,
     SnapshotReaperControl,
     BackupQueued,
+    BtrfsSendCapture,
+    CompletedTransfer,
     ReleaseStorageRow,
     RestoreFailure,
     SnapshotRowFacts,
@@ -3241,6 +3243,110 @@ class SuspendCodecAssertions:
         """A sandbox-pool worker node other than `node_name`."""
 
         return self._control.other_sandbox_worker_node(node_name)
+
+    def expect_deferred_capture(
+        self, node_name: str, *, since_time: str, visibility_timeout: float = 60
+    ) -> BtrfsSendCapture:
+        """The capture taken after `since_time` on `node_name` retained its source.
+
+        sandbox-manager's encode line is the record: `deferred=true` with no
+        stream bytes means the source stayed a retained btrfs snapshot and no
+        `rootfs.btrfs-send` was written. Polls because the line reaches the
+        pod log a beat after the public state settles.
+        """
+
+        deadline = time.monotonic() + visibility_timeout
+        while True:
+            captures = self._control.btrfs_send_captures(
+                self._fixture.sandbox.sandbox_id, node_name, since_time=since_time
+            )
+            if captures or time.monotonic() >= deadline:
+                break
+            time.sleep(2)
+        self._fixture.verify(
+            len(captures) >= 1,
+            "sandbox-manager logged no btrfs-send capture for the suspend",
+            sandbox_id=self._fixture.sandbox.sandbox_id,
+            worker_node=node_name,
+            since_time=since_time,
+        )
+        capture = captures[-1]
+        self._fixture.verify(
+            capture.deferred and capture.stream_bytes == 0,
+            "the suspend materialized a send file instead of retaining its source",
+            sandbox_id=self._fixture.sandbox.sandbox_id,
+            worker_node=node_name,
+            deferred=capture.deferred,
+            stream_bytes=capture.stream_bytes,
+        )
+        self._fixture.record("deferred_capture", asdict(capture))
+        return capture
+
+    def expect_streamed_upload(
+        self, node_name: str, *, since_time: str, visibility_timeout: float = 60
+    ) -> CompletedTransfer:
+        """volume-manager streamed the backup's rootfs from the retained source.
+
+        A completed `push_btrfs_send` job for the sandbox's send stream is the
+        record. The snapshot directory cannot tell: a fallback that
+        materializes `rootfs.btrfs-send`, uploads it as a file, and lets
+        bookkeeping reclaim it once the backup is durable leaves the same
+        entries behind.
+        """
+
+        from space_smoke.adapters import ROOTFS_SEND_FILE
+
+        def streamed() -> list[CompletedTransfer]:
+            return [
+                transfer
+                for transfer in self._control.completed_transfers(
+                    self._fixture.sandbox.sandbox_id, node_name, since_time=since_time
+                )
+                if transfer.kind == "push_btrfs_send"
+                and PurePosixPath(transfer.local_path).name == ROOTFS_SEND_FILE
+            ]
+
+        deadline = time.monotonic() + visibility_timeout
+        while True:
+            transfers = streamed()
+            if transfers or time.monotonic() >= deadline:
+                break
+            time.sleep(2)
+        self._fixture.verify(
+            len(transfers) >= 1,
+            "volume-manager completed no push_btrfs_send for the snapshot; the "
+            "backup did not stream from the retained source",
+            sandbox_id=self._fixture.sandbox.sandbox_id,
+            worker_node=node_name,
+            since_time=since_time,
+        )
+        transfer = transfers[-1]
+        self._fixture.record("streamed_upload", asdict(transfer))
+        return transfer
+
+    def expect_retained_source_without_send_file(self, node_name: str) -> tuple[str, ...]:
+        """The canonical snapshot holds the retained bundle and no send file."""
+
+        from space_smoke.adapters import RETAINED_SOURCE_BUNDLE, ROOTFS_SEND_FILE
+
+        entries = self._control.sandbox_canonical_snapshot_entries(
+            node_name, self._fixture.sandbox.sandbox_id
+        )
+        self._fixture.verify(
+            RETAINED_SOURCE_BUNDLE in entries,
+            "the suspend snapshot has no retained source bundle",
+            sandbox_id=self._fixture.sandbox.sandbox_id,
+            worker_node=node_name,
+            entries=entries,
+        )
+        self._fixture.verify(
+            ROOTFS_SEND_FILE not in entries,
+            "a rootfs.btrfs-send file exists beside the retained source",
+            sandbox_id=self._fixture.sandbox.sandbox_id,
+            worker_node=node_name,
+            entries=entries,
+        )
+        return entries
 
     def require_btrfs_send_default(self, node_name: str) -> str:
         """The worker resolves an omitted suspend format to the stream codec, or refuse.

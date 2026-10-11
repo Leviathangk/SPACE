@@ -1724,3 +1724,26 @@ fn a_hostile_plan_field_is_bounded_on_the_line_that_is_logged() {
         "the real length must survive the truncation: {detail}"
     );
 }
+
+#[test]
+fn restored_sidecar_is_replaced_without_writing_the_pulled_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp
+        .path()
+        .join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME);
+    let mut meta = meta_with_diff_format(Some("btrfs-send-v1"));
+    meta.rootfs_send_source_id = Some(uuid::Uuid::now_v7());
+    std::fs::write(&path, serde_json::to_vec(&meta).unwrap()).unwrap();
+    // Volume-manager owns the pulled file; emulate the closest a single-user
+    // test can get to a file this service may read but not open for writing.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+    meta.rootfs_send_source_id = None;
+    replace_restored_sidecar(tmp.path(), &meta).unwrap();
+
+    let written: crate::snapshot_upload::SnapshotMeta =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(written.rootfs_send_source_id, None);
+    assert!(!tmp.path().join(".snapshot.json.restore").exists());
+}

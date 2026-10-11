@@ -138,12 +138,16 @@ actual snapshot bucket used by that canary, including non-production buckets.
 ## Streaming from retained btrfs sources
 
 `SPACE_SNAPSHOT_STREAM_BTRFS_SEND=true` on sandbox-manager opts new btrfs
-captures into retaining an immutable `rootfs.btrfs-source` bundle. It defers
-send-file creation only when volume-manager advertises streaming support
+suspend captures into retaining an immutable `rootfs.btrfs-source` bundle. It
+defers send-file creation only when volume-manager advertises streaming support
 (compression enabled, a positive upload buffer budget, and an authorized
-node-manager capability probe). The default remains
-the existing materialized path. LUKS artifacts keep their existing upload path;
-this option changes the btrfs-send codec, not encryption policy.
+node-manager capability probe) and node-manager advertises source inspection.
+Both answers are reused for thirty seconds (five after a negative or failed
+probe), so captures and backups do not pay a round trip each.
+The default remains the existing materialized path. Named operation snapshots
+always materialize: they have no local sidecar to hold a source identity. LUKS
+artifacts keep their existing upload path; this option changes the btrfs-send
+codec, not encryption policy.
 
 Each bundle contains private copy-on-write snapshots of the frozen rootfs and
 its template parent, plus a manifest binding their read-only subvolume UUIDs to
@@ -206,9 +210,108 @@ Turning the capture option off stops new deferred captures. Setting the upload
 budget to zero changes how existing source jobs upload; it does not remove their
 source dependencies. Before downgrading binaries, drain source jobs and materialize
 any retained local artifacts needed by old readers using `BtrfsMaterializeRootfsSend`.
+Sandbox-manager binaries that predate source inspection read the bundle directly
+and fail on every deferred artifact. Rolling back to one also requires their
+local `size_bytes` to describe the materialized stream, so reconcile that
+metadata after materializing. Binaries from before the reclaim rewrite count
+the stream of a retained artifact and read a reclaimed, image-counting sidecar
+as a size mismatch; roll forward rather than back once reclaim has run.
 Do not downgrade node-manager while source-aware volume jobs remain. Source cleanup
 continues while streaming is disabled. Normal artifact retirement reclaims the
 original bundle; the upload lease has independent terminal cleanup.
+
+### Sandbox-manager's view of a retained source
+
+The bundle's source subvolume keeps the sandbox jail's ownership, which
+sandbox-manager cannot traverse, so node-manager is the bundle's only reader.
+Sandbox-manager learns the source identity, and for a deferred capture the
+retained rootfs length, from the capture response, and persists the identity as
+`snapshot.json` `rootfs_send_source_id`. It never opens the bundle or its
+manifest. A local artifact's btrfs-send rootfs is its `rootfs.btrfs-send` file
+while that exists; without one, the persisted identity names the retained
+source. The artifact's own `snapshot.json` counts whichever of the two it has:
+the stream while present, the retained image after reclaim removes it. Reclaim
+runs in the backup's bookkeeping task, after the upload job has recorded its
+outcome: it asks node-manager for the image length, rewrites the sidecar, then
+unlinks the stream. The rewrite recomputes the total from the remaining VM
+files plus the verified image, so an interrupted or repeated reclaim converges
+on one value. Validation accepts either accounting while both exist, and
+recovery inspects a source whenever validation needs its length, including an
+artifact whose sidecar already counts the image beside a stream, so neither
+order nor a crash between the two steps strands the artifact. The copy staged for upload
+counts the stream restorers will find and omits the node-local identity, which
+no other node can resolve; restore and fork projection drop one if an older
+upload carried it.
+
+When a new suspend replaces a published snapshot, sandbox-manager cannot delete
+the old one: deferred capture leaves read-only subvolumes inside it. Publication
+moves it to a `snapshots/.suspend-retired-<new artifact>` hold, publishes the
+replacement, then renames the hold into the staging sweep's
+`snapshots/.suspend-gc-pending-*` lane, which the periodic sweep deletes through
+node-manager. The hold is outside that lane, so a publication interrupted
+between its renames keeps its rollback candidate: a retry restores the hold when
+no canonical snapshot exists, and releases it once the replacement is canonical.
+The sweep handles holds only under the sandbox's lifecycle guards. It releases
+a hold once the canonical snapshot names a different artifact that the
+suspended row pins: durable supersession, which also covers a later
+publication that replaced the artifact that displaced the hold. A canonical
+directory without that evidence, such as one a restore has only begun to
+fill, keeps the hold. Without a canonical snapshot, a hold whose publication
+may still be in flight stays as the rollback candidate; once the sandbox is
+back in a stable state, the sweep restores the hold to the canonical path if
+the suspended row still pins its artifact and otherwise releases it. A hold
+whose sidecar cannot be read is retained, since unknown identity is not
+evidence that nothing pins it. Lane entries are
+reclaimed as soon as they are created: an ordinary snapshot in one local
+removal, as publication deleted it before the lane existed, and one that holds
+retained subvolumes through node-manager, under a two-slot admission whose
+overflow waits in a bounded in-memory backlog that running reclaims drain as
+slots free up; node-manager bounds the deletions themselves at four, holding
+each slot inside the blocking work even when the caller stops waiting. The
+sweep, which handles a bounded batch per pass, is the retry owner across
+restarts and backlog overflow. A snapshot consumed by a same-node wake
+takes the same path.
+
+`BtrfsInspectSendSource` is node-manager's read-only check of one source. It
+verifies the manifest identity, the subvolume lineage, and the read-only state,
+then returns the rootfs length. It runs in its own four-slot lane, separate from
+both the filesystem permits that suspend and restore receive share and the
+diagnostic lane. `NOT_FOUND` means the artifact or bundle is absent.
+`FAILED_PRECONDITION` means it is unusable, including a bundle without its
+manifest: capture syncs the manifest before it reports the identity a caller
+inspects, so that manifest was lost and no later inspection will find it. Any
+other status, including
+`UNIMPLEMENTED` from an older node-manager, proves nothing about the artifact.
+
+| Caller | Present | Absent | Unusable | No answer |
+| --- | --- | --- | --- | --- |
+| Suspend publication | Uses the capture response, without another call | — | — | — |
+| Backup preparation | Streams when volume-manager supports it; otherwise materializes this source first | Fails the attempt | Fails the attempt | Fails the attempt for retry |
+| Backup and reupload preconditions | Proceed | Terminal missing marker | Terminal missing marker | `Internal`, retried |
+| Artifact validation: publication recovery, quarantine adoption, cleanup completion, orphan inventory | Complete if the local sizes match | Missing artifact | Evidence of an unusable artifact | Pending: retried; never quarantined or pruned |
+
+Synchronous validation never waits on node-manager. An `Absent` answer counts
+as a missing source only once the bundle directory entry, which sandbox-manager
+can stat without traversing the bundle, is definitely gone too. If the entry
+exists, the answer predates a rename that brought the artifact back to that
+path and the source is pending another inspection; if it cannot be stat'ed,
+the answer proves nothing. Its async
+callers inspect first and pass the answers in:
+- startup recovery, for interrupted publications;
+- quarantine adoption and cleanup completion, under their artifact fences;
+- each periodic recovery and orphan-inventory batch, for exactly the rows or
+  directories that batch will validate.
+
+Answers are not cached across batches. Background inspections run two at a
+time, with a two-second deadline and a ten-second budget per batch. Periodic
+recovery remembers when it last tried each source and starts every batch with
+the sources tried least recently, so slow sources cannot keep the rest waiting. `snapshot.retained_source.inspection`
+counts outcomes by `outcome` and, when unanswered, gRPC `code`.
+`snapshot.retained_source.pending` and
+`snapshot.retained_source.pending_oldest_age_seconds` track sources that periodic
+recovery could not resolve, from their first unresolved pass until an answer. A
+persistent `unimplemented` or `permission_denied` code indicates a version or
+socket-identity mismatch, not a missing artifact.
 
 ### Isolated btrfs transfer measurement
 
@@ -267,6 +370,13 @@ does not currently permit deleting the bundle: local artifact validation,
 promotion/reupload, and downgrade materialization still use it. Ordinary local
 wake uses the retained instance rootfs, but that alone is insufficient to release
 the artifact's recovery inputs.
+
+Kind runs this path in CI: its volume-manager carries the separate
+`space-volmgr` identity that node-manager's lease RPCs authorize,
+credential-manager serves it on the volume socket, sandbox-manager sets the
+flag, and `local.deferred_btrfs_send_capture_restores_cross_node` requires a
+deferred capture with no send file before and after upload and a cross-node
+restore from object storage.
 
 Before widening enablement, use a small canary and matched controls to verify:
 

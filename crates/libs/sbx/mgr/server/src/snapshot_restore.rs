@@ -1762,8 +1762,30 @@ async fn restore_pull_metadata_from_source_for_identity(
     let meta_path = snapshot_dir.join("snapshot.json");
     let meta_bytes = std::fs::read(&meta_path)
         .map_err(|e| RestoreError::Other(format!("read {}: {e}", meta_path.display())))?;
-    let meta: crate::snapshot_upload::SnapshotMeta = serde_json::from_slice(&meta_bytes)
+    let mut meta: crate::snapshot_upload::SnapshotMeta = serde_json::from_slice(&meta_bytes)
         .map_err(|e| RestoreError::Other(format!("parse {}: {e}", meta_path.display())))?;
+    // A retained source identity is node-local. Uploads no longer carry one,
+    // but a restored artifact never has the bundle it would name, and its
+    // local sidecar must describe the pulled stream. Volume-manager wrote the
+    // pulled file under its own identity, so replace it through a sibling and
+    // a rename rather than opening it for writing.
+    if meta.rootfs_send_source_id.take().is_some() {
+        // The durable replacement syncs a file and its directory, so it runs
+        // off the async workers. The staging guard travels with it: a
+        // cancelled restore cannot remove the directory mid-replacement.
+        let dir = snapshot_dir.clone();
+        let (guard, rewritten) = tokio::task::spawn_blocking(move || {
+            let rewritten = replace_restored_sidecar(&dir, &meta).map(|()| meta);
+            (sandbox_dir_guard, rewritten)
+        })
+        .await
+        .map_err(|source| {
+            RestoreError::Other(format!("join rewrite of {}: {source}", meta_path.display()))
+        })?;
+        sandbox_dir_guard = guard;
+        meta = rewritten
+            .map_err(|e| RestoreError::Other(format!("rewrite {}: {e}", meta_path.display())))?;
+    }
     validate_restore_metadata_identity(&meta, sandbox_id, expected_source_sandbox_id)?;
     let codec = codec_from_meta(&meta).map_err(|error| RestoreError::Other(error.to_string()))?;
     tracing::info!(
@@ -1786,6 +1808,23 @@ async fn restore_pull_metadata_from_source_for_identity(
         credential_subject_id: expected_source_sandbox_id.to_string(),
         filesystem_scope_id,
     })
+}
+
+/// Replace a pulled `snapshot.json` with `meta` through a sibling and a
+/// rename. The pulled file belongs to volume-manager's identity and is not
+/// writable by this service; the snapshot directory is.
+pub(crate) fn replace_restored_sidecar(
+    snapshot_dir: &Path,
+    meta: &crate::snapshot_upload::SnapshotMeta,
+) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(meta)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    crate::snapshot_upload::replace_file_durably(
+        snapshot_dir,
+        ".snapshot.json.restore",
+        crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME,
+        &bytes,
+    )
 }
 
 fn preserve_attributed_metadata_retry(

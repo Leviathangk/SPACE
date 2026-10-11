@@ -80,6 +80,11 @@ spec:
               value: {{ .Values.snapshots.region | quote }}
             - name: SPACE_SNAPSHOT_ENDPOINT
               value: {{ .Values.snapshots.endpoint | quote }}
+            {{- if .Values.snapshotStreamBtrfsSend }}
+            # Deferred btrfs-send capture (values.yaml).
+            - name: SPACE_SNAPSHOT_STREAM_BTRFS_SEND
+              value: "true"
+            {{- end }}
             {{- with .Values.clusterDeletedEvictionQuiescenceSecs }}
             - name: SPACE_SBX_CLUSTER_DELETED_QUIESCENCE_SECS
               value: {{ . | quote }}

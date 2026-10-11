@@ -80,6 +80,8 @@ from space_smoke.capabilities import (
     SandboxPodPlacement,
     SnapshotRecord,
     BackupQueued,
+    BtrfsSendCapture,
+    CompletedTransfer,
     ReleaseStorageRow,
     RestoreFailure,
     TemplatePullLine,
@@ -280,6 +282,7 @@ KIND_WORKER_ROLE = "space-worker"
 KIND_BUILDER_ROLE = "space-builder"
 NODE_SANDBOX_MANAGER = "sandbox-manager"
 NODE_TEMPLATE_MANAGER = "template-manager"
+NODE_VOLUME_MANAGER = "volume-manager"
 NODE_CTL = "node-ctl"
 NODE_API = "node-api"
 NODE_BUILD_MANAGER = "build-manager"
@@ -404,6 +407,15 @@ SELECT content_hash
 """
 _TEMPLATE_IN_USE_MARKER = "sandbox(es) were created from"
 BTRFS_SEND_V1 = "btrfs-send-v1"
+# sandbox-manager's encode line for the stream codec; `deferred=true` means
+# the capture retained its source and wrote no `rootfs.btrfs-send`
+# (crates/libs/sbx/mgr/server/src/service/grpc_lifecycle/suspend_snapshot.rs).
+BTRFS_SEND_ENCODED_MESSAGE = "btrfs-send codec: rootfs encoded as btrfs send -p stream (via nodemgr)"
+RETAINED_SOURCE_BUNDLE = "rootfs.btrfs-source"
+ROOTFS_SEND_FILE = "rootfs.btrfs-send"
+# volume-manager's line for every single-file transfer job, the streamed
+# `push_btrfs_send` included (crates/libs/vol/mgr/server/src/executor.rs).
+TRANSFER_JOB_COMPLETED_MESSAGE = "transfer job completed"
 # `SPACE_TEMPLATE_RECEIVED_UUID_NS` (crates/libs/common/core/src/host/btrfs.rs):
 # a template installed from `(name, content_hash)` is stamped with
 # `UUIDv5(NS, "name@content_hash")` so a btrfs-send stream produced against
@@ -1731,6 +1743,36 @@ ON CONFLICT (key_hash) DO NOTHING;
     def snapshot_reaper_config(self, node_name: str) -> SnapshotReaperConfig:
         return _snapshot_reaper_config_from_env(
             self._node_service_env(node_name, NODE_SANDBOX_MANAGER)
+        )
+
+    def sandbox_canonical_snapshot_entries(self, node_name: str, sandbox_id: str) -> tuple[str, ...]:
+        """Entries of the sandbox's canonical suspend snapshot directory, dotfiles included."""
+
+        path = f"{SANDBOX_CACHE_ROOT}/{_sql_uuid(sandbox_id)}/snapshot"
+        result = self._node_shell_exec(
+            node_name,
+            f"if [ ! -e {path} ]; then exit 0; fi; ls -1A {path}",
+            timeout=30,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"could not list {path} on {node_name} ({result.returncode}): "
+                f"{result.detail() or '<no output>'}"
+            )
+        return tuple(line.strip() for line in result.stdout.splitlines() if line.strip())
+
+    def btrfs_send_captures(
+        self, sandbox_id: str, node_name: str, *, since_time: str
+    ) -> list[BtrfsSendCapture]:
+        logs = self._node_service_logs(node_name, NODE_SANDBOX_MANAGER, since_time=since_time)
+        return _btrfs_send_captures_from_logs(logs, _sql_uuid(sandbox_id), node_name)
+
+    def completed_transfers(
+        self, sandbox_id: str, node_name: str, *, since_time: str
+    ) -> list[CompletedTransfer]:
+        logs = self._node_service_logs(node_name, NODE_VOLUME_MANAGER, since_time=since_time)
+        return _completed_transfers_from_logs(
+            logs, f"{SANDBOX_CACHE_ROOT}/{_sql_uuid(sandbox_id)}/", node_name
         )
 
     def sandbox_snapshot_dirs(self, node_name: str, sandbox_id: str) -> tuple[str, ...]:
@@ -4463,6 +4505,66 @@ def _snapshot_reaper_config_from_env(env: Mapping[str, str | None]) -> SnapshotR
         grace_seconds=seconds("SPACE_SBX_GC_GRACE_SECS", _REAPER_DEFAULT_GRACE_SECONDS),
         idle_seconds=seconds("SPACE_SBX_GC_IDLE_SECS", _REAPER_DEFAULT_IDLE_SECONDS),
     )
+
+
+def _btrfs_send_captures_from_logs(
+    logs: str, canonical_sandbox_id: str, node_name: str
+) -> list[BtrfsSendCapture]:
+    """The sandbox's btrfs-send captures in `logs`, in log order."""
+
+    captures: list[BtrfsSendCapture] = []
+    for line in logs.splitlines():
+        if BTRFS_SEND_ENCODED_MESSAGE not in line:
+            continue
+        fields = _tracing_fields(line)
+        if fields is None or fields.get("message") != BTRFS_SEND_ENCODED_MESSAGE:
+            continue
+        if str(fields.get("sandbox_id", "")) != canonical_sandbox_id:
+            continue
+        deferred = str(fields.get("deferred", "false")).lower() == "true"
+        try:
+            stream_bytes = int(fields.get("stream_bytes", 0) or 0)
+        except (TypeError, ValueError):
+            stream_bytes = 0
+        captures.append(
+            BtrfsSendCapture(
+                node_name=node_name,
+                sandbox_id=canonical_sandbox_id,
+                stream_bytes=stream_bytes,
+                deferred=deferred,
+            )
+        )
+    return captures
+
+
+def _completed_transfers_from_logs(
+    logs: str, path_prefix: str, node_name: str
+) -> list[CompletedTransfer]:
+    """Completed transfer jobs in `logs` whose local path is under `path_prefix`."""
+
+    transfers: list[CompletedTransfer] = []
+    for line in logs.splitlines():
+        if TRANSFER_JOB_COMPLETED_MESSAGE not in line:
+            continue
+        fields = _tracing_fields(line)
+        if fields is None or fields.get("message") != TRANSFER_JOB_COMPLETED_MESSAGE:
+            continue
+        local_path = str(fields.get("local_path", ""))
+        if not local_path.startswith(path_prefix):
+            continue
+        try:
+            transferred = int(fields.get("bytes", 0) or 0)
+        except (TypeError, ValueError):
+            transferred = 0
+        transfers.append(
+            CompletedTransfer(
+                node_name=node_name,
+                kind=str(fields.get("kind", "")),
+                local_path=local_path,
+                bytes=transferred,
+            )
+        )
+    return transfers
 
 
 def _tracing_fields(line: str) -> dict[str, Any] | None:
