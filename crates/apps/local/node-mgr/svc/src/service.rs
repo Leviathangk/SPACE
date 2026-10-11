@@ -1287,12 +1287,24 @@ impl NodeManager for LocalNodeManager {
         Err(not_btrfs())
     }
 
+    async fn btrfs_inspect_send_source(
+        &self,
+        _request: Request<BtrfsInspectSendSourceRequest>,
+    ) -> Result<Response<BtrfsInspectSendSourceResponse>, Status> {
+        // This runtime never retains send sources, so there is nothing to
+        // find. Unimplemented keeps callers from reading that as an absence.
+        Err(Status::unimplemented(
+            "local runtime does not retain btrfs send sources",
+        ))
+    }
+
     async fn get_btrfs_send_capabilities(
         &self,
         _request: Request<GetBtrfsSendCapabilitiesRequest>,
     ) -> Result<Response<GetBtrfsSendCapabilitiesResponse>, Status> {
         Ok(Response::new(GetBtrfsSendCapabilitiesResponse {
             supported: false,
+            inspect_send_source: false,
         }))
     }
 

@@ -151,8 +151,10 @@ fn sidecarless_format_from_artifacts(
     if probe(crate::snapshot_upload::ROOTFS_FULL_FILENAME)? {
         return Ok(pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat::Full);
     }
+    // The bundle's own entry, not its contents: a retained-only artifact is
+    // still a btrfs-send artifact, whose rootfs the presence check reports.
     if probe(crate::snapshot_upload::ROOTFS_BTRFS_SEND_FILENAME)?
-        || probe("rootfs.btrfs-source/source.json")?
+        || probe(crate::retained_source::BUNDLE_DIRECTORY)?
     {
         return Ok(pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat::BtrfsSend);
     }
@@ -225,28 +227,124 @@ pub(super) fn artifact_backup_lookup_error(status: Status, full_current_instance
     }
 }
 
-pub(super) fn require_artifact_backup_files(
+/// Which caller a backup file preflight answers for. The drain reconciler
+/// classifies `FailedPrecondition` responses carrying the artifact-missing
+/// marker as terminal, so the policy decides where that marker appears.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BackupFilesPolicy {
+    /// An artifact backup; the marker only when the sandbox's current full
+    /// instance is being backed up for a drain.
+    Backup { full_current_instance: bool },
+    /// A reupload of the canonical suspend snapshot for promotion.
+    Reupload,
+}
+
+impl BackupFilesPolicy {
+    fn missing(self, path: &str) -> Status {
+        use pplx_space_common_core::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER;
+        match self {
+            Self::Backup {
+                full_current_instance: true,
+            } => Status::failed_precondition(format!(
+                "cannot back up artifact: {REUPLOAD_ARTIFACT_MISSING_MARKER} at {path}"
+            )),
+            Self::Backup {
+                full_current_instance: false,
+            } => Status::failed_precondition(format!(
+                "cannot back up artifact: local file is missing at {path}"
+            )),
+            // The marker substring is the classifier signal the cluster
+            // controller's promote handler keys off; both sides reference
+            // the constant.
+            Self::Reupload => Status::failed_precondition(format!(
+                "cannot reupload snapshot: {REUPLOAD_ARTIFACT_MISSING_MARKER} at {path} \
+                 — the local snapshot has already been pruned; the sandbox cannot \
+                 be promoted from this node"
+            )),
+        }
+    }
+
+    fn unusable(self, detail: &str) -> Status {
+        use pplx_space_common_core::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER;
+        match self {
+            Self::Backup {
+                full_current_instance: true,
+            } => Status::failed_precondition(format!(
+                "cannot back up artifact: {REUPLOAD_ARTIFACT_MISSING_MARKER}: {detail}"
+            )),
+            Self::Backup {
+                full_current_instance: false,
+            } => Status::failed_precondition(format!(
+                "cannot back up artifact: local file is missing: {detail}"
+            )),
+            Self::Reupload => Status::failed_precondition(format!(
+                "cannot reupload snapshot: {REUPLOAD_ARTIFACT_MISSING_MARKER}: {detail}"
+            )),
+        }
+    }
+
+    /// Retryable: nothing proved the artifact unusable.
+    fn unverified(self, detail: &str) -> Status {
+        match self {
+            Self::Backup { .. } => Status::internal(format!("cannot back up artifact: {detail}")),
+            Self::Reupload => Status::internal(format!("cannot reupload snapshot: {detail}")),
+        }
+    }
+}
+
+/// Require every local file a backup of `local_path` reads, with the retained
+/// btrfs-send rootfs checked through node-manager. `try_exists` separates a
+/// genuinely missing file (terminal) from a failed stat (retryable).
+pub(super) async fn require_artifact_backup_files(
+    inspector: &dyn crate::retained_source::RetainedSourceInspector,
+    sandbox_id: &str,
     local_path: &str,
     kind: pplx_space_common_core::types::ArtifactKind,
     format: crate::proto::SuspendSnapshotFormat,
-    full_current_instance: bool,
+    policy: BackupFilesPolicy,
 ) -> Result<(), Status> {
+    use crate::retained_source::BtrfsSendRootfsPresence;
     for file in crate::snapshot_upload::artifact_files_for_kind(kind, format) {
-        let path =
-            crate::snapshot_upload::local_artifact_path(std::path::Path::new(local_path), &file)
-                .to_string_lossy()
-                .into_owned();
-        if !std::path::Path::new(&path).try_exists().map_err(|error| {
-            Status::internal(format!("failed to stat artifact at {path}: {error}"))
-        })? {
-            let reason = if full_current_instance {
-                pplx_space_common_core::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER
-            } else {
-                "local file is missing"
+        if file.kind == pplx_space_common_core::types::SnapshotArtifact::RootfsBtrfsSend {
+            // Disk artifacts never retain a source: they have no sidecar.
+            let source_id = match kind {
+                pplx_space_common_core::types::ArtifactKind::Full => {
+                    super::sidecar_rootfs_send_source_id(local_path)?
+                }
+                pplx_space_common_core::types::ArtifactKind::Disk => None,
             };
-            return Err(Status::failed_precondition(format!(
-                "cannot back up artifact: {reason} at {path}"
-            )));
+            match crate::retained_source::btrfs_send_rootfs_presence(
+                inspector,
+                sandbox_id,
+                std::path::Path::new(local_path),
+                source_id,
+            )
+            .await
+            {
+                BtrfsSendRootfsPresence::Present => continue,
+                BtrfsSendRootfsPresence::Missing { path } => {
+                    return Err(policy.missing(&path.to_string_lossy()));
+                }
+                BtrfsSendRootfsPresence::Unusable { detail } => {
+                    return Err(policy.unusable(&detail));
+                }
+                BtrfsSendRootfsPresence::Unverified { detail } => {
+                    return Err(policy.unverified(&detail));
+                }
+            }
+        }
+        let path = std::path::Path::new(local_path)
+            .join(file.local_name)
+            .to_string_lossy()
+            .into_owned();
+        match std::path::Path::new(&path).try_exists() {
+            Ok(true) => {}
+            Ok(false) => return Err(policy.missing(&path)),
+            Err(error) => {
+                return Err(
+                    policy.unverified(&format!("failed to stat artifact at {path}: {error}"))
+                );
+            }
         }
     }
     Ok(())
@@ -614,11 +712,16 @@ impl SandboxManagerService {
                             .to_string_lossy()
                             .into_owned();
                         require_artifact_backup_files(
+                            self.retained_source_inspector.as_ref(),
+                            &sandbox.id,
                             &local_path,
                             expected_kind,
                             reupload_format_from_sidecar(&local_path)?,
-                            full_current_instance,
-                        )?;
+                            BackupFilesPolicy::Backup {
+                                full_current_instance,
+                            },
+                        )
+                        .await?;
                         pre_adoption_upload_config = Some(reupload_resolution_to_config(
                             self.resolve_org_snapshot_upload_config(&sandbox.id).await,
                             self.snapshot_upload_config.is_some(),
@@ -794,11 +897,16 @@ impl SandboxManagerService {
 
         let format = artifact_backup_format(&artifact)?;
         require_artifact_backup_files(
+            self.retained_source_inspector.as_ref(),
+            &artifact.sandbox_id,
             &artifact.local_path,
             artifact.artifact_kind,
             format,
-            full_current_instance,
-        )?;
+            BackupFilesPolicy::Backup {
+                full_current_instance,
+            },
+        )
+        .await?;
 
         let parsed_upload_config = match pre_adoption_upload_config {
             Some(config) => config,
@@ -972,49 +1080,17 @@ impl SandboxManagerService {
         // which rootfs artifact filename we require on disk
         // (`rootfs.ext4` for Full, `rootfs.btrfs-send` for BtrfsSend).
         let reupload_format = reupload_format_from_sidecar(&snapshot_dir)?;
-        let artifact_set = crate::snapshot_upload::vm_artifacts_for_format(reupload_format);
-        // Check exactly the VM artifacts `submit_suspend_snapshot` reads
-        // off disk. The `snapshot.json` metadata document it also uploads
-        // is *regenerated* from these files at submit time, not required
-        // to pre-exist, so it stays out of this precondition — but the VM
-        // artifacts must be present, or the inner submit surfaces a
-        // missing-file as `Status::internal` (without the terminal marker
-        // the reconciler classifies on).
-        for artifact in &artifact_set {
-            let path = crate::snapshot_upload::local_artifact_path(
-                std::path::Path::new(&snapshot_dir),
-                artifact,
-            )
-            .to_string_lossy()
-            .into_owned();
-            // `try_exists` distinguishes "stat says no" (Ok(false), genuine
-            // missing artifact, terminal) from "stat itself failed" (Err,
-            // transient permission/IO/mount issue). Only Ok(false) maps to
-            // FailedPrecondition; stat errors surface as Internal so the
-            // reconciler retries instead of escalating to mark-as-failed.
-            match std::path::Path::new(&path).try_exists() {
-                Ok(true) => {}
-                Ok(false) => {
-                    // The marker substring is the classifier signal the
-                    // cluster controller's promote handler keys off (see
-                    // `pplx_space_common_core::node_drain_signals`). Both
-                    // sides must reference the constant — a reworded
-                    // literal here would silently flip the consumer from
-                    // "terminal, mark sandbox failed" to "retry forever".
-                    return Err(Status::failed_precondition(format!(
-                        "cannot reupload snapshot: {marker} at {path} \
-                         — the local snapshot has already been pruned; the sandbox cannot \
-                         be promoted from this node",
-                        marker = pplx_space_common_core::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER,
-                    )));
-                }
-                Err(err) => {
-                    return Err(Status::internal(format!(
-                        "cannot reupload snapshot: failed to stat artifact at {path}: {err}",
-                    )));
-                }
-            }
-        }
+        // Exactly the VM artifacts `submit_suspend_snapshot` reads off disk;
+        // `snapshot.json` is regenerated at submit time and stays out of it.
+        require_artifact_backup_files(
+            self.retained_source_inspector.as_ref(),
+            &sandbox.id,
+            &snapshot_dir,
+            pplx_space_common_core::types::ArtifactKind::Full,
+            reupload_format,
+            BackupFilesPolicy::Reupload,
+        )
+        .await?;
 
         // Backup admission must distinguish a transient cluster-api lookup
         // failure (retryable — surface as `Internal` so the reconciler keeps
