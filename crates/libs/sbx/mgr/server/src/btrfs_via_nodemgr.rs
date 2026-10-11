@@ -15,7 +15,8 @@
 use pplx_space_node_mgr_client::execution_fence::{ExecutionFence, InstanceTarget};
 use pplx_space_node_mgr_client::proto::{
     BtrfsDeleteSandboxInstanceRequest, BtrfsEncodeRootfsSendRequest,
-    BtrfsEncodeSnapshotRootfsSendRequest, BtrfsReceiveInstanceRequest,
+    BtrfsEncodeSnapshotRootfsSendRequest, BtrfsInspectSendSourceRequest,
+    BtrfsReceiveInstanceRequest, GetBtrfsSendCapabilitiesRequest,
 };
 use thiserror::Error;
 use tonic::Status;
@@ -32,6 +33,11 @@ pub enum BtrfsViaNodemgrError {
         #[source]
         status: tonic::Status,
     },
+    #[error("node-manager rpc {rpc} returned an unusable response: {reason}")]
+    InvalidResponse {
+        rpc: &'static str,
+        reason: &'static str,
+    },
 }
 
 impl BtrfsViaNodemgrError {
@@ -46,6 +52,75 @@ impl BtrfsViaNodemgrError {
                 Status::internal(format!("node-manager unreachable: {reason}"))
             }
             BtrfsViaNodemgrError::Rpc { rpc: _, status } => status,
+            // Not FailedPrecondition: a deferred capture has already removed
+            // rootfs.ext4, so falling back to the Full codec cannot help.
+            error @ BtrfsViaNodemgrError::InvalidResponse { .. } => {
+                Status::internal(error.to_string())
+            }
+        }
+    }
+}
+
+/// What a btrfs-send capture left in the artifact directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CapturedRootfs {
+    /// `rootfs.btrfs-send` was written. A retained source, if any, only
+    /// regenerates the stream after it is reclaimed.
+    Stream {
+        stream_bytes: u64,
+        source_id: Option<uuid::Uuid>,
+    },
+    /// No stream was written; volume-manager streams from the retained source.
+    Deferred {
+        source_id: uuid::Uuid,
+        /// The retained rootfs image length, not a stream length.
+        rootfs_bytes: u64,
+    },
+}
+
+impl CapturedRootfs {
+    /// Capability probes are advisory, so validate what node-manager actually
+    /// did. A deferral without the retained size fails rather than becoming a
+    /// zero-sized artifact. A materialized capture needs no size, so an older
+    /// node-manager's response stays valid.
+    fn from_response(
+        rpc: &'static str,
+        defer_requested: bool,
+        stream_bytes: u64,
+        source_id: Option<&str>,
+        rootfs_bytes: Option<u64>,
+    ) -> Result<Self, BtrfsViaNodemgrError> {
+        let invalid = |reason| BtrfsViaNodemgrError::InvalidResponse { rpc, reason };
+        let source_id = source_id
+            .map(str::parse::<uuid::Uuid>)
+            .transpose()
+            .map_err(|_| invalid("invalid retained source identity"))?;
+        // A btrfs send stream always has a header, so zero bytes with a
+        // retained source is node-manager's deferral acknowledgement.
+        match source_id {
+            Some(source_id) if defer_requested && stream_bytes == 0 => Ok(Self::Deferred {
+                source_id,
+                rootfs_bytes: rootfs_bytes
+                    .ok_or_else(|| invalid("deferred capture omitted the retained rootfs size"))?,
+            }),
+            source_id => Ok(Self::Stream {
+                stream_bytes,
+                source_id,
+            }),
+        }
+    }
+
+    pub(crate) fn source_id(self) -> Option<uuid::Uuid> {
+        match self {
+            Self::Stream { source_id, .. } => source_id,
+            Self::Deferred { source_id, .. } => Some(source_id),
+        }
+    }
+
+    pub(crate) fn stream_bytes(self) -> u64 {
+        match self {
+            Self::Stream { stream_bytes, .. } => stream_bytes,
+            Self::Deferred { .. } => 0,
         }
     }
 }
@@ -59,10 +134,12 @@ pub(crate) async fn encode_rootfs_send(
     content_hash: &str,
     snapshot_dir: &str,
     execution_fence: ExecutionFence,
-) -> Result<u64, BtrfsViaNodemgrError> {
+) -> Result<CapturedRootfs, BtrfsViaNodemgrError> {
+    const RPC: &str = "BtrfsEncodeRootfsSend";
     let mut client = pplx_space_node_mgr_client::connect()
         .await
         .map_err(|e| BtrfsViaNodemgrError::Connect(e.to_string()))?;
+    let defer = defer_send().await;
     let response = client
         .btrfs_encode_rootfs_send(BtrfsEncodeRootfsSendRequest {
             sandbox_id: sandbox_id.to_string(),
@@ -71,19 +148,25 @@ pub(crate) async fn encode_rootfs_send(
             dest_dir: Some(snapshot_dir.to_string()),
             execution_fence: Some(execution_fence.into()),
             retain_source: retain_send_sources(),
-            defer_send: defer_send().await,
+            defer_send: defer,
         })
         .await
-        .map_err(|status| BtrfsViaNodemgrError::Rpc {
-            rpc: "BtrfsEncodeRootfsSend",
-            status,
-        })?
+        .map_err(|status| BtrfsViaNodemgrError::Rpc { rpc: RPC, status })?
         .into_inner();
-    Ok(response.stream_bytes)
+    CapturedRootfs::from_response(
+        RPC,
+        defer,
+        response.stream_bytes,
+        response.source_id.as_deref(),
+        response.rootfs_bytes,
+    )
 }
 
 /// Encode an already-created immutable named snapshot. This is distinct from
 /// [`encode_rootfs_send`], which captures the live instance itself.
+///
+/// Always materialized, never retained: these artifacts have no local sidecar
+/// to persist a source identity, and their stream is never reclaimed.
 pub(crate) async fn encode_snapshot_rootfs_send(
     sandbox_id: &str,
     template_name: &str,
@@ -101,8 +184,8 @@ pub(crate) async fn encode_snapshot_rootfs_send(
             content_hash: content_hash.to_string(),
             snapshot_name: snapshot_name.to_string(),
             dest_dir: dest_dir.to_string(),
-            retain_source: retain_send_sources(),
-            defer_send: defer_send().await,
+            retain_source: false,
+            defer_send: false,
         })
         .await
         .map_err(|status| BtrfsViaNodemgrError::Rpc {
@@ -199,10 +282,96 @@ pub(crate) async fn materialize_rootfs_send(
         })
 }
 
-async fn defer_send() -> bool {
-    if !retain_send_sources() {
-        return false;
+/// Read-only check of a retained source. Node-manager maps an absent bundle to
+/// `NotFound` and an unusable one to `FailedPrecondition`; any other status,
+/// including `Unimplemented` from an older node-manager, proves nothing.
+pub(crate) async fn inspect_send_source(
+    sandbox_id: &str,
+    artifact_dir: &std::path::Path,
+    source_id: uuid::Uuid,
+) -> Result<u64, BtrfsViaNodemgrError> {
+    // Inspections are frequent and bounded; they share node-manager's lazy,
+    // reconnecting channel instead of dialing the socket per call. A dead
+    // socket surfaces as an RPC status, which proves nothing about the source.
+    pplx_space_node_mgr_client::lazy()
+        .btrfs_inspect_send_source(BtrfsInspectSendSourceRequest {
+            sandbox_id: sandbox_id.to_owned(),
+            artifact_dir: artifact_dir.to_string_lossy().into_owned(),
+            source_id: source_id.to_string(),
+        })
+        .await
+        .map(|response| response.into_inner().rootfs_bytes)
+        .map_err(|status| BtrfsViaNodemgrError::Rpc {
+            rpc: "BtrfsInspectSendSource",
+            status,
+        })
+}
+
+const CAPABILITY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long a capability answer is reused. Capabilities change only with a
+/// peer's deployment, so every capture and backup need not pay a round trip;
+/// a peer that answered negatively or not at all is asked again sooner.
+const CAPABILITY_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+const CAPABILITY_RETRY_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A capability answer with the moment it was obtained.
+pub(crate) struct CapabilityCache(std::sync::Mutex<Option<(std::time::Instant, bool)>>);
+
+impl CapabilityCache {
+    pub(crate) const fn new() -> Self {
+        Self(std::sync::Mutex::new(None))
     }
+
+    /// The cached answer while it is fresh, otherwise `probe`'s, cached.
+    pub(crate) async fn get<F>(&self, probe: F) -> bool
+    where
+        F: std::future::Future<Output = bool>,
+    {
+        let now = std::time::Instant::now();
+        if let Some((at, value)) = *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            let ttl = if value {
+                CAPABILITY_CACHE_TTL
+            } else {
+                CAPABILITY_RETRY_TTL
+            };
+            if now.duration_since(at) < ttl {
+                return value;
+            }
+        }
+        let value = probe.await;
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((std::time::Instant::now(), value));
+        value
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear(&self) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
+static VOLUME_MANAGER_STREAMS: CapabilityCache = CapabilityCache::new();
+static NODE_MANAGER_INSPECTS: CapabilityCache = CapabilityCache::new();
+
+/// Whether volume-manager can stream an upload from a retained source. Gates
+/// existing retained artifacts too: without it they materialize first.
+pub(crate) async fn volume_manager_streams_btrfs_send() -> bool {
+    VOLUME_MANAGER_STREAMS
+        .get(probe_volume_manager_streams_btrfs_send())
+        .await
+}
+
+async fn probe_volume_manager_streams_btrfs_send() -> bool {
     let probe = async {
         let mut client = pplx_space_volmgr_client::connect(pplx_space_volmgr_client::VOLMGR_SOCKET)
             .await
@@ -212,7 +381,7 @@ async fn defer_send() -> bool {
             .await
             .map(|response| response.into_inner().btrfs_send)
     };
-    match tokio::time::timeout(std::time::Duration::from_secs(2), probe).await {
+    match tokio::time::timeout(CAPABILITY_PROBE_TIMEOUT, probe).await {
         Ok(Ok(enabled)) => enabled,
         result => {
             tracing::debug!(
@@ -223,3 +392,45 @@ async fn defer_send() -> bool {
         }
     }
 }
+
+/// Whether node-manager can inspect retained sources and report their size.
+/// A deferred artifact is unverifiable without both.
+async fn node_manager_inspects_send_sources() -> bool {
+    NODE_MANAGER_INSPECTS
+        .get(probe_node_manager_inspects_send_sources())
+        .await
+}
+
+async fn probe_node_manager_inspects_send_sources() -> bool {
+    let probe = async {
+        let mut client = pplx_space_node_mgr_client::lazy();
+        client
+            .get_btrfs_send_capabilities(GetBtrfsSendCapabilitiesRequest {})
+            .await
+            .map(|response| response.into_inner().inspect_send_source)
+    };
+    match tokio::time::timeout(CAPABILITY_PROBE_TIMEOUT, probe).await {
+        Ok(Ok(supported)) => supported,
+        result => {
+            tracing::debug!(
+                ?result,
+                "using materialized send without retained-source inspection"
+            );
+            false
+        }
+    }
+}
+
+async fn defer_send() -> bool {
+    if !retain_send_sources() {
+        return false;
+    }
+    let (streams, inspects) = tokio::join!(
+        volume_manager_streams_btrfs_send(),
+        node_manager_inspects_send_sources()
+    );
+    streams && inspects
+}
+
+#[cfg(test)]
+mod tests;

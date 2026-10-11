@@ -339,6 +339,8 @@ enum ArtifactBackupSubmissionError {
     Other(String),
     #[error("begin restore-visible snapshot backup: {0}")]
     Begin(#[source] pplx_space_common_jobs::JobError),
+    #[error(transparent)]
+    RetainedUpload(#[from] suspend_snapshot::RetainedUploadError),
 }
 
 impl From<String> for ArtifactBackupSubmissionError {
@@ -360,6 +362,32 @@ struct TeardownSuspendBackup<'a> {
     execution_generation: pplx_space_common_core::types::ExecutionGeneration,
     artifact: &'a crate::db::LocalArtifactRow,
     format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
+}
+
+/// The persisted retained-source identity of a full artifact, if any.
+pub(super) fn sidecar_rootfs_send_source_id(
+    snapshot_dir: &str,
+) -> Result<Option<uuid::Uuid>, Status> {
+    let path =
+        std::path::Path::new(snapshot_dir).join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(Status::internal(format!(
+                "failed to read snapshot metadata at {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    serde_json::from_slice::<crate::snapshot_upload::SnapshotMeta>(&bytes)
+        .map(|meta| meta.rootfs_send_source_id)
+        .map_err(|error| {
+            Status::internal(format!(
+                "snapshot metadata present but unparseable at {}: {error}",
+                path.display()
+            ))
+        })
 }
 
 #[cfg(test)]

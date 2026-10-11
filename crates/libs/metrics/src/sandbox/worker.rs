@@ -1312,6 +1312,8 @@ pub enum InventoryReconcileReason {
     MaterializationError,
     MalformedCleanupIntent,
     FilesystemInspectionFailed,
+    /// A retained send source has no node-manager answer in this pass.
+    RetainedSourcePending,
 }
 
 impl InventoryReconcileReason {
@@ -1334,6 +1336,7 @@ impl InventoryReconcileReason {
             Self::MaterializationError => "materialization_error",
             Self::MalformedCleanupIntent => "malformed_cleanup_intent",
             Self::FilesystemInspectionFailed => "filesystem_inspection_failed",
+            Self::RetainedSourcePending => "retained_source_pending",
         }
     }
 }

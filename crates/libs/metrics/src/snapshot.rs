@@ -269,6 +269,29 @@ pub fn stream_reclaim_skipped(reason: &str) {
     );
 }
 
+/// One node-manager inspection of a retained btrfs send source. `outcome` is
+/// `present`, `absent`, `invalid`, or `unavailable`. Unavailable outcomes carry
+/// the gRPC `code`; a persistent `unimplemented` means an older node-manager,
+/// and `permission_denied` a socket identity mismatch.
+pub fn retained_source_inspection(outcome: &str, code: Option<&str>) {
+    let mut tags = vec![tag("outcome", outcome)];
+    if let Some(code) = code {
+        tags.push(tag("code", code));
+    }
+    counter("snapshot.retained_source.inspection", 1, &tags);
+}
+
+/// Retained sources that periodic recovery still cannot resolve after a pass,
+/// and the age of the oldest. Their artifacts are preserved meanwhile.
+pub fn retained_source_pending(count: usize, oldest_age_seconds: f64) {
+    gauge("snapshot.retained_source.pending", count as f64, &[]);
+    gauge(
+        "snapshot.retained_source.pending_oldest_age_seconds",
+        oldest_age_seconds,
+        &[],
+    );
+}
+
 /// Unidentifiable completed-upload evidence observed by a bounded repair pass.
 /// Reasons are `malformed_payload` and `missing_artifact_id`. Repeated sweeps
 /// count a retained row again; this is neither unique jobs nor total backlog.

@@ -1740,6 +1740,7 @@ impl SandboxManagerService {
         db: &Arc<Mutex<rusqlite::Connection>>,
         sandbox_id: &str,
         cleanup_id: SandboxCleanupEpisodeId,
+        verdicts: &crate::retained_source::RetainedSourceVerdicts,
     ) -> Result<(), QuarantineRecoveryArtifactError> {
         let expected_artifact_id = {
             let db = db
@@ -1762,6 +1763,7 @@ impl SandboxManagerService {
             super::suspend_snapshot_publication::validate_canonical_suspend_snapshot_for_recovery(
                 Path::new(CACHE_DIR),
                 sandbox_id_typed,
+                verdicts,
             )?;
         if artifact.local_artifact_id == expected_artifact_id {
             Ok(())
@@ -1785,12 +1787,20 @@ impl SandboxManagerService {
             .lock_owned()
             .await;
         let owned_sandbox_id = sandbox_id.to_owned();
+        // Inspected under the artifact lock, which the completion below keeps.
+        let verdicts = self
+            .inspect_retained_sources_in(
+                vec![Path::new(CACHE_DIR).join(sandbox_id)],
+                &mut Default::default(),
+            )
+            .await;
         let recovery_validation = match self
             .blocking_io(move |service| {
                 Ok(Self::validate_quarantine_recovery_artifact(
                     &service.db,
                     &owned_sandbox_id,
                     cleanup_id,
+                    &verdicts,
                 ))
             })
             .await
