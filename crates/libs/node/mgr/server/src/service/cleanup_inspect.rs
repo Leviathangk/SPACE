@@ -853,6 +853,11 @@ impl NodeManagerService {
             } else {
                 String::new()
             },
+            cgroup_cpu_stat: if cgroup_exists {
+                read_cgroup("cpu.stat")
+            } else {
+                String::new()
+            },
             cache_dir_exists: std::path::Path::new(&format!("{CACHE_DIR}/{sandbox_id}")).exists(),
             run_dir_exists: std::path::Path::new(&run_dir).exists(),
             jailer_chroot_exists: std::path::Path::new(&jail_root).exists(),
