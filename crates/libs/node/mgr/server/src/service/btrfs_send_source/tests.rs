@@ -101,6 +101,13 @@ fn retained_source_regenerates_after_producer_deletion_and_receives_on_same_file
     let instance = artifact_fs::directory(&directory, "instance".as_ref()).unwrap();
     let expected = b"frozen snapshot data: longer than the original";
     std::fs::write(root.join("instance/rootfs.ext4"), expected).unwrap();
+    let old_uid = 100_042;
+    nix::unistd::chown(
+        &root.join("instance/rootfs.ext4"),
+        Some(nix::unistd::Uid::from_raw(old_uid)),
+        Some(nix::unistd::Gid::from_raw(old_uid)),
+    )
+    .unwrap();
     std::fs::create_dir(root.join("snapshot")).unwrap();
     let snapshot = root.join("snapshot");
     let id = capture(&snapshot, &root.join("template"), &root.join("instance")).unwrap();
@@ -118,6 +125,47 @@ fn retained_source_regenerates_after_producer_deletion_and_receives_on_same_file
         inspect(&snapshot, Uuid::now_v7()).unwrap_err().code(),
         tonic::Code::FailedPrecondition
     );
+    // Slot retirement must leave immutable send inputs intact, including
+    // staging artifacts that the ordinary snapshots sweep visits separately.
+    let staged = root.join("snapshots/.suspend-publish-test");
+    std::fs::create_dir(root.join("snapshots")).unwrap();
+    for artifact in [&snapshot, &staged] {
+        if artifact == &staged {
+            std::fs::rename(&snapshot, &staged).unwrap();
+        }
+        for scoped in [true, false] {
+            let mutable = root.join("retired-slot-data");
+            std::fs::write(&mutable, b"retire this owner").unwrap();
+            nix::unistd::chown(
+                &mutable,
+                Some(nix::unistd::Uid::from_raw(old_uid)),
+                Some(nix::unistd::Gid::from_raw(old_uid)),
+            )
+            .unwrap();
+            assert!(if scoped {
+                super::super::cleanup_helpers::neutralize_retained_cache_dir_owned_by_uid(
+                    &root, old_uid,
+                )
+                .unwrap()
+            } else {
+                super::super::cleanup_helpers::neutralize_retained_cache_dir(&root).unwrap()
+            });
+            assert_eq!(
+                crate::cache_ownership::first_path_owned_by_uid(&root, old_uid).unwrap(),
+                None
+            );
+            let bundle = artifact.join(DIRECTORY);
+            assert_eq!(std::fs::metadata(&bundle).unwrap().mode() & 0o7777, 0o750);
+            assert_eq!(
+                std::fs::metadata(bundle.join("source/rootfs.ext4"))
+                    .unwrap()
+                    .uid(),
+                old_uid
+            );
+            assert_eq!(inspect(artifact, id).unwrap(), expected.len() as u64);
+        }
+    }
+    std::fs::rename(&staged, &snapshot).unwrap();
     let mut lengths = Vec::new();
     // Reopen all persisted state for every attempt; no in-memory pin survives.
     for _ in 0..2 {
