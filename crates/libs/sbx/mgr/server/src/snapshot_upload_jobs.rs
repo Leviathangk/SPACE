@@ -457,22 +457,21 @@ pub(crate) fn spawn_backup_bookkeeping(
         // The durability marker first, waiting on nothing but the database.
         // Whether a reclaim is due is read in the same hold, so node-manager
         // is asked only when the stream exists and the pin still stands.
-        let (stamped, reclaim_due) = {
+        let reclaim_due = {
             let db = std::sync::Arc::clone(&db);
             let payload = payload.clone();
             tokio::task::spawn_blocking(move || {
                 let conn = db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let stamped = stamp_backup_completed(&conn, &payload);
-                let due = stamped.is_ok() && stream_reclaim_due(&conn, &payload).unwrap_or(false);
-                (stamped, due)
+                stamp_backup_completed(&conn, &payload)?;
+                stream_reclaim_due(&conn, &payload)
             })
             .await
-            .unwrap_or_else(|join| (Err(join_failed(join)), false))
+            .unwrap_or_else(|join| Err(join_failed(join)))
         };
-        let result = match (stamped, reclaim_due) {
-            (Err(error), _) => Err(error),
-            (Ok(()), false) => Ok(()),
-            (Ok(()), true) => {
+        let result = match reclaim_due {
+            Err(error) => Err(error),
+            Ok(false) => Ok(()),
+            Ok(true) => {
                 let reclaim_image = retained_image_for_reclaim(inspector.as_ref(), &payload).await;
                 let payload = payload.clone();
                 tokio::task::spawn_blocking(move || {
@@ -669,7 +668,9 @@ fn stamp_backup_completed(
 }
 
 /// Whether a reclaim is worth an inspection: a reclaimable artifact whose
-/// stream still exists while the sandbox is suspended with it pinned.
+/// stream still exists while the sandbox is suspended with it pinned. A
+/// reclaimable artifact that fails either check is counted as skipped here,
+/// because no later step sees it.
 fn stream_reclaim_due(
     conn: &rusqlite::Connection,
     payload: &SnapshotUploadJobs,
@@ -680,18 +681,30 @@ fn stream_reclaim_due(
     if !stream_reclaim_applies(&payload.meta) {
         return Ok(false);
     }
+    let sandbox_id = &payload.meta.sandbox_id;
+    if !crate::db::sandbox_suspended_with_pinned_artifact(
+        conn,
+        sandbox_id,
+        &local_artifact_id.to_string(),
+    )? {
+        pplx_space_metrics::snapshot::stream_reclaim_skipped("not_pinned_suspended");
+        tracing::info!(
+            sandbox_id,
+            backup_attempt_id = %payload.snapshot_id,
+            local_artifact_id = %local_artifact_id,
+            "rootfs stream reclaim skipped: sandbox no longer suspended with this artifact pinned",
+        );
+        return Ok(false);
+    }
     if !payload
         .snapshot_dir
         .join(ROOTFS_BTRFS_SEND_FILENAME)
         .exists()
     {
+        pplx_space_metrics::snapshot::stream_reclaim_skipped("missing");
         return Ok(false);
     }
-    crate::db::sandbox_suspended_with_pinned_artifact(
-        conn,
-        &payload.meta.sandbox_id,
-        &local_artifact_id.to_string(),
-    )
+    Ok(true)
 }
 
 /// Reclaim the uploaded stream under the connection hold that rechecks the
