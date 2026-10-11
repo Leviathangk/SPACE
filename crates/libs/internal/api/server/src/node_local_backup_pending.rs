@@ -9,15 +9,14 @@
 //! read a bounded, node-scoped queue instead of deriving the set from
 //! `sandboxes` history.
 //!
-//! ## Written from the first census, read by nothing yet
+//! ## Written from the first census
 //!
 //! The node-side producer of `pending_local_backups` ships alongside this, so
 //! the queue starts filling as soon as both are deployed — this is not a
-//! dormant path waiting on a flag. Nothing reads it: no consumer of
-//! `node_local_backup_pending` or of
-//! `node_status_snapshots.local_backup_inventory_reported_at` exists outside
-//! this module and its tests. The node-drain reader is a separate change and
-//! is expected to carry its own default-off flag, but that reader and that
+//! dormant path waiting on a flag. Backup admission uses exact pending-artifact
+//! evidence together with retired execution ownership when placement has cleared.
+//! The node-drain reader is a separate change and is expected to carry its own
+//! default-off flag, but that reader and that
 //! flag are **not in this tree** — nothing here gates them, and this
 //! paragraph is not evidence that a cutover control exists. Writing early and
 //! reading late is deliberate: the mirror has to have been correct for a
@@ -775,6 +774,47 @@ pub(super) async fn clear_finalized(
         .rows_affected()
         > 0;
     Ok(removed)
+}
+
+/// Recover only the exact retained artifact from the last scheduled execution.
+/// The row lock fences a concurrent activation while Begin binds the attempt.
+/// Census claims alone are not execution authority, and neither an older node
+/// nor a current restore lease may supply this unplaced-sandbox fallback.
+pub(super) async fn retired_artifact_source(
+    conn: &mut sqlx::PgConnection,
+    sandbox_id: SandboxId,
+    artifact_id: LocalArtifactId,
+    artifact_kind: ArtifactKind,
+) -> Result<Option<NodeId>, sqlx::Error> {
+    sqlx::query_scalar(sql!(
+        "SELECT pending.node_id
+           FROM sandboxes sandbox
+           JOIN node_k8s node ON node.k8s_node_name = (
+               SELECT execution.k8s_node_name FROM sandbox_k8s_executions execution
+                WHERE execution.sandbox_id = sandbox.id
+                  AND execution.k8s_node_name IS NOT NULL
+                ORDER BY execution.generation DESC LIMIT 1
+           )
+           JOIN nodes registered ON registered.id = node.node_id AND registered.role = 'worker'
+           JOIN node_local_backup_pending pending
+             ON pending.node_id = node.node_id AND pending.sandbox_id = sandbox.id
+          WHERE sandbox.id = $1 AND sandbox.managed_by = 'k8s'
+            AND sandbox.active_node_id IS NULL AND sandbox.target_node_id IS NULL
+            AND sandbox.lifecycle IN ('suspended', 'suspending', 'stopped', 'stopping', 'restoring')
+            AND (sandbox.restore_lease_expires_at IS NULL OR sandbox.restore_lease_expires_at <= NOW())
+            AND (sandbox.current_local_artifact_id IS NULL OR sandbox.current_local_artifact_id = $2)
+            AND pending.artifact_id = $2 AND pending.artifact_kind = $3
+            AND NOT EXISTS (
+                SELECT 1 FROM sandbox_k8s_executions current_execution
+                 WHERE current_execution.sandbox_id = sandbox.id AND current_execution.active
+            )
+          FOR UPDATE OF sandbox"
+    ))
+    .bind(sandbox_id)
+    .bind(artifact_id)
+    .bind(artifact_kind.as_str())
+    .fetch_optional(conn)
+    .await
 }
 
 #[cfg(test)]

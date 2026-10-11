@@ -538,7 +538,14 @@ pub(crate) fn prepared_upload_requires_begin(payload: &SnapshotUploadJobs) -> bo
         && payload.meta.execution.is_some()
 }
 
-pub(crate) async fn begin_prepared_upload(payload: &SnapshotUploadJobs) -> Result<(), JobError> {
+#[derive(Debug)]
+pub(crate) struct BackupRegistration {
+    pub(crate) accepts_unstaged_retry: bool,
+}
+
+pub(crate) async fn begin_prepared_upload(
+    payload: &SnapshotUploadJobs,
+) -> Result<BackupRegistration, JobError> {
     let local_artifact_id = payload.meta.local_artifact_id.ok_or_else(|| {
         JobError::permanent("prepared snapshot upload is missing local_artifact_id")
     })?;
@@ -1076,7 +1083,7 @@ pub(crate) enum BeginArtifactBackupError {
 
 pub(crate) async fn begin_with_cluster_api(
     request: BeginArtifactBackup<'_>,
-) -> Result<(), BeginArtifactBackupError> {
+) -> Result<BackupRegistration, BeginArtifactBackupError> {
     let mut client = pplx_space_node_api_client::cluster::connect_from_env()
         .await
         .map_err(BeginArtifactBackupError::Connect)?;
@@ -1115,7 +1122,12 @@ pub(crate) async fn begin_with_cluster_api(
     client
         .begin_artifact_backup(req)
         .await
-        .map(|_| ())
+        .map(|response| BackupRegistration {
+            accepts_unstaged_retry: response
+                .metadata()
+                .get(pplx_space_node_api_client::BACKUP_ATTEMPT_OPEN_METADATA)
+                .is_some_and(|value| value == "true"),
+        })
         .map_err(|status| BeginArtifactBackupError::BeginArtifactBackup {
             code: status.code(),
             message: status.message().to_string(),

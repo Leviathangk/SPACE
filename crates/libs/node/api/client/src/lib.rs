@@ -1,3 +1,8 @@
+/// BeginArtifactBackup acknowledgement that the attempt is still creating.
+/// Older servers omit it; callers must not automatically reopen a permanently
+/// failed local upload without this positive, authenticated response.
+pub const BACKUP_ATTEMPT_OPEN_METADATA: &str = "x-space-backup-attempt-open";
+
 pub mod activation;
 pub mod cluster;
 

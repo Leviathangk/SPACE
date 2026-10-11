@@ -837,6 +837,24 @@ impl ClusterApiService {
         }
         let execution_metadata = snapshot_execution_metadata(req.execution.as_ref())?;
         let sandbox = self.lookup_snapshot_sandbox(sandbox_id).await?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| Status::internal(format!("begin tx: {e}")))?;
+        // Current placement wins. Once retirement clears it, recover authority
+        // only from the exact pending artifact and its last execution owner.
+        let source_node = match sandbox.source_node_id() {
+            Some(node) => Some(node),
+            None => node_local_backup_pending::retired_artifact_source(
+                &mut tx,
+                sandbox_id,
+                local_artifact_id,
+                artifact_kind,
+            )
+            .await
+            .map_err(|e| Status::internal(format!("retired backup source: {e}")))?,
+        };
         let snapshot = sandbox
             .new_snapshot(
                 snapshot_id,
@@ -845,13 +863,9 @@ impl ClusterApiService {
                 SnapshotState::Creating,
                 storage_uri,
             )?
+            .with_source_node_id(source_node)
             .with_artifact(artifact)
             .with_execution_metadata(execution_metadata);
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| Status::internal(format!("begin tx: {e}")))?;
 
         let persisted = snapshot_store::insert(&mut tx, &snapshot)
             .await
@@ -866,14 +880,26 @@ impl ClusterApiService {
             "backup attempt",
         )
         .await?;
+        if persisted.state() == SnapshotState::Failed {
+            return Err(Status::failed_precondition(
+                "backup attempt already failed; a new attempt is required",
+            ));
+        }
         tx.commit()
             .await
             .map_err(|e| Status::internal(format!("commit tx: {e}")))?;
 
-        Ok(Response::new(BeginArtifactBackupResponse {
+        let mut response = Response::new(BeginArtifactBackupResponse {
             local_artifact_id: local_artifact_id.to_string(),
             backup_attempt_id: backup_attempt_id.to_string(),
-        }))
+        });
+        if persisted.state() == SnapshotState::Creating {
+            response.metadata_mut().insert(
+                pplx_space_node_api_client::BACKUP_ATTEMPT_OPEN_METADATA,
+                tonic::metadata::MetadataValue::from_static("true"),
+            );
+        }
+        Ok(response)
     }
 
     pub(crate) async fn finalize_artifact_backup(
@@ -1444,8 +1470,8 @@ impl ClusterApiService {
         subject: &str,
     ) -> Result<NodeId, Status> {
         let node_id = source_node_id.ok_or_else(|| {
-            Status::failed_precondition(format!(
-                "{subject} has no source node that may publish a backup for it"
+            Status::unavailable(format!(
+                "{subject} has no verified source node yet; waiting for placement or retained-artifact evidence"
             ))
         })?;
         let origin = self
