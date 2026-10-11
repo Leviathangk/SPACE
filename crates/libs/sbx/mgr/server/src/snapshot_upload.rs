@@ -721,8 +721,25 @@ pub(crate) fn write_snapshot_metadata_to(
     };
     let meta_json = serde_json::to_string_pretty(&written)?;
     std::fs::create_dir_all(metadata_dir).map_err(SnapshotMetadataWriteError::CreateMetadataDir)?;
-    std::fs::write(metadata_dir.join(SNAPSHOT_METADATA_FILENAME), &meta_json)
-        .map_err(SnapshotMetadataWriteError::WriteMetadata)?;
+    // Restores may leave a sidecar owned by volume-manager. Directory write
+    // permission lets us replace it without writing another service's inode;
+    // readers keep a complete old or new document even across a crash.
+    let publish = || -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let mut temporary = tempfile::NamedTempFile::new_in(metadata_dir)?;
+        temporary.write_all(meta_json.as_bytes())?;
+        // Volume-manager must be able to read the staged upload metadata.
+        temporary
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o644))?;
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist(metadata_dir.join(SNAPSHOT_METADATA_FILENAME))
+            .map_err(|error| error.error)?;
+        std::fs::File::open(metadata_dir)?.sync_all()
+    };
+    publish().map_err(SnapshotMetadataWriteError::WriteMetadata)?;
     Ok(meta_final)
 }
 
