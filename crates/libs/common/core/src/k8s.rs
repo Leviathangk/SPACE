@@ -456,6 +456,7 @@ fn env_or(key: &str, default: &str) -> String {
 
 #[derive(Debug, Clone, Copy)]
 pub struct SandboxPoolPodMetadata {
+    pub encryptable: bool,
     pub slot_id: Uuid,
     pub config_id: Uuid,
     pub vcpu: VcpuCount,
@@ -987,6 +988,12 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
             SANDBOX_POOL_SLOT_ID_KEY.to_string(),
             pool.slot_id.to_string(),
         );
+        if pool.encryptable {
+            annotations.insert(
+                "space.pplx.net/encryptable-pool-member".to_string(),
+                "true".to_string(),
+            );
+        }
         annotations.insert(
             SANDBOX_POOL_CONFIG_ID_KEY.to_string(),
             pool.config_id.to_string(),

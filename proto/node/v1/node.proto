@@ -1169,22 +1169,33 @@ message PrepareEncryptedRootfsRequest {
   // fresh create and on a same-node restore (the COW was kept in place).
   optional string restore_cow_source = 2;
   ExecutionFence execution_fence = 3;
+  // Convert a paused pool member's existing COW; mutually exclusive with restore.
+  optional PoolRootfsAdoption pool_adoption = 4;
+}
+
+message PoolRootfsAdoption {
+  string claim_id = 1;
+  string expected_org_id = 2;
 }
 
 message PrepareEncryptedRootfsResponse {
   // /dev/mapper/<composite> for Firecracker path_on_host.
   string mapper_path = 1;
+  optional string adopted_claim_id = 2;
 }
 
 message PrepareSnapshotRootfsRequest {
   string sandbox_id = 1;
   ExecutionFence execution_fence = 2;
+  // Collapse the pre-claim COW for a plaintext adopter, keeping the open device.
+  optional PoolRootfsAdoption pool_adoption = 3;
 }
 
 message PrepareSnapshotRootfsResponse {
   // /dev/mapper/<composite> for Firecracker path_on_host — the same shape
   // PrepareEncryptedRootfs returns, so the caller's boot path is identical.
   string mapper_path = 1;
+  optional string adopted_claim_id = 2;
 }
 
 message PrepareEncryptedVolumeRequest {

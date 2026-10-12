@@ -189,6 +189,7 @@ fn immediate_work_rpcs() -> [Case; 8] {
                 Box::pin(async move {
                     service
                         .prepare_snapshot_rootfs(root(PrepareSnapshotRootfsRequest {
+                            pool_adoption: None,
                             sandbox_id,
                             ..Default::default()
                         }))

@@ -1485,6 +1485,7 @@ impl SandboxManagerService {
         identity_free_direct_authority: IdentityFreeDirectActivationAuthority,
     ) -> Result<Response<StartResponse>, Status> {
         let sandbox_id = &req.sandbox_id;
+        self.require_completed_pool_adoption(sandbox_id)?;
         let mut start_ctx = StartSandboxContext::from_request(&req)?;
         start_ctx.identity_free_direct_authority = identity_free_direct_authority;
         let req_vcpu = start_ctx.req_vcpu;
@@ -2157,7 +2158,9 @@ impl SandboxManagerService {
                     return Err(status);
                 }
             }
-        } else if crate::rootfs_encryption::pool_plain_cow_exists(id) {
+        } else if self.is_encryptable_pool_member(id)?
+            || crate::rootfs_encryption::pool_plain_cow_exists(id)
+        {
             // Warm-pool member: boot on the dm-snapshot composite over a
             // plaintext COW so a later claim can re-home that COW onto an
             // org-keyed LUKS one without cold-creating. A surviving cow.plain
@@ -2189,6 +2192,7 @@ impl SandboxManagerService {
                 Ok(path) => Some(path),
                 Err(e)
                     if e.degrade_to_rootfs_file_is_safe()
+                        && !self.is_encryptable_pool_member(id)?
                         && !crate::rootfs_encryption::committed_cow_state_exists(id) =>
                 {
                     tracing::warn!(

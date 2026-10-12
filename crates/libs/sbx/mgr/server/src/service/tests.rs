@@ -718,6 +718,62 @@ pub(crate) mod service_tests {
     }
 
     #[tokio::test]
+    async fn completed_encrypted_pool_adoption_replay_keeps_the_guest_running() {
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        let claim = uuid::Uuid::now_v7();
+        let org = pplx_space_common_core::types::OrgId::new();
+        let claim_receipt = crate::db::pool_adoption::PoolClaim {
+            id: claim,
+            org_id: org,
+            volume_encryption: true,
+        };
+        let mut request = pool_adoption_request(None);
+        let owner = SandboxOwner::parse(request.owner.clone()).unwrap();
+        insert_test_sandbox(&conn, &id, SandboxState::Paused);
+        crate::db::update_user(
+            &conn,
+            &id,
+            &pplx_space_common_core::types::ROOT_SANDBOX_OWNER,
+        )
+        .unwrap();
+        crate::db::pool_adoption::register(&conn, &id).unwrap();
+        assert!(
+            crate::db::pool_adoption::begin(&conn, &id, claim_receipt, &owner, &BTreeMap::new())
+                .unwrap()
+        );
+        assert!(crate::db::pool_adoption::complete(&conn, &id, claim_receipt).unwrap());
+        crate::db::update_state(&conn, &id, SandboxState::Started)
+            .unwrap()
+            .require_applied()
+            .unwrap();
+        request.content_hash = Some("hash".to_string());
+        request.claimed_sandbox = Some(crate::proto::ClaimedPoolSandbox {
+            sandbox_id: id.clone(),
+            claim_id: claim.to_string(),
+        });
+        request.encryption = Some(crate::proto::PoolSandboxEncryption {
+            expected_org_id: org.to_string(),
+            enabled: true,
+        });
+        let service = service_for_teardown_test(conn);
+
+        let response = service
+            .adopt_pool_sandbox(internal_request(request))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.sandbox_id, id);
+        assert_eq!(response.claim_id, Some(claim.to_string()));
+        assert!(response.volume_encryption);
+        assert_eq!(
+            service.lookup_sandbox(&id).unwrap().state,
+            SandboxState::Started
+        );
+    }
+
+    #[tokio::test]
     async fn pool_adoption_persists_complete_direct_route_identity() {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new();

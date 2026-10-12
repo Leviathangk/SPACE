@@ -72,6 +72,9 @@ use std::process::Command;
 use crate::device_backing::{self, Backing, LoopDevice};
 use pplx_space_common_core::types::SandboxId;
 
+mod pool_adoption;
+pub(crate) use pool_adoption::{collapse_pool_rootfs, encrypt_pool_rootfs};
+
 /// Bytes of the *decrypted* COW mapper zeroed before a FRESH dm-snapshot is
 /// created over it, so the kernel sees a clean exception store rather than
 /// LUKS header noise. Never written on restore. 4 MiB comfortably covers the
