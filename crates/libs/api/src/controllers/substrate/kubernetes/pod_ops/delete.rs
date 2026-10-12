@@ -50,12 +50,74 @@ where
     }
 }
 
-pub(super) async fn delete_sandbox_pod_with_throttle_retry(
+/// Cleanup is scoped to the pod object created by this materialization. Neither
+/// a name nor an elapsed create deadline authorizes deleting its successor.
+pub(super) async fn delete_materialization_pod(
     k8s: &KubernetesState,
-    pod_name: &str,
-    operation: &'static str,
-) -> Result<(), KubeError> {
-    retry_kube_delete_throttling(operation, || delete_sandbox_pod(k8s, pod_name)).await
+    pod: &SandboxPodView,
+    expected: Option<pplx_space_common_core::types::PodMaterializationId>,
+) -> Result<(), SubstrateError> {
+    if expected.is_none() || pod.materialization_id()? != expected {
+        return Err(SubstrateError::Unavailable {
+            message: "pod cleanup materialization changed".into(),
+        });
+    }
+    delete_observed_pod(k8s, pod).await
+}
+
+pub(super) async fn delete_execution_pod(
+    k8s: &KubernetesState,
+    pod: &SandboxPodView,
+    expected: &crate::controllers::substrate::kubernetes::store::SandboxExecutionRow,
+) -> Result<(), SubstrateError> {
+    let matches = match expected.materialization_id {
+        Some(token) => pod.materialization_id()? == Some(token),
+        None => expected
+            .observed_pod_uid
+            .as_deref()
+            .is_some_and(|uid| pod.uid() == Some(uid)),
+    };
+    if !matches {
+        return Err(SubstrateError::Unavailable {
+            message: "stale-pod cleanup no longer owns the observed pod".into(),
+        });
+    }
+    delete_observed_pod(k8s, pod).await
+}
+
+async fn delete_observed_pod(
+    k8s: &KubernetesState,
+    pod: &SandboxPodView,
+) -> Result<(), SubstrateError> {
+    let uid = pod.uid().ok_or_else(|| SubstrateError::Unavailable {
+        message: "pod cleanup requires an observed UID".into(),
+    })?;
+    let pods: Api<Pod> = Api::namespaced(k8s.client.clone(), &k8s.sandbox_namespace);
+    let params = DeleteParams {
+        preconditions: Some(kube::api::Preconditions {
+            uid: Some(uid.to_owned()),
+            resource_version: None,
+        }),
+        ..Default::default()
+    };
+    match timeout(
+        k8s.k8s_blocking_delete_timeout,
+        retry_kube_delete_throttling("materialization_cleanup", || {
+            pods.delete(pod.name(), &params)
+        }),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) if is_not_found_error(&error) => Ok(()),
+        Ok(Err(error)) => Err(kube_error_for_substrate(
+            "delete materialization pod",
+            error,
+        )),
+        Err(_) => Err(SubstrateError::Unavailable {
+            message: "materialization pod cleanup timed out".into(),
+        }),
+    }
 }
 
 /// Names of this sandbox's live pods from generations **strictly older** than

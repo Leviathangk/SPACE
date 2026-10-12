@@ -124,22 +124,10 @@ impl KubernetesSubstrate {
             reason = %reason,
             "pod create recovery found stale Kubernetes sandbox pod; replacing it"
         );
-        if let Err(err) = delete_sandbox_pod_with_throttle_retry(
-            &self.k8s,
-            &claim.row.pod_name,
-            "delete_stale_sandbox_pod_after_create_error",
-        )
-        .await
-            && !is_not_found_error(&err)
-        {
-            return Err(kube_error_for_substrate(
-                "failed to delete stale sandbox pod",
-                err,
-            ));
-        }
+        super::delete::delete_execution_pod(&self.k8s, existing, &claim.row).await?;
         let _ = self
             .store
-            .cleanup_replaced_pod_tracking_if_generation(sandbox.id, claim.row.generation)
+            .cleanup_replaced_pod_tracking_if_generation(sandbox.id, &claim.row)
             .await?;
         Ok(true)
     }
@@ -407,11 +395,12 @@ impl KubernetesSubstrate {
                 let pod_ip = assigned_pod_ip(existing)?.map(|ip| ip.to_string());
                 if self
                     .store
-                    .persist_pod_metadata(
+                    .persist_observed_pod_metadata(
                         sandbox.id,
                         claim.row.generation,
                         existing.uid(),
                         pod_ip.as_deref(),
+                        existing.materialization_id()?,
                     )
                     .await?
                     .is_none()
@@ -550,19 +539,7 @@ impl KubernetesSubstrate {
                         reason = %reason,
                         "replacing stale creating Kubernetes pod"
                     );
-                    if let Err(err) = delete_sandbox_pod_with_throttle_retry(
-                        &self.k8s,
-                        &pod_name,
-                        "delete_stale_create_pod",
-                    )
-                    .await
-                        && !is_not_found_error(&err)
-                    {
-                        return Err(kube_error_for_substrate(
-                            "failed to delete stale create pod",
-                            err,
-                        ));
-                    }
+                    super::delete::delete_execution_pod(&self.k8s, existing, &claim.row).await?;
                     reason.to_string()
                 } else {
                     self.remember_pod_node_placement(
@@ -574,11 +551,12 @@ impl KubernetesSubstrate {
                     let pod_ip = assigned_pod_ip(existing)?.map(|ip| ip.to_string());
                     if self
                         .store
-                        .persist_pod_metadata(
+                        .persist_observed_pod_metadata(
                             sandbox.id,
                             claim.row.generation,
                             existing.uid(),
                             pod_ip.as_deref(),
+                            existing.materialization_id()?,
                         )
                         .await?
                         .is_none()
@@ -697,19 +675,7 @@ impl KubernetesSubstrate {
                         reason = %reason,
                         "replacing stale Kubernetes sandbox execution pod"
                     );
-                    if let Err(err) = delete_sandbox_pod_with_throttle_retry(
-                        &self.k8s,
-                        &pod_name,
-                        "delete_stale_sandbox_pod",
-                    )
-                    .await
-                        && !is_not_found_error(&err)
-                    {
-                        return Err(kube_error_for_substrate(
-                            "failed to delete stale sandbox pod",
-                            err,
-                        ));
-                    }
+                    super::delete::delete_execution_pod(&self.k8s, &existing, &claim.row).await?;
                     if started_recovery_requires_handoff {
                         if !self
                             .replace_started_recovery_pod(
@@ -781,11 +747,12 @@ impl KubernetesSubstrate {
                     let pod_ip = assigned_pod_ip(&existing)?.map(|ip| ip.to_string());
                     if self
                         .store
-                        .persist_pod_metadata(
+                        .persist_observed_pod_metadata(
                             sandbox.id,
                             claim.row.generation,
                             existing.uid(),
                             pod_ip.as_deref(),
+                            existing.materialization_id()?,
                         )
                         .await?
                         .is_none()
@@ -990,23 +957,15 @@ impl KubernetesSubstrate {
             }
         }
 
-        if !self
+        let Some(materialization_id) = self
             .store
-            .claim_active_execution_pod_materialization(
-                sandbox.id,
-                claim.row.generation,
-                claim_lifecycle,
-            )
+            .claim_pod_materialization(sandbox.id, &claim.row, claim_lifecycle)
             .await?
-        {
-            tracing::debug!(
-                sandbox_id = %sandbox.id,
-                pod_name = %claim.row.pod_name,
-                generation = claim.row.generation,
-                "skipping Kubernetes sandbox pod create for replaced execution generation"
-            );
+        else {
             return Ok(());
-        }
+        };
+        claim.row.materialization_id = Some(materialization_id);
+        claim.row.observed_pod_uid = None;
 
         let pod_result = create_sandbox_pod(
             &self.k8s,
@@ -1112,6 +1071,7 @@ impl KubernetesSubstrate {
                 claim_lifecycle,
                 pod.uid(),
                 pod_ip.as_deref(),
+                pod.materialization_id()?,
             )
             .await
         {
@@ -1124,11 +1084,10 @@ impl KubernetesSubstrate {
                         generation = claim.row.generation,
                         "deleting Kubernetes sandbox pod created after materialization ownership was revoked"
                     );
-                    self.delete_pod_and_forget_tracking(
-                        sandbox.id,
-                        &claim.row.pod_name,
-                        claim.row.generation,
-                        PodTrackingCleanupCause::ExplicitTeardown,
+                    super::delete::delete_materialization_pod(
+                        &self.k8s,
+                        &pod,
+                        claim.row.materialization_id,
                     )
                     .await?;
                 }

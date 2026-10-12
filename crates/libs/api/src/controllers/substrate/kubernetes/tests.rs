@@ -1177,17 +1177,32 @@ mod kubernetes_tests {
                     (Method::DELETE, path)
                         if path.starts_with("/api/v1/namespaces/space/pods/") =>
                     {
-                        *existing_pod.lock().expect("existing pod mutex poisoned") = None;
-                        deleted_pods.fetch_add(1, Ordering::SeqCst);
+                        // A stale reflector may cause the older-generation sweep
+                        // to repeat an already completed delete. The API returns
+                        // NotFound; it does not delete a second pod.
+                        let existed = existing_pod
+                            .lock()
+                            .expect("existing pod mutex poisoned")
+                            .take()
+                            .is_some();
+                        if existed {
+                            deleted_pods.fetch_add(1, Ordering::SeqCst);
+                        }
+                        let status = if existed {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::NOT_FOUND
+                        };
                         let body = serde_json::json!({
                             "kind": "Status",
                             "apiVersion": "v1",
-                            "status": "Success",
-                            "code": 200
+                            "status": if existed { "Success" } else { "Failure" },
+                            "reason": if existed { "Success" } else { "NotFound" },
+                            "code": status.as_u16()
                         });
                         Ok::<_, BoxError>(
                             Response::builder()
-                                .status(StatusCode::OK)
+                                .status(status)
                                 .header("content-type", "application/json")
                                 .body(Body::from(serde_json::to_vec(&body)?))?,
                         )
@@ -1207,11 +1222,12 @@ mod kubernetes_tests {
                         captured_pod_creates
                             .lock()
                             .expect("capture mutex poisoned")
-                            .push(request_pod);
+                            .push(request_pod.clone());
                         let response_pod = serde_json::json!({
                             "apiVersion": "v1",
                             "kind": "Pod",
                             "metadata": {
+                                "annotations": request_pod.pointer("/metadata/annotations").cloned(),
                                 "name": pod_name,
                                 "namespace": "space",
                                 "uid": format!("{pod_name}-uid")
@@ -1298,11 +1314,12 @@ mod kubernetes_tests {
                         captured_pod_creates
                             .lock()
                             .expect("capture mutex poisoned")
-                            .push(request_pod);
+                            .push(request_pod.clone());
                         let response_pod = serde_json::json!({
                             "apiVersion": "v1",
                             "kind": "Pod",
                             "metadata": {
+                                "annotations": request_pod.pointer("/metadata/annotations").cloned(),
                                 "name": pod_name,
                                 "namespace": "space",
                                 "uid": format!("{pod_name}-uid")
@@ -1397,10 +1414,23 @@ mod kubernetes_tests {
                 match (method, path.as_str()) {
                     (Method::GET, path) if path.starts_with("/api/v1/namespaces/space/pods/") => {
                         let pod_name = path.rsplit('/').next().unwrap_or("space-sbx-conflict");
+                        let annotations = captured_pod_creates
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .rev()
+                            .find(|pod| {
+                                pod.pointer("/metadata/name")
+                                    .and_then(serde_json::Value::as_str)
+                                    == Some(pod_name)
+                            })
+                            .and_then(|pod| pod.pointer("/metadata/annotations"))
+                            .cloned();
                         let body = serde_json::json!({
                             "apiVersion": "v1",
                             "kind": "Pod",
                             "metadata": {
+                                "annotations": annotations,
                                 "name": pod_name,
                                 "namespace": "space",
                                 "uid": format!("{pod_name}-uid")
@@ -1447,7 +1477,7 @@ mod kubernetes_tests {
                         captured_pod_creates
                             .lock()
                             .expect("capture mutex poisoned")
-                            .push(request_pod);
+                            .push(request_pod.clone());
 
                         let mut attempts = create_attempts.lock().expect("attempt mutex poisoned");
                         let attempt = *attempts;
@@ -1475,6 +1505,7 @@ mod kubernetes_tests {
                             "apiVersion": "v1",
                             "kind": "Pod",
                             "metadata": {
+                                "annotations": request_pod.pointer("/metadata/annotations").cloned(),
                                 "name": pod_name,
                                 "namespace": "space",
                                 "uid": format!("{pod_name}-uid")
@@ -1643,11 +1674,12 @@ mod kubernetes_tests {
                         captured_pod_creates
                             .lock()
                             .expect("capture mutex poisoned")
-                            .push(request_pod);
+                            .push(request_pod.clone());
                         let response_pod = serde_json::json!({
                             "apiVersion": "v1",
                             "kind": "Pod",
                             "metadata": {
+                                "annotations": request_pod.pointer("/metadata/annotations").cloned(),
                                 "name": pod_name,
                                 "namespace": "space",
                                 "uid": format!("{pod_name}-uid")
@@ -3979,9 +4011,9 @@ mod kubernetes_tests {
         .await?;
         sqlx::query(sql!(
             "INSERT INTO sandbox_k8s_executions
-                 (sandbox_id, generation, pod_name, pod_namespace, pod_ip, state, active)
+                 (sandbox_id, generation, pod_name, pod_namespace, pod_uid, pod_ip, state, active)
              VALUES
-                 ($1, 2, $2, 'space', '127.0.0.1', 'running', TRUE)"
+                 ($1, 2, $2, 'space', $2 || '-uid', '127.0.0.1', 'running', TRUE)"
         ))
         .bind(sandbox_id)
         .bind(pod_name)
@@ -4167,13 +4199,17 @@ mod kubernetes_tests {
         .await?;
         let pending_local_pod = Pod {
             metadata: kube::api::ObjectMeta {
-                name: Some(successor_pod_name),
+                name: Some(successor_pod_name.clone()),
                 namespace: Some("space".to_string()),
-                uid: Some("local-restore-pod-uid".to_string()),
-                annotations: Some(BTreeMap::from([(
-                    SANDBOX_SUSPEND_RESTORE_SOURCE_NODE_ANNOTATION.to_string(),
-                    source_node_name.to_string(),
-                )])),
+                uid: Some(format!("{successor_pod_name}-uid")),
+                // This is the pod created above, retaining its materialization
+                // annotation and API-assigned UID across the source-node loss.
+                annotations: Some(serde_json::from_value(
+                    captured_pod_creates.lock().unwrap()[0]
+                        .pointer("/metadata/annotations")
+                        .unwrap()
+                        .clone(),
+                )?),
                 ..Default::default()
             },
             status: Some(PodStatus {
@@ -7007,6 +7043,8 @@ mod kubernetes_tests {
         let route = SandboxActivationAttemptId::new();
         let operation = SandboxActivationAttemptId::new_after(route).unwrap();
         let execution = SandboxExecutionRow {
+            materialization_id: None,
+            observed_pod_uid: None,
             generation: 3,
             pod_name: "space-sbx-test-g3".to_string(),
             pod_materialized: false,
@@ -9834,7 +9872,7 @@ mod kubernetes_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn failed_create_rejects_stale_pod_loaded_by_recovery_get() -> Result<(), BoxError> {
+    async fn failed_create_preserves_unowned_pod_loaded_by_recovery_get() -> Result<(), BoxError> {
         // Arrange.
         let db = pplx_space_db_test_fixtures::pg_test_db().await?;
         let pool = db.pool.clone();
@@ -9850,8 +9888,9 @@ mod kubernetes_tests {
             failed_create_then_stale_restore_pod_kubernetes_client(Arc::clone(&deleted_pods)),
         );
 
-        // Act.
-        substrate
+        // The returned pod has no matching materialization annotation. Its stale
+        // restore plan is not authority to delete a pod this claim never owned.
+        let error = substrate
             .ensure_pod_exists(
                 &sandbox,
                 None,
@@ -9859,17 +9898,19 @@ mod kubernetes_tests {
                 Some(storage_uri),
                 PodMaterializationOwnership::default(),
             )
-            .await?;
+            .await
+            .expect_err("unowned pod must remain for diagnosis");
+        assert!(matches!(error, SubstrateError::Unavailable { .. }));
 
         // Assert.
-        assert_eq!(deleted_pods.load(Ordering::SeqCst), 1);
+        assert_eq!(deleted_pods.load(Ordering::SeqCst), 0);
         let active_executions: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND active",
         )
         .bind(sandbox_id)
         .fetch_one(&pool)
         .await?;
-        assert_eq!(active_executions, 0);
+        assert_eq!(active_executions, 1);
         Ok(())
     }
 
@@ -9916,9 +9957,9 @@ mod kubernetes_tests {
         .await?;
         sqlx::query(
             "INSERT INTO sandbox_k8s_executions
-                 (sandbox_id, generation, pod_name, pod_namespace, state, active)
+                 (sandbox_id, generation, pod_name, pod_namespace, pod_uid, state, active)
              VALUES
-                 ($1, 7, 'space-sbx-conflict-g7', 'space', 'running', TRUE)",
+                 ($1, 7, 'space-sbx-conflict-g7', 'space', 'space-sbx-conflict-g7-uid', 'running', TRUE)",
         )
         .bind(sandbox_id)
         .execute(&pool)
@@ -11686,6 +11727,7 @@ mod kubernetes_tests {
                 "pool-pod-uid",
                 "10.90.0.7",
                 pod.node_name.unwrap_or("unscheduled"),
+                &pplx_space_common_core::types::K8sNodeUid::parse("original-worker-uid")?,
             )
             .await?;
 
@@ -13220,6 +13262,8 @@ mod kubernetes_tests {
     #[test]
     fn route_publication_classification_uses_materialization_evidence() {
         let row = |state, pod_materialized, route_initialized: bool| SandboxExecutionRow {
+            materialization_id: None,
+            observed_pod_uid: None,
             generation: 1,
             pod_name: "space-sbx-test-g1".to_string(),
             pod_materialized,
@@ -14126,7 +14170,12 @@ mod kubernetes_tests {
 
         assert!(
             !store
-                .backfill_missing_pod_uid(sandbox_id, &backfill_identity(&pod_name), "uid-observed")
+                .backfill_missing_pod_uid(
+                    sandbox_id,
+                    &backfill_identity(&pod_name),
+                    "uid-observed",
+                    None
+                )
                 .await?,
             "a recorded UID must not be overwritten"
         );
@@ -14149,7 +14198,12 @@ mod kubernetes_tests {
             .await?;
         assert!(
             store
-                .backfill_missing_pod_uid(sandbox_id, &backfill_identity(&pod_name), "uid-observed")
+                .backfill_missing_pod_uid(
+                    sandbox_id,
+                    &backfill_identity(&pod_name),
+                    "uid-observed",
+                    None
+                )
                 .await?
         );
         let (uid, ip, state): (Option<String>, Option<String>, String) = sqlx::query_as(

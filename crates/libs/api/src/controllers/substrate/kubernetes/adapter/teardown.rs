@@ -177,6 +177,11 @@ impl KubernetesSubstrate {
                     sandbox_id,
                     &current_execution_identity(&active, live_pod.as_deref()),
                     observed_uid,
+                    live_pod
+                        .as_ref()
+                        .map(|pod| pod.materialization_id())
+                        .transpose()?
+                        .flatten(),
                 )
                 .await;
             }
@@ -253,13 +258,17 @@ impl KubernetesSubstrate {
         sandbox_id: SandboxId,
         identity: &ExecutionIdentity,
         observed_uid: &str,
+        materialization_id: Option<pplx_space_common_core::types::PodMaterializationId>,
     ) {
         match self
             .store
-            .backfill_missing_pod_uid(sandbox_id, identity, observed_uid)
+            .backfill_missing_pod_uid(sandbox_id, identity, observed_uid, materialization_id)
             .await
         {
-            Ok(_) => tracing::info!(
+            Ok(false) => {
+                tracing::debug!(sandbox_id = %sandbox_id, "pod UID hydration did not match the current materialization")
+            }
+            Ok(true) => tracing::info!(
                 sandbox_id = %sandbox_id,
                 generation = ?identity.generation,
                 "recorded the pod uid a name-only fence could not verify; the next sweep \
@@ -480,8 +489,13 @@ impl KubernetesSubstrate {
                         })?
             {
                 if let Some(observed_uid) = materialized.uid() {
-                    self.hydrate_materialized_pod_uid(sandbox_id, &fenced.identity, observed_uid)
-                        .await;
+                    self.hydrate_materialized_pod_uid(
+                        sandbox_id,
+                        &fenced.identity,
+                        observed_uid,
+                        materialized.materialization_id()?,
+                    )
+                    .await;
                 }
                 return Ok(self.refuse_fenced_teardown(
                     sandbox_id,
