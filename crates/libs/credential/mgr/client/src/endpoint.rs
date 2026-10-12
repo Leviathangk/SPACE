@@ -28,10 +28,11 @@ const TLS_CA_VAR: &str = "SPACE_CREDMGR_TLS_CA";
 
 const SERVICE_NAME: &str = "credential-manager";
 
-/// Bounds each TCP dial, not the TLS handshake. The connect retry budget is
-/// checked only between dials, so without this bound a SYN pinned to a stale
-/// conntrack entry (one sent to a ClusterIP before kube-proxy programmed it on
-/// the node) holds the first dial through about two minutes of retransmits.
+/// Bounds each TCP dial, so a SYN pinned to a stale conntrack entry (one sent
+/// to a ClusterIP before kube-proxy programmed it on the node) is redialed
+/// after this bound rather than at the connect helper's longer attempt cap.
+/// The TLS handshake has its own bound,
+/// [`pplx_space_common_grpc::CLIENT_TLS_HANDSHAKE_TIMEOUT`].
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// PEM file location for the server-TLS client side: the CA bundle that
@@ -201,7 +202,9 @@ async fn client_tls_config(files: &TlsFiles) -> Result<ClientTlsConfig, ConnectE
             .await
             .map_err(|source| ConnectError::TlsRead { path, source })?
     };
-    Ok(ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca)))
+    Ok(ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(ca))
+        .timeout(pplx_space_common_grpc::CLIENT_TLS_HANDSHAKE_TIMEOUT))
 }
 
 static CACHED_ENDPOINT: OnceLock<Result<CredmgrEndpoint, EndpointConfigError>> = OnceLock::new();

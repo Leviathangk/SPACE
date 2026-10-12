@@ -57,9 +57,10 @@ mod trace;
 
 pub use client::GrpcClient;
 pub use connect::{
-    UdsConnectError, connect_tcp_channel_with_retry, connect_tcp_channel_with_retrying_redials,
-    connect_uds_channel, connect_uds_channel_lazy, connect_uds_channel_with_endpoint,
-    connect_uds_channel_with_endpoint_with_retry, connect_uds_channel_with_retry,
+    CLIENT_TLS_HANDSHAKE_TIMEOUT, TcpConnectError, UdsConnectError, connect_tcp_channel_with_retry,
+    connect_tcp_channel_with_retrying_redials, connect_uds_channel, connect_uds_channel_lazy,
+    connect_uds_channel_with_endpoint, connect_uds_channel_with_endpoint_with_retry,
+    connect_uds_channel_with_retry,
 };
 pub use context::GrpcRetryContext;
 pub use idempotency::generated_idempotency_key;

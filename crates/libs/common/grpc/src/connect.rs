@@ -24,6 +24,39 @@ pub enum UdsConnectError {
     },
 }
 
+/// Why [`connect_tcp_channel_with_retry`] gave up.
+#[derive(Debug, thiserror::Error)]
+pub enum TcpConnectError {
+    #[error(transparent)]
+    Transport(#[from] tonic::transport::Error),
+    /// The last attempt neither connected nor failed within its cap and was
+    /// abandoned.
+    #[error("connect attempt to {service_name} at {target} did not finish within {cap:?}")]
+    AttemptTimeout {
+        service_name: &'static str,
+        target: String,
+        cap: std::time::Duration,
+    },
+}
+
+/// Bound for a client TLS handshake. The internal-transport and
+/// credential-manager client TLS configs set it, so a peer that accepts TCP
+/// but never answers the ClientHello fails each dial of their channels,
+/// reconnects included, instead of holding it. It is also what a TCP connect
+/// attempt is allowed beyond its TCP dial, so a handshake within this bound
+/// always fits the attempt cap.
+pub const CLIENT_TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The TCP dial bound assumed for an endpoint that sets no `connect_timeout`.
+const DEFAULT_TCP_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How long one TCP connect attempt may run: its TCP dial, plus name
+/// resolution, the TLS handshake and the HTTP/2 preface, which tonic's
+/// `connect_timeout` does not bound.
+fn tcp_attempt_cap(dial_timeout: std::time::Duration) -> std::time::Duration {
+    dial_timeout + CLIENT_TLS_HANDSHAKE_TIMEOUT
+}
+
 /// Retry only initial Unix-socket channel establishment.
 ///
 /// This returns a raw channel. Service crates should wrap it with their
@@ -196,29 +229,54 @@ pub fn connect_uds_channel_lazy(
 /// client. Do not call this from a [`crate::GrpcClient`] connect closure or a
 /// [`crate::retry_grpc_status_with_context`] operation unless a separate
 /// connect-only retry budget is intentional.
+///
+/// Each attempt (name resolution, the TCP dial the endpoint's
+/// `connect_timeout` bounds, TLS and the HTTP/2 preface) is abandoned after the
+/// endpoint's `connect_timeout` (3s when it sets none) plus
+/// [`CLIENT_TLS_HANDSHAKE_TIMEOUT`], and redialed while the policy's
+/// `max_elapsed` remains. That budget is checked between attempts, so the call
+/// takes at most `max_elapsed` plus one attempt cap: 16s for
+/// [`crate::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY`] and a 3s `connect_timeout`.
+/// The returned channel's later reconnects are outside these bounds; a TLS
+/// config should set [`CLIENT_TLS_HANDSHAKE_TIMEOUT`] to bound their handshake.
 pub async fn connect_tcp_channel_with_retry(
     service_name: &'static str,
     target: impl AsRef<str>,
     endpoint: tonic::transport::Endpoint,
     retry_policy: GrpcRetryPolicy,
-) -> Result<tonic::transport::Channel, tonic::transport::Error> {
-    retry_tcp_connect(service_name, target.as_ref(), retry_policy, || {
-        let endpoint = endpoint.clone();
-        async move { endpoint.connect().await }
-    })
+) -> Result<tonic::transport::Channel, TcpConnectError> {
+    let attempt_cap = tcp_attempt_cap(
+        endpoint
+            .get_connect_timeout()
+            .unwrap_or(DEFAULT_TCP_DIAL_TIMEOUT),
+    );
+    retry_tcp_connect(
+        service_name,
+        target.as_ref(),
+        retry_policy,
+        attempt_cap,
+        || {
+            let endpoint = endpoint.clone();
+            async move { endpoint.connect().await.map_err(TcpConnectError::from) }
+        },
+    )
     .await
 }
 
 /// Run `attempt` until it succeeds or `retry_policy` is spent, with the span,
-/// retry metric and logs every TCP connect shares.
+/// retry metric and logs every TCP connect shares. An attempt still running
+/// after `attempt_cap` fails with [`TcpConnectError::AttemptTimeout`], counted
+/// and retried like any other failure, so the whole call ends within
+/// `max_elapsed` plus one `attempt_cap`.
 async fn retry_tcp_connect<T, E, F, Fut>(
     service_name: &'static str,
     target: &str,
     retry_policy: GrpcRetryPolicy,
+    attempt_cap: std::time::Duration,
     mut attempt: F,
 ) -> Result<T, E>
 where
-    E: std::fmt::Display,
+    E: std::fmt::Display + From<TcpConnectError>,
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, E>>,
 {
@@ -226,7 +284,16 @@ where
     let mut retry_index = 0;
     loop {
         let connect_span = connect_span(service_name, "Connect", "tcp", &target, retry_index);
-        let error = match attempt().instrument(connect_span.clone()).await {
+        let outcome = tokio::time::timeout(attempt_cap, attempt().instrument(connect_span.clone()))
+            .await
+            .unwrap_or_else(|_| {
+                Err(E::from(TcpConnectError::AttemptTimeout {
+                    service_name,
+                    target: target.to_owned(),
+                    cap: attempt_cap,
+                }))
+            });
+        let error = match outcome {
             Ok(connected) => {
                 record_connect_ok(&connect_span);
                 return Ok(connected);
@@ -260,9 +327,13 @@ where
 /// [`connect_tcp_channel_with_retry`] it retries the first dial, and the
 /// channel retries every later redial, after a connection drops, with the same
 /// policy, spans and metrics: a call that arrives while the peer restarts
-/// waits for it, as a call on a freshly dialed channel would. Each dial is
-/// bounded by `attempt_timeout`. Only the TCP dial is retried; TLS, when the
-/// endpoint configures it, is layered on top by the channel.
+/// waits for it, as a call on a freshly dialed channel would. Each TCP dial is
+/// bounded by `attempt_timeout`, and each attempt, name resolution included,
+/// by `attempt_timeout` plus [`CLIENT_TLS_HANDSHAKE_TIMEOUT`]. Only those
+/// attempts are retried: TLS, when the endpoint configures it, is layered on
+/// top by the channel once one succeeds, its handshake bounded by the TLS
+/// config's timeout when it sets one. The endpoint bounds each whole dial or redial, retries
+/// and TLS included, at `max_elapsed` plus `attempt_timeout`.
 pub async fn connect_tcp_channel_with_retrying_redials(
     service_name: &'static str,
     endpoint: tonic::transport::Endpoint,
@@ -280,6 +351,7 @@ pub async fn connect_tcp_channel_with_retrying_redials(
             http,
             service_name,
             retry_policy,
+            attempt_cap: tcp_attempt_cap(attempt_timeout),
         })
         .await
 }
@@ -289,13 +361,13 @@ struct RetryingTcpConnector {
     http: hyper_util::client::legacy::connect::HttpConnector,
     service_name: &'static str,
     retry_policy: GrpcRetryPolicy,
+    attempt_cap: std::time::Duration,
 }
 
 impl tower::Service<http::Uri> for RetryingTcpConnector {
     type Response =
         <hyper_util::client::legacy::connect::HttpConnector as tower::Service<http::Uri>>::Response;
-    type Error =
-        <hyper_util::client::legacy::connect::HttpConnector as tower::Service<http::Uri>>::Error;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
     type Future = std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
     >;
@@ -304,7 +376,7 @@ impl tower::Service<http::Uri> for RetryingTcpConnector {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        self.http.poll_ready(cx)
+        self.http.poll_ready(cx).map_err(Into::into)
     }
 
     fn call(&mut self, uri: http::Uri) -> Self::Future {
@@ -312,13 +384,14 @@ impl tower::Service<http::Uri> for RetryingTcpConnector {
             http,
             service_name,
             retry_policy,
+            attempt_cap,
         } = self.clone();
         Box::pin(async move {
             let target = uri.to_string();
-            retry_tcp_connect(service_name, &target, retry_policy, || {
+            retry_tcp_connect(service_name, &target, retry_policy, attempt_cap, || {
                 let mut http = http.clone();
                 let uri = uri.clone();
-                async move { tower::Service::call(&mut http, uri).await }
+                async move { Ok(tower::Service::call(&mut http, uri).await?) }
             })
             .await
         })

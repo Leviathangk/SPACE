@@ -81,7 +81,9 @@ Discovery advertises HTTPS for TLS-configured listeners and HTTP only for explic
 identity-free development listeners. Clients do not perform protocol fallback.
 Listeners admit at most 64 pending TLS handshakes, each with a ten-second
 deadline. Established channels do not consume that budget. Shutdown releases
-the listening socket even when handshake admission is saturated.
+the listening socket even when handshake admission is saturated. Clients give
+each handshake, reconnects included, three seconds, so a listener that accepts
+TCP but never answers fails the dial instead of holding it.
 
 Migrate every caller and operational tool to TLS before deploying TLS-only
 listener images. Verify lifecycle, discovery, reconciliation, artifact transfers

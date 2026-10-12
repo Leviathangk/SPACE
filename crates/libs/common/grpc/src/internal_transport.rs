@@ -171,7 +171,8 @@ impl ClientTransport {
                 let ca = ca.ok_or(TransportError::Missing(CA_ENV))?;
                 let tls = ClientTlsConfig::new()
                     .ca_certificate(Certificate::from_pem(ca))
-                    .domain_name(name);
+                    .domain_name(name)
+                    .timeout(crate::CLIENT_TLS_HANDSHAKE_TIMEOUT);
                 // Validate the fixed trust/name once before an endpoint discovery
                 // closure uses it for individual pod addresses.
                 Endpoint::from(uri.clone()).tls_config(tls.clone())?;

@@ -136,6 +136,19 @@ pub enum ConnectError {
     InvalidBearer(#[source] tonic::metadata::errors::InvalidMetadataValue),
     #[error("build manager transport failed: {0}")]
     Transport(#[from] tonic::transport::Error),
+    #[error("build manager connect failed: {0}")]
+    TcpConnect(#[source] pplx_space_common_grpc::TcpConnectError),
+}
+
+impl From<pplx_space_common_grpc::TcpConnectError> for ConnectError {
+    /// A connect's transport failure stays [`ConnectError::Transport`]; only an
+    /// abandoned attempt is [`ConnectError::TcpConnect`].
+    fn from(error: pplx_space_common_grpc::TcpConnectError) -> Self {
+        match error {
+            pplx_space_common_grpc::TcpConnectError::Transport(error) => Self::Transport(error),
+            error => Self::TcpConnect(error),
+        }
+    }
 }
 
 pub async fn connect() -> Result<BuildManagerGrpcClient, ConnectError> {

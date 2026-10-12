@@ -169,3 +169,151 @@ async fn a_kept_tcp_channel_waits_for_its_peer_to_come_back() {
     stop.send(()).unwrap();
     server.await.unwrap();
 }
+
+fn stalled_tcp_policy(budget: Duration) -> crate::GrpcRetryPolicy {
+    crate::GrpcRetryPolicy {
+        max_elapsed: budget,
+        jitter_factor: 0.0,
+        ..crate::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY
+    }
+}
+
+// An attempt that never finishes, such as a DNS lookup or TLS handshake no peer
+// answers, is abandoned at its cap and redialed while the budget remains.
+#[tokio::test(start_paused = true)]
+async fn a_stalled_tcp_attempt_is_abandoned_at_its_cap_and_redialed() {
+    let cap = Duration::from_secs(1);
+    let policy = stalled_tcp_policy(Duration::from_secs(10));
+    let started = tokio::time::Instant::now();
+    let attempts = std::cell::Cell::new(0);
+    let connect = super::retry_tcp_connect("stalled", "stalled:1", policy, cap, || {
+        let attempt = attempts.get() + 1;
+        attempts.set(attempt);
+        async move {
+            if attempt == 1 {
+                std::future::pending().await
+            } else {
+                Ok::<_, super::TcpConnectError>(attempt)
+            }
+        }
+    });
+    let connected = tokio::time::timeout(policy.max_elapsed, connect)
+        .await
+        .expect("a stalled attempt must not hold the connect")
+        .expect("the redial connects");
+    assert_eq!(connected, 2);
+    assert_eq!(started.elapsed(), cap + policy.initial_delay);
+}
+
+// Attempts that never finish still end the call within the budget plus the one
+// attempt the budget let start before it ran out.
+#[tokio::test(start_paused = true)]
+async fn stalled_tcp_attempts_end_within_the_budget_and_one_attempt_cap() {
+    let cap = Duration::from_secs(1);
+    let policy = stalled_tcp_policy(Duration::from_secs(3));
+    let started = tokio::time::Instant::now();
+    let attempts = std::cell::Cell::new(0);
+    let connect = super::retry_tcp_connect("stalled", "stalled:1", policy, cap, || {
+        attempts.set(attempts.get() + 1);
+        std::future::pending::<Result<(), super::TcpConnectError>>()
+    });
+    let result = tokio::time::timeout(policy.max_elapsed * 2, connect)
+        .await
+        .expect("stalled attempts must not bypass the attempt cap");
+    assert!(
+        matches!(result, Err(super::TcpConnectError::AttemptTimeout { cap: fired, .. }) if fired == cap),
+        "{result:?}"
+    );
+    assert!(attempts.get() > 1, "the budget allowed redials");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed > policy.max_elapsed && elapsed <= policy.max_elapsed + cap,
+        "gave up after {elapsed:?}"
+    );
+}
+
+#[cfg(feature = "internal-tls")]
+#[derive(Default)]
+struct TestEnvironment(std::collections::HashMap<&'static str, std::ffi::OsString>);
+
+#[cfg(feature = "internal-tls")]
+impl pplx_space_common_core::env::Environment for TestEnvironment {
+    fn var_os(&self, key: &str) -> Option<std::ffi::OsString> {
+        self.0.get(key).cloned()
+    }
+}
+
+// A peer that accepts TCP but never answers the ClientHello fails the connect
+// at the client TLS handshake bound, not at the attempt cap and not at once.
+// This waits out the real bound: a paused clock could fire the attempt cap
+// before the loopback dial's readiness is observed.
+#[cfg(feature = "internal-tls")]
+#[tokio::test]
+async fn a_tls_peer_that_never_answers_fails_the_connect_at_the_handshake_bound() {
+    use crate::internal_transport::{CA_ENV, ClientTransport, Service};
+
+    if rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .is_err()
+    {
+        rustls::crypto::CryptoProvider::get_default()
+            .expect("a rejected provider installation leaves an installed provider");
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let silent_peer = tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            held.push(listener.accept().await.unwrap().0);
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let ca = dir.path().join("ca.pem");
+    let certificate = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+    std::fs::write(&ca, certificate.cert.pem()).unwrap();
+    let mut env = TestEnvironment::default();
+    env.0.insert(CA_ENV, ca.into_os_string());
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("https://{address}")).unwrap();
+    let endpoint = ClientTransport::from_environment(Service::NodeApi, endpoint.uri(), &env)
+        .await
+        .unwrap()
+        .endpoint(endpoint)
+        .unwrap()
+        .connect_timeout(Duration::from_secs(1));
+    let attempt_cap = super::tcp_attempt_cap(Duration::from_secs(1));
+
+    let started = tokio::time::Instant::now();
+    let result = tokio::time::timeout(
+        attempt_cap * 2,
+        super::connect_tcp_channel_with_retry(
+            "silent-tls",
+            address.to_string(),
+            endpoint,
+            crate::GrpcRetryPolicy::none(),
+        ),
+    )
+    .await
+    .expect("an unanswered TLS handshake must be bounded");
+    let elapsed = started.elapsed();
+    let error = match result {
+        Err(error @ super::TcpConnectError::Transport(_)) => error,
+        other => panic!("expected the TLS handshake bound to fail the dial: {other:?}"),
+    };
+    let chain = std::iter::successors(
+        Some(&error as &(dyn std::error::Error + 'static)),
+        |error| error.source(),
+    )
+    .map(ToString::to_string)
+    .collect::<Vec<_>>();
+    assert!(
+        chain
+            .iter()
+            .any(|message| message.contains("TLS handshake timeout")),
+        "{chain:?}"
+    );
+    assert!(
+        elapsed >= crate::CLIENT_TLS_HANDSHAKE_TIMEOUT && elapsed < attempt_cap,
+        "failed after {elapsed:?}"
+    );
+    silent_peer.abort();
+}
