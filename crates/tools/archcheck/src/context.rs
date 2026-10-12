@@ -49,6 +49,8 @@ pub enum LoadError {
     /// Debug-formatted, so the invalid bytes are shown escaped.
     #[error("{path:?} is not valid UTF-8")]
     NonUtf8Path { path: PathBuf },
+    #[error("{path} resolves outside the repository root through a symlink")]
+    OutsideRoot { path: PathBuf },
     #[error("no Cargo.toml with a [workspace] table found at or above {start}")]
     NoWorkspaceRoot { start: PathBuf },
 }
@@ -72,14 +74,24 @@ pub struct Context {
 
 impl Context {
     pub fn load(root: &Path) -> Result<Self, LoadError> {
-        let baseline = Baseline::load(&root.join(BASELINE_FILE))?;
+        let baseline_path = root.join(BASELINE_FILE);
+        inside_root(&real_path(root)?, &baseline_path)?;
+        let baseline = Baseline::load(&baseline_path)?;
         Self::load_with_baseline(root, baseline)
     }
 
+    /// Every path read must stay inside `root` once symlinks are resolved:
+    /// the tree may be an untrusted pull request checkout, and a symlink must
+    /// not make the tool read, quote in an error, or report a file elsewhere.
     pub fn load_with_baseline(root: &Path, baseline: Baseline) -> Result<Self, LoadError> {
-        let config = load_config(&root.join(CONFIG_FILE))?;
-        let members = load_members(&root.join("Cargo.toml"))?;
-        let files = production_files(root, &members)?;
+        let real_root = real_path(root)?;
+        let config_path = root.join(CONFIG_FILE);
+        inside_root(&real_root, &config_path)?;
+        let config = load_config(&config_path)?;
+        let manifest = root.join("Cargo.toml");
+        inside_root(&real_root, &manifest)?;
+        let members = load_members(&manifest)?;
+        let files = production_files(root, &real_root, &members)?;
         Ok(Self {
             config,
             baseline,
@@ -134,6 +146,23 @@ pub fn count_code_lines(text: &str) -> usize {
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with("//"))
         .count()
+}
+
+fn real_path(path: &Path) -> Result<PathBuf, LoadError> {
+    path.canonicalize().map_err(|source| LoadError::Read {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn inside_root(real_root: &Path, path: &Path) -> Result<(), LoadError> {
+    if real_path(path)?.starts_with(real_root) {
+        Ok(())
+    } else {
+        Err(LoadError::OutsideRoot {
+            path: path.to_path_buf(),
+        })
+    }
 }
 
 fn read(path: &Path) -> Result<String, LoadError> {
@@ -194,7 +223,11 @@ fn load_members(path: &Path) -> Result<Vec<String>, LoadError> {
     Ok(members)
 }
 
-fn production_files(root: &Path, members: &[String]) -> Result<Vec<ProductionFile>, LoadError> {
+fn production_files(
+    root: &Path,
+    real_root: &Path,
+    members: &[String],
+) -> Result<Vec<ProductionFile>, LoadError> {
     let mut paths = Vec::new();
     for member in members {
         let manifest = root.join(member).join("Cargo.toml");
@@ -204,8 +237,11 @@ fn production_files(root: &Path, members: &[String]) -> Result<Vec<ProductionFil
                 manifest,
             });
         }
+        inside_root(real_root, &manifest)?;
         let src = root.join(member).join("src");
         if src.is_dir() {
+            inside_root(real_root, &src)?;
+            // The walk itself does not follow symlinks.
             collect_rust_files(&src, &mut paths)?;
         }
     }

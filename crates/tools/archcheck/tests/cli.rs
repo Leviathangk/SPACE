@@ -1061,6 +1061,81 @@ fn changed_file_list_errors_exit_2() {
     assert!(run.stderr.contains("is not valid UTF-8"), "{}", run.stderr);
 }
 
+/// A pull request checkout is untrusted: a symlink must not make archcheck
+/// read, quote in an error, or report a file outside the root.
+#[cfg(unix)]
+#[test]
+fn symlinks_out_of_the_root_are_errors() {
+    use std::os::unix::fs::symlink;
+
+    let outside = tempfile::tempdir().unwrap();
+    let secret = outside.path().join("secret");
+    fs::write(&secret, "token = \"do-not-print\"\n").unwrap();
+    fs::create_dir_all(outside.path().join("member/src")).unwrap();
+    fs::write(outside.path().join("member/Cargo.toml"), "[package]\n").unwrap();
+    fs::write(
+        outside.path().join("member/src/lib.rs"),
+        "let x = 1;\n".repeat(LIMIT + 1),
+    )
+    .unwrap();
+
+    let cases: [(&str, &str, &Path); 5] = [
+        ("ARCHITECTURE.toml", "ARCHITECTURE.toml", &secret),
+        (
+            "architecture-baseline.toml",
+            "architecture-baseline.toml",
+            &secret,
+        ),
+        ("Cargo.toml", "Cargo.toml", &secret),
+        (
+            "member directory",
+            "crates/b",
+            &outside.path().join("member"),
+        ),
+        (
+            "src directory",
+            "crates/b/src",
+            &outside.path().join("member/src"),
+        ),
+    ];
+    for (name, link, target) in cases {
+        let ws = Workspace::new("advisory");
+        let link = ws.root().join(link);
+        if link.is_dir() {
+            fs::remove_dir_all(&link).unwrap();
+        } else if link.exists() {
+            fs::remove_file(&link).unwrap();
+        }
+        symlink(target, &link).unwrap();
+
+        let run = ws.run(&["--format", "markdown"]);
+
+        assert_eq!(run.code, 2, "{name}: {}{}", run.stdout, run.stderr);
+        assert!(
+            run.stderr.contains("outside the repository root"),
+            "{name}: {}",
+            run.stderr
+        );
+        assert!(
+            !run.stderr.contains("do-not-print"),
+            "{name}: {}",
+            run.stderr
+        );
+        assert!(run.stdout.is_empty(), "{name}: {}", run.stdout);
+    }
+
+    // Symlinks that stay inside the root are followed as before.
+    let ws = Workspace::new("advisory");
+    fs::rename(
+        ws.root().join("ARCHITECTURE.toml"),
+        ws.root().join("crates/arch.toml"),
+    )
+    .unwrap();
+    symlink("crates/arch.toml", ws.root().join("ARCHITECTURE.toml")).unwrap();
+    ws.rust_file("crates/a/src/lib.rs", LIMIT);
+    ws.run(&[]).assert_clean();
+}
+
 #[test]
 fn usage_errors_exit_2() {
     let ws = Workspace::new("advisory");

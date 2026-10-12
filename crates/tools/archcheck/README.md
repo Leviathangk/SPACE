@@ -41,6 +41,11 @@ normalized repository-relative `.rs` path (no leading `./` or `/`, no `.` or
 `..` segments, no empty segments), and a workspace `members` entry with glob
 characters are all errors (exit 2), not skipped checks.
 
+The checked tree may be an untrusted pull request checkout, so the tool reads
+nothing outside `--root`. A configuration file, baseline, root manifest, member
+directory or member `src/` directory that resolves outside the root through a
+symlink is an error (exit 2), and the walk under `src/` skips symlinks.
+
 `--summary` writes the Markdown report whatever `--format` prints and does not
 change the exit status: required findings still exit 1. A configuration error
 writes no report, and a report that cannot be written exits 2.
