@@ -30,6 +30,7 @@ jobs:
             rust_cache_size: 2G
             rust_cache_refresh_misses: 20
             timeout: 45
+            archcheck: true
 
     steps:
       - name: Check out SPACE
@@ -107,6 +108,16 @@ jobs:
 
           docker run "${docker_args[@]}" "space-ci:${GITHUB_SHA}" \
             bash -c 'git config --global --add safe.directory /workspace && exec bash -c "$SPACE_CI_COMMAND"'
+
+      # Annotates pull requests with structure findings from ARCHITECTURE.toml.
+      # Advisory findings exit 0; a broken config (2) or a required-mode
+      # finding (1) fails the job.
+      - name: Check repository structure
+        if: matrix.archcheck == true && github.event_name == 'pull_request'
+        run: >-
+          docker run --rm --volume "${GITHUB_WORKSPACE}:/workspace" --workdir /workspace
+          --env CI=true --env CARGO_INCREMENTAL=0 "space-ci:${GITHUB_SHA}"
+          cargo arch --format github
 
       - name: Decide whether to refresh the Rust compiler cache
         id: refresh-rust-cache

@@ -1,5 +1,8 @@
 [alias]
 lint = "clippy --workspace --locked -- -D warnings"
+# A separate target directory keeps `cargo arch` from waiting on the build-directory
+# lock held by a concurrent workspace build.
+arch = "run -q --locked -p pplx-space-archcheck --target-dir target/archcheck --"
 
 [target.aarch64-unknown-linux-musl]
 linker = "aarch64-linux-musl-gcc"
