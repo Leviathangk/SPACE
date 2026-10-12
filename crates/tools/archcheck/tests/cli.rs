@@ -207,6 +207,31 @@ fn sibling_test_files_and_non_members_are_excluded() {
     );
 }
 
+/// Only `.rs` names must be UTF-8: other files are ignored, and a `.rs` name
+/// that is not UTF-8 is an error that shows the name escaped.
+#[cfg(unix)]
+#[test]
+fn non_utf8_names_are_ignored_unless_they_are_rust_files() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+    let ws = Workspace::new("advisory");
+    ws.rust_file("crates/a/src/lib.rs", LIMIT);
+    let src = ws.root().join("crates/a/src");
+    fs::write(src.join(OsStr::from_bytes(b"notes-\xff.txt")), "x\n").unwrap();
+    fs::write(src.join(OsStr::from_bytes(b"\xff")), "x\n").unwrap();
+    ws.run(&[]).assert_clean();
+
+    fs::write(src.join(OsStr::from_bytes(b"bad-\xff.rs")), "let x = 1;\n").unwrap();
+    let run = ws.run(&[]);
+    assert_eq!(run.code, 2, "{}{}", run.stdout, run.stderr);
+    assert!(
+        run.stderr.contains("bad-\\xFF.rs") && run.stderr.contains("is not valid UTF-8"),
+        "{}",
+        run.stderr
+    );
+    assert!(run.stdout.is_empty(), "{}", run.stdout);
+}
+
 #[test]
 fn listed_file_findings_follow_its_count() {
     let ws = Workspace::new("advisory");

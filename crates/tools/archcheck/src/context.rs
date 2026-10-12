@@ -41,7 +41,8 @@ pub enum LoadError {
     MemberOutsideRoot { path: PathBuf, member: String },
     #[error("workspace member {member:?} has no Cargo.toml at {manifest}")]
     MissingMember { member: String, manifest: PathBuf },
-    #[error("{path} is not valid UTF-8")]
+    /// Debug-formatted, so the invalid bytes are shown escaped.
+    #[error("{path:?} is not valid UTF-8")]
     NonUtf8Path { path: PathBuf },
     #[error("no Cargo.toml with a [workspace] table found at or above {start}")]
     NoWorkspaceRoot { start: PathBuf },
@@ -237,10 +238,15 @@ fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), LoadErro
             }
             continue;
         }
+        // Only `.rs` names have to be UTF-8, so the extension is checked on
+        // the raw name first.
+        if !file_type.is_file() || path.extension() != Some(OsStr::new("rs")) {
+            continue;
+        }
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             return Err(LoadError::NonUtf8Path { path });
         };
-        if file_type.is_file() && name.ends_with(".rs") && !is_test_file(name) {
+        if !is_test_file(name) {
             out.push(path);
         }
     }
