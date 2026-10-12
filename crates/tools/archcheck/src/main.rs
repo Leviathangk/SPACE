@@ -6,15 +6,20 @@
 use std::{env, ffi::OsString, path::PathBuf, process::ExitCode};
 
 use pplx_space_archcheck::{
-    BASELINE_FILE, Context, check, context::find_workspace_root, report::Format, write_baseline,
+    BASELINE_FILE, Context, check,
+    context::find_workspace_root,
+    report::{Format, render},
+    write_baseline,
 };
 
 const USAGE: &str = "\
-usage: archcheck [--root <path>] [--format human|github] [--write-baseline]
+usage: archcheck [--root <path>] [--format human|github|markdown] [--summary <path>]
+       archcheck [--root <path>] --write-baseline
 
   --root <path>       repository root (default: the Cargo workspace containing
                       the current directory)
-  --format <format>   human (default) or github workflow annotations
+  --format <format>   human (default), github workflow annotations, or markdown
+  --summary <path>    also write the markdown report to <path>
   --write-baseline    regenerate architecture-baseline.toml from the current tree";
 
 const EXIT_REQUIRED_FINDINGS: u8 = 1;
@@ -23,6 +28,7 @@ const EXIT_ERROR: u8 = 2;
 struct Options {
     root: Option<PathBuf>,
     format: Format,
+    summary: Option<PathBuf>,
     write_baseline: bool,
 }
 
@@ -69,10 +75,11 @@ fn run(options: Options) -> Result<ExitCode, String> {
 
     let ctx = Context::load(&root).map_err(|err| err.to_string())?;
     let findings = check(&ctx);
-    print!(
-        "{}",
-        pplx_space_archcheck::report::render(options.format, &findings, ctx.files.len())
-    );
+    print!("{}", render(options.format, &findings, ctx.files.len()));
+    if let Some(path) = &options.summary {
+        std::fs::write(path, render(Format::Markdown, &findings, ctx.files.len()))
+            .map_err(|err| format!("could not write {}: {err}", path.display()))?;
+    }
     if findings.iter().any(|finding| finding.mode.is_required()) {
         Ok(ExitCode::from(EXIT_REQUIRED_FINDINGS))
     } else {
@@ -85,6 +92,7 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Option<Options>, S
     let mut options = Options {
         root: None,
         format: Format::Human,
+        summary: None,
         write_baseline: false,
     };
     let mut args = args.map(|arg| {
@@ -107,9 +115,13 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Option<Options>, S
             "-h" | "--help" => return Ok(None),
             "--root" => options.root = Some(PathBuf::from(value()?)),
             "--format" => options.format = value()?.parse()?,
+            "--summary" => options.summary = Some(PathBuf::from(value()?)),
             "--write-baseline" if inline_value.is_none() => options.write_baseline = true,
             other => return Err(format!("unexpected argument {other:?}")),
         }
+    }
+    if options.write_baseline && options.summary.is_some() {
+        return Err("--summary cannot be combined with --write-baseline".into());
     }
     Ok(Some(options))
 }

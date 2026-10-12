@@ -8,6 +8,8 @@ rule tolerates for now are listed in
 ```sh
 cargo arch                     # human-readable report
 cargo arch --format github     # GitHub Actions annotations
+cargo arch --format markdown   # Markdown report
+cargo arch --summary <path>    # also write the Markdown report to <path>
 cargo arch --write-baseline    # regenerate architecture-baseline.toml
 cargo arch --root <path>       # check another checkout
 ```
@@ -35,8 +37,29 @@ Configuration fails closed. A missing `ARCHITECTURE.toml` or baseline,
 unparseable TOML, an unknown key, section or mode, and a workspace `members`
 entry with glob characters are all errors (exit 2), not skipped checks.
 
-In `--format github` output, advisory findings are `::warning` annotations and
-required findings are `::error` annotations.
+`--summary` writes the Markdown report whatever `--format` prints and does not
+change the exit status: required findings still exit 1. A configuration error
+writes no report, and a report that cannot be written exits 2.
+
+## Output formats
+
+- `human`: findings grouped by rule and behaviour, then a one-line summary.
+- `github`: one workflow command per finding, then the summary. Advisory
+  findings are `::warning` annotations and required findings are `::error`
+  annotations. Each is attached to line 1 of the file, because GitHub may not
+  show an annotation without a line on the file in a pull request's diff.
+- `markdown`: a report for the CI job summary and pull request comments. A
+  heading carries the summary; findings are grouped by rule and behaviour under
+  a heading that names the mode, followed by a short footer. With no findings
+  the report is the heading line alone.
+
+On a pull request, file paths are chosen by its author, so the Markdown report
+treats them as untrusted. A path appears only inside an inline code span whose
+backtick fence is longer than any backtick run in the path. Control and
+invisible formatting characters are escaped as `\n` or `\u{…}`, and paths
+longer than 200 characters are shortened to their end. Other text is
+backslash-escaped, and the report contains no raw HTML. At most 50 findings
+are listed, followed by how many were left out.
 
 ## Definitions
 

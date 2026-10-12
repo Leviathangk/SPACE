@@ -1,4 +1,6 @@
-//! Rendering findings for people and for GitHub Actions annotations.
+//! Rendering findings for people, GitHub Actions annotations, and Markdown.
+
+mod markdown;
 
 use std::str::FromStr;
 
@@ -10,6 +12,8 @@ pub enum Format {
     Human,
     /// `::warning`/`::error` workflow commands, then the summary.
     Github,
+    /// A Markdown report for a job summary or pull request comment.
+    Markdown,
 }
 
 impl FromStr for Format {
@@ -19,8 +23,9 @@ impl FromStr for Format {
         match value {
             "human" => Ok(Self::Human),
             "github" => Ok(Self::Github),
+            "markdown" => Ok(Self::Markdown),
             other => Err(format!(
-                "unknown format {other:?}; expected human or github"
+                "unknown format {other:?}; expected human, github or markdown"
             )),
         }
     }
@@ -54,8 +59,10 @@ pub fn render(format: Format, findings: &[Finding], files_checked: usize) -> Str
                     Mode::Advisory => "warning",
                     Mode::Required => "error",
                 };
+                // GitHub may not show an annotation without a line on the
+                // file in the pull request diff.
                 out.push_str(&format!(
-                    "::{level} file={},title={}::{}\n",
+                    "::{level} file={},line=1,title={}::{}\n",
                     escape_property(&finding.path),
                     escape_property(&format!(
                         "archcheck {}.{} ({})",
@@ -65,6 +72,7 @@ pub fn render(format: Format, findings: &[Finding], files_checked: usize) -> Str
                 ));
             }
         }
+        Format::Markdown => return markdown::render(findings, files_checked),
     }
     out.push_str(&summary(findings, files_checked));
     out.push('\n');

@@ -257,11 +257,11 @@ fn only_required_findings_fail_the_check() {
     assert_eq!(
         lines,
         [
-            "::warning file=crates/b/src/new.rs,title=archcheck file_size.no_crossing \
+            "::warning file=crates/b/src/new.rs,line=1,title=archcheck file_size.no_crossing \
              (advisory)::crates/b/src/new.rs: 6 code lines, over the 5-line limit (comments and \
              blank lines are not counted). Split it into submodules by responsibility.",
-            "::warning file=crates/a/src/listed.rs,title=archcheck file_size.listed_no_growth \
-             (advisory)::crates/a/src/listed.rs grew from 6 to 7 code lines. Once this rule is \
+            "::warning file=crates/a/src/listed.rs,line=1,title=archcheck \
+             file_size.listed_no_growth (advisory)::crates/a/src/listed.rs grew from 6 to 7 code lines. Once this rule is \
              required, split the file before adding to it.",
             "archcheck: 2 findings (2 advisory, 0 required; 2 production Rust files checked)",
         ]
@@ -272,12 +272,13 @@ fn only_required_findings_fail_the_check() {
     let crossing_required = ws.run(&["--format", "github"]);
     assert_eq!(crossing_required.code, 1);
     assert!(crossing_required.stdout.contains(
-        "::error file=crates/b/src/new.rs,title=archcheck file_size.no_crossing (required)::"
+        "::error file=crates/b/src/new.rs,line=1,title=archcheck file_size.no_crossing \
+         (required)::"
     ));
     assert!(
         crossing_required
             .stdout
-            .contains("::warning file=crates/a/src/listed.rs")
+            .contains("::warning file=crates/a/src/listed.rs,line=1,")
     );
 
     ws.config("advisory", "required");
@@ -288,6 +289,147 @@ fn only_required_findings_fail_the_check() {
          lines. Split the file before adding to it.\n"
     ));
     assert!(growth_required.stdout.contains("(1 advisory, 1 required;"));
+}
+
+#[test]
+fn markdown_report_groups_findings_by_behaviour() {
+    let ws = Workspace::new("advisory");
+    ws.config("required", "advisory");
+    ws.baseline(&[("crates/a/src/listed.rs", 6)]);
+    ws.rust_file("crates/a/src/listed.rs", 7);
+    ws.rust_file("crates/b/src/new.rs", 6);
+
+    let run = ws.run(&["--format", "markdown"]);
+
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    assert_eq!(
+        run.stdout,
+        "### archcheck: 2 findings (1 advisory, 1 required; 2 production Rust files checked)\n\
+         \n\
+         #### `file_size.no_crossing` (required)\n\
+         \n\
+         - `crates/b/src/new.rs`: 6 code lines, over the 5-line limit (comments and blank lines \
+         are not counted). Split it into submodules by responsibility.\n\
+         \n\
+         #### `file_size.listed_no_growth` (advisory)\n\
+         \n\
+         - `crates/a/src/listed.rs` grew from 6 to 7 code lines. Once this rule is required, \
+         split the file before adding to it.\n\
+         \n\
+         Advisory findings are reported but do not block merging; required findings fail the \
+         check. Run `cargo arch` locally to reproduce this report. Comments and blank lines are \
+         not counted as code lines.\n"
+    );
+}
+
+#[test]
+fn markdown_report_keeps_paths_inside_code_spans() {
+    let ws = Workspace::new("advisory");
+    ws.rust_file("crates/a/src/x``y|<b>&@z.rs", LIMIT + 1);
+    ws.rust_file("crates/a/src/`start.rs", LIMIT + 1);
+    ws.rust_file("crates/a/src/new\n::error::line\u{202e}.rs", LIMIT + 1);
+    let long = format!(
+        "crates/b/src/{}end.rs",
+        format!("{}/", "d".repeat(49)).repeat(5)
+    );
+    ws.rust_file(&long, LIMIT + 1);
+    let long_tail: String = long.chars().skip(long.len() - 200).collect();
+
+    let run = ws.run(&["--format", "markdown"]);
+
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    let items: Vec<&str> = run
+        .stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("- "))
+        .map(|item| {
+            item.split_once(": 6 code lines")
+                .expect("each item is one line")
+                .0
+        })
+        .collect();
+    assert_eq!(
+        items,
+        [
+            "``crates/a/src/`start.rs``",
+            "`crates/a/src/new\\n::error::line\\u{202e}.rs`",
+            "```crates/a/src/x``y|<b>&@z.rs```",
+            &format!("`…{long_tail}`"),
+        ]
+    );
+}
+
+#[test]
+fn markdown_report_caps_the_findings_shown() {
+    let ws = Workspace::new("advisory");
+    for index in 0..53 {
+        ws.rust_file(&format!("crates/a/src/f{index:02}.rs"), LIMIT + 1);
+    }
+
+    let run = ws.run(&["--format", "markdown"]);
+
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    let items: Vec<&str> = run
+        .stdout
+        .lines()
+        .filter(|line| line.starts_with("- "))
+        .collect();
+    assert_eq!(items.len(), 50);
+    assert!(items[49].starts_with("- `crates/a/src/f49.rs`"));
+    assert!(run.stdout.contains("\n3 more findings not shown.\n"));
+    assert!(run.stdout.starts_with("### archcheck: 53 findings"));
+}
+
+#[test]
+fn markdown_report_without_findings_is_one_line() {
+    let ws = Workspace::new("advisory");
+    ws.rust_file("crates/a/src/lib.rs", LIMIT);
+
+    let run = ws.run(&["--format", "markdown"]);
+
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(
+        run.stdout,
+        "### archcheck: no findings (1 production Rust files checked)\n"
+    );
+}
+
+#[test]
+fn summary_writes_the_markdown_report_and_keeps_the_exit_status() {
+    let ws = Workspace::new("advisory");
+    ws.rust_file("crates/a/src/lib.rs", LIMIT + 1);
+    let summary = ws.root().join("out/summary.md");
+    fs::create_dir_all(summary.parent().unwrap()).unwrap();
+    let summary_arg = summary.to_str().unwrap();
+
+    let advisory = ws.run(&["--format", "github", "--summary", summary_arg]);
+    assert_eq!(advisory.code, 0, "{}", advisory.stderr);
+    assert!(
+        advisory
+            .stdout
+            .starts_with("::warning file=crates/a/src/lib.rs,line=1,")
+    );
+    let markdown = ws.run(&["--format", "markdown"]).stdout;
+    assert_eq!(fs::read_to_string(&summary).unwrap(), markdown);
+
+    ws.config("required", "required");
+    let required = ws.run(&["--summary", summary_arg]);
+    assert_eq!(required.code, 1, "{}", required.stderr);
+    assert!(
+        fs::read_to_string(&summary)
+            .unwrap()
+            .contains("#### `file_size.no_crossing` (required)")
+    );
+
+    let unwritable = ws.root().join("missing/summary.md");
+    let run = ws.run(&["--summary", unwritable.to_str().unwrap()]);
+    assert_eq!(run.code, 2);
+    assert!(run.stderr.contains("could not write"), "{}", run.stderr);
+
+    ws.write("ARCHITECTURE.toml", "[rules.file_size\n");
+    fs::remove_file(&summary).unwrap();
+    assert_eq!(ws.run(&["--summary", summary_arg]).code, 2);
+    assert!(!summary.exists());
 }
 
 #[test]
@@ -378,7 +520,13 @@ fn configuration_errors_exit_2() {
 #[test]
 fn usage_errors_exit_2() {
     let ws = Workspace::new("advisory");
-    for args in [&["--format", "json"][..], &["--format"], &["--bogus"]] {
+    for args in [
+        &["--format", "json"][..],
+        &["--format"],
+        &["--bogus"],
+        &["--summary"],
+        &["--write-baseline", "--summary", "summary.md"],
+    ] {
         assert_eq!(ws.run(args).code, 2, "{args:?}");
     }
 }

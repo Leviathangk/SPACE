@@ -109,15 +109,23 @@ jobs:
           docker run "${docker_args[@]}" "space-ci:${GITHUB_SHA}" \
             bash -c 'git config --global --add safe.directory /workspace && exec bash -c "$SPACE_CI_COMMAND"'
 
-      # Annotates pull requests with structure findings from ARCHITECTURE.toml.
-      # Advisory findings exit 0; a broken config (2) or a required-mode
-      # finding (1) fails the job.
+      # Annotates pull requests with structure findings from ARCHITECTURE.toml
+      # and adds the Markdown report to the job summary. Advisory findings exit
+      # 0; a broken config (2) or a required-mode finding (1) fails the job.
       - name: Check repository structure
         if: matrix.archcheck == true && github.event_name == 'pull_request'
-        run: >-
-          docker run --rm --volume "${GITHUB_WORKSPACE}:/workspace" --workdir /workspace
-          --env CI=true --env CARGO_INCREMENTAL=0 "space-ci:${GITHUB_SHA}"
-          cargo arch --format github
+        env:
+          SUMMARY: target/archcheck-summary.md
+        run: |
+          set -euo pipefail
+          status=0
+          docker run --rm --volume "${GITHUB_WORKSPACE}:/workspace" --workdir /workspace \
+            --env CI=true --env CARGO_INCREMENTAL=0 "space-ci:${GITHUB_SHA}" \
+            cargo arch --format github --summary "${SUMMARY}" || status=$?
+          if [[ -f "${GITHUB_WORKSPACE}/${SUMMARY}" ]]; then
+            cat "${GITHUB_WORKSPACE}/${SUMMARY}" >>"${GITHUB_STEP_SUMMARY}"
+          fi
+          exit "${status}"
 
       - name: Decide whether to refresh the Rust compiler cache
         id: refresh-rust-cache
