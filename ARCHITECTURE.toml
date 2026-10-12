@@ -8,3 +8,6 @@ mode = "advisory"
 
 [rules.file_size.listed_no_growth]    # files in the baseline may not gain code lines
 mode = "advisory"
+
+[rules.file_size.stale_entries]       # entries whose file shrank, fell under the limit, or is gone
+mode = "advisory"

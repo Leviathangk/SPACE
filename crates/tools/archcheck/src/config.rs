@@ -30,6 +30,7 @@ pub struct FileSizeConfig {
     pub limit: usize,
     pub no_crossing: BehaviourConfig,
     pub listed_no_growth: BehaviourConfig,
+    pub stale_entries: BehaviourConfig,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]

@@ -17,7 +17,7 @@ struct Run {
 }
 
 impl Workspace {
-    /// A workspace with members `a` and `b`, both behaviours in `mode`, and an
+    /// A workspace with members `a` and `b`, every behaviour in `mode`, and an
     /// empty baseline.
     fn new(mode: &str) -> Self {
         let workspace = Self {
@@ -30,7 +30,7 @@ impl Workspace {
         for member in ["crates/a", "crates/b"] {
             workspace.write(&format!("{member}/Cargo.toml"), "[package]\n");
         }
-        workspace.config(mode, mode);
+        workspace.config(mode, mode, mode);
         workspace.write("architecture-baseline.toml", "[file_size]\n");
         workspace
     }
@@ -48,13 +48,14 @@ impl Workspace {
         fs::write(&path, contents).expect("write a workspace file");
     }
 
-    fn config(&self, no_crossing: &str, listed_no_growth: &str) {
+    fn config(&self, no_crossing: &str, listed_no_growth: &str, stale_entries: &str) {
         self.write(
             "ARCHITECTURE.toml",
             &format!(
                 "[rules.file_size]\nlimit = {LIMIT}\n\n\
                  [rules.file_size.no_crossing]\nmode = \"{no_crossing}\"\n\n\
-                 [rules.file_size.listed_no_growth]\nmode = \"{listed_no_growth}\"\n"
+                 [rules.file_size.listed_no_growth]\nmode = \"{listed_no_growth}\"\n\n\
+                 [rules.file_size.stale_entries]\nmode = \"{stale_entries}\"\n"
             ),
         );
     }
@@ -264,20 +265,56 @@ fn listed_file_findings_follow_its_count() {
     assert_eq!(
         run.findings(),
         [
-            "crates/a/src/deleted.rs: listed in architecture-baseline.toml but no longer a \
-             production Rust file. Remove the entry; a renamed file is checked under its new path.",
             "crates/a/src/grew.rs grew from 8 to 9 code lines. Once this rule is required, split \
              the file before adding to it.",
+            "crates/a/src/deleted.rs: listed in architecture-baseline.toml but no longer a \
+             production Rust file. Remove the entry; a renamed file is checked under its new path.",
             "crates/a/src/shrank.rs shrank from 8 to 7 code lines. Lower its cap in \
              architecture-baseline.toml to 7.",
             "crates/a/src/under.rs is down to 5 code lines, within the 5-line limit. Remove it \
              from architecture-baseline.toml.",
         ]
     );
-    assert!(
-        run.stdout
-            .contains("file_size.listed_no_growth (advisory):")
+    let headings: Vec<&str> = run
+        .stdout
+        .lines()
+        .filter(|line| line.starts_with("file_size."))
+        .collect();
+    assert_eq!(
+        headings,
+        [
+            "file_size.listed_no_growth (advisory):",
+            "file_size.stale_entries (advisory):"
+        ]
     );
+}
+
+/// Requiring no growth must not fail the change that shrinks, splits or
+/// removes a listed file; those only leave a stale entry.
+#[test]
+fn stale_entries_have_their_own_mode() {
+    let ws = Workspace::new("advisory");
+    ws.config("required", "required", "advisory");
+    ws.baseline(&[
+        ("crates/a/src/deleted.rs", 9),
+        ("crates/a/src/shrank.rs", 8),
+        ("crates/a/src/under.rs", 8),
+    ]);
+    ws.rust_file("crates/a/src/shrank.rs", 7);
+    ws.rust_file("crates/a/src/under.rs", LIMIT);
+
+    let run = ws.run(&[]);
+    assert_eq!(run.code, 0, "{}{}", run.stdout, run.stderr);
+    assert!(
+        run.stdout.contains("(3 advisory, 0 required;"),
+        "{}",
+        run.stdout
+    );
+
+    ws.config("advisory", "advisory", "required");
+    let run = ws.run(&[]);
+    assert_eq!(run.code, 1, "{}{}", run.stdout, run.stderr);
+    assert!(run.stdout.contains("file_size.stale_entries (required):"));
 }
 
 #[test]
@@ -316,7 +353,7 @@ fn only_required_findings_fail_the_check() {
     );
 
     // Each behaviour graduates on its own.
-    ws.config("required", "advisory");
+    ws.config("required", "advisory", "advisory");
     let crossing_required = ws.run(&["--format", "github"]);
     assert_eq!(crossing_required.code, 1);
     assert!(crossing_required.stdout.contains(
@@ -329,7 +366,7 @@ fn only_required_findings_fail_the_check() {
             .contains("::warning file=crates/a/src/listed.rs,line=1,")
     );
 
-    ws.config("advisory", "required");
+    ws.config("advisory", "required", "advisory");
     let growth_required = ws.run(&[]);
     assert_eq!(growth_required.code, 1);
     assert!(growth_required.stdout.contains(
@@ -342,7 +379,7 @@ fn only_required_findings_fail_the_check() {
 #[test]
 fn markdown_report_groups_findings_by_behaviour() {
     let ws = Workspace::new("advisory");
-    ws.config("required", "advisory");
+    ws.config("required", "advisory", "advisory");
     ws.baseline(&[("crates/a/src/listed.rs", 6)]);
     ws.rust_file("crates/a/src/listed.rs", 7);
     ws.rust_file("crates/b/src/new.rs", 6);
@@ -460,7 +497,7 @@ fn summary_writes_the_markdown_report_and_keeps_the_exit_status() {
     let markdown = ws.run(&["--format", "markdown"]).stdout;
     assert_eq!(fs::read_to_string(&summary).unwrap(), markdown);
 
-    ws.config("required", "required");
+    ws.config("required", "required", "required");
     let required = ws.run(&["--summary", summary_arg]);
     assert_eq!(required.code, 1, "{}", required.stderr);
     assert!(
@@ -491,7 +528,8 @@ fn required_mode_without_findings_passes() {
 fn configuration_errors_exit_2() {
     let config = "[rules.file_size]\nlimit = 5\n\
                   [rules.file_size.no_crossing]\nmode = \"advisory\"\n\
-                  [rules.file_size.listed_no_growth]\nmode = \"advisory\"\n";
+                  [rules.file_size.listed_no_growth]\nmode = \"advisory\"\n\
+                  [rules.file_size.stale_entries]\nmode = \"advisory\"\n";
     let members = "[workspace]\nmembers = [\"crates/a\", \"crates/b\"]\n";
     let cases: &[(&str, &str, &str)] = &[
         (

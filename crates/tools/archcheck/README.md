@@ -91,18 +91,25 @@ mode = "advisory"
 
 [rules.file_size.listed_no_growth]
 mode = "advisory"
+
+[rules.file_size.stale_entries]
+mode = "advisory"
 ```
 
 - `no_crossing`: a production file that is not in the baseline has more code
   lines than `limit`.
-- `listed_no_growth`: for each `[file_size]` baseline entry, reports when
+- `listed_no_growth`: a file with a `[file_size]` baseline entry has more code
+  lines than its cap: it grew.
+- `stale_entries`: a `[file_size]` baseline entry can be tightened, because
   - the file is gone (deleted, renamed, or no longer a production file):
     remove the entry. A renamed file is then checked by `no_crossing` under its
     new path;
-  - the file has more code lines than its cap: it grew;
   - the file has fewer code lines than its cap but is still over the limit:
     lower the cap to the new count;
   - the file is at or under the limit: remove the entry.
+
+`stale_entries` is separate from `listed_no_growth` so that requiring no growth
+does not also fail the change that shrinks or splits a listed file.
 
 ## Baseline
 
@@ -112,7 +119,7 @@ rule that needs a baseline owns one table. `[file_size]` maps every production
 file over the limit to its current code-line count, which becomes its cap.
 
 Entries should only be removed or have their caps lowered. The
-`listed_no_growth` findings say when an entry can be tightened.
+`stale_entries` findings say when an entry can be tightened.
 
 ## Adding a rule
 
