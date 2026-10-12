@@ -569,6 +569,36 @@ fn configuration_errors_exit_2() {
             "[file_size]\n\"crates/a/src/lib.rs\" = \"9\"\n",
         ),
         (
+            "baseline key with a leading ./",
+            "architecture-baseline.toml",
+            "[file_size]\n\"./crates/a/src/lib.rs\" = 9\n",
+        ),
+        (
+            "baseline key with ..",
+            "architecture-baseline.toml",
+            "[file_size]\n\"crates/b/../a/src/lib.rs\" = 9\n",
+        ),
+        (
+            "baseline key with an empty segment",
+            "architecture-baseline.toml",
+            "[file_size]\n\"crates//a/src/lib.rs\" = 9\n",
+        ),
+        (
+            "absolute baseline key",
+            "architecture-baseline.toml",
+            "[file_size]\n\"/crates/a/src/lib.rs\" = 9\n",
+        ),
+        (
+            "baseline key that is not a Rust file",
+            "architecture-baseline.toml",
+            "[file_size]\n\"crates/a/src/lib\" = 9\n",
+        ),
+        (
+            "empty baseline key",
+            "architecture-baseline.toml",
+            "[file_size]\n\"\" = 9\n",
+        ),
+        (
             "glob member",
             "Cargo.toml",
             "[workspace]\nmembers = [\"crates/a\", \"crates/*\"]\n",

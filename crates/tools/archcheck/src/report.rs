@@ -51,7 +51,7 @@ pub fn render(format: Format, findings: &[Finding], files_checked: usize) -> Str
                         finding.rule, finding.behaviour, finding.mode
                     ));
                 }
-                out.push_str(&format!("  {}\n", finding.message));
+                out.push_str(&format!("  {}\n", finding.message()));
             }
             if !findings.is_empty() {
                 out.push('\n');
@@ -72,7 +72,7 @@ pub fn render(format: Format, findings: &[Finding], files_checked: usize) -> Str
                         "archcheck {}.{} ({})",
                         finding.rule, finding.behaviour, finding.mode
                     )),
-                    escape_data(&finding.message),
+                    escape_data(&finding.message()),
                 ));
             }
         }

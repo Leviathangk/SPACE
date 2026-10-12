@@ -36,9 +36,8 @@ impl Rule for FileSize {
                     mode,
                     &file.path,
                     format!(
-                        "{}: {} code lines, over the {}-line limit (comments and blank lines \
-                         are not counted). Split it into submodules by responsibility.",
-                        file.path,
+                        ": {} code lines, over the {}-line limit (comments and blank lines are \
+                         not counted). Split it into submodules by responsibility.",
                         file.code_lines,
                         thousands(limit),
                     ),
@@ -56,8 +55,8 @@ impl Rule for FileSize {
                     stale_mode,
                     path,
                     format!(
-                        "{path}: listed in {BASELINE_FILE} but no longer a production Rust \
-                         file. Remove the entry; a renamed file is checked under its new path."
+                        ": listed in {BASELINE_FILE} but no longer a production Rust file. \
+                         Remove the entry; a renamed file is checked under its new path."
                     ),
                 )),
                 Some(lines) if lines <= limit => stale.push(finding(
@@ -65,8 +64,8 @@ impl Rule for FileSize {
                     stale_mode,
                     path,
                     format!(
-                        "{path} is down to {lines} code lines, within the {}-line limit. Remove \
-                         it from {BASELINE_FILE}.",
+                        " is down to {lines} code lines, within the {}-line limit. Remove it \
+                         from {BASELINE_FILE}.",
                         thousands(limit),
                     ),
                 )),
@@ -80,7 +79,7 @@ impl Rule for FileSize {
                         LISTED_NO_GROWTH,
                         growth_mode,
                         path,
-                        format!("{path} grew from {cap} to {lines} code lines. {advice}"),
+                        format!(" grew from {cap} to {lines} code lines. {advice}"),
                     ));
                 }
                 Some(lines) if lines < cap => stale.push(finding(
@@ -88,7 +87,7 @@ impl Rule for FileSize {
                     stale_mode,
                     path,
                     format!(
-                        "{path} shrank from {cap} to {lines} code lines. Lower its cap in \
+                        " shrank from {cap} to {lines} code lines. Lower its cap in \
                          {BASELINE_FILE} to {lines}."
                     ),
                 )),
@@ -112,12 +111,12 @@ impl Rule for FileSize {
     }
 }
 
-fn finding(behaviour: &'static str, mode: Mode, path: &str, message: String) -> Finding {
+fn finding(behaviour: &'static str, mode: Mode, path: &str, detail: String) -> Finding {
     Finding {
         rule: RULE,
         behaviour,
         path: path.to_owned(),
-        message,
+        detail,
         mode,
     }
 }

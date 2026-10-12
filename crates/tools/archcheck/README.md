@@ -35,8 +35,10 @@ time:
 | 2 | Configuration, usage or I/O error. |
 
 Configuration fails closed. A missing `ARCHITECTURE.toml` or baseline,
-unparseable TOML, an unknown key, section or mode, and a workspace `members`
-entry with glob characters are all errors (exit 2), not skipped checks.
+unparseable TOML, an unknown key, section or mode, a baseline key that is not a
+normalized repository-relative `.rs` path (no leading `./` or `/`, no `.` or
+`..` segments, no empty segments), and a workspace `members` entry with glob
+characters are all errors (exit 2), not skipped checks.
 
 `--summary` writes the Markdown report whatever `--format` prints and does not
 change the exit status: required findings still exit 1. A configuration error

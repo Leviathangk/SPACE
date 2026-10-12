@@ -31,6 +31,11 @@ pub enum LoadError {
         #[source]
         source: toml::de::Error,
     },
+    #[error(
+        "{path}: [file_size] key {key:?} is not a normalized repository-relative .rs path (no \
+         leading ./ or /, no . or .. segments, no empty segments)"
+    )]
+    BaselineKey { path: PathBuf, key: String },
     #[error("{path} has no [workspace] members list")]
     NoWorkspaceMembers { path: PathBuf },
     #[error(

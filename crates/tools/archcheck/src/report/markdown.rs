@@ -51,17 +51,9 @@ pub fn render(findings: &[Finding], files_checked: usize) -> String {
     out
 }
 
-/// The message with each occurrence of the path rendered as code.
+/// The path as code, then the rest of the message as text.
 fn item(finding: &Finding) -> String {
-    if finding.path.is_empty() {
-        return text(&finding.message);
-    }
-    finding
-        .message
-        .split(finding.path.as_str())
-        .map(text)
-        .collect::<Vec<_>>()
-        .join(&code(&finding.path))
+    format!("{}{}", code(&finding.path), text(&finding.detail))
 }
 
 /// An inline code span that cannot be closed early: its backtick fence is

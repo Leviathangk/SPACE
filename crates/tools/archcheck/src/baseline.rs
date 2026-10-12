@@ -49,10 +49,21 @@ impl Baseline {
             path: path.to_path_buf(),
             source,
         })?;
-        toml::from_str(&text).map_err(|source| LoadError::Parse {
+        let baseline: Self = toml::from_str(&text).map_err(|source| LoadError::Parse {
             path: path.to_path_buf(),
             source,
-        })
+        })?;
+        if let Some(key) = baseline
+            .file_size
+            .keys()
+            .find(|key| !is_normalized_rust_path(key))
+        {
+            return Err(LoadError::BaselineKey {
+                path: path.to_path_buf(),
+                key: key.clone(),
+            });
+        }
+        Ok(baseline)
     }
 
     pub fn render(&self) -> Result<String, toml::ser::Error> {
@@ -65,4 +76,14 @@ impl Baseline {
             source,
         })
     }
+}
+
+/// A repository-relative `.rs` path as the inventory spells it: `/`-separated,
+/// with no leading `./` or `/`, no `.` or `..` segment and no empty segment.
+/// Anything else could never match a production file.
+fn is_normalized_rust_path(key: &str) -> bool {
+    key.ends_with(".rs")
+        && key
+            .split('/')
+            .all(|segment| !matches!(segment, "" | "." | ".."))
 }
