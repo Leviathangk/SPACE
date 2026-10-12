@@ -4,6 +4,8 @@ mod markdown;
 
 use std::str::FromStr;
 
+use thiserror::Error;
+
 use crate::{config::Mode, finding::Finding};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,17 +18,19 @@ pub enum Format {
     Markdown,
 }
 
+#[derive(Debug, Error)]
+#[error("unknown format {0:?}; expected human, github or markdown")]
+pub struct UnknownFormatError(pub String);
+
 impl FromStr for Format {
-    type Err = String;
+    type Err = UnknownFormatError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "human" => Ok(Self::Human),
             "github" => Ok(Self::Github),
             "markdown" => Ok(Self::Markdown),
-            other => Err(format!(
-                "unknown format {other:?}; expected human, github or markdown"
-            )),
+            other => Err(UnknownFormatError(other.to_owned())),
         }
     }
 }

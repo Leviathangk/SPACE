@@ -3,14 +3,21 @@
 //! Exit status: 0 when no required-mode finding exists, 1 when one does, and 2
 //! for configuration, usage or I/O errors.
 
-use std::{env, ffi::OsString, path::PathBuf, process::ExitCode};
+use std::{
+    env,
+    ffi::OsString,
+    io,
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
 
 use pplx_space_archcheck::{
-    BASELINE_FILE, Context, check,
+    BASELINE_FILE, Context, LoadError, WriteBaselineError, check,
     context::find_workspace_root,
-    report::{Format, render},
+    report::{Format, UnknownFormatError, render},
     write_baseline,
 };
+use thiserror::Error;
 
 const USAGE: &str = "\
 usage: archcheck [--root <path>] [--format human|github|markdown] [--summary <path>]
@@ -24,6 +31,37 @@ usage: archcheck [--root <path>] [--format human|github|markdown] [--summary <pa
 
 const EXIT_REQUIRED_FINDINGS: u8 = 1;
 const EXIT_ERROR: u8 = 2;
+
+/// A command line that cannot be run; printed with the usage text.
+#[derive(Debug, Error)]
+enum UsageError {
+    #[error("argument {0:?} is not valid UTF-8")]
+    NonUtf8Argument(OsString),
+    #[error("{0} needs a value")]
+    MissingValue(String),
+    #[error("unexpected argument {0:?}")]
+    UnexpectedArgument(String),
+    #[error(transparent)]
+    Format(#[from] UnknownFormatError),
+    #[error("--summary cannot be combined with --write-baseline")]
+    SummaryWithWriteBaseline,
+}
+
+#[derive(Debug, Error)]
+enum RunError {
+    #[error("could not read the current directory: {0}")]
+    CurrentDir(#[source] io::Error),
+    #[error(transparent)]
+    Load(#[from] LoadError),
+    #[error(transparent)]
+    WriteBaseline(#[from] WriteBaselineError),
+    #[error("could not write {path}: {source}")]
+    WriteSummary {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+}
 
 struct Options {
     root: Option<PathBuf>,
@@ -39,32 +77,28 @@ fn main() -> ExitCode {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
         }
-        Err(message) => {
-            eprintln!("archcheck: {message}\n{USAGE}");
+        Err(err) => {
+            eprintln!("archcheck: {err}\n{USAGE}");
             return ExitCode::from(EXIT_ERROR);
         }
     };
     match run(options) {
         Ok(code) => code,
-        Err(message) => {
-            eprintln!("archcheck: error: {message}");
+        Err(err) => {
+            eprintln!("archcheck: error: {err}");
             ExitCode::from(EXIT_ERROR)
         }
     }
 }
 
-fn run(options: Options) -> Result<ExitCode, String> {
+fn run(options: Options) -> Result<ExitCode, RunError> {
     let root = match options.root {
         Some(root) => root,
-        None => {
-            let cwd = env::current_dir()
-                .map_err(|err| format!("could not read the current directory: {err}"))?;
-            find_workspace_root(&cwd).map_err(|err| err.to_string())?
-        }
+        None => find_workspace_root(&env::current_dir().map_err(RunError::CurrentDir)?)?,
     };
 
     if options.write_baseline {
-        let baseline = write_baseline(&root).map_err(|err| err.to_string())?;
+        let baseline = write_baseline(&root)?;
         println!(
             "archcheck: wrote {} file_size entries to {}",
             baseline.file_size.len(),
@@ -73,12 +107,11 @@ fn run(options: Options) -> Result<ExitCode, String> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let ctx = Context::load(&root).map_err(|err| err.to_string())?;
+    let ctx = Context::load(&root)?;
     let findings = check(&ctx);
     print!("{}", render(options.format, &findings, ctx.files.len()));
     if let Some(path) = &options.summary {
-        std::fs::write(path, render(Format::Markdown, &findings, ctx.files.len()))
-            .map_err(|err| format!("could not write {}: {err}", path.display()))?;
+        write_summary(path, &render(Format::Markdown, &findings, ctx.files.len()))?;
     }
     if findings.iter().any(|finding| finding.mode.is_required()) {
         Ok(ExitCode::from(EXIT_REQUIRED_FINDINGS))
@@ -87,18 +120,22 @@ fn run(options: Options) -> Result<ExitCode, String> {
     }
 }
 
+fn write_summary(path: &Path, report: &str) -> Result<(), RunError> {
+    std::fs::write(path, report).map_err(|source| RunError::WriteSummary {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
 /// `Ok(None)` asks for help.
-fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Option<Options>, String> {
+fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Option<Options>, UsageError> {
     let mut options = Options {
         root: None,
         format: Format::Human,
         summary: None,
         write_baseline: false,
     };
-    let mut args = args.map(|arg| {
-        arg.into_string()
-            .map_err(|arg| format!("argument {arg:?} is not valid UTF-8"))
-    });
+    let mut args = args.map(|arg| arg.into_string().map_err(UsageError::NonUtf8Argument));
     while let Some(arg) = args.next() {
         let arg = arg?;
         let (flag, inline_value) = match arg.split_once('=') {
@@ -109,7 +146,7 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Option<Options>, S
             Some(value) => Ok(value),
             None => args
                 .next()
-                .unwrap_or_else(|| Err(format!("{flag} needs a value"))),
+                .unwrap_or_else(|| Err(UsageError::MissingValue(flag.clone()))),
         };
         match flag.as_str() {
             "-h" | "--help" => return Ok(None),
@@ -117,11 +154,11 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Option<Options>, S
             "--format" => options.format = value()?.parse()?,
             "--summary" => options.summary = Some(PathBuf::from(value()?)),
             "--write-baseline" if inline_value.is_none() => options.write_baseline = true,
-            other => return Err(format!("unexpected argument {other:?}")),
+            other => return Err(UsageError::UnexpectedArgument(other.to_owned())),
         }
     }
     if options.write_baseline && options.summary.is_some() {
-        return Err("--summary cannot be combined with --write-baseline".into());
+        return Err(UsageError::SummaryWithWriteBaseline);
     }
     Ok(Some(options))
 }
