@@ -490,7 +490,7 @@ impl SandboxManagerService {
         Ok(current_id)
     }
 
-    async fn existing_ready_artifact_backup_response(
+    pub(super) async fn existing_ready_artifact_backup_response(
         &self,
         artifact: &crate::db::LocalArtifactRow,
     ) -> Result<Option<EnqueueArtifactBackupResponse>, Status> {

@@ -310,6 +310,7 @@ type SbxExportSandboxStream =
 type TeardownSuspendDrivers = Arc<dashmap::DashMap<SandboxId, tokio::sync::OwnedSemaphorePermit>>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TeardownSuspendDriverAdmission {
+    Deferred,
     Started,
     Existing,
     Saturated,
@@ -318,6 +319,7 @@ enum TeardownSuspendDriverAdmission {
 impl TeardownSuspendDriverAdmission {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::Deferred => "deferred",
             Self::Started => "started",
             Self::Existing => "existing",
             Self::Saturated => "saturated",
