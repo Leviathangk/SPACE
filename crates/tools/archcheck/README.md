@@ -44,7 +44,9 @@ characters are all errors (exit 2), not skipped checks.
 The checked tree may be an untrusted pull request checkout, so the tool reads
 nothing outside `--root`. A configuration file, baseline, root manifest, member
 directory or member `src/` directory that resolves outside the root through a
-symlink is an error (exit 2), and the walk under `src/` skips symlinks.
+symlink is an error (exit 2). The repository tracks no symlinks under any
+member's `src/`, so any symlink found there is an error too (exit 2), whatever
+it points to: it is neither followed nor silently skipped.
 
 `--summary` writes the Markdown report whatever `--format` prints and does not
 change the exit status: required findings still exit 1. A configuration error

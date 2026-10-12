@@ -1136,6 +1136,57 @@ fn symlinks_out_of_the_root_are_errors() {
     ws.run(&[]).assert_clean();
 }
 
+/// A symlink under a member's `src/` is an error whatever it points to. The
+/// in-root targets would be counted, or the walk would loop, if it followed
+/// symlinks; a walk that skipped them would hide files.
+#[cfg(unix)]
+#[test]
+fn symlinks_under_src_are_errors() {
+    use std::os::unix::fs::symlink;
+
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(
+        outside.path().join("big.rs"),
+        "let x = 1;\n".repeat(LIMIT + 1),
+    )
+    .unwrap();
+    let cases: [(&str, &str, &Path); 5] = [
+        ("in-root file", "crates/a/src/link.rs", Path::new("real.rs")),
+        (
+            "in-root directory",
+            "crates/a/src/linked",
+            Path::new("../../b/src"),
+        ),
+        ("loop", "crates/a/src/again", Path::new(".")),
+        (
+            "outside file",
+            "crates/a/src/outside.rs",
+            &outside.path().join("big.rs"),
+        ),
+        (
+            "dangling",
+            "crates/a/src/dangling.rs",
+            Path::new("missing.rs"),
+        ),
+    ];
+    for (name, link, target) in cases {
+        let ws = Workspace::new("advisory");
+        ws.rust_file("crates/a/src/real.rs", LIMIT + 1);
+        ws.rust_file("crates/b/src/lib.rs", LIMIT + 1);
+        symlink(target, ws.root().join(link)).unwrap();
+
+        let run = ws.run(&[]);
+
+        assert_eq!(run.code, 2, "{name}: {}{}", run.stdout, run.stderr);
+        assert!(
+            run.stderr.contains(&format!("{link} is a symlink;")),
+            "{name}: {}",
+            run.stderr
+        );
+        assert!(run.stdout.is_empty(), "{name}: {}", run.stdout);
+    }
+}
+
 #[test]
 fn usage_errors_exit_2() {
     let ws = Workspace::new("advisory");

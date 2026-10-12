@@ -51,6 +51,11 @@ pub enum LoadError {
     NonUtf8Path { path: PathBuf },
     #[error("{path} resolves outside the repository root through a symlink")]
     OutsideRoot { path: PathBuf },
+    /// The repository tracks no symlinks under a member's `src/`, so one in
+    /// the checked tree is refused whatever it points to, rather than counted
+    /// or skipped.
+    #[error("{path} is a symlink; symlinks under a workspace member's src/ are not supported")]
+    SymlinkInSrc { path: PathBuf },
     #[error("no Cargo.toml with a [workspace] table found at or above {start}")]
     NoWorkspaceRoot { start: PathBuf },
 }
@@ -241,7 +246,6 @@ fn production_files(
         let src = root.join(member).join("src");
         if src.is_dir() {
             inside_root(real_root, &src)?;
-            // The walk itself does not follow symlinks.
             collect_rust_files(&src, &mut paths)?;
         }
     }
@@ -270,7 +274,11 @@ fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), LoadErro
     for entry in std::fs::read_dir(dir).map_err(read_error)? {
         let entry = entry.map_err(read_error)?;
         let path = entry.path();
+        // `DirEntry::file_type` does not follow symlinks.
         let file_type = entry.file_type().map_err(read_error)?;
+        if file_type.is_symlink() {
+            return Err(LoadError::SymlinkInSrc { path });
+        }
         if file_type.is_dir() {
             if !is_test_directory(&entry.file_name()) {
                 collect_rust_files(&path, out)?;
