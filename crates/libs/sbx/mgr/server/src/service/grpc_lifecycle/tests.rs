@@ -566,6 +566,94 @@ fn disk_artifact_backup_uses_the_codec_witnessed_by_its_bytes() {
 }
 
 #[tokio::test]
+async fn encrypted_backup_admission_requires_the_published_container_files() {
+    use super::artifact_backup::BackupFilesPolicy;
+    use pplx_space_common_core::types::ArtifactKind;
+
+    let sandbox_id = "01900000-0000-7000-8000-000000000001";
+    for format in [
+        SuspendSnapshotFormat::Full,
+        SuspendSnapshotFormat::BtrfsSend,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().to_str().unwrap();
+        let metadata = serde_json::json!({
+            "version": 1,
+            "sandbox_id": sandbox_id,
+            "size_bytes": 0,
+            "created_at": "2026-01-01T00:00:00Z",
+            "source": {"runtime": "fc", "template_id": "seed"},
+            "encrypted": true,
+        });
+        let sidecar = directory.path().join("snapshot.json");
+        std::fs::write(&sidecar, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        // Encrypted capture publishes these two containers, with no plaintext
+        // memory, vmstate, rootfs file, or retained btrfs-send source.
+        for file in ["snapshot.luks", "cow.luks"] {
+            std::fs::write(directory.path().join(file), b"encrypted capture").unwrap();
+        }
+        let inspector = crate::retained_source::FakeInspector::new(
+            crate::retained_source::RetainedSourceCheck::Absent,
+        );
+        for policy in [
+            BackupFilesPolicy::Backup {
+                full_current_instance: false,
+            },
+            BackupFilesPolicy::Backup {
+                full_current_instance: true,
+            },
+            BackupFilesPolicy::Reupload,
+        ] {
+            require_artifact_backup_files(
+                &inspector,
+                sandbox_id,
+                path,
+                ArtifactKind::Full,
+                format,
+                policy,
+            )
+            .await
+            .unwrap();
+            for file in ["snapshot.luks", "cow.luks"] {
+                let file_path = directory.path().join(file);
+                std::fs::remove_file(&file_path).unwrap();
+                let error = require_artifact_backup_files(
+                    &inspector,
+                    sandbox_id,
+                    path,
+                    ArtifactKind::Full,
+                    format,
+                    policy,
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+                assert!(error.message().contains(file));
+                std::fs::write(file_path, b"encrypted capture").unwrap();
+            }
+        }
+        assert!(inspector.calls().is_empty());
+
+        for bytes in [b"{\"encrypted\":".as_slice(), b"{\"encrypted\":\"true\"}"] {
+            std::fs::write(&sidecar, bytes).unwrap();
+            let error = require_artifact_backup_files(
+                &inspector,
+                sandbox_id,
+                path,
+                ArtifactKind::Full,
+                format,
+                BackupFilesPolicy::Backup {
+                    full_current_instance: false,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::Internal);
+        }
+    }
+}
+
+#[tokio::test]
 async fn retained_source_backup_precondition_follows_node_manager() {
     use crate::retained_source::{FakeInspector, RetainedSourceCheck};
     use pplx_space_common_core::node_drain_signals::REUPLOAD_ARTIFACT_MISSING_MARKER;
