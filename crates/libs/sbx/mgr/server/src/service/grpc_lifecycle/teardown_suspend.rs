@@ -476,6 +476,22 @@ impl SandboxManagerService {
         execution_generation: pplx_space_common_core::types::ExecutionGeneration,
         event_trigger: SandboxEventTrigger,
     ) -> TeardownSuspendDriverAdmission {
+        let due = self.db_conn().and_then(|db| {
+            crate::db::teardown_suspend_retry_due(
+                &db,
+                &sandbox_id.to_string(),
+                execution_generation,
+            )
+            .map_err(|error| Status::internal(format!("read teardown retry deadline: {error}")))
+        });
+        match due {
+            Ok(true) => {}
+            Ok(false) => return TeardownSuspendDriverAdmission::Deferred,
+            Err(error) => {
+                tracing::warn!(%sandbox_id, %error, "cannot read teardown retry deadline");
+                return TeardownSuspendDriverAdmission::Deferred;
+            }
+        }
         let dashmap::mapref::entry::Entry::Vacant(entry) =
             self.teardown_suspend_drivers.entry(sandbox_id)
         else {
@@ -559,6 +575,19 @@ impl SandboxManagerService {
             ) {
                 tracing::warn!(%sandbox_id, %execution_generation, %record_error,
                     "failed to persist teardown suspend driver failure; caller polling will retry");
+            }
+            if let Err(error) = self.db_conn().and_then(|db| {
+                crate::db::defer_teardown_suspend_retry(
+                    &db,
+                    &sandbox_id.to_string(),
+                    execution_generation,
+                    error.message(),
+                )
+                .map_err(|error| {
+                    Status::internal(format!("persist teardown retry deadline: {error}"))
+                })
+            }) {
+                tracing::warn!(%sandbox_id, %error, "cannot persist teardown retry deadline");
             }
         }
         result
