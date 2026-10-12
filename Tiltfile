@@ -429,9 +429,13 @@ local_resource(
 # The seed rootfs, built as soon as the Rust artifacts exist for the same
 # reason: space-seed-publish's image build waits for space-internal-api, and
 # with it the privileged rootfs build waited for the whole space-api →
-# space-internal-api deploy chain. The custom_build still runs the same
-# commands; it finds the seed lock held and waits, or finds the stamp current
-# and only packages.
+# space-internal-api deploy chain — on a changed-code bring-up it started 34 s
+# after the Rust build finished and then spent 22 s on the rootfs before
+# packaging (2026-10-12 bench). The custom_build still runs the same commands;
+# it finds the seed lock held and waits, or finds the stamp current and only
+# packages. The worker image needs no such resource: the node-service
+# DaemonSets wait only for the bootstrap resources, so the first of them starts
+# the space-worker build together with the Rust build.
 local_resource(
     "seed-artifacts",
     cmd = RUST_ARTIFACT_BUILD + " && " + SEED_BUILD,
