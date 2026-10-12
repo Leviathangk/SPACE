@@ -26,9 +26,15 @@
 #
 # Idempotent: skips the (slow, privileged) rootfs build when the inputs
 # (guest binaries, builder script, seed recipe source, pubkey) are unchanged.
+# Safe to run concurrently: Tilt runs it from the seed-artifacts resource and
+# the space-seed-publish custom_build at once. A file lock serializes the
+# builds; the later caller then finds the stamp current.
 #
 # Usage:
 #   bash infra/space/kind/scripts/build-seed.sh
+#   bash infra/space/kind/scripts/build-seed.sh -- CMD [ARG...]
+#       then run CMD on the current artifacts, still holding the lock, so a
+#       concurrent build cannot replace them while CMD reads them
 #
 # Env knobs:
 #   SPACE_SEED_OUTPUT_DIR       artifact dir (default: ~/.space-devbox/kind/seed/build)
@@ -56,8 +62,36 @@ SEED_STATE_FORMAT_VERSION="${SPACE_SEED_STATE_FORMAT_VERSION:-9.0.0}"
 log() { printf '[build-seed] %s\n' "$*"; }
 die() { printf '[build-seed] ERROR: %s\n' "$*" >&2; exit 1; }
 
+THEN=()
+if (( $# > 0 )); then
+  [[ "$1" == "--" && $# -gt 1 ]] || die "usage: $0 [-- CMD [ARG...]]"
+  THEN=("${@:2}")
+fi
+# Exit once the artifacts are current, handing the lock to the caller's
+# command when there is one (exec keeps the lock's descriptor open).
+finish() {
+  (( ${#THEN[@]} == 0 )) || exec "${THEN[@]}"
+  exit 0
+}
+
 command -v docker >/dev/null 2>&1 || die "docker not on PATH"
 command -v python3 >/dev/null 2>&1 || die "python3 not on PATH (needed to author manifest.json)"
+
+# One build at a time. Without the lock, two callers each extract the guest
+# binaries over the files the other's rootfs build mounts, and both rebuild the
+# rootfs; with it the later caller waits, then finds the stamp current. Off
+# Linux there may be no flock; callers then run unguarded, as they always have.
+mkdir -p "$OUT_DIR"
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$OUT_DIR/.build.lock"
+  if ! flock -n 9; then
+    log "another seed build holds $OUT_DIR/.build.lock; waiting for it"
+    flock 9
+    log "lock acquired after ${SECONDS}s"
+  fi
+else
+  log "flock is not on PATH; concurrent callers of this build are not serialized"
+fi
 
 # ── Sandbox SSH keypair (Packer-parity, generated once per devbox) ───────────
 if [[ ! -f "$SSH_DIR/sandbox_ed25519" ]]; then
@@ -103,7 +137,7 @@ if [[ "${SPACE_SEED_REBUILD:-0}" != "1" \
       && -f "$OUT_DIR/rootfs.ext4" && -f "$OUT_DIR/metadata.json" && -f "$OUT_DIR/manifest.json" \
       && -f "$stamp" && "$(cat "$stamp")" == "$inputs_hash" ]]; then
   log "seed artifacts up to date in $OUT_DIR (inputs unchanged); skipping build"
-  exit 0
+  finish
 fi
 
 # ── Seed source config, read from the seed recipe like build.sh does ─────────
@@ -197,3 +231,4 @@ PY
 printf '%s\n' "$inputs_hash" >"$stamp"
 log "seed artifacts ready:"
 ls -lh "$OUT_DIR"/rootfs.ext4 "$OUT_DIR"/metadata.json "$OUT_DIR"/manifest.json
+finish

@@ -244,23 +244,26 @@ custom_build(
 # publisher that uploads it to the object store and registers the release through
 # the real ClusterApi RPCs. build-seed.sh skips the privileged rootfs build
 # when its inputs (guest binaries, builder script, recipe, pubkey) are
-# unchanged, so watch-mode rebuilds are cheap unless spaced changed.
+# unchanged, so watch-mode rebuilds are cheap unless spaced changed. The image
+# build runs under build-seed.sh's lock (its `--` command), so the seed-artifacts
+# resource below cannot replace the artifacts while they are being packaged.
+SEED_BUILD = "SPACE_RUST_BUILD_IMAGE={} bash infra/space/kind/scripts/build-seed.sh".format(RUST_ARTIFACT_IMAGE)
+SEED_DEPS = RUST_ARTIFACT_DEPS + [
+    "templates/firecracker/seed",
+    "templates/firecracker/recipes/seed.toml",
+    "docker/Dockerfile.seed-publish",
+    "infra/space/kind/scripts/build-seed.sh",
+    "infra/space/kind/scripts/seed-publish-entry.sh"]
 custom_build(
     ref = "space-seed-publish:local",
     command = " && ".join([
         pull_base_images("docker/Dockerfile.seed-publish"),
         RUST_ARTIFACT_BUILD,
-        "SPACE_RUST_BUILD_IMAGE={} bash infra/space/kind/scripts/build-seed.sh".format(RUST_ARTIFACT_IMAGE),
-        ("docker build --provenance=false --sbom=false -t $EXPECTED_REF " +
+        (SEED_BUILD + " -- docker build --provenance=false --sbom=false -t $EXPECTED_REF " +
          "-f docker/Dockerfile.seed-publish " + mirrored_bases("docker/Dockerfile.seed-publish") + " " +
          "--build-context seed=$HOME/.space-devbox/kind/seed/build ."),
     ]),
-    deps = RUST_ARTIFACT_DEPS + [
-            "templates/firecracker/seed",
-            "templates/firecracker/recipes/seed.toml",
-            "docker/Dockerfile.seed-publish",
-            "infra/space/kind/scripts/build-seed.sh",
-            "infra/space/kind/scripts/seed-publish-entry.sh"],
+    deps = SEED_DEPS,
     skips_local_docker = False,
 )
 
@@ -420,6 +423,21 @@ local_resource(
     deps = RUST_ARTIFACT_DEPS,
     allow_parallel = True,
     resource_deps = RUST_ARTIFACTS_AFTER,
+    labels = ["build"],
+)
+
+# The seed rootfs, built as soon as the Rust artifacts exist for the same
+# reason: space-seed-publish's image build waits for space-internal-api, and
+# with it the privileged rootfs build waited for the whole space-api →
+# space-internal-api deploy chain. The custom_build still runs the same
+# commands; it finds the seed lock held and waits, or finds the stamp current
+# and only packages.
+local_resource(
+    "seed-artifacts",
+    cmd = RUST_ARTIFACT_BUILD + " && " + SEED_BUILD,
+    deps = SEED_DEPS,
+    allow_parallel = True,
+    resource_deps = ["rust-artifacts"],
     labels = ["build"],
 )
 
