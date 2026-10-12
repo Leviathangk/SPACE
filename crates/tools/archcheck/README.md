@@ -124,8 +124,10 @@ are listed, followed by how many were left out.
   keeps one comment on each pull request to `main` that lists the findings,
   updated on every push and edited to say so once they are gone. It runs on
   `pull_request_target`, builds archcheck from the base branch, and reads the
-  pull request's tree only as data through `--root`. It is informational and
-  is not a required check.
+  pull request's tree only as data through `--root`. The changed-file list
+  comes from GitHub's list of the pull request's files (`filename` and
+  `previous_filename`), not from git; when that list is incomplete, the whole
+  tree is reported. It is informational and is not a required check.
 
 ## Definitions
 

@@ -9,8 +9,9 @@ name: Archcheck report
 # the pull request runs. Its head is checked out into pr/ and read as data:
 # archcheck is built from trusted/ (the base branch, whose toolchain file and
 # Cargo config apply) and given pr/ as --root. Nothing runs with pr/ as its
-# working directory, nothing from pr/ is executed, and this job saves no cache,
-# because a cache written here would land in the base branch's scope.
+# working directory, nothing from pr/ is executed, no git command runs in pr/,
+# and this job saves no cache, because a cache written here would land in the
+# base branch's scope.
 #
 # For now the pull request's own ARCHITECTURE.toml and baseline are used, the
 # same input as the Rust clippy job's archcheck step.
@@ -57,16 +58,49 @@ jobs:
           rustup toolchain install --no-self-update
           cargo build --locked --release -p pplx-space-archcheck --target-dir "$RUNNER_TEMP/archcheck"
 
+      # The report covers only the files the pull request changes, so it is
+      # not told about findings already on main. The list comes from the API,
+      # with both sides of every rename, rather than from git in pr/. GitHub
+      # lists at most 3,000 files, and a name with a line break cannot be put
+      # in the list; in either case the whole tree is reported. Only the
+      # number of files is logged: the names come from the pull request.
+      - name: List the pull request's changed files
+        id: changed-files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
+        run: |
+          set -euo pipefail
+          files="$RUNNER_TEMP/archcheck-pr-files.jsonl"
+          gh api --paginate "repos/${REPOSITORY}/pulls/${PR_NUMBER}/files?per_page=100" \
+            --jq '.[] | [.filename, .previous_filename] | @json' >"$files"
+          listed="$(wc -l <"$files")"
+          if [ "$listed" -lt "$CHANGED_FILES" ] || jq -s -e 'any(.[][]; strings | test("[\r\n]"))' "$files" >/dev/null; then
+            echo "archcheck: reporting the whole tree; GitHub listed ${listed} of ${CHANGED_FILES} changed files."
+            echo "scope=tree" >>"$GITHUB_OUTPUT"
+          else
+            jq -r '.[0], (.[1] // empty)' "$files" >"$RUNNER_TEMP/archcheck-changed-files"
+            echo "archcheck: reporting findings in the ${listed} files this pull request changes."
+            echo "scope=changed" >>"$GITHUB_OUTPUT"
+          fi
+
       # Exit 1 (a required-mode finding) is reported like any other finding;
       # the Rust clippy job is what fails on it. Exit 2 (a configuration, usage
       # or I/O error) fails this job and posts no comment.
       - name: Check the pull request head
+        env:
+          SCOPE: ${{ steps.changed-files.outputs.scope }}
         run: |
           set -euo pipefail
           report="$RUNNER_TEMP/archcheck-report.md"
+          args=(--root "$GITHUB_WORKSPACE/pr" --format markdown)
+          if [ "$SCOPE" = changed ]; then
+            args+=(--changed-files "$RUNNER_TEMP/archcheck-changed-files")
+          fi
           status=0
-          "$RUNNER_TEMP/archcheck/release/archcheck" --root "$GITHUB_WORKSPACE/pr" --format markdown >"$report" ||
-            status=$?
+          "$RUNNER_TEMP/archcheck/release/archcheck" "${args[@]}" >"$report" || status=$?
           if [ "$status" -ne 0 ] && [ "$status" -ne 1 ]; then
             echo "::error title=archcheck::archcheck exited $status; no comment was posted."
             exit "$status"
