@@ -127,7 +127,9 @@ are listed, followed by how many were left out.
   pull request's tree only as data through `--root`. The changed-file list
   comes from GitHub's list of the pull request's files (`filename` and
   `previous_filename`), not from git; when that list is incomplete, the whole
-  tree is reported. It is informational and is not a required check.
+  tree is reported. archcheck runs between `::stop-commands::` and its resume
+  token, generated at run time, so even unescaped output could not run a
+  workflow command. It is informational and is not a required check.
 
 ## Definitions
 

@@ -86,9 +86,12 @@ jobs:
             echo "scope=changed" >>"$GITHUB_OUTPUT"
           fi
 
-      # Exit 1 (a required-mode finding) is reported like any other finding;
-      # the Rust clippy job is what fails on it. Exit 2 (a configuration, usage
-      # or I/O error) fails this job and posts no comment.
+      # archcheck escapes text from the tree so it cannot start a workflow
+      # command. As a second line of defence, command processing is stopped
+      # while it runs, with a token generated here and never derived from the
+      # pull request. Exit 1 (a required-mode finding) is reported like any
+      # other finding; the Rust clippy job is what fails on it. Exit 2 (a
+      # configuration, usage or I/O error) fails this job and posts no comment.
       - name: Check the pull request head
         env:
           SCOPE: ${{ steps.changed-files.outputs.scope }}
@@ -99,8 +102,11 @@ jobs:
           if [ "$SCOPE" = changed ]; then
             args+=(--changed-files "$RUNNER_TEMP/archcheck-changed-files")
           fi
+          stop_token="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+          echo "::stop-commands::${stop_token}"
           status=0
           "$RUNNER_TEMP/archcheck/release/archcheck" "${args[@]}" >"$report" || status=$?
+          echo "::${stop_token}::"
           if [ "$status" -ne 0 ] && [ "$status" -ne 1 ]; then
             echo "::error title=archcheck::archcheck exited $status; no comment was posted."
             exit "$status"
