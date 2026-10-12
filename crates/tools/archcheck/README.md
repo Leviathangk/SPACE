@@ -118,6 +118,12 @@ are listed, followed by how many were left out.
   first parent (`git diff --name-only --no-renames`), after checking that its
   second parent is the pull request's head. The step runs even when clippy
   fails.
+- [`archcheck-report.yml`](../../../.github/workflows/archcheck-report.yml)
+  keeps one comment on each pull request to `main` that lists the findings,
+  updated on every push and edited to say so once they are gone. It runs on
+  `pull_request_target`, builds archcheck from the base branch, and reads the
+  pull request's tree only as data through `--root`. It is informational and
+  is not a required check.
 
 ## Definitions
 

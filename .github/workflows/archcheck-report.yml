@@ -1,0 +1,85 @@
+name: Archcheck report
+
+# Keeps one comment on each pull request that lists its archcheck findings
+# (crates/tools/archcheck), including pull requests from forks. Informational:
+# not a required check and not part of any aggregate.
+#
+# pull_request_target runs this file with the base branch's code and a token
+# that can write pull request comments. That is only safe while no code from
+# the pull request runs. Its head is checked out into pr/ and read as data:
+# archcheck is built from trusted/ (the base branch, whose toolchain file and
+# Cargo config apply) and given pr/ as --root. Nothing runs with pr/ as its
+# working directory, nothing from pr/ is executed, and this job saves no cache,
+# because a cache written here would land in the base branch's scope.
+#
+# For now the pull request's own ARCHITECTURE.toml and baseline are used, the
+# same input as the Rust clippy job's archcheck step.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: archcheck-report-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  report:
+    if: github.repository == 'perplexityai/SPACE'
+    name: Archcheck report
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out the base branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: trusted
+          persist-credentials: false
+
+      - name: Check out the pull request head as data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr
+          persist-credentials: false
+
+      # rustup and cargo read trusted/rust-toolchain.toml and
+      # trusted/.cargo/config.toml, never the pull request's copies.
+      - name: Build archcheck from the base branch
+        working-directory: trusted
+        run: |
+          rustup toolchain install --no-self-update
+          cargo build --locked --release -p pplx-space-archcheck --target-dir "$RUNNER_TEMP/archcheck"
+
+      # Exit 1 (a required-mode finding) is reported like any other finding;
+      # the Rust clippy job is what fails on it. Exit 2 (a configuration, usage
+      # or I/O error) fails this job and posts no comment.
+      - name: Check the pull request head
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/archcheck-report.md"
+          status=0
+          "$RUNNER_TEMP/archcheck/release/archcheck" --root "$GITHUB_WORKSPACE/pr" --format markdown >"$report" ||
+            status=$?
+          if [ "$status" -ne 0 ] && [ "$status" -ne 1 ]; then
+            echo "::error title=archcheck::archcheck exited $status; no comment was posted."
+            exit "$status"
+          fi
+          cat "$report" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Update the pull request comment
+        working-directory: trusted
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: >-
+          bash ci/scripts/archcheck-pr-comment.sh --repo "$REPOSITORY" --pr "$PR_NUMBER"
+          --sha "$HEAD_SHA" --report "$RUNNER_TEMP/archcheck-report.md"
