@@ -116,3 +116,46 @@ fn host_is_required_for_tcp_schemes() {
         EndpointConfigError::InvalidUri { .. } | EndpointConfigError::MissingHost { .. }
     ));
 }
+
+// A dial whose SYN is never answered must not hold connect for the kernel's
+// SYN retransmits: each dial is bounded, so connect redials until the retry
+// budget is spent and then fails. Linux drops a SYN to a listener whose accept
+// queue is full, which stands in for a SYN pinned to a stale conntrack entry.
+#[cfg(target_os = "linux")]
+#[tokio::test(start_paused = true)]
+async fn an_unanswered_dial_fails_within_the_connect_budget() {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = socket.listen(0).unwrap();
+    let address = listener.local_addr().unwrap();
+    // A zero backlog admits one unaccepted connection; this one fills it.
+    let _queued = tokio::net::TcpStream::connect(address).await.unwrap();
+    // The dial never completes, so the empty CA is never consulted.
+    let dir = tempfile::tempdir().unwrap();
+    let ca = dir.path().join("ca.pem");
+    std::fs::write(&ca, "").unwrap();
+
+    for endpoint in [
+        CredmgrEndpoint::Tcp(format!("http://{address}").parse().unwrap()),
+        CredmgrEndpoint::Tls {
+            uri: format!("https://{address}").parse().unwrap(),
+            files: TlsFiles::new(ca.clone()),
+        },
+    ] {
+        let budget = pplx_space_common_grpc::DEFAULT_GRPC_CONNECT_RETRY_POLICY.max_elapsed;
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(budget * 6, endpoint.connect())
+            .await
+            .unwrap_or_else(|_| panic!("{endpoint:?}: an unanswered dial must be bounded"));
+        assert!(
+            matches!(result, Err(ConnectError::Transport(_))),
+            "{endpoint:?}: {:?}",
+            result.map(|_| ())
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= budget && elapsed <= budget + CONNECT_TIMEOUT,
+            "{endpoint:?}: connect gave up after {elapsed:?}"
+        );
+    }
+}

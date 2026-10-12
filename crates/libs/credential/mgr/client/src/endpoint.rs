@@ -16,6 +16,7 @@
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use tonic::codegen::http::Uri;
 use tonic::transport::{Certificate, ClientTlsConfig};
@@ -26,6 +27,12 @@ const ENDPOINT_VAR: &str = "SPACE_CREDMGR_ENDPOINT";
 const TLS_CA_VAR: &str = "SPACE_CREDMGR_TLS_CA";
 
 const SERVICE_NAME: &str = "credential-manager";
+
+/// Bounds each TCP dial, not the TLS handshake. The connect retry budget is
+/// checked only between dials, so without this bound a SYN pinned to a stale
+/// conntrack entry (one sent to a ClusterIP before kube-proxy programmed it on
+/// the node) holds the first dial through about two minutes of retransmits.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// PEM file location for the server-TLS client side: the CA bundle that
 /// signed the credmgr server certificate. With identity moved to the
@@ -147,7 +154,8 @@ impl CredmgrEndpoint {
                 (channel, CredmgrBearerInterceptor::None)
             }
             Self::Tcp(uri) => {
-                let endpoint = tonic::transport::Endpoint::from(uri.clone());
+                let endpoint =
+                    tonic::transport::Endpoint::from(uri.clone()).connect_timeout(CONNECT_TIMEOUT);
                 let channel = pplx_space_common_grpc::connect_tcp_channel_with_retry(
                     SERVICE_NAME,
                     uri.to_string(),
@@ -159,7 +167,9 @@ impl CredmgrEndpoint {
             }
             Self::Tls { uri, files } => {
                 let tls = client_tls_config(files).await?;
-                let endpoint = tonic::transport::Endpoint::from(uri.clone()).tls_config(tls)?;
+                let endpoint = tonic::transport::Endpoint::from(uri.clone())
+                    .connect_timeout(CONNECT_TIMEOUT)
+                    .tls_config(tls)?;
                 let channel = pplx_space_common_grpc::connect_tcp_channel_with_retry(
                     SERVICE_NAME,
                     uri.to_string(),
