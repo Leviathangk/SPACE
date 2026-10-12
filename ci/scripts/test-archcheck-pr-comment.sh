@@ -7,10 +7,14 @@ SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/archcheck-pr-comment.sh"
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
 
-FAILURES=0
+# Failures are recorded in a file, not a variable: assertions inside a
+# command substitution, such as dry_run_body's, run in a subshell whose
+# variables are discarded.
+FAILURES="${WORK}/failures"
+: >"${FAILURES}"
 fail() {
     echo "FAIL: $*" >&2
-    FAILURES=$((FAILURES + 1))
+    echo "$*" >>"${FAILURES}"
 }
 
 SHA=0123456789abcdef0123456789abcdef01234567
@@ -171,5 +175,8 @@ for args in \
 done
 [ ! -s "${FAKE_GH_LOG}" ] || fail "bad arguments reached gh: $(cat "${FAKE_GH_LOG}")"
 
-[ "${FAILURES}" -eq 0 ] || exit 1
+if [ -s "${FAILURES}" ]; then
+    echo "archcheck-pr-comment tests: $(wc -l <"${FAILURES}") failed" >&2
+    exit 1
+fi
 echo "archcheck-pr-comment tests passed"
