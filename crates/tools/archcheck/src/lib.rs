@@ -40,6 +40,6 @@ pub fn write_baseline(root: &Path) -> Result<Baseline, WriteBaselineError> {
     for rule in rules::registered() {
         rule.update_baseline(&ctx, &mut baseline);
     }
-    baseline.write(&root.join(BASELINE_FILE))?;
+    baseline.write(root, &root.join(BASELINE_FILE))?;
     Ok(baseline)
 }

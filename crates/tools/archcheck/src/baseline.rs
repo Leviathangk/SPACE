@@ -35,6 +35,8 @@ pub enum WriteBaselineError {
     Load(#[from] LoadError),
     #[error("could not serialize the baseline: {0}")]
     Serialize(#[from] toml::ser::Error),
+    #[error("refusing to write {path}: it is a symlink or resolves outside the repository root")]
+    UnsafeTarget { path: PathBuf },
     #[error("could not write {path}: {source}")]
     Write {
         path: PathBuf,
@@ -70,11 +72,33 @@ impl Baseline {
         Ok(format!("{HEADER}\n{}", toml::to_string(self)?))
     }
 
-    pub fn write(&self, path: &Path) -> Result<(), WriteBaselineError> {
-        std::fs::write(path, self.render()?).map_err(|source| WriteBaselineError::Write {
+    /// Writes the baseline to `path` inside `root`. The tree may not be
+    /// trusted, so a symlink, even one that stays inside the root, or a path
+    /// that resolves outside it is refused rather than written through.
+    pub fn write(&self, root: &Path, path: &Path) -> Result<(), WriteBaselineError> {
+        let write_error = |source| WriteBaselineError::Write {
             path: path.to_path_buf(),
             source,
-        })
+        };
+        let unsafe_target = || WriteBaselineError::UnsafeTarget {
+            path: path.to_path_buf(),
+        };
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return Err(unsafe_target()),
+            Ok(_) => {
+                let real_root = root.canonicalize().map_err(write_error)?;
+                if !path
+                    .canonicalize()
+                    .map_err(write_error)?
+                    .starts_with(real_root)
+                {
+                    return Err(unsafe_target());
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(write_error(err)),
+        }
+        std::fs::write(path, self.render()?).map_err(write_error)
     }
 }
 

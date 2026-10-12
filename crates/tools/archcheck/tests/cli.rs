@@ -1119,3 +1119,37 @@ fn write_baseline_records_files_over_the_limit() {
     assert_eq!(ws.run(&["--write-baseline"]).code, 0);
     ws.run(&[]).assert_clean();
 }
+
+/// The tree may be untrusted: `--write-baseline` must not write through a
+/// symlink, whether it leads outside the root or not.
+#[cfg(unix)]
+#[test]
+fn write_baseline_refuses_a_symlinked_baseline() {
+    use std::os::unix::fs::symlink;
+
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("victim.toml");
+    fs::write(&target, "keep me\n").unwrap();
+
+    let ws = Workspace::new("advisory");
+    ws.rust_file("crates/a/src/lib.rs", LIMIT + 1);
+    let baseline = ws.root().join("architecture-baseline.toml");
+    fs::remove_file(&baseline).unwrap();
+    symlink(&target, &baseline).unwrap();
+
+    let run = ws.run(&["--write-baseline"]);
+    assert_eq!(run.code, 2, "{}{}", run.stdout, run.stderr);
+    assert!(run.stderr.contains("refusing to write"), "{}", run.stderr);
+    assert_eq!(fs::read_to_string(&target).unwrap(), "keep me\n");
+    assert!(fs::symlink_metadata(&baseline).unwrap().is_symlink());
+
+    // A symlink inside the root is refused too.
+    fs::remove_file(&baseline).unwrap();
+    ws.write("crates/baseline.toml", "keep me\n");
+    symlink("crates/baseline.toml", &baseline).unwrap();
+    assert_eq!(ws.run(&["--write-baseline"]).code, 2);
+    assert_eq!(
+        fs::read_to_string(ws.root().join("crates/baseline.toml")).unwrap(),
+        "keep me\n"
+    );
+}
