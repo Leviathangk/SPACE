@@ -28,14 +28,13 @@
 #   SPACE_KIND_DATADOG_MODE  off (default), fakeintake, or explicit saas
 #   SPACE_KIND_OBSERVABILITY_CONFIG watched non-secret experiment JSON file;
 #                            required for SaaS. See the Kind README.
-#   SPACE_KIND_OBSERVABILITY auto (default) installs the local metrics, traces,
-#                            logs and visualization backends when the telemetry
-#                            mode uses them; off skips them.
-#   SPACE_KIND_TELEMETRY_MODE otel (default), datadog, or journald. The otel
-#                            mode sends SPACE traces (including the Go shim)
-#                            and all Rust metric types to the Collectors,
-#                            and moves the Go shim's metrics there too. Rust
-#                            metrics sinks are exclusive; logs stay on stdout.
+#   SPACE_KIND_TELEMETRY_MODE otel (default), datadog, or off. The otel
+#                            mode installs the local metrics, traces, logs and
+#                            visualization backends and sends SPACE traces and
+#                            all metric types, the Go shim's included, to the
+#                            Collectors. datadog uses the native exporters; off
+#                            disables metrics and traces. Metrics sinks are
+#                            exclusive; logs stay on stdout in every mode.
 #
 # Host-path knobs, shared with the rendered cluster config and documented in
 # infra/space/kind/scripts/lib/kind-host-paths.sh:
@@ -91,10 +90,6 @@ TELEMETRY_HELM_ARGS=()
 while IFS= read -r value; do
   TELEMETRY_HELM_ARGS+=(--set-string "$value")
 done <<<"$telemetry_values"
-INSTALL_OBSERVABILITY="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["install_observability"])' <<<"$TELEMETRY_JSON")"
-if [[ "$TELEMETRY_MODE" == otel && "$INSTALL_OBSERVABILITY" != True ]]; then
-  log "otel mode with SPACE_KIND_OBSERVABILITY=off: point SPACE_KIND_SHIM_OTLP_ENDPOINT and the telemetry chart's endpoints at your own receiver, or shim installation will fail."
-fi
 
 # ── Step 0: prereqs ──────────────────────────────────────────────────────────
 require_bin() {
@@ -266,10 +261,11 @@ done
 # every per-sandbox pod fails to start. install-shim.sh is idempotent: it
 # only builds the shim if needed and only edits containerd config.toml if
 # the runtime stanza isn't already present.
-# The local backends come up before the shim: install-shim resolves the
-# metrics and traces Collector Services to ClusterIPs and fails if they are
-# absent. Each helper is idempotent and refuses any cluster but this bench.
-if [[ "$INSTALL_OBSERVABILITY" == True ]]; then
+# The local backends otel mode exports to come up early so start-up telemetry
+# has a receiver, but nothing depends on them: the shim addresses the
+# Collectors by fixed ClusterIPs, and every exporter retries until a receiver
+# answers. Each helper is idempotent and refuses any cluster but this bench.
+if [[ "$TELEMETRY_MODE" == otel ]]; then
   bash "$KIND_DIR/scripts/install-observability.sh"
 fi
 
@@ -486,14 +482,11 @@ else
 fi
 
 # ── Step 9: optional port-forwards ───────────────────────────────────────────
-# kubectl port-forward dies on its own when:
-#   - the target pod restarts (e.g., during a chart redeploy)
-#   - the controlling tty/shell exits
-#   - some node-side gRPC keepalives time out
 # Without supervision the smoke tests can't be re-run later in the session
-# because their localhost:80{80,90} endpoints have silently gone away. Wrap
-# each port-forward in a self-restarting loop inside a `setsid` so it
-# survives our parent shell + emits a pid we can later kill via PF_PIDFILE.
+# because their localhost:80{80,90} endpoints have silently gone away: kubectl
+# port-forward dies on its own when its pod restarts. port-forward.sh restarts
+# each forward whenever kubectl exits, and `setsid` lets it survive our parent
+# shell and its tty and emits a pid we can later kill via PF_PIDFILE.
 start_pf() {
   # Note: assigning all three on one `local` line evaluates `${target##*/}`
   # before `target=$1` lands in the local scope, which trips `set -u`.
@@ -502,21 +495,11 @@ start_pf() {
   local namespace=${3:-$NAMESPACE}
   local name=${target##*/}
   log "port-forward $namespace/$target -> localhost:${mapping%%:*} (self-restarting)"
-  # The trailing `space-kind-pf:<ctx>` argument is a label, not input — the loop
-  # reads $1..$5. It gives the supervisor's own command line one expanded,
-  # cluster-scoped token, so a pattern-based reap can find the loop and not only
-  # its kubectl child, without depending on whether the matcher's `.` crosses the
-  # newlines in the script text below.
-  setsid bash -c '
-    target="$1" mapping="$2" name="$3" ns="$4" kctx="$5"
-    while true; do
-      kubectl --context "$kctx" -n "$ns" port-forward --address=127.0.0.1 \
-        "$target" "$mapping" >>/tmp/space-local-pf-"$name".log 2>&1
-      # kubectl exited (target rolled, conn dropped); back off then retry.
-      sleep 2
-    done
-  ' _ "$target" "$mapping" "$name" "$namespace" "$KCTX" "space-kind-pf:$KCTX" \
-    >/dev/null 2>&1 < /dev/null &
+  # The trailing `space-kind-pf:<ctx>` argument is a label, not input (see
+  # port-forward.sh).
+  setsid bash "$KIND_DIR/scripts/port-forward.sh" \
+    "$KCTX" "$namespace" "$target" "$mapping" "space-kind-pf:$KCTX" \
+    >>/tmp/space-local-pf-"$name".log 2>&1 < /dev/null &
   echo "$!" >>"$PF_PIDFILE"
 }
 
@@ -548,6 +531,14 @@ if (( PORT_FORWARD )); then
   start_pf svc/object-store     8333:8333
   if [[ "$DATADOG_MODE" == fakeintake ]]; then
     start_pf svc/datadog-fakeintake 8088:80 kube-system
+  fi
+  # The local observability backends exist only in otel mode. Each takes the
+  # port its own `local.sh ui` helper uses; the Tiltfile forwards the same.
+  if [[ "$TELEMETRY_MODE" == otel ]]; then
+    start_pf svc/prometheus 19090:9090 space-metrics
+    start_pf svc/tempo      13200:3200 space-traces
+    start_pf svc/loki       13101:3100 space-logs
+    start_pf svc/grafana    13000:3000 space-grafana
   fi
 
   # The forwards bind asynchronously; callers (e.g. the devbox kind command)

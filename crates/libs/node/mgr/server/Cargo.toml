@@ -55,7 +55,7 @@ pplx-space-metrics = { workspace = true }
 pplx-space-net-common = { workspace = true }
 pplx-space-node-ctl-client = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
-pplx-space-node-runtime-core = { workspace = true, features = ["host-runtime"] }
+pplx-space-node-runtime-core = { workspace = true, features = ["artifact-store", "host-runtime"] }
 pplx-space-observability = { workspace = true, default-features = false }
 sqlx = { workspace = true, features = ["macros", "migrate"] }
 uuid = { workspace = true }
@@ -67,7 +67,6 @@ rtnetlink = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["test-hooks"] }
 insta = { workspace = true, features = ["json"] }
 rstest = { workspace = true }
-pplx-space-test-env = { workspace = true }
 # test-capture lets the encrypted-volume tests assert which BYOK counters a
 # code path emitted, so the attempted/failed pairing is enforced rather than
 # reviewed.

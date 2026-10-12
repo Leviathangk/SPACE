@@ -1,7 +1,9 @@
 //! Immutable settings resolved before the daemon becomes active.
 //!
 //! Parsers stay with their domain owner; this is the single startup composition
-//! point. Loop-device sizing retains its separate live-pool policy.
+//! point. Loop-device sizing retains its separate live-pool policy. The service
+//! is handed its memory-admission sources and runtime-supervisor client from
+//! here rather than constructing them, so tests can substitute their own.
 
 use std::path::PathBuf;
 
@@ -13,6 +15,8 @@ pub(crate) struct ServiceSettings {
     pub lifecycle_limiter: crate::lifecycle_limiter::LifecycleLimiter,
     pub runtime_paths: RuntimePaths,
     pub guest_console_logs: bool,
+    pub memory_admission_sources: crate::memory_admission::MemoryAdmissionSources,
+    pub runtime_supervisor: crate::runtime_supervisor_client::RuntimeSupervisorLazyClient,
 }
 
 #[derive(Clone, Debug)]
@@ -20,14 +24,28 @@ pub(crate) struct RuntimePaths {
     pub vendor: PathBuf,
     pub assets: PathBuf,
     pub kernels: PathBuf,
+    pub store: ArtifactStorePaths,
 }
 
-impl Default for RuntimePaths {
+/// The node's artifact store, which node-manager alone publishes into, and
+/// where publications come from.
+#[derive(Clone, Debug)]
+pub(crate) struct ArtifactStorePaths {
+    pub releases: PathBuf,
+    pub kernels: PathBuf,
+    /// The runtime manager's staging directory, read and never written.
+    pub staging: PathBuf,
+    /// Root-owned catalog files adding pins to the compiled ones.
+    pub catalog: PathBuf,
+}
+
+impl Default for ArtifactStorePaths {
     fn default() -> Self {
         Self {
-            vendor: paths::FIRECRACKER_VENDOR_DIR.into(),
-            assets: paths::FIRECRACKER_ASSET_DIR.into(),
-            kernels: paths::FIRECRACKER_KERNEL_ASSET_DIR.into(),
+            releases: paths::NODE_FIRECRACKER_DIR.into(),
+            kernels: paths::NODE_KERNELS_DIR.into(),
+            staging: paths::RUNTIME_MANAGER_STAGING_DIR.into(),
+            catalog: paths::RUNTIME_MANAGER_CATALOG_DIR.into(),
         }
     }
 }
@@ -47,6 +65,7 @@ impl ServiceSettings {
                     "SPACE_FIRECRACKER_KERNEL_ASSET_DIR",
                     paths::FIRECRACKER_KERNEL_ASSET_DIR,
                 ),
+                store: ArtifactStorePaths::default(),
             },
             guest_console_logs: std::env::var("SPACE_ENABLE_GUEST_CONSOLE_LOGS").is_ok_and(
                 |value| {
@@ -55,6 +74,9 @@ impl ServiceSettings {
                         "1" | "true" | "yes" | "on"
                     )
                 },
+            ),
+            memory_admission_sources: crate::memory_admission::MemoryAdmissionSources::default(),
+            runtime_supervisor: crate::runtime_supervisor_client::RuntimeSupervisorLazyClient::new(
             ),
         };
         // Explicit non-secret fields, not a Debug dump of arbitrary config.

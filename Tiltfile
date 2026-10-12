@@ -54,8 +54,8 @@ local(["bash", "infra/space/kind/scripts/check-object-store-transition.sh", KIND
 # "Upgrading from the node-stack layout" in infra/space/kind/README.md.
 local(["bash", "infra/space/kind/scripts/check-node-layout.sh", KIND_CLUSTER], quiet = True)
 
-# Select one metrics sink per process. The Datadog and OTel comparison modes
-# also select the matching trace exporter; journald leaves traces on Datadog.
+# Select one metrics sink per process. The datadog and otel modes also select
+# the matching trace exporter; off disables both.
 # These local selectors do not activate any deployed environment.
 TELEMETRY_SCRIPT = "infra/space/kind/scripts/telemetry_config.py"
 OBSERVABILITY_CONFIG = os.getenv("SPACE_KIND_OBSERVABILITY_CONFIG", "")
@@ -70,15 +70,11 @@ DATADOG_MODE = TELEMETRY_CONFIG["backend"]
 TELEMETRY_MODE = TELEMETRY_CONFIG["mode"]
 TELEMETRY_SET = TELEMETRY_CONFIG["helm_set"]
 watch_file("infra/space/kind/charts/space-kind-telemetry")
-INSTALL_OBSERVABILITY = TELEMETRY_CONFIG["install_observability"]
-if TELEMETRY_MODE == "otel" and not INSTALL_OBSERVABILITY:
-    print("otel mode with SPACE_KIND_OBSERVABILITY=off: point the telemetry chart's endpoints at your own receiver, or exports will have nowhere to go.")
 
-# install-shim.sh resolves the metrics and traces Collector Services and exits 2
-# when they are absent, so the backends are a dependency of the shim on this
-# path exactly as they are in bootstrap.sh. Without this, defaulting to otel
-# fails the shim and blocks rust-artifacts and the sandbox stack.
-if INSTALL_OBSERVABILITY:
+# The local backends otel mode exports to, installed as on the bootstrap path.
+# Nothing waits on them: the shim addresses the Collectors by fixed ClusterIPs,
+# and every exporter retries until a receiver answers.
+if TELEMETRY_MODE == "otel":
     local_resource(
         "install-observability-backends",
         cmd = "SPACE_KIND_CLUSTER={} bash infra/space/kind/scripts/install-observability.sh".format(KIND_CLUSTER),
@@ -94,6 +90,27 @@ if INSTALL_OBSERVABILITY:
         ],
         labels = ["bootstrap"],
     )
+
+    # Each backend on the port its own `local.sh ui` helper uses; bootstrap.sh
+    # forwards the same. Tilt does not deploy these releases, so it tracks no
+    # pods for port_forwards to follow: port-forward.sh holds each forward
+    # instead, restarting it whenever its pod does.
+    for name, namespace, mapping in [
+        ("prometheus", "space-metrics", "19090:9090"),
+        ("tempo", "space-traces", "13200:3200"),
+        ("loki", "space-logs", "13101:3100"),
+        ("grafana", "space-grafana", "13000:3000"),
+    ]:
+        local_resource(
+            "{}-port-forward".format(name),
+            serve_cmd = [
+                "bash", "infra/space/kind/scripts/port-forward.sh", "kind-" + KIND_CLUSTER,
+                namespace, "svc/" + name, mapping, "space-kind-pf:kind-" + KIND_CLUSTER,
+            ],
+            links = [link("http://127.0.0.1:" + mapping.split(":")[0], name)],
+            labels = ["observability"],
+            resource_deps = ["install-observability-backends"],
+        )
 
 # ── Image builds ──────────────────────────────────────────────────────────
 #
@@ -372,9 +389,7 @@ SPACE_KIND_CLUSTER={cluster} bash infra/space/kind/scripts/internal-rpc-tls.sh
 )
 
 # containerd-shim-space-v2 on each sandbox worker, so per-sandbox pause pods
-# are hijacked into real Firecracker sandboxes. install-shim.sh resolves the
-# local metrics and traces Collector Services, so in otel mode it waits for
-# the observability backends.
+# are hijacked into real Firecracker sandboxes.
 local_resource(
     "install-space-shim",
     cmd = "SPACE_KIND_CLUSTER={} SPACE_KIND_TELEMETRY_MODE={} bash infra/space/kind/scripts/install-shim.sh".format(
@@ -382,7 +397,6 @@ local_resource(
         TELEMETRY_MODE,
     ),
     deps = [TELEMETRY_SCRIPT, "infra/space/kind/scripts/install-shim.sh"] + ([OBSERVABILITY_CONFIG] if OBSERVABILITY_CONFIG else []),
-    resource_deps = ["install-observability-backends"] if INSTALL_OBSERVABILITY else [],
     labels = ["bootstrap"],
 )
 
@@ -486,6 +500,7 @@ k8s_yaml(helm(
     "infra/space/kind/charts/space-internal-api-local",
     name = "space",
     namespace = NAMESPACE,
+    set = TELEMETRY_SET,
 ))
 k8s_resource(
     "space-internal-api",

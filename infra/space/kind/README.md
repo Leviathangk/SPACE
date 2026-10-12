@@ -232,6 +232,52 @@ Datadog collection, or metrics/traces settings. It includes local-only UI access
 an existing-process-fixture validation workflow, and scoped cleanup commands.
 The ingestion and visualization releases can still be managed independently.
 
+### Querying telemetry
+
+In `otel` mode both bring-up paths forward each backend to localhost, as they
+do the API (bootstrap unless `--no-port-forward`), and restart a forward
+whenever its pod restarts:
+
+| Backend | URL |
+| --- | --- |
+| Prometheus | <http://localhost:19090> |
+| Tempo | <http://localhost:13200> |
+| Loki | <http://localhost:13101> |
+| Grafana | <http://localhost:13000> |
+
+Each backend's own `local.sh ui` helper uses the same port, for a backend
+installed on its own. Every signal can be read with `curl`:
+
+```bash
+now=$(date +%s)
+
+# PromQL. OTLP resource attributes are labels: service_name, k8s_pod_name, ...
+curl -sG localhost:19090/api/v1/query \
+  --data-urlencode 'query=count by (service_name) ({__name__=~"space_.+"})'
+curl -sG localhost:19090/api/v1/query \
+  --data-urlencode 'query=histogram_quantile(0.9, sum by (op) (rate(space_sandbox_api_latency_milliseconds[15m])))'
+
+# TraceQL search, then the whole trace by an ID it returned.
+curl -sG localhost:13200/api/search \
+  --data-urlencode 'q={resource.service.name="space-api" && status=error}' \
+  -d start=$((now - 3600)) -d end=$now -d limit=20
+curl -s localhost:13200/api/v2/traces/TRACE_ID_FROM_THE_SEARCH
+
+# LogQL. Lines are JSON; `| json` exposes their fields, such as sandbox_id.
+curl -sG localhost:13101/loki/api/v1/query_range \
+  --data-urlencode 'query={namespace="space"} | json | sandbox_id="SANDBOX_ID"' \
+  -d start=$((now - 3600))000000000 -d end=${now}000000000 -d limit=100
+```
+
+Tempo search never returns the newest 30 seconds, whatever `end` says
+(`query_end_cutoff`), and rejects a window that the cutoff leaves empty, so
+poll for a trace you just caused; fetching a trace by ID has no such delay.
+For tag values use `/api/v2/search/tag/resource.service.name/values`: the v1
+route answers scoped names with an empty list. Span IDs in fetched traces are
+base64. Log lines carry `sandbox_id` where the service knows it, but no trace
+ID, so join logs to traces by sandbox ID and time. Grafana shows the same
+three datasources and the packaged dashboards.
+
 ### Datadog (optional)
 
 The Kind-only `datadog-agent-local` chart supports two explicit backends:
@@ -253,31 +299,40 @@ bash infra/space/kind/scripts/bootstrap.sh
 ```
 
 Bootstrap and full-stack Tilt install the metrics, traces, logs and visualization
-backends before the shim, because `install-shim.sh` resolves the metrics and
-traces Collector Services to ClusterIPs and fails if they are absent. No manual
-Collector installation is needed on these default paths. Each helper is
+backends, but nothing waits on them: the shim and the Rust services start
+without a receiver and retry their exports until one answers, so the backends
+can be removed and reinstalled under a running stack. No manual Collector
+installation is needed on these default paths. Each helper is
 idempotent, so re-running bootstrap does not churn them.
 
-To keep a cluster lean, or to point the exporters at a receiver you run
-yourself:
+Before installing, `install-observability.sh` loads each backend image onto
+every node at the linux/amd64 digest `ci/mirrored-images.txt` lists for the
+charts' pin, under the tag the Kind profiles name, so the pods start without a
+registry pull. GitHub CI takes these images from the GHCR mirror; elsewhere
+they come from Docker Hub. A load that fails leaves the pull to the kubelet.
+
+The `off` and `datadog` modes install no local backends:
 
 ```bash
-# No local backends; supply your own receiver.
-SPACE_KIND_OBSERVABILITY=off bash infra/space/kind/scripts/bootstrap.sh
+# No metrics or traces at all, and no local backends.
+SPACE_KIND_TELEMETRY_MODE=off bash infra/space/kind/scripts/bootstrap.sh
 
 # Native Datadog instead, with local capture rather than the SaaS backend.
 SPACE_KIND_TELEMETRY_MODE=datadog SPACE_KIND_DATADOG_MODE=fakeintake \
   bash infra/space/kind/scripts/bootstrap.sh
 ```
 
-When skipping local backends in `otel` mode, set `SPACE_KIND_SHIM_OTLP_ENDPOINT`
-to a node-reachable OTLP/gRPC receiver and configure the workload endpoints
-described below. `SPACE_KIND_OBSERVABILITY=off` skips backend installation; it
-does not disable exporters or uninstall existing releases.
+`off` sets `SPACE_METRICS_SINK=off` and `SPACE_TRACE_EXPORTER=off` for every
+Rust service and the shim, with no OTLP endpoint or identity overrides, for a
+leaner bench. The Kind CI shards pin `otel`, so they run what a devbox runs;
+the typed `local.telemetry_reaches_local_backends` scenario, in their normal
+inventory, polls Tempo, Prometheus and Loki for its own sandbox's trace, shim
+metrics and log lines.
 
-CI pins `SPACE_KIND_OBSERVABILITY=off` and `SPACE_KIND_TELEMETRY_MODE=datadog`
-for the Kind smoke shards: they test sandbox lifecycle, and the backends'
-images are not in `ci/mirrored-images.txt`.
+To export to a receiver you run yourself, stay in `otel` mode, set
+`SPACE_KIND_SHIM_OTLP_ENDPOINT` for the shim and runtime-supervisor, and
+override the workload endpoints below. The local backends are still installed
+alongside it.
 
 Rust workloads send metrics to
 `http://collector.space-metrics.svc.cluster.local:4317` and traces to
@@ -290,11 +345,6 @@ exporters. Logs stay on stdout for Alloy to collect; no log endpoint is needed.
 `otel` is the Kind default. Set `SPACE_KIND_TELEMETRY_MODE=datadog` to return
 to native Datadog metrics and traces; pair it with
 `SPACE_KIND_DATADOG_MODE=fakeintake` for local capture.
-
-One thing the table does not show: `journald` suppresses Rust metrics rather
-than writing them to the journal. The sink emits on a tracing target every
-formatting layer filters out, and no journald layer is installed, so expect no
-Rust metric output. It keeps Datadog traces.
 
 The two selectors are independent. `SPACE_KIND_DATADOG_MODE` chooses where the
 Agent sends what it collects, and `SPACE_KIND_TELEMETRY_MODE=otel` bypasses the
@@ -326,7 +376,7 @@ over the launch environment, including during rollback.
 
 The default Kind telemetry mode sends Rust custom metrics and traces through
 the upstream OpenTelemetry SDKs and local Collectors. On an existing Kind
-cluster, full-stack Tilt installs the backends before the shim automatically:
+cluster, full-stack Tilt installs the backends automatically:
 
 ```bash
 tilt up
@@ -337,8 +387,8 @@ for a side-by-side capture; `otel` does not require one.
 
 `datadog` remains an explicit rollback option. The default `otel` mode selects
 the exclusive `SPACE_METRICS_SINK=otlp` and `SPACE_TRACE_EXPORTER=otlp` paths with an
-`always_on` diagnostic trace sampler. `journald` suppresses Rust metrics and
-leaves traces on Datadog. In `otel` mode the shim moves to OTLP as well.
+`always_on` diagnostic trace sampler, and `off` turns both signals off. In
+`otel` mode the shim moves to OTLP as well.
 There is no dual-publish or non-counter mode. Counters use the same metric
 names: native intake reports RATE and OTLP reports COUNT. Compare event totals
 rather than raw values, and keep a same-name type comparison off any backend
@@ -356,7 +406,7 @@ harness. A direct render must choose `values-fakeintake.yaml` or an existing
 SaaS Secret explicitly. The ordinary chart defaults do not deploy a backend.
 
 SPACE bootstrap completes application readiness before installing the optional
-Datadog Agent; the default local OTLP backends are installed before the shim.
+Datadog Agent; the default local OTLP backends are installed with the stack.
 An Agent failure is reported as a failure without preventing the SPACE releases
 from being installed. Comparison runs still require verified Agents and
 received payloads.
@@ -437,29 +487,49 @@ verify. Previously ingested SaaS data remains subject to backend retention.
 
 The same mode selects the Go containerd shim's trace exporter and its metrics
 sink: `datadog` keeps DogStatsD, `otel` moves the shim to OTLP alongside the
-workloads, and `journald` disables shim metrics, since the shim has no
-journald sink. In `datadog` and `journald` modes the wrapper leaves the SPACE
-and OTel identity settings unset, so the shim's DogStatsD tags are exactly
-what they were before this mode existed. Because containerd starts
+workloads, and `off` disables both. In `datadog` and `off` modes the wrapper
+leaves the SPACE and OTel identity settings unset, so the shim's DogStatsD tags
+are exactly what they were before this mode existed; `off` sets no OTLP
+endpoint either. Because containerd starts
 the shim on the Kind node rather than in a Pod, `install-shim.sh` installs a
 small production-shaped wrapper around the compiled binary instead of relying
-on workload environment inheritance. In `otel` mode, installation looks up
-`collector` in both `space-traces` and `space-metrics` using the selected
-Kind context and uses `http://<ClusterIP>:4317` for each signal. Kind nodes cannot
-resolve pod DNS, but kube-proxy routes the Service's ClusterIP. Installation fails
-if either Service is missing or has no ClusterIP. Default bootstrap and
-full-stack Tilt install them automatically. For a standalone shim install, run
-`infra/space/kind/traces/local.sh up` and `infra/space/kind/metrics/local.sh up`
-first, or set `SPACE_KIND_SHIM_OTLP_ENDPOINT` to another OTLP/gRPC receiver
-reachable from the Kind node. An explicit override bypasses Service discovery
-for both signals.
+on workload environment inheritance. Kind nodes cannot resolve pod DNS, but
+kube-proxy routes a Service's ClusterIP, so in `otel` mode the wrapper sends
+each signal to `http://<ClusterIP>:4317` of its Collector. The addresses are
+fixed by `collector.clusterIP` in each chart's `profiles/kind.yaml`:
+`10.96.0.20` for `space-metrics` and `10.96.0.21` for `space-traces`, in the
+first 256 addresses of Kind's `10.96.0.0/16` Service range, which dynamic
+allocation avoids. The shim can therefore be installed before the Collectors,
+and reinstalling them does not leave the wrapper with a stale address. Set
+`SPACE_KIND_SHIM_OTLP_ENDPOINT` to send both signals to another OTLP/gRPC
+receiver reachable from the Kind node instead.
+
+The host runtime-supervisor is the other SPACE process outside a pod. Its unit
+reads `/space/config/space.env`, which node-manager's Kind-only `kind-node-env`
+init container writes from the same selector: the pods' telemetry settings,
+with each OTLP endpoint replaced by the fixed address above, or by
+`SPACE_KIND_SHIM_OTLP_ENDPOINT` when that is set. Check it with
+`docker exec <node> cat /space/config/space.env`.
+
+A Collector installed before its address was pinned keeps the ClusterIP it was
+allocated, which Kubernetes will not change in place: `local.sh up` fails with
+`spec.clusterIPs[0]: ... may not change once set`. Only that Service is
+immutable; the data lives in the release's PersistentVolumeClaim. Delete the
+Service and run `up` again, which recreates it at the pinned address and keeps
+the stored metrics and traces:
+
+```bash
+kubectl --context kind-space-local -n space-metrics delete svc collector
+bash infra/space/kind/metrics/local.sh up
+```
+
+Do the same for `space-traces`, then re-run `install-shim.sh` (bootstrap and
+Tilt both do) so the wrapper names the pinned addresses.
 
 The shim takes `SPACE_METRICS_SINK` from the same telemetry mode as the Rust
-workloads: `datadog` keeps DogStatsD, `otel` selects OTLP, and `journald` maps to
-`off` because the Go shim has no journald sink and rejects that value. Left
-unset the shim would default to `auto`, meaning native Datadog, and would keep
-emitting DogStatsD metrics through an otel comparison.
-Re-run `install-shim.sh` if the Service is recreated with a different ClusterIP.
+workloads: `datadog` keeps DogStatsD, `otel` selects OTLP, and `off` selects
+`off`. Left unset the shim would default to `auto`, meaning native Datadog, and
+would keep emitting DogStatsD metrics through an otel comparison.
 Datadog mode keeps the existing node-local shim settings.
 
 Updating the shim binary or wrapper does not restart containerd unless its
@@ -752,7 +822,7 @@ reflector use) and `app.kubernetes.io/part-of=space-node`.
 | Service | Identity | Pod shape | Why (public code) |
 |---|---|---|---|
 | node-manager | root | privileged, hostNetwork, hostPID; `/space/cache` and `/var/run/netns` Bidirectional; `/sys/fs/cgroup`, `/space/bin`, `/space/etc`, `/space/vendor`, `/dev/kvm`; projected token for the credential-manager authority | mounts jail rootfs and late snapshot-memory binds that must reach the host jailer, netns binds the host jailer and sidecar launcher open, loop and device-mapper devices, cgroup limits, root-namespace veth/nft/ip_forward, pidfds on host processes (`crates/libs/node/mgr/server`); init container `node-manager-init.sh` writes the node's systemd unit via `nsenter --target 1` |
-| runtime-supervisor | root | host systemd unit, no pod | `scripts/k8s/node-manager-init.sh`, `node-manager-runtime-supervisor.sh` |
+| runtime-supervisor | root | host systemd unit, no pod; environment from `/space/config/space.env`, which node-manager's Kind-only `kind-node-env` init container writes | `scripts/k8s/node-manager-init.sh`, `node-manager-runtime-supervisor.sh` |
 | runtime-manager | space-rtmgr + space-rtmgrclients | non-root, no capabilities, read-only rootfs; `/space/vendor`, `/space/bin`, `/space/cache` read-only | lists runtimes and kernels |
 | volume-manager | space-volmgr + SPACE_VOLUME_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs; `/space/cache` HostToContainer | file transfers only (`crates/libs/vol/mgr/server`); the separate identity `docs/installation.md` describes: node-manager's btrfs send-lease RPCs authorize it and credential-manager serves it on the volume socket |
 | credential-manager | space-sbxmgr + SPACE_CREDENTIAL_MANAGER_GROUPS | non-root, no capabilities, read-only rootfs; `/space/run` only; projected token for the authority | the node credential agent (`--role=agent`): sockets only, forwarding to `space-credmgr-authority`; no database, KEK or AWS credential; its peer-process check (`SPACE_UDS_PEER_PROCESS_CHECK`) is off, so no host PID namespace |
@@ -838,7 +908,12 @@ holds its mutex (`SPACE_NODEMGR_ACTIVATE_RUNTIME_SUPERVISOR_ON_START=true`,
 directory by its image tag; every Kind build is tagged `local`, so the chart
 passes the digest of the staged binaries and the compatibility file as
 `SPACE_IMAGE_TAG`. Firecracker jails therefore live in the node's mount
-namespace and outlive every service pod. Inspect it with
+namespace and outlive every service pod. The unit reads
+`/space/config/space.env`, which a production node's bootstrap writes; on Kind
+the chart's `kind-node-env` init container writes it first (see the shim's
+telemetry below) and touches `restart-required` when it changes, so a new
+telemetry mode reaches a running supervisor through the same deferred restart.
+Inspect it with
 `docker exec <node> systemctl status space-runtime-supervisor` and
 `docker exec <node> journalctl -u space-runtime-supervisor`.
 
@@ -908,7 +983,8 @@ this harness** — e.g. warm-pool fills are authorized as `Service(space-tmplmgr
 not silently as root.
 
 The runtime manager only lists the node's Firecracker releases and kernels
-(`space-rtmgr list`); nothing depends on it yet, and it restarts on its own like
+(`space-rtmgr list`): its DaemonSet starts it with `--list-only`, so it opens
+no install root; nothing depends on it yet, and it restarts on its own like
 every other service. The baseline Kind smoke checks its JSON listing on both a
 worker and a builder, requiring a complete scan with a valid vendor runtime and a
 staged cache kernel. These checks do not gate node readiness.
@@ -997,7 +1073,7 @@ asks of the hosting deployment.
 | vhost-vsock jail nodes provided by the AMI                | the Kind-only `space-kind-vsock-jails.service` mknods them into each jail under `/space/cache/firecracker/jails` as it appears (kind-only) |
 | Sandbox SSH key generated by Packer per AMI               | generated per host by `build-seed.sh` under `~/.space-devbox/kind/ssh` |
 | ALB ingress in front of api / data-plane / ui             | NodePort + `kubectl port-forward` (started in background by bootstrap.sh)     |
-| The runtime manager uses writable `/space/vendor/{firecracker,kernels}` and `/space/vendor/runtime-manager/state` | `/space/vendor` is a read-only host bind: install roots report unprotected and state absent; listing and cache checks still work |
+| The runtime manager installs releases and kernels, which node-manager publishes into the root-owned store `/space/vendor/artifacts` | `/space/vendor` is a read-only host bind, so the runtime manager runs `--list-only`: listing and cache checks work, installs are off |
 | Operators run node-local CLIs from the node host's shell   | the same CLIs run in the Kind-only `space-node-debug` root shell DaemonSet     |
 | Build sizing, concurrency, and multipart sizes are configurable | 20 GiB default build disk, one concurrent build, and smaller multipart parts fit the 40 GiB local btrfs cache |
 

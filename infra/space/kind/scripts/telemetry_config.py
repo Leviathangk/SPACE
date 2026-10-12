@@ -2,14 +2,12 @@
 """Shared, non-secret Kind telemetry configuration for Tilt, bootstrap and shims."""
 
 import argparse
-import ipaddress
 import json
 import os
 import re
 import shlex
 import socket
 import urllib.parse
-import subprocess
 from pathlib import Path
 
 OPTIONS = {
@@ -27,13 +25,14 @@ OPTIONS = {
     "SPACE_KIND_OWNER",
     "SPACE_KIND_SHIM_ENV",
     "SPACE_KIND_SHIM_OTLP_ENDPOINT",
-    "SPACE_KIND_OBSERVABILITY",
 }
 PHASES = {"before-main", "after-datadog", "after-otel"}
+# Each mode's (SPACE_METRICS_SINK, SPACE_TRACE_EXPORTER), for the Rust
+# services and the Go shim alike.
 MODES = {
     "datadog": ("datadog", "datadog"),
     "otel": ("otlp", "otlp"),
-    "journald": ("journald", "datadog"),
+    "off": ("off", "off"),
 }
 
 
@@ -132,7 +131,7 @@ def configuration(env):
     # to validate DogStatsD output locally.
     mode = env.get("SPACE_KIND_TELEMETRY_MODE", "otel")
     if mode not in MODES:
-        raise ValueError("SPACE_KIND_TELEMETRY_MODE must be datadog, otel, or journald")
+        raise ValueError("SPACE_KIND_TELEMETRY_MODE must be otel, datadog, or off")
     environment = token(
         env.get("SPACE_KIND_ENV")
         or env.get("SPACE_KIND_SHIM_ENV")
@@ -147,7 +146,7 @@ def configuration(env):
         raise ValueError("SPACE_KIND_PHASE must name a supported before/after phase")
     owner = token(env.get("SPACE_KIND_OWNER", ""), "SPACE_KIND_OWNER", empty=True)
     endpoint = env.get("SPACE_KIND_SHIM_OTLP_ENDPOINT")
-    if endpoint is None and mode != "otel":
+    if endpoint is None and mode == "datadog":
         endpoint = "http://127.0.0.1:4317"
     if endpoint is not None:
         rejection = otlp_endpoint_rejection(endpoint)
@@ -155,18 +154,8 @@ def configuration(env):
             raise ValueError(f"SPACE_KIND_SHIM_OTLP_ENDPOINT {rejection}")
     version = f"{revision}-{phase}" if revision and phase else revision
     metrics, traces = MODES[mode]
-    # `otel` needs the local Collectors: install-shim resolves their ClusterIPs
-    # and fails without them. `auto` installs them exactly when the mode uses
-    # them. `off` is for a caller supplying its own receiver, and for CI, whose
-    # Kind jobs test sandbox lifecycle and should not pull six more images
-    # through a rate-limited mirror.
-    observability = env.get("SPACE_KIND_OBSERVABILITY", "auto")
-    if observability not in {"auto", "off"}:
-        raise ValueError("SPACE_KIND_OBSERVABILITY must be auto or off")
-    return {
+    config = {
         "mode": mode,
-        "observability": observability,
-        "install_observability": observability == "auto" and mode == "otel",
         "kind_cluster": kind_cluster,
         "cluster_id": cluster_id,
         "environment": environment,
@@ -187,48 +176,30 @@ def configuration(env):
             f"clusterId={cluster_id}",
         ],
     }
+    # The host runtime-supervisor's node environment (space-node-manager-local)
+    # needs the Collectors at addresses the node reaches, as the shim does.
+    config["helm_set"] += [
+        f"telemetry.nodeOtlpMetricsEndpoint={collector_endpoint(config, 'metrics')}",
+        f"telemetry.nodeOtlpTracesEndpoint={collector_endpoint(config, 'traces')}",
+    ]
+    return config
 
 
-# The Go shim reads SPACE_METRICS_SINK too and has no journald sink, erroring
-# on that value. Left unset it defaults to auto -> datadog, which would keep the
-# shim on native metrics while every workload moved to OTLP: wrong, silently.
-SHIM_METRICS_SINKS = {"datadog": "datadog", "otel": "otlp", "journald": "off"}
-# Each signal has its own Collector Service; the shim needs both.
-SHIM_COLLECTORS = {"traces": "space-traces", "metrics": "space-metrics"}
+# Each signal has its own Collector Service. containerd runs the shim, and
+# systemd the runtime-supervisor, on the Kind node, which has no cluster DNS, so
+# both name each Service by the fixed ClusterIP that chart's profiles/kind.yaml
+# pins as collector.clusterIP; change the two together. Because it is fixed
+# rather than looked up, the shim wrapper and the supervisor's node environment
+# can be written before the Collectors exist and stay right when they are
+# reinstalled.
+NODE_COLLECTORS = {"metrics": "10.96.0.20", "traces": "10.96.0.21"}
 
 
 def collector_endpoint(config, signal):
-    """A node-reachable OTLP endpoint for one signal's Collector.
-
-    containerd runs outside pods, so the Kind node has no cluster DNS: resolve
-    the Service to its ClusterIP and let kube-proxy route. Only at install time.
-    """
+    """A node-reachable OTLP endpoint for one signal's Collector."""
     if config["shim_endpoint"] is not None:
         return config["shim_endpoint"]
-    namespace = SHIM_COLLECTORS[signal]
-    context = f"kind-{config['kind_cluster']}"
-    try:
-        result = subprocess.run(
-            [
-                "kubectl", "--context", context,
-                "get", "svc", "collector", "-n", namespace,
-                "-o", "jsonpath={.spec.clusterIP}", "--request-timeout=10s",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        address = ipaddress.ip_address(result.stdout.strip())
-    except (OSError, subprocess.SubprocessError, ValueError) as error:
-        raise ValueError(
-            f"cannot resolve the {signal} Collector Service {namespace}/collector "
-            f"to a ClusterIP in {context}; install it with "
-            f"infra/space/kind/{signal}/local.sh up, or set "
-            "SPACE_KIND_SHIM_OTLP_ENDPOINT to a node-reachable OTLP/gRPC endpoint"
-        ) from error
-    host = f"[{address}]" if address.version == 6 else str(address)
-    return f"http://{host}:4317"
+    return f"http://{NODE_COLLECTORS[signal]}:4317"
 
 
 def shim_endpoint(config):
@@ -237,22 +208,28 @@ def shim_endpoint(config):
 
 def exports_otlp(config):
     """Whether the shim sends either signal over OTLP in this mode."""
-    return "otlp" in (SHIM_METRICS_SINKS[config["mode"]], MODES[config["mode"]][1])
+    return "otlp" in MODES[config["mode"]]
 
 
 def shim_wrapper(config, binary, fallback_version):
     version = config["version"] or fallback_version
+    metrics, traces = MODES[config["mode"]]
     values = {
         "SPACE_CLUSTER_ID": config["cluster_id"],
-        "SPACE_TRACE_EXPORTER": MODES[config["mode"]][1],
+        "SPACE_TRACE_EXPORTER": traces,
         "DD_AGENT_HOST": "127.0.0.1",
         "DD_ENV": config["environment"],
         "DD_SERVICE": "containerd-shim-space-v2",
         "DD_VERSION": version,
-        "SPACE_METRICS_SINK": SHIM_METRICS_SINKS[config["mode"]],
-        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": shim_endpoint(config),
-        "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL": "grpc",
+        # The shim reads SPACE_METRICS_SINK too. Left unset it defaults to
+        # auto -> datadog, which would keep the shim on native metrics while
+        # every workload moved to OTLP: wrong, silently.
+        "SPACE_METRICS_SINK": metrics,
     }
+    # `off` exports nothing, so it names no receiver either.
+    if traces != "off":
+        values["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] = shim_endpoint(config)
+        values["OTEL_EXPORTER_OTLP_TRACES_PROTOCOL"] = "grpc"
     if exports_otlp(config):
         # The SPACE and OTel identity settings outrank the DD_* ones, so
         # setting them in a Datadog-only mode would change the tags this shim
@@ -262,7 +239,7 @@ def shim_wrapper(config, binary, fallback_version):
         values["SPACE_ENV"] = config["environment"]
         values["SPACE_VERSION"] = version
         values["OTEL_SERVICE_NAME"] = "containerd-shim-space-v2"
-    if SHIM_METRICS_SINKS[config["mode"]] == "otlp":
+    if metrics == "otlp":
         # Shim metrics have no endpoint fallback, unlike traces: without these
         # the shim fails to start rather than guessing a port.
         values["OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"] = collector_endpoint(config, "metrics")

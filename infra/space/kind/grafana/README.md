@@ -14,11 +14,13 @@ helm dependency build infra/space/observability/charts/grafana
 helm lint infra/space/observability/charts/grafana -f infra/space/observability/charts/grafana/profiles/kind.yaml
 # The Kind profile enables Prometheus, Loki and Tempo.
 bash infra/space/kind/grafana/local.sh up
+# Default bootstrap and full-stack Tilt already forward this port in otel mode.
 bash infra/space/kind/grafana/local.sh ui
 ```
 
-The helper verifies Docker Kind `space-local`, its published loopback API, the
-explicit `kind-space-local` context and owned namespace `space-grafana`.
+The helper verifies Docker Kind `space-local` (or `$SPACE_KIND_CLUSTER`), its
+published loopback API, the explicit matching `kind-` context and owned
+namespace `space-grafana`.
 It applies the chart's Kind overlay, which is what permits anonymous access,
 disposable state and no network policies. For shared clusters use the portable
 [observability charts and deployment runbook](../../observability/README.md),
