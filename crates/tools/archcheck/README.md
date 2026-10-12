@@ -75,6 +75,8 @@ request's merge commit or from GitHub's list of the pull request's files.
   findings are `::warning` annotations and required findings are `::error`
   annotations. Each is attached to line 1 of the file, because GitHub may not
   show an annotation without a line on the file in a pull request's diff.
+  GitHub shows at most 10 annotations of each level per step, so after 10 of
+  a level one line counts the rest and points to the job summary.
 - `markdown`: a report for the CI job summary and pull request comments. A
   heading carries the summary; findings are grouped by rule and behaviour under
   a heading that names the mode, followed by a short footer. With no findings

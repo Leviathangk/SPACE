@@ -376,6 +376,47 @@ fn only_required_findings_fail_the_check() {
     assert!(growth_required.stdout.contains("(1 advisory, 1 required;"));
 }
 
+/// GitHub shows at most 10 annotations of each level per step, so the rest
+/// are counted in one line that points to the job summary.
+#[test]
+fn github_annotations_are_capped_per_level() {
+    let ws = Workspace::new("advisory");
+    ws.config("advisory", "required", "advisory");
+    let mut listed = Vec::new();
+    for index in 0..12 {
+        ws.rust_file(&format!("crates/a/src/new{index:02}.rs"), LIMIT + 1);
+        ws.rust_file(&format!("crates/b/src/listed{index:02}.rs"), LIMIT + 2);
+        listed.push(format!("crates/b/src/listed{index:02}.rs"));
+    }
+    let entries: Vec<(&str, usize)> = listed.iter().map(|path| (path.as_str(), 6)).collect();
+    ws.baseline(&entries);
+
+    let run = ws.run(&["--format", "github"]);
+
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    let lines: Vec<&str> = run.stdout.lines().collect();
+    assert_eq!(
+        lines.iter().filter(|l| l.starts_with("::warning ")).count(),
+        10
+    );
+    assert_eq!(
+        lines.iter().filter(|l| l.starts_with("::error ")).count(),
+        10
+    );
+    assert!(lines[9].starts_with("::warning file=crates/a/src/new09.rs,"));
+    assert!(lines[19].starts_with("::error file=crates/b/src/listed09.rs,"));
+    assert_eq!(
+        lines[20..],
+        [
+            "archcheck: 2 more advisory findings not annotated; the job summary lists them, and \
+             `cargo arch` reproduces them.",
+            "archcheck: 2 more required findings not annotated; the job summary lists them, and \
+             `cargo arch` reproduces them.",
+            "archcheck: 24 findings (12 advisory, 12 required; 24 production Rust files checked)",
+        ]
+    );
+}
+
 /// Workflow commands need `%`, CR and LF escaped in the message, and also `:`
 /// and `,` in properties such as `file=`.
 #[test]

@@ -35,6 +35,10 @@ impl FromStr for Format {
     }
 }
 
+/// GitHub shows at most 10 `::warning` and 10 `::error` annotations per step;
+/// later findings are counted in one line instead.
+pub const MAX_ANNOTATIONS_PER_LEVEL: usize = 10;
+
 /// What a report shows.
 #[derive(Debug, Clone, Copy)]
 pub struct Report<'a> {
@@ -69,11 +73,16 @@ pub fn render(format: Format, report: &Report<'_>) -> String {
             }
         }
         Format::Github => {
+            let (mut warnings, mut errors) = (0, 0);
             for finding in findings {
-                let level = match finding.mode {
-                    Mode::Advisory => "warning",
-                    Mode::Required => "error",
+                let (level, count) = match finding.mode {
+                    Mode::Advisory => ("warning", &mut warnings),
+                    Mode::Required => ("error", &mut errors),
                 };
+                *count += 1;
+                if *count > MAX_ANNOTATIONS_PER_LEVEL {
+                    continue;
+                }
                 // GitHub may not show an annotation without a line on the
                 // file in the pull request diff.
                 out.push_str(&format!(
@@ -85,6 +94,17 @@ pub fn render(format: Format, report: &Report<'_>) -> String {
                     )),
                     escape_data(&finding.message()),
                 ));
+            }
+            for (count, mode) in [(warnings, Mode::Advisory), (errors, Mode::Required)] {
+                let rest = count.saturating_sub(MAX_ANNOTATIONS_PER_LEVEL);
+                if rest > 0 {
+                    out.push_str(&log_line(&format!(
+                        "archcheck: {rest} more {mode} finding{} not annotated; the job summary \
+                         lists them, and `cargo arch` reproduces them.",
+                        if rest == 1 { "" } else { "s" },
+                    )));
+                    out.push('\n');
+                }
             }
         }
         Format::Markdown => return markdown::render(report),
