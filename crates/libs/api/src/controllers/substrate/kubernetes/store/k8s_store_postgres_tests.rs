@@ -9043,6 +9043,8 @@ async fn placement_retryability_follows_the_operation_not_the_statement() -> Tes
         store.persist_pod_node_placement_after_pod_exists(
             PodNodePlacement {
                 sandbox_id,
+                pod_name: "observed-pod",
+                pod_uid: None,
                 node_name: "ip-10-0-0-1.ec2.internal",
                 node_uid: "11111111-1111-1111-1111-111111111111",
                 node_id,
@@ -9170,5 +9172,115 @@ async fn retired_pool_reserved_generation_moves_cold_create_past_the_pool_pod() 
         next.row.pod_name,
         pplx_space_common_core::kubernetes::sandbox_pod_name(sandbox_id, 3)
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn execution_node_identity_is_bound_once() -> TestResult {
+    let fixture = postgres_store().await?;
+    for (recorded_name, recorded_uid, accepted) in [
+        (None, None, true),
+        (Some("worker-original"), Some("original-uid"), true),
+        (Some("worker-original"), None, true),
+        (Some("worker-original"), Some("older-uid"), false),
+        (Some("worker-other"), Some("original-uid"), false),
+    ] {
+        let sandbox = SandboxId::new();
+        let node = NodeId::new();
+        insert_sandbox(&fixture.pool, sandbox, "started").await?;
+        fixture.store.ensure_active_execution_row(sandbox).await?;
+        sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions SET k8s_node_name=$2,k8s_node_uid=$3 WHERE sandbox_id=$1"
+        ))
+        .bind(sandbox)
+        .bind(recorded_name)
+        .bind(recorded_uid)
+        .execute(&fixture.pool)
+        .await?;
+        let result = fixture
+            .store
+            .persist_pod_node_placement(
+                sandbox,
+                "worker-original",
+                "original-uid",
+                node,
+                NodeRole::Worker,
+                Some("10.0.0.9"),
+            )
+            .await;
+        assert_eq!(
+            result.is_ok(),
+            accepted,
+            "{recorded_name:?}/{recorded_uid:?}: {result:?}"
+        );
+        let stored: (Option<String>, Option<String>) = sqlx::query_as(sql!(
+            "SELECT k8s_node_name,k8s_node_uid FROM sandbox_k8s_executions WHERE sandbox_id=$1 AND active"
+        )).bind(sandbox).fetch_one(&fixture.pool).await?;
+        let expected = if recorded_name.is_none() {
+            (Some("worker-original"), Some("original-uid"))
+        } else {
+            (recorded_name, recorded_uid)
+        };
+        assert_eq!((stored.0.as_deref(), stored.1.as_deref()), expected);
+        // Each iteration needs a distinct registry name because it is unique.
+        sqlx::query(sql!("DELETE FROM node_k8s WHERE node_id=$1"))
+            .bind(node)
+            .execute(&fixture.pool)
+            .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_pod_observation_cannot_bind_a_successor_execution() -> TestResult {
+    let fixture = postgres_store().await?;
+    let sandbox_id = SandboxId::new();
+    insert_sandbox(&fixture.pool, sandbox_id, "started").await?;
+    fixture
+        .store
+        .ensure_active_execution_row(sandbox_id)
+        .await?;
+    let pod_name: String = sqlx::query_scalar(sql!(
+        "SELECT pod_name FROM sandbox_k8s_executions WHERE sandbox_id=$1 AND active"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(&fixture.pool)
+    .await?;
+    for (observed_name, observed_uid) in [
+        ("retired-pod", None),
+        (pod_name.as_str(), Some("different-pod-uid")),
+    ] {
+        sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions SET pod_uid='current-pod-uid' WHERE sandbox_id=$1"
+        ))
+        .bind(sandbox_id)
+        .execute(&fixture.pool)
+        .await?;
+        let error = fixture
+            .store
+            .persist_pod_node_placement_after_pod_exists(
+                PodNodePlacement {
+                    sandbox_id,
+                    pod_name: observed_name,
+                    pod_uid: observed_uid,
+                    node_name: "worker-original",
+                    node_uid: "original-uid",
+                    node_id: NodeId::new(),
+                    role: NodeRole::Worker,
+                    address: Some("10.0.0.9"),
+                },
+                PlacementRetryDisposition::RetryConverges,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SubstrateError::Unavailable { .. }));
+        let identity: Option<String> = sqlx::query_scalar(sql!(
+            "SELECT k8s_node_uid FROM sandbox_k8s_executions WHERE sandbox_id=$1 AND active"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(&fixture.pool)
+        .await?;
+        assert!(identity.is_none());
+    }
     Ok(())
 }

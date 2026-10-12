@@ -174,6 +174,8 @@ impl KubernetesSubstrate {
             .persist_pod_node_placement_after_pod_exists(
                 PodNodePlacement {
                     sandbox_id,
+                    pod_name: pod.name(),
+                    pod_uid: pod.uid(),
                     node_name,
                     node_uid,
                     node_id,

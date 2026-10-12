@@ -11686,6 +11686,7 @@ mod kubernetes_tests {
                 "pool-pod-uid",
                 "10.90.0.7",
                 pod.node_name.unwrap_or("unscheduled"),
+                &pplx_space_common_core::types::K8sNodeUid::parse("original-worker-uid")?,
             )
             .await?;
 

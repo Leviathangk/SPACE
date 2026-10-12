@@ -870,7 +870,7 @@ async fn observe_warming_slots_retries_not_started_probe_and_promotes_slot() -> 
     pod_writer.apply_watcher_event(&Event::Init);
     pod_writer.apply_watcher_event(&Event::InitApply(SandboxPodView::from(pod)));
     pod_writer.apply_watcher_event(&Event::InitDone);
-    let (node_store, _) = reflector::store();
+    let (node_store, mut node_writer) = reflector::store();
     let reconciler = Reconciler {
         kube,
         pod_cache: PodCache {
@@ -910,11 +910,29 @@ async fn observe_warming_slots_retries_not_started_probe_and_promotes_slot() -> 
         .find(|config| config.id == config_id)
         .expect("seeded pool config is reconcilable");
 
-    // act
+    // A ready pod alone cannot bind its node incarnation.
+    let pending = reconciler.observe_warming_slots(&config).await?;
+    assert_eq!(pending.marked_ready_slots, 0);
+    assert_eq!(worker.calls(SPACED_WAIT_READY), 0);
+    node_writer.apply_watcher_event(&Event::Apply(Node {
+        metadata: ObjectMeta {
+            name: Some("worker-1".to_string()),
+            uid: Some("original-worker-uid".to_string()),
+            ..Default::default()
+        },
+        ..Default::default()
+    }));
     let summary = reconciler.observe_warming_slots(&config).await?;
 
     // assert
     assert_eq!(summary.marked_ready_slots, 1);
+    let recorded: Option<String> = sqlx::query_scalar(sql!(
+        "SELECT k8s_node_uid FROM kubernetes_pool_slots WHERE id=$1"
+    ))
+    .bind(slot.id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(recorded.as_deref(), Some("original-worker-uid"));
     assert_eq!(worker.calls(SPACED_WAIT_READY), 2);
     let counts = store.slot_counts(config_id).await?;
     assert_eq!(counts.warming, 0);
@@ -1036,7 +1054,13 @@ async fn reconcile_config_refills_after_observation_failure() -> TestResult {
         })
         .await?;
     store
-        .mark_slot_ready(ready_slot.id, "pod-uid", "127.0.0.1", "worker-1")
+        .mark_slot_ready(
+            ready_slot.id,
+            "pod-uid",
+            "127.0.0.1",
+            "worker-1",
+            &pplx_space_common_core::types::K8sNodeUid::parse("original-worker-uid")?,
+        )
         .await?;
     let observation_failure = Arc::new(AtomicBool::new(true));
     let reconciler = reconcile_test_reconciler(

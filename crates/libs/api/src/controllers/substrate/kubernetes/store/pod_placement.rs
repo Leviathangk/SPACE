@@ -173,6 +173,7 @@ impl K8sStore {
         Ok(Some(resulting_state))
     }
 
+    #[cfg(test)]
     pub(in crate::controllers::substrate::kubernetes) async fn persist_pod_node_placement(
         &self,
         sandbox_id: SandboxId,
@@ -182,11 +183,69 @@ impl K8sStore {
         role: NodeRole,
         address: Option<&str>,
     ) -> Result<(), SubstrateError> {
+        let pod_identity: Option<(String, Option<String>)> = sqlx::query_as(sql!(
+            "SELECT pod_name, pod_uid FROM sandbox_k8s_executions WHERE sandbox_id=$1 AND active"
+        ))
+        .bind(sandbox_id)
+        .fetch_optional(&self.pool)
+        .await
+        .db_context("read fixture execution pod name")?;
+        let (pod_name, pod_uid) = pod_identity.unwrap_or_default();
+        self.persist_observed_pod_node_placement(PodNodePlacement {
+            sandbox_id,
+            pod_name: &pod_name,
+            pod_uid: pod_uid.as_deref(),
+            node_name,
+            node_uid,
+            node_id,
+            role,
+            address,
+        })
+        .await
+    }
+
+    async fn persist_observed_pod_node_placement(
+        &self,
+        placement: PodNodePlacement<'_>,
+    ) -> Result<(), SubstrateError> {
+        let PodNodePlacement {
+            sandbox_id,
+            pod_name,
+            pod_uid,
+            node_name,
+            node_uid,
+            node_id,
+            role,
+            address,
+        } = placement;
         let mut tx = self
             .pool
             .begin()
             .await
             .db_context("failed to start pod node placement transaction")?;
+
+        let sandbox_exists =
+            Self::lock_sandbox_for_execution_mutation_in(&mut tx, sandbox_id).await?;
+
+        // Fence first identity capture to the observed pod, while holding the
+        // sandbox lock that serializes retirement and successor creation.
+        if sandbox_exists {
+            let active_pod: Option<(String, Option<String>)> = sqlx::query_as(sql!(
+                "SELECT pod_name, NULLIF(BTRIM(pod_uid), '')
+                 FROM sandbox_k8s_executions WHERE sandbox_id=$1 AND active FOR UPDATE"
+            ))
+            .bind(sandbox_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .db_context("lock observed pod execution")?;
+            if let Some((name, uid)) = active_pod
+                && (name != pod_name || (uid.is_some() && uid.as_deref() != pod_uid))
+            {
+                return Err(SubstrateError::Unavailable {
+                    message: "observed pod no longer owns the active execution".to_string(),
+                });
+            }
+        }
 
         self.upsert_k8s_node_role(
             &mut tx,
@@ -201,11 +260,9 @@ impl K8sStore {
         )
         .await?;
 
-        let sandbox_exists =
-            Self::lock_sandbox_for_execution_mutation_in(&mut tx, sandbox_id).await?;
         if sandbox_exists {
             let active_execution = self
-                .update_active_execution_node_name(&mut tx, sandbox_id, node_name)
+                .update_active_execution_node_name(&mut tx, sandbox_id, node_name, node_uid)
                 .await?;
 
             if active_execution {
@@ -239,7 +296,7 @@ impl K8sStore {
         Ok(())
     }
 
-    /// [`Self::persist_pod_node_placement`], demoting the whole result when the
+    /// Persist the observed pod placement, demoting the whole result when the
     /// calling operation's retry would not converge.
     ///
     /// This function only ever runs once the pod exists — recording its node
@@ -261,17 +318,7 @@ impl K8sStore {
         placement: PodNodePlacement<'_>,
         retry: PlacementRetryDisposition,
     ) -> Result<(), SubstrateError> {
-        let PodNodePlacement {
-            sandbox_id,
-            node_name,
-            node_uid,
-            node_id,
-            role,
-            address,
-        } = placement;
-        let result = self
-            .persist_pod_node_placement(sandbox_id, node_name, node_uid, node_id, role, address)
-            .await;
+        let result = self.persist_observed_pod_node_placement(placement).await;
         match retry {
             PlacementRetryDisposition::RetryDuplicatesExecution => {
                 result.map_err(SubstrateError::demoted_after_side_effect)

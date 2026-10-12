@@ -201,32 +201,53 @@ impl K8sStore {
             .transpose()
     }
 
+    /// Bind only a newly scheduled execution. In particular, do not attach
+    /// today's same-name Node UID to an execution recorded before UID tracking.
     pub(super) async fn update_active_execution_node_name(
         &self,
         conn: &mut PgConnection,
         sandbox_id: SandboxId,
         node_name: &str,
+        node_uid: &str,
     ) -> Result<bool, SubstrateError> {
-        sqlx::query_scalar::<_, bool>(sql!(
-            "WITH updated AS (
-                UPDATE sandbox_k8s_executions
-                SET k8s_node_name = $1::TEXT,
+        sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions
+                SET k8s_node_name = $1, k8s_node_uid = $3,
                     updated_at = CASE WHEN state = 'recovering' THEN updated_at ELSE NOW() END
-                WHERE sandbox_id = $2 AND active
-                  AND k8s_node_name IS DISTINCT FROM $1::TEXT
-                RETURNING 1
-             )
-             SELECT EXISTS (
-                SELECT 1
-                FROM sandbox_k8s_executions
-                WHERE sandbox_id = $2 AND active
-             )"
+              WHERE sandbox_id = $2 AND active AND k8s_node_name IS NULL"
         ))
         .bind(node_name)
         .bind(sandbox_id)
-        .fetch_one(conn)
+        .bind(node_uid)
+        .execute(&mut *conn)
         .await
-        .db_context("failed to persist sandbox pod node name")
+        .db_context("failed to bind sandbox pod node identity")?;
+        let matches: bool = sqlx::query_scalar(sql!(
+            "SELECT EXISTS (SELECT 1 FROM sandbox_k8s_executions
+              WHERE sandbox_id = $1 AND active AND k8s_node_name = $2
+                AND (k8s_node_uid = $3 OR k8s_node_uid IS NULL))"
+        ))
+        .bind(sandbox_id)
+        .bind(node_name)
+        .bind(node_uid)
+        .fetch_one(&mut *conn)
+        .await
+        .db_context("failed to check sandbox pod node identity")?;
+        if !matches {
+            let active: bool = sqlx::query_scalar(sql!(
+                "SELECT EXISTS (SELECT 1 FROM sandbox_k8s_executions WHERE sandbox_id=$1 AND active)"
+            ))
+            .bind(sandbox_id).fetch_one(conn).await
+            .db_context("failed to check active execution after identity mismatch")?;
+            if active {
+                return Err(SubstrateError::Unavailable {
+                    message:
+                        "observed pod node differs from the execution's original node identity"
+                            .to_string(),
+                });
+            }
+        }
+        Ok(matches)
     }
 
     pub(super) async fn finish_active_execution_in(

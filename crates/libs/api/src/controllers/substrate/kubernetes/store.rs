@@ -65,6 +65,8 @@ pub(super) struct K8sStore {
 /// proxy-reachability wait.
 pub(super) struct PodNodePlacement<'a> {
     pub sandbox_id: SandboxId,
+    pub pod_name: &'a str,
+    pub pod_uid: Option<&'a str>,
     pub node_name: &'a str,
     pub node_uid: &'a str,
     pub node_id: NodeId,
