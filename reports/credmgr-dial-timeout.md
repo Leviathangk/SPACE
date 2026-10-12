@@ -1,14 +1,24 @@
 # Bound each credential-manager client dial: report
 
-Status: **PARTIAL, blocked on Docker-root disk space.** The change is landed
-and pushed. Steps 1 and 2 are done. Step 3 has 1 of 3 runs, and step 4 has not
-run: after the step-3 run-2 teardown, Docker-root free space was 14.3 GiB,
-below the 20 GiB floor the task sets. No images, volumes or build caches were
-pruned.
+Status: **PARTIAL, blocked again on Docker-root disk space.**
 
-- Change: `refs/heads/ac/credmgr-dial-timeout` at
-  `2b25606a36a819317402af4159abbaea23a1a41f`, one commit on `main` at
-  `a8b5df675d8526bedbc2a1939b1748bafa317ef3`.
+- **Code and tests:** the change and the follow-up test revision are pushed.
+- **Done:** steps 1 and 2, and step 3 runs 1–2, both passing.
+- **Blocked:** step 3 run 3 and step 4. Each needs a bring-up, and the
+  20 GiB Docker-root floor stops them: free space after the run-2 teardown was
+  13.7 GiB.
+- **Disk history:**
+  - Run 2 first hit the floor (14.3 GiB) after run 1.
+  - The box owner then authorized one `docker builder prune -af` plus
+    `docker image prune -f`. That freed space to 25.1 GiB.
+  - Run 2 was a cold rebuild, which used it up again.
+  - Volumes were never touched. No other prune was run.
+- **Change:** `refs/heads/ac/credmgr-dial-timeout` at
+  `270775ae0ec709c687eb517fa74f3f359e4cb71a`, two commits on `main` at
+  `a8b5df675d8526bedbc2a1939b1748bafa317ef3`:
+  - `2b25606` adds the bound and the test.
+  - `270775a` revises the test's lower bound (review item 1). It is test-only,
+    so the Kind binaries are the same as for `2b25606`.
 - No pull request was opened, as instructed.
 
 ## A/B decision: A
@@ -52,6 +62,7 @@ of its conditions to hold. The first one fails:
   - No other callers changed. `run_agent`'s exit-on-failure startup, the
     Tiltfile and the charts are unchanged.
 - `crates/libs/credential/mgr/client/src/endpoint/tests.rs`: one test (below).
+  `270775a` changes its lower bound, as described in the test section.
 - `crates/libs/credential/mgr/client/Cargo.toml`: dev-dependency
   `tokio = { features = ["macros", "rt", "test-util"] }`, which the paused-time
   test needs.
@@ -118,8 +129,15 @@ How it works:
 - It runs over both arms: `Tcp`, and `Tls` with an empty CA file, which is
   never read because TCP never completes.
 - It asserts `Err(ConnectError::Transport)` and
-  `max_elapsed <= elapsed <= max_elapsed + CONNECT_TIMEOUT` on Tokio's clock.
-  An outer `timeout(6 × budget)` turns an unbounded dial into a fast failure.
+  `CONNECT_TIMEOUT <= elapsed <= max_elapsed + CONNECT_TIMEOUT` on Tokio's
+  clock. An outer `timeout(6 × budget)` turns an unbounded dial into a fast
+  failure.
+- **Lower bound, revised in `270775a`.** It was `elapsed >= max_elapsed`, which
+  depends on the policy's backoff schedule: a later policy change could fail
+  the test while every dial was still bounded. It is now
+  `elapsed >= CONNECT_TIMEOUT`, meaning the dial really hung and the bound cut
+  it, rather than failing fast for some other reason. The upper bound and the
+  test comment were adjusted to match.
 - It is `#[cfg(target_os = "linux")]`, because dropping SYNs on a full accept
   queue is Linux behaviour.
 
@@ -129,6 +147,16 @@ then the same for `Tls { .. }`. With the fix restored it passes.
 
 **Flakiness.** 0 failures in 500 sequential runs and in 800 concurrent runs
 (8 × 100).
+
+**Re-checked after `270775a`:**
+- `cargo fmt --all -- --check` passes.
+- `CARGO_TARGET_DIR=target/buildkite-lint cargo clippy --locked -p pplx-space-credmgr-client --all-targets --all-features -- -D warnings`
+  passes.
+- `cargo nextest run --locked -p pplx-space-credmgr-client --all-targets --all-features`
+  passes 28/28.
+- With the bound removed from `Tcp`, then from `Tls`, the test fails each time
+  with "an unanswered dial must be bounded", and passes again once restored.
+- 0 failures in 300 more sequential runs.
 
 ## Validation
 
@@ -212,23 +240,24 @@ Each run: `infra/space/kind/scripts/teardown.sh`, then
 A watcher polled every node's conntrack for port-9810 `SYN_SENT`/`UNREPLIED`
 entries every ~0.5 s for the whole bring-up.
 
-**Run 1:** smoke rc 0 (round trip ok), wall time 395 s, which includes this
-branch's first image builds. The authority Service was created at
-16:02:03Z. The conntrack watcher found no pinned SYN, so the race was not hit.
+Pass rule: no credential-manager pod Ready later than 60 s after the authority
+Service was created.
 
-| Pod (node) | Ready after the authority Service was created | Restarts | Last exit |
-|---|---|---|---|
-| space-credential-manager (worker) | 13 s | 0 | — |
-| space-credential-manager (worker2) | 13 s | 0 | — |
-| space-builder-credential-manager (worker4) | 4 s | 0 | — |
-| space-builder-credential-manager (worker5) | 5 s | 0 | — |
+| Run | HEAD | Smoke | Wall time | Authority Service created | Pods Ready after the Service (worker, worker2, builder worker4, builder worker5) | Restarts | Last exit | Pinned SYN (race hit) | Pass |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | `2b25606` | rc 0 | 395 s (first image builds) | 16:02:03Z | 13, 13, 4, 5 s | 0 ×4 | — | no | **pass** |
+| 2 | `270775a` | rc 0 | 259 s (cold rebuild after the prune) | 16:40:38Z | 14, 13, 16, 11 s | 0 ×4 | — | no | **pass** |
+| 3 | — | not started | — | — | — | — | — | — | **BLOCKED**: 13.7 GiB free after teardown |
 
-**Runs 2 and 3: BLOCKED.** After the run-2 teardown, Docker-root free space
-read 14.3 GiB, below the 20 GiB floor. The bring-up was not started.
+Neither completed run hit the race, so the natural-run evidence shows no
+regression rather than a measured improvement. The deterministic repro in
+step 2 is the proof for the race itself.
 
 ### 4. Full typed Kind smoke suite
 
-**Not run.** It needs a new bring-up, which the same disk floor blocks.
+**Not run.** I planned to run it on run 3's cluster after that run's baseline
+smoke (`SKIP_BOOTSTRAP=1`, as CI does). Run 3 could not start, so step 4 has no
+cluster.
 
 ## Disk: why the floor was reached
 
@@ -241,20 +270,32 @@ Docker-root free space is the separate Docker volume, read with
 | Run 1 cluster up, after the fix repro | 10.9 GiB |
 | After a Tilt no-op rebuild | 8.5 GiB |
 | After loading the base image | 8.3 GiB |
-| After teardown | **14.3 GiB** |
+| After the run-1 teardown | 14.3 GiB (run 2 first blocked) |
+| After the owner-authorized `docker builder prune -af` and `docker image prune -f` | 25.1 GiB (builder prune reclaimed 13.9 GB; image prune reclaimed 0 B) |
+| Before run 2 (after teardown) | 25.1 GiB |
+| After the run-2 teardown | **13.7 GiB** (run 3 blocked) |
 
-- `docker system df` after teardown: images 25.5 GB (17.3 GB reclaimable),
-  build cache 13.9 GB (4.6 GB reclaimable).
-- This task's own builds added a new `space-rust-chef-base:local` (3.4 GB), the
-  Rust artifact image, and a new Tilt image set.
-- **The Tilt no-op rebuild was my mistake.** I first started the base swap by
-  reverting the client crate in the Tilt-watched worktree. When I saw 10.9 GiB
-  free, I restored the source at once, and from then on built the base binary
-  outside Tilt (the smaller-footprint method above). Tilt still rebuilt.
-  The images came out byte-identical (same image ID `06abdd149dc2`, no
-  rollout), but the rebuild used about 2.4 GiB, which looks like build cache.
-- To unblock, the operator has to free Docker-root space or authorize removing
-  this task's images and build cache. Then runs 2–3 and step 4 can run as above.
+**Why it fell again.** Emptying the build cache made run 2's bring-up a cold
+Docker build:
+- a new `space-rust-chef-base:local` (3.4 GB),
+- a new `space-rust-build-kind:local`,
+- a full new set of Tilt images,
+- 11.4 GB of build cache regenerated.
+
+The earlier image sets remain, because they are tagged and `docker image prune
+-f` removes only dangling images. After teardown, `docker system df` shows
+images 28.5 GB (21.6 GB reclaimable) and build cache 11.4 GB.
+
+**Earlier loss.** About 2.4 GiB of the run-1 drop came from my mistake: I began
+the base swap by reverting the client crate in the Tilt-watched worktree, then
+restored the source at once and built the base binary outside Tilt instead.
+Tilt still rebuilt; it produced identical images and no rollout, but used the
+space.
+
+**To finish.** One more owner-authorized `docker builder prune -af` would bring
+free space back above 20 GiB. Run 3 and step 4 can then share one bring-up: the
+natural run, then the typed suite on that cluster with `SKIP_BOOTSTRAP=1`, as
+CI does. That needs no further bring-up.
 
 ## Cleanup done
 
@@ -263,7 +304,7 @@ Docker-root free space is the separate Docker volume, read with
 - The task's base source and target directories are deleted, and so is the
   `space-worker:credmgr-base-a8b5df6` image I built. Nothing else was removed.
 - The task checkout is on `ac/credmgr-dial-timeout` at its pushed HEAD,
-  `2b25606`, and is clean.
+  `270775a`, and is clean.
 
 ## Follow-ups (not in this change)
 
@@ -286,15 +327,16 @@ Docker-root free space is the separate Docker volume, read with
 | Step | Result |
 |---|---|
 | A/B | **A**: `connect_from_env` callers use short-lived per-operation clients, so B's first condition fails |
-| Unit test | Added. Deterministic (paused time, loopback full accept queue), covers both arms, fails without the fix, 0/1300 flaky |
-| 1. fmt / clippy / nextest (20 pkgs) | pass / pass / 5662 pass, 19 ENVIRONMENTAL (root-only ignored tests), 1 PRE-EXISTING (fails on base) |
-| 2. Pinned-SYN repro | fix **7.1 s, 6.5 s, 0 restarts** vs base **146.5 s, 1 restart** (`os error 110`); PREROUTING clean |
-| 3. Natural bring-ups | run 1 **pass** (max 13 s after the Service, 0 restarts, race not hit); runs 2–3 **BLOCKED** (14.3 GiB < 20 GiB) |
-| 4. Typed Kind suite | **not run** (same disk block) |
+| Unit test | Added. Deterministic (paused time, loopback full accept queue), covers both arms. The lower bound is now `CONNECT_TIMEOUT` (`270775a`). Fails without the fix on each arm, re-checked after the revision. 0 flaky runs in 1600 |
+| 1. fmt / clippy / nextest | Workspace clippy pass. Nextest over 20 packages: 5662 pass, 19 ENVIRONMENTAL (root-only ignored tests), 1 PRE-EXISTING (fails on base). After `270775a`: fmt pass, crate clippy pass, crate nextest 28/28 |
+| 2. Pinned-SYN repro | Fix **7.1 s and 6.5 s, 0 restarts** vs base **146.5 s, 1 restart** (`os error 110`). PREROUTING clean |
+| 3. Natural bring-ups | Run 1 **pass** (≤ 13 s after the Service, 0 restarts). Run 2 **pass** (≤ 16 s, 0 restarts). Race not hit in either. Run 3 **BLOCKED** (13.7 GiB < 20 GiB) |
+| 4. Typed Kind suite | **Not run** (needs run 3's cluster; same disk block) |
 
-**Verdict: PARTIAL.** The change is landed and pushed. Unit tests and the
-deterministic Kind repro show that a pinned SYN now costs one 3 s dial: a
-worker credential-manager pod is Ready in about 7 s with no restart, instead of
-about 147 s with one restart. Natural bring-ups 2–3 and the full typed suite
-are blocked by the 20 GiB Docker-root floor and need operator-freed disk to
-finish.
+**Verdict: PARTIAL.** The fix and the revised test are landed and pushed.
+Unit tests and the deterministic Kind repro show that a pinned SYN now costs
+one 3 s dial: a worker credential-manager pod is Ready in about 7 s with no
+restart, instead of about 147 s with one restart. Two natural bring-ups pass
+the 60 s rule with wide margin (worst case 16 s). Run 3 and the full typed suite
+are still blocked by the 20 GiB Docker-root floor. They need one more
+authorized build-cache prune, and then can share a single bring-up.
