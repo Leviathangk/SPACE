@@ -202,9 +202,11 @@ only stage/read/list/release send-source operations. Then deploy volume-manager
 and sandbox-manager, and opt in new capture after validation. Old servers retain
 the file path when capability negotiation is unavailable. Deployments that still
 share sandbox-manager's UID with volume-manager must migrate to the dedicated
-volume-manager identity before enabling this path; negotiation otherwise keeps
-the materialized file. The capability probe adds at most two seconds before
-falling back if a service is unavailable.
+volume-manager identity before enabling this path. Negotiation does not detect a
+shared UID: node-manager answers that UID's capability probe, because
+sandbox-manager negotiates under it, but refuses it the send-source lease, so
+deferred uploads fail instead of keeping the materialized file. The capability
+probe adds at most two seconds before falling back if a service is unavailable.
 
 Turning the capture option off stops new deferred captures. Setting the upload
 budget to zero changes how existing source jobs upload; it does not remove their
