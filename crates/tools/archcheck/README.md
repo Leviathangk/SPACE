@@ -129,7 +129,9 @@ are listed, followed by how many were left out.
   `previous_filename`), not from git; when that list is incomplete, the whole
   tree is reported. archcheck runs between `::stop-commands::` and its resume
   token, generated at run time, so even unescaped output could not run a
-  workflow command. It is informational and is not a required check.
+  workflow command. When archcheck cannot run (exit 2), the job fails and an
+  existing comment is edited to say so and to see the job log, without quoting
+  the error. It is informational and is not a required check.
 
 ## Definitions
 

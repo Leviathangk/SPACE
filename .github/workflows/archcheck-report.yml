@@ -90,9 +90,11 @@ jobs:
       # command. As a second line of defence, command processing is stopped
       # while it runs, with a token generated here and never derived from the
       # pull request. Exit 1 (a required-mode finding) is reported like any
-      # other finding; the Rust clippy job is what fails on it. Exit 2 (a
-      # configuration, usage or I/O error) fails this job and posts no comment.
+      # other finding; the Rust clippy job is what fails on it. Any other
+      # failure (exit 2: a configuration, usage or I/O error) fails this job
+      # after the next step updates the comment.
       - name: Check the pull request head
+        id: check
         env:
           SCOPE: ${{ steps.changed-files.outputs.scope }}
         run: |
@@ -107,19 +109,31 @@ jobs:
           status=0
           "$RUNNER_TEMP/archcheck/release/archcheck" "${args[@]}" >"$report" || status=$?
           echo "::${stop_token}::"
+          echo "status=$status" >>"$GITHUB_OUTPUT"
           if [ "$status" -ne 0 ] && [ "$status" -ne 1 ]; then
-            echo "::error title=archcheck::archcheck exited $status; no comment was posted."
+            echo "::error title=archcheck::archcheck exited $status; see its error above."
             exit "$status"
           fi
           cat "$report" >>"$GITHUB_STEP_SUMMARY"
 
+      # After a failed check, an existing comment is edited to say archcheck
+      # could not run on this head, without quoting its error.
       - name: Update the pull request comment
+        if: ${{ !cancelled() && steps.check.outputs.status != '' }}
         working-directory: trusted
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: >-
-          bash ci/scripts/archcheck-pr-comment.sh --repo "$REPOSITORY" --pr "$PR_NUMBER"
-          --sha "$HEAD_SHA" --report "$RUNNER_TEMP/archcheck-report.md"
+          ARCHCHECK_STATUS: ${{ steps.check.outputs.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          args=(--repo "$REPOSITORY" --pr "$PR_NUMBER" --sha "$HEAD_SHA")
+          if [ "$ARCHCHECK_STATUS" = 0 ] || [ "$ARCHCHECK_STATUS" = 1 ]; then
+            args+=(--report "$RUNNER_TEMP/archcheck-report.md")
+          else
+            args+=(--could-not-run --run-url "$RUN_URL")
+          fi
+          bash ci/scripts/archcheck-pr-comment.sh "${args[@]}"
