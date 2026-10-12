@@ -122,7 +122,9 @@ are listed, followed by how many were left out.
   fails.
 - [`archcheck-report.yml`](../../../.github/workflows/archcheck-report.yml)
   keeps one comment on each pull request to `main` that lists the findings,
-  updated on every push and edited to say so once they are gone. It runs on
+  updated on every push and edited to say so once they are gone. It also runs
+  when a pull request's base changes, such as a stacked pull request
+  retargeted to `main`. It runs on
   `pull_request_target`, builds archcheck from the base branch, and reads the
   pull request's tree only as data through `--root`. The changed-file list
   comes from GitHub's list of the pull request's files (`filename` and

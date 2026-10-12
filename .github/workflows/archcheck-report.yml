@@ -18,20 +18,26 @@ name: Archcheck report
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened, ready_for_review]
+    # `edited` re-evaluates a pull request whose base changed, such as a
+    # stacked pull request retargeted to main; other edits are skipped below.
+    types: [opened, synchronize, reopened, ready_for_review, edited]
     branches: [main]
 
 permissions:
   contents: read
   pull-requests: write
 
+# An edit that does not change the base gets a group of its own, so it does
+# not cancel a report in progress.
 concurrency:
-  group: archcheck-report-${{ github.event.pull_request.number }}
+  group: archcheck-report-${{ github.event.pull_request.number }}${{ github.event.action == 'edited' && !github.event.changes.base && format('-edit-{0}', github.run_id) || '' }}
   cancel-in-progress: true
 
 jobs:
   report:
-    if: github.repository == 'perplexityai/SPACE'
+    if: >-
+      github.repository == 'perplexityai/SPACE' &&
+      (github.event.action != 'edited' || github.event.changes.base)
     name: Archcheck report
     runs-on: ubuntu-24.04
     timeout-minutes: 20
