@@ -32,3 +32,14 @@ allow = ["CDLA-Permissive-2.0"]
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[advisories]
+ignore = [
+    # unsafe-libyaml is unmaintained (archived upstream, no CVE). It reaches us
+    # only via datadog-opentelemetry -> libdd-library-config -> serde_yaml.
+    # libdatadog switched libdd-library-config to the maintained `yaml_serde`
+    # on 2026-10-06 (https://github.com/DataDog/libdatadog/pull/1770), but no
+    # release carries it yet. Once a datadog-opentelemetry release depends on
+    # that libdd-library-config, upgrade our Datadog version and remove this.
+    { id = "RUSTSEC-2024-0449", reason = "transitive via datadog-opentelemetry; fixed upstream in libdatadog#1770, awaiting release" },
+]
