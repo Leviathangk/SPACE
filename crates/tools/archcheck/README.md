@@ -65,8 +65,7 @@ line says how many findings elsewhere in the tree were not shown, and only the
 findings shown decide the exit status. Without the flag, as with a local
 `cargo arch`, the whole tree is reported.
 
-The tool runs no git: callers produce the list. CI takes it from the pull
-request's merge commit or from GitHub's list of the pull request's files.
+The tool runs no git: callers produce the list.
 
 ## Output formats
 
@@ -103,6 +102,17 @@ escaped as `\n` or `\u{…}`, and paths longer than 200 characters are shortened
 to their end. Other text is
 backslash-escaped, and the report contains no raw HTML. At most 50 findings
 are listed, followed by how many were left out.
+
+## In CI
+
+- On pull requests, the Rust clippy job in
+  [`rust-static-ci.yml`](../../../.github/workflows/rust-static-ci.yml) runs
+  `cargo arch --format github --summary <path> --changed-files <list>`:
+  annotations on the files, the Markdown report in the job summary, and the
+  exit status above. The list is the diff of GitHub's merge commit against its
+  first parent (`git diff --name-only --no-renames`), after checking that its
+  second parent is the pull request's head. The step runs even when clippy
+  fails.
 
 ## Definitions
 

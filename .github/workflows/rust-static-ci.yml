@@ -110,18 +110,33 @@ jobs:
             bash -c 'git config --global --add safe.directory /workspace && exec bash -c "$SPACE_CI_COMMAND"'
 
       # Annotates pull requests with structure findings from ARCHITECTURE.toml
-      # and adds the Markdown report to the job summary. Advisory findings exit
-      # 0; a broken config (2) or a required-mode finding (1) fails the job.
+      # in the files they change, and adds the Markdown report to the job
+      # summary. It runs even when clippy fails, so both results are reported.
+      # Advisory findings exit 0; a broken config (2) or a required-mode
+      # finding (1) fails the job.
       - name: Check repository structure
-        if: matrix.archcheck == true && github.event_name == 'pull_request'
+        if: ${{ !cancelled() && matrix.archcheck == true && github.event_name == 'pull_request' }}
         env:
           SUMMARY: target/archcheck-summary.md
+          PULL_REQUEST_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
+          # The checkout is GitHub's merge of the pull request into its base.
+          # resolve-migration-base.sh proves that its second parent is the pull
+          # request's head and prints its first parent. The changed files are
+          # the merge's diff against that parent, with both sides of every
+          # rename. Only their count is logged: the names come from the pull
+          # request.
+          base="$(bash ci/scripts/resolve-migration-base.sh "" "${PULL_REQUEST_HEAD_SHA}")"
+          changed_files="${RUNNER_TEMP}/archcheck-changed-files"
+          git -c core.quotePath=false diff --name-only --no-renames "${base}" HEAD >"${changed_files}"
+          echo "archcheck: reporting findings in the $(wc -l <"${changed_files}") files this pull request changes."
           status=0
           docker run --rm --volume "${GITHUB_WORKSPACE}:/workspace" --workdir /workspace \
+            --volume "${changed_files}:/tmp/archcheck-changed-files:ro" \
             --env CI=true --env CARGO_INCREMENTAL=0 "space-ci:${GITHUB_SHA}" \
-            cargo arch --format github --summary "${SUMMARY}" || status=$?
+            cargo arch --format github --summary "${SUMMARY}" \
+            --changed-files /tmp/archcheck-changed-files || status=$?
           if [[ -f "${GITHUB_WORKSPACE}/${SUMMARY}" ]]; then
             cat "${GITHUB_WORKSPACE}/${SUMMARY}" >>"${GITHUB_STEP_SUMMARY}"
             echo "Added the archcheck report ($(wc -l <"${GITHUB_WORKSPACE}/${SUMMARY}") lines) to the job summary."
