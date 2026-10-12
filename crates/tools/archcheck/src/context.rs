@@ -1,6 +1,7 @@
 //! Everything a rule may inspect, loaded once before any rule runs.
 
 use std::{
+    ffi::OsStr,
     io,
     path::{Component, Path, PathBuf},
 };
@@ -115,6 +116,13 @@ pub fn is_test_file(name: &str) -> bool {
     name == "tests.rs" || name.ends_with("_tests.rs")
 }
 
+/// A `tests/` directory under `src/` holds test modules (`#[cfg(test)] mod
+/// tests;` with a `tests/mod.rs`), so nothing below it is production code.
+/// `scripts/check-rust-error-policy.sh` excludes `*/tests/*` the same way.
+pub fn is_test_directory(name: &OsStr) -> bool {
+    name == "tests"
+}
+
 /// Lines that are non-empty after trimming and do not start with `//`. Line,
 /// doc and inner-doc comments are free; block comments and attributes count.
 pub fn count_code_lines(text: &str) -> usize {
@@ -224,7 +232,9 @@ fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), LoadErro
         let path = entry.path();
         let file_type = entry.file_type().map_err(read_error)?;
         if file_type.is_dir() {
-            collect_rust_files(&path, out)?;
+            if !is_test_directory(&entry.file_name()) {
+                collect_rust_files(&path, out)?;
+            }
             continue;
         }
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {

@@ -184,15 +184,27 @@ fn sibling_test_files_and_non_members_are_excluded() {
     ws.rust_file("crates/a/src/tests.rs", LIMIT + 1);
     ws.rust_file("crates/a/src/module/tests.rs", LIMIT + 1);
     ws.rust_file("crates/a/src/module_tests.rs", LIMIT + 1);
+    ws.rust_file("crates/a/src/module/tests/mod.rs", LIMIT + 1);
+    ws.rust_file("crates/a/src/tests/nested/helpers.rs", LIMIT + 1);
     ws.rust_file("crates/a/tests/integration.rs", LIMIT + 1);
     ws.rust_file("crates/a/build.rs", LIMIT + 1);
     ws.rust_file("crates/not-a-member/src/lib.rs", LIMIT + 1);
     ws.rust_file("crates/b/src/latests.rs", LIMIT + 1);
+    ws.rust_file("crates/b/src/latests/mod.rs", LIMIT + 1);
 
     let run = ws.run(&[]);
 
-    assert_eq!(run.findings().len(), 1, "{}", run.stdout);
-    assert!(run.findings()[0].starts_with("crates/b/src/latests.rs: 6 code lines"));
+    let paths: Vec<&str> = run
+        .findings()
+        .iter()
+        .map(|finding| finding.split_once(':').unwrap().0)
+        .collect();
+    assert_eq!(
+        paths,
+        ["crates/b/src/latests.rs", "crates/b/src/latests/mod.rs"],
+        "{}",
+        run.stdout
+    );
 }
 
 #[test]

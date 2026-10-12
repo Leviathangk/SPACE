@@ -65,11 +65,13 @@ are listed, followed by how many were left out.
 ## Definitions
 
 - **Production Rust file**: a `.rs` file under `<member>/src/` for each
-  workspace member listed in the root `Cargo.toml`, excluding files named
-  `tests.rs` or ending in `_tests.rs` (the sibling-test convention
-  `scripts/check_no_inline_rust_test_modules.py` uses). The tool walks each
-  member's `src/` directory on disk. Integration tests, benches, examples and
-  build scripts are outside `src/` and are not counted.
+  workspace member listed in the root `Cargo.toml`, excluding test modules:
+  files named `tests.rs` or ending in `_tests.rs` (the sibling-test convention
+  `scripts/check_no_inline_rust_test_modules.py` uses), and every file below a
+  directory named `tests` under `src/`, such as `src/<module>/tests/mod.rs`
+  (the `*/tests/*` exclusion `scripts/check-rust-error-policy.sh` uses). The
+  tool walks each member's `src/` directory on disk. Integration tests,
+  benches, examples and build scripts are outside `src/` and are not counted.
 - **Code line**: a line that, after trimming whitespace, is non-empty and does
   not start with `//`, so `///` and `//!` doc comments do not count either.
   Block comments and attributes do count. Comments and blank lines are free, so
