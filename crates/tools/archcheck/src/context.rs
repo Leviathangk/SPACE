@@ -126,7 +126,9 @@ pub fn is_test_directory(name: &OsStr) -> bool {
 
 /// Lines that are non-empty after trimming and do not start with `//`. Line,
 /// doc and inner-doc comments are free; block comments and attributes count.
+/// A leading byte order mark is not part of the first line.
 pub fn count_code_lines(text: &str) -> usize {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with("//"))

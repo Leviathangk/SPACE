@@ -75,7 +75,8 @@ are listed, followed by how many were left out.
 - **Code line**: a line that, after trimming whitespace, is non-empty and does
   not start with `//`, so `///` and `//!` doc comments do not count either.
   Block comments and attributes do count. Comments and blank lines are free, so
-  the only way under the limit is to restructure the file.
+  the only way under the limit is to restructure the file. A leading UTF-8 byte
+  order mark is ignored.
 
 ## Rules
 

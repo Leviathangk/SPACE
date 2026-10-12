@@ -179,6 +179,17 @@ fn comments_doc_comments_and_blank_lines_are_not_counted() {
 }
 
 #[test]
+fn a_byte_order_mark_does_not_make_a_comment_count() {
+    let ws = Workspace::new("advisory");
+    ws.write(
+        "crates/a/src/lib.rs",
+        &format!("\u{feff}//! Crate docs.\n{}", "let x = 1;\n".repeat(LIMIT)),
+    );
+
+    ws.run(&[]).assert_clean();
+}
+
+#[test]
 fn sibling_test_files_and_non_members_are_excluded() {
     let ws = Workspace::new("advisory");
     ws.rust_file("crates/a/src/tests.rs", LIMIT + 1);
