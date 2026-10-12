@@ -394,3 +394,6 @@ pub(super) fn sidecar_rootfs_send_source_id(
 mod backup_policy_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod teardown_backup_tests;

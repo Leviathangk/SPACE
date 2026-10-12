@@ -873,6 +873,19 @@ impl SandboxManagerService {
             crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
             &artifact_dedup_key,
         )?;
+        // An active local upload still owns its completion. Only probe before
+        // enqueueing or joining a terminal job: a restored artifact can already
+        // be durable without a local completion marker. A failed probe leaves
+        // the ordinary upload path responsible for durability.
+        if persisted_job.as_ref().is_none_or(|job| job.is_terminal())
+            && matches!(
+                self.existing_ready_artifact_backup_response(backup.artifact)
+                    .await,
+                Ok(Some(_))
+            )
+        {
+            return self.verify_teardown_suspend_backup_ownership(sandbox, &backup);
+        }
         let job_id = match persisted_job {
             Some(job)
                 if !job.is_terminal()
@@ -936,7 +949,14 @@ impl SandboxManagerService {
                 Status::internal(format!("persist durable suspend completion: {error}"))
             })?;
         }
+        self.verify_teardown_suspend_backup_ownership(sandbox, &backup)
+    }
 
+    fn verify_teardown_suspend_backup_ownership(
+        &self,
+        sandbox: &crate::db::SandboxRow,
+        backup: &TeardownSuspendBackup<'_>,
+    ) -> Result<(), Status> {
         let still_owned = {
             let db = self.db_conn()?;
             crate::db::teardown_suspend_status(&db, &sandbox.id)
