@@ -8,6 +8,7 @@
 pub mod baseline;
 pub mod config;
 pub mod context;
+pub mod escape;
 pub mod finding;
 pub mod report;
 pub mod rules;

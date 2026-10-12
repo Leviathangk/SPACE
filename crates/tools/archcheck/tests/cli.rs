@@ -633,6 +633,137 @@ fn configuration_errors_exit_2() {
     }
 }
 
+/// Lines GitHub's runner would read as a workflow command: `::` after leading
+/// whitespace (the runner trims Unicode whitespace, as `trim_start` does), or
+/// `##[` anywhere.
+fn workflow_commands(output: &str) -> Vec<&str> {
+    output
+        .lines()
+        .filter(|line| line.trim_start().starts_with("::") || line.contains("##["))
+        .collect()
+}
+
+/// Every way the tree can put text in the output: a workspace member name, a
+/// TOML key and a file path. Each must stay on its line in every format and
+/// on stderr, and no line may become a workflow command.
+#[cfg(unix)]
+#[test]
+fn text_from_the_tree_cannot_start_a_workflow_command() {
+    const MEMBER: &str = "x\n::add-mask::archcheck\n::stop-commands::tok";
+    const KEY: &str = "x\n::error title=pwn::spoofed";
+    const PATH: &str = "crates/a/src/new\n::error::line.rs";
+
+    // A member, a baseline key and a file path, each reported as a finding.
+    let ws = Workspace::new("advisory");
+    let members = format!(
+        "[workspace]\nmembers = [\"crates/a\", \"crates/b\", {MEMBER:?}, \"::error::m\", \
+         \"\u{2003}::error::n\"]\n"
+    );
+    ws.write("Cargo.toml", &members);
+    for member in [MEMBER, "::error::m", "\u{2003}::error::n"] {
+        ws.write(&format!("{member}/Cargo.toml"), "[package]\n");
+        ws.rust_file(&format!("{member}/src/lib.rs"), LIMIT + 1);
+    }
+    ws.rust_file(PATH, LIMIT + 1);
+    ws.rust_file("crates/b/src/##[add-mask]x.rs", LIMIT + 1);
+    ws.write(
+        "architecture-baseline.toml",
+        &format!("[file_size]\n{:?} = 9\n", format!("crates/a/src/{KEY}.rs")),
+    );
+    for format in ["human", "github", "markdown"] {
+        let run = ws.run(&["--format", format]);
+        assert_eq!(run.code, 0, "{format}: {}{}", run.stdout, run.stderr);
+        let commands = workflow_commands(&run.stdout);
+        if format == "github" {
+            // Only archcheck's own annotations, one per finding.
+            assert_eq!(commands.len(), 6, "{}", run.stdout);
+            assert!(
+                commands
+                    .iter()
+                    .all(|line| line.starts_with("::warning file=")),
+                "{}",
+                run.stdout
+            );
+        } else {
+            assert_eq!(commands, Vec::<&str>::new(), "{format}");
+        }
+        for injected in ["::add-mask::", "::error title=pwn::", "::error::line"] {
+            let lines = run
+                .stdout
+                .lines()
+                .filter(|line| line.contains(injected))
+                .count();
+            assert_eq!(lines, 1, "{format}: {injected:?} in\n{}", run.stdout);
+        }
+        assert!(run.stderr.is_empty(), "{format}: {}", run.stderr);
+    }
+    let human = ws.run(&[]).stdout;
+    for escaped in [
+        "  x\\n::add-mask::archcheck\\n::stop-commands::tok/src/lib.rs: 6 code lines",
+        "  crates/a/src/new\\n::error::line.rs: 6 code lines",
+        "  crates/a/src/x\\n::error title=pwn::spoofed.rs: listed in",
+        "  \\u{3a}:error::m/src/lib.rs: 6 code lines",
+        "  \u{2003}\\u{3a}:error::n/src/lib.rs: 6 code lines",
+        "  crates/b/src/##\\u{5b}add-mask]x.rs: 6 code lines",
+    ] {
+        assert!(
+            human.lines().any(|line| line.starts_with(escaped)),
+            "{escaped:?} in\n{human}"
+        );
+    }
+
+    // The same text in errors, which quote members, keys and paths.
+    let errors: [(&str, String); 3] = [
+        (
+            "Cargo.toml",
+            format!(
+                "[workspace]\nmembers = [\"crates/a\", {:?}]\n",
+                format!("{MEMBER}/y")
+            ),
+        ),
+        (
+            "ARCHITECTURE.toml",
+            format!("[rules.file_size]\n{KEY:?} = 1\n"),
+        ),
+        (
+            "architecture-baseline.toml",
+            format!("[file_size]\n{:?} = 1\n", format!("crates/{KEY}")),
+        ),
+    ];
+    for (file, contents) in errors {
+        let ws = Workspace::new("advisory");
+        ws.write(file, &contents);
+        let run = ws.run(&[]);
+        assert_eq!(run.code, 2, "{file}: {}{}", run.stdout, run.stderr);
+        assert_eq!(run.stderr.lines().count(), 1, "{file}: {}", run.stderr);
+        assert_eq!(workflow_commands(&run.stderr), Vec::<&str>::new(), "{file}");
+        assert!(run.stderr.contains("x\\n::"), "{file}: {}", run.stderr);
+    }
+    // A path in an error: a `.rs` name that is not UTF-8.
+    {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+        let ws = Workspace::new("advisory");
+        let src = ws.root().join("crates/a/src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join(OsStr::from_bytes(b"new\n::error::\xff.rs")), "").unwrap();
+        let run = ws.run(&[]);
+        assert_eq!(run.code, 2, "{}{}", run.stdout, run.stderr);
+        assert_eq!(run.stderr.lines().count(), 1, "{}", run.stderr);
+        assert_eq!(workflow_commands(&run.stderr), Vec::<&str>::new());
+        assert!(run.stderr.contains("new\\n::error::"), "{}", run.stderr);
+    }
+
+    let ws = Workspace::new("advisory");
+    let run = ws.run(&["--format", "x\n::error::usage"]);
+    assert_eq!(run.code, 2);
+    assert_eq!(workflow_commands(&run.stderr), Vec::<&str>::new());
+    assert!(
+        run.stderr
+            .starts_with("archcheck: unknown format \"x\\n::error::usage\"")
+    );
+}
+
 #[test]
 fn usage_errors_exit_2() {
     let ws = Workspace::new("advisory");

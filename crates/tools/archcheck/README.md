@@ -56,11 +56,23 @@ writes no report, and a report that cannot be written exits 2.
   a heading that names the mode, followed by a short footer. With no findings
   the report is the heading line alone.
 
-On a pull request, file paths are chosen by its author, so the Markdown report
-treats them as untrusted. A path appears only inside an inline code span whose
-backtick fence is longer than any backtick run in the path. Control and
-invisible formatting characters are escaped as `\n` or `\u{…}`, and paths
-longer than 200 characters are shortened to their end. Other text is
+On a pull request, file paths, workspace member names and TOML keys are chosen
+by its author, and archcheck's output may land in a GitHub Actions log, where
+the runner reads a line as a workflow command when it starts with `::` after
+leading whitespace or contains `##[` anywhere. Every human-format line, the
+summary line and every error on stderr therefore go through one escaping
+function: control characters (including CR, LF and DEL) and line or paragraph
+separators are escaped as `\n` or `\u{…}`, the `[` of `##[` is escaped, and so
+is the first `:` of a leading `::`. Text from the tree stays on its own line
+and never becomes a command. The `github` format escapes `%`, CR and LF in
+messages, and also `:` and `,` in properties, as the workflow command syntax
+requires.
+
+The Markdown report also treats paths as untrusted. A path appears only inside
+an inline code span whose backtick fence is longer than any backtick run in the
+path. Control and invisible formatting characters, line separators and the `[`
+of `##[` are escaped as `\n` or `\u{…}`, and paths longer than 200 characters
+are shortened to their end. Other text is
 backslash-escaped, and the report contains no raw HTML. At most 50 findings
 are listed, followed by how many were left out.
 

@@ -14,6 +14,7 @@ use std::{
 use pplx_space_archcheck::{
     BASELINE_FILE, Context, LoadError, WriteBaselineError, check,
     context::find_workspace_root,
+    escape::log_line,
     report::{Format, UnknownFormatError, render},
     write_baseline,
 };
@@ -78,14 +79,15 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(err) => {
-            eprintln!("archcheck: {err}\n{USAGE}");
+            eprintln!("{}\n{USAGE}", log_line(&format!("archcheck: {err}")));
             return ExitCode::from(EXIT_ERROR);
         }
     };
     match run(options) {
         Ok(code) => code,
         Err(err) => {
-            eprintln!("archcheck: error: {err}");
+            // Errors quote paths, member names and TOML keys from the tree.
+            eprintln!("{}", log_line(&format!("archcheck: error: {err}")));
             ExitCode::from(EXIT_ERROR)
         }
     }
@@ -100,9 +102,12 @@ fn run(options: Options) -> Result<ExitCode, RunError> {
     if options.write_baseline {
         let baseline = write_baseline(&root)?;
         println!(
-            "archcheck: wrote {} file_size entries to {}",
-            baseline.file_size.len(),
-            root.join(BASELINE_FILE).display()
+            "{}",
+            log_line(&format!(
+                "archcheck: wrote {} file_size entries to {}",
+                baseline.file_size.len(),
+                root.join(BASELINE_FILE).display()
+            ))
         );
         return Ok(ExitCode::SUCCESS);
     }

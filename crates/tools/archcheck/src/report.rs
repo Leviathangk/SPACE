@@ -6,7 +6,7 @@ use std::str::FromStr;
 
 use thiserror::Error;
 
-use crate::{config::Mode, finding::Finding};
+use crate::{config::Mode, escape::log_line, finding::Finding};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
@@ -46,12 +46,13 @@ pub fn render(format: Format, findings: &[Finding], files_checked: usize) -> Str
                 let key = (finding.rule, finding.behaviour, finding.mode);
                 if group != Some(key) {
                     group = Some(key);
-                    out.push_str(&format!(
-                        "{}.{} ({}):\n",
-                        finding.rule, finding.behaviour, finding.mode
-                    ));
+                    let heading =
+                        format!("{}.{} ({}):", finding.rule, finding.behaviour, finding.mode);
+                    out.push_str(&log_line(&heading));
+                    out.push('\n');
                 }
-                out.push_str(&format!("  {}\n", finding.message()));
+                out.push_str(&log_line(&format!("  {}", finding.message())));
+                out.push('\n');
             }
             if !findings.is_empty() {
                 out.push('\n');
@@ -78,7 +79,7 @@ pub fn render(format: Format, findings: &[Finding], files_checked: usize) -> Str
         }
         Format::Markdown => return markdown::render(findings, files_checked),
     }
-    out.push_str(&summary(findings, files_checked));
+    out.push_str(&log_line(&summary(findings, files_checked)));
     out.push('\n');
     out
 }

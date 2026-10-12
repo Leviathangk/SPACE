@@ -7,7 +7,10 @@
 //! most [`MAX_FINDINGS_SHOWN`] findings are listed.
 
 use super::summary;
-use crate::finding::Finding;
+use crate::{
+    escape::{escape_where, is_line_separator},
+    finding::Finding,
+};
 
 /// Keeps the report far below GitHub's 65,536-character comment limit.
 pub const MAX_FINDINGS_SHOWN: usize = 50;
@@ -102,22 +105,20 @@ fn text(value: &str) -> String {
     out
 }
 
-/// Escapes control characters, which could end a line or a code span, and
-/// characters that reorder or hide text, as `\u{…}` (`\n`, `\t` and `\r` keep
-/// their short forms).
+/// Escapes control characters, which could end a line or a code span, line
+/// separators, characters that reorder or hide text, and the `[` of every
+/// `##[`, as `\u{…}` (`\n`, `\t` and `\r` keep their short forms).
 fn visible(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for c in value.chars() {
-        let invisible = matches!(
-            c,
-            '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}'
-                | '\u{FEFF}'
-        );
-        if c.is_control() || invisible {
-            out.extend(c.escape_default());
-        } else {
-            out.push(c);
-        }
-    }
-    out
+    escape_where(value, |c| {
+        c.is_control()
+            || is_line_separator(c)
+            || matches!(
+                c,
+                '\u{061C}'
+                    | '\u{200B}'..='\u{200F}'
+                    | '\u{202A}'..='\u{202E}'
+                    | '\u{2060}'..='\u{2069}'
+                    | '\u{FEFF}'
+            )
+    })
 }
