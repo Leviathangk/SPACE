@@ -6,12 +6,13 @@ rule tolerates for now are listed in
 [`architecture-baseline.toml`](../../../architecture-baseline.toml).
 
 ```sh
-cargo arch                     # human-readable report
-cargo arch --format github     # GitHub Actions annotations
-cargo arch --format markdown   # Markdown report
-cargo arch --summary <path>    # also write the Markdown report to <path>
-cargo arch --write-baseline    # regenerate architecture-baseline.toml
-cargo arch --root <path>       # check another checkout
+cargo arch                          # human-readable report
+cargo arch --format github          # GitHub Actions annotations
+cargo arch --format markdown        # Markdown report
+cargo arch --summary <path>         # also write the Markdown report to <path>
+cargo arch --changed-files <path>   # report only findings in the listed files
+cargo arch --write-baseline         # regenerate architecture-baseline.toml
+cargo arch --root <path>            # check another checkout
 ```
 
 `cargo arch` is an alias in `.cargo/config.toml`. It builds into the
@@ -43,6 +44,29 @@ characters are all errors (exit 2), not skipped checks.
 `--summary` writes the Markdown report whatever `--format` prints and does not
 change the exit status: required findings still exit 1. A configuration error
 writes no report, and a report that cannot be written exits 2.
+
+## Reporting only what a change touched
+
+Findings cover the whole tree. While behaviours are advisory and caps sit at
+exact sizes, findings accumulate on `main`, and every later pull request would
+be told about files it never touched. `--changed-files <path>` takes a
+newline-separated list of repository-relative paths that a change added,
+modified or deleted, with both the old and the new path of a rename. Only these
+findings are then reported:
+
+- a file's own finding (`no_crossing`, `listed_no_growth`, `stale_entries`)
+  when the file is in the list;
+- a baseline entry's finding when the entry's path is in the list, so a
+  deleted or renamed listed file is matched by its old path.
+
+When the list names `ARCHITECTURE.toml` or `architecture-baseline.toml`, the
+change edits the rules themselves, and the whole tree is reported. The summary
+line says how many findings elsewhere in the tree were not shown, and only the
+findings shown decide the exit status. Without the flag, as with a local
+`cargo arch`, the whole tree is reported.
+
+The tool runs no git: callers produce the list. CI takes it from the pull
+request's merge commit or from GitHub's list of the pull request's files.
 
 ## Output formats
 

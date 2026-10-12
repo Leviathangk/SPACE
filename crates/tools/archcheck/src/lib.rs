@@ -6,6 +6,7 @@
 //! request (`advisory`) long before it is allowed to fail one (`required`).
 
 pub mod baseline;
+pub mod changed;
 pub mod config;
 pub mod context;
 pub mod escape;
@@ -14,6 +15,7 @@ pub mod report;
 pub mod rules;
 
 pub use baseline::{BASELINE_FILE, Baseline, WriteBaselineError};
+pub use changed::{ChangedFiles, ChangedFilesError, Selection};
 pub use config::{ArchitectureConfig, CONFIG_FILE, Mode};
 pub use context::{Context, LoadError, ProductionFile};
 pub use finding::Finding;

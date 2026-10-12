@@ -12,23 +12,30 @@ use std::{
 };
 
 use pplx_space_archcheck::{
-    BASELINE_FILE, Context, LoadError, WriteBaselineError, check,
+    BASELINE_FILE, ChangedFiles, ChangedFilesError, Context, LoadError, Selection,
+    WriteBaselineError, check,
     context::find_workspace_root,
     escape::log_line,
-    report::{Format, UnknownFormatError, render},
+    report::{Format, Report, UnknownFormatError, render},
     write_baseline,
 };
 use thiserror::Error;
 
 const USAGE: &str = "\
 usage: archcheck [--root <path>] [--format human|github|markdown] [--summary <path>]
+                 [--changed-files <path>]
        archcheck [--root <path>] --write-baseline
 
-  --root <path>       repository root (default: the Cargo workspace containing
-                      the current directory)
-  --format <format>   human (default), github workflow annotations, or markdown
-  --summary <path>    also write the markdown report to <path>
-  --write-baseline    regenerate architecture-baseline.toml from the current tree";
+  --root <path>           repository root (default: the Cargo workspace
+                          containing the current directory)
+  --format <format>       human (default), github workflow annotations, or
+                          markdown
+  --summary <path>        also write the markdown report to <path>
+  --changed-files <path>  report only findings in these repository-relative
+                          paths, one per line (the whole tree when the list
+                          names ARCHITECTURE.toml or the baseline)
+  --write-baseline        regenerate architecture-baseline.toml from the
+                          current tree";
 
 const EXIT_REQUIRED_FINDINGS: u8 = 1;
 const EXIT_ERROR: u8 = 2;
@@ -44,8 +51,8 @@ enum UsageError {
     UnexpectedArgument(String),
     #[error(transparent)]
     Format(#[from] UnknownFormatError),
-    #[error("--summary cannot be combined with --write-baseline")]
-    SummaryWithWriteBaseline,
+    #[error("{0} cannot be combined with --write-baseline")]
+    WithWriteBaseline(&'static str),
 }
 
 #[derive(Debug, Error)]
@@ -56,6 +63,8 @@ enum RunError {
     Load(#[from] LoadError),
     #[error(transparent)]
     WriteBaseline(#[from] WriteBaselineError),
+    #[error(transparent)]
+    ChangedFiles(#[from] ChangedFilesError),
     #[error("could not write {path}: {source}")]
     WriteSummary {
         path: PathBuf,
@@ -68,6 +77,7 @@ struct Options {
     root: Option<PathBuf>,
     format: Format,
     summary: Option<PathBuf>,
+    changed_files: Option<PathBuf>,
     write_baseline: bool,
 }
 
@@ -112,13 +122,36 @@ fn run(options: Options) -> Result<ExitCode, RunError> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    let changed = options
+        .changed_files
+        .as_deref()
+        .map(ChangedFiles::load)
+        .transpose()?;
     let ctx = Context::load(&root)?;
     let findings = check(&ctx);
-    print!("{}", render(options.format, &findings, ctx.files.len()));
+    let selection = match &changed {
+        Some(changed) => changed.select(findings),
+        None => Selection {
+            shown: findings,
+            hidden: 0,
+        },
+    };
+    let report = Report {
+        findings: &selection.shown,
+        hidden: selection.hidden,
+        files_checked: ctx.files.len(),
+    };
+    print!("{}", render(options.format, &report));
     if let Some(path) = &options.summary {
-        write_summary(path, &render(Format::Markdown, &findings, ctx.files.len()))?;
+        write_summary(path, &render(Format::Markdown, &report))?;
     }
-    if findings.iter().any(|finding| finding.mode.is_required()) {
+    // Only shown findings decide the exit status: a change is not failed for
+    // files it did not touch.
+    if selection
+        .shown
+        .iter()
+        .any(|finding| finding.mode.is_required())
+    {
         Ok(ExitCode::from(EXIT_REQUIRED_FINDINGS))
     } else {
         Ok(ExitCode::SUCCESS)
@@ -138,6 +171,7 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Option<Options>, U
         root: None,
         format: Format::Human,
         summary: None,
+        changed_files: None,
         write_baseline: false,
     };
     let mut args = args.map(|arg| arg.into_string().map_err(UsageError::NonUtf8Argument));
@@ -158,12 +192,18 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Option<Options>, U
             "--root" => options.root = Some(PathBuf::from(value()?)),
             "--format" => options.format = value()?.parse()?,
             "--summary" => options.summary = Some(PathBuf::from(value()?)),
+            "--changed-files" => options.changed_files = Some(PathBuf::from(value()?)),
             "--write-baseline" if inline_value.is_none() => options.write_baseline = true,
             other => return Err(UsageError::UnexpectedArgument(other.to_owned())),
         }
     }
-    if options.write_baseline && options.summary.is_some() {
-        return Err(UsageError::SummaryWithWriteBaseline);
+    if options.write_baseline {
+        if options.summary.is_some() {
+            return Err(UsageError::WithWriteBaseline("--summary"));
+        }
+        if options.changed_files.is_some() {
+            return Err(UsageError::WithWriteBaseline("--changed-files"));
+        }
     }
     Ok(Some(options))
 }

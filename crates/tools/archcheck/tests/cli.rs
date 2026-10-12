@@ -823,6 +823,203 @@ fn text_from_the_tree_cannot_start_a_workflow_command() {
     );
 }
 
+impl Workspace {
+    /// Writes `paths` as a changed-file list and returns `--changed-files`
+    /// arguments for it. The list lives outside the checked tree.
+    fn changed_files(&self, list: &TempDir, paths: &[&str]) -> [String; 2] {
+        let path = list.path().join("changed-files");
+        let text: String = paths.iter().map(|path| format!("{path}\n")).collect();
+        fs::write(&path, text).expect("write the changed-file list");
+        [
+            "--changed-files".to_owned(),
+            path.to_str().expect("temporary paths are UTF-8").to_owned(),
+        ]
+    }
+
+    fn run_changed(&self, paths: &[&str], args: &[&str]) -> Run {
+        let list = tempfile::tempdir().expect("create a directory for the list");
+        let changed = self.changed_files(&list, paths);
+        let mut all: Vec<&str> = changed.iter().map(String::as_str).collect();
+        all.extend_from_slice(args);
+        self.run(&all)
+    }
+}
+
+#[test]
+fn changed_files_limit_the_report_to_the_files_a_change_touched() {
+    let ws = Workspace::new("advisory");
+    ws.rust_file("crates/a/src/touched.rs", LIMIT + 1);
+    ws.rust_file("crates/a/src/untouched.rs", LIMIT + 1);
+    ws.rust_file("crates/b/src/untouched.rs", LIMIT + 1);
+    ws.baseline(&[("crates/b/src/listed.rs", 6)]);
+    ws.rust_file("crates/b/src/listed.rs", 7);
+
+    let run = ws.run_changed(&["crates/a/src/touched.rs", "docs/unrelated.md"], &[]);
+
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(
+        run.findings(),
+        [
+            "crates/a/src/touched.rs: 6 code lines, over the 5-line limit (comments and blank \
+             lines are not counted). Split it into submodules by responsibility."
+        ]
+    );
+    assert!(
+        run.stdout.ends_with(
+            "archcheck: 1 finding (1 advisory, 0 required; 4 production Rust files checked; 3 \
+             findings elsewhere in the tree not shown)\n"
+        ),
+        "{}",
+        run.stdout
+    );
+
+    // Without the list, the whole tree.
+    assert!(ws.run(&[]).stdout.contains(
+        "archcheck: 4 findings (4 advisory, 0 required; 4 production Rust files \
+                       checked)\n"
+    ));
+
+    // The hidden count is in every format.
+    let markdown = ws.run_changed(&["crates/a/src/touched.rs"], &["--format", "markdown"]);
+    assert!(
+        markdown.stdout.starts_with(
+            "### archcheck: 1 finding (1 advisory, 0 required; 4 production Rust files checked; \
+             3 findings elsewhere in the tree not shown)\n"
+        ),
+        "{}",
+        markdown.stdout
+    );
+    assert_eq!(
+        markdown.stdout.matches("\n- ").count(),
+        1,
+        "{}",
+        markdown.stdout
+    );
+    let github = ws.run_changed(&["crates/a/src/touched.rs"], &["--format", "github"]);
+    assert_eq!(
+        workflow_commands(&github.stdout).len(),
+        1,
+        "{}",
+        github.stdout
+    );
+    assert!(
+        github
+            .stdout
+            .contains("; 3 findings elsewhere in the tree not shown)\n")
+    );
+}
+
+#[test]
+fn changed_files_without_findings_say_how_many_were_not_shown() {
+    let ws = Workspace::new("required");
+    ws.rust_file("crates/a/src/untouched.rs", LIMIT + 1);
+    ws.rust_file("crates/a/src/small.rs", LIMIT);
+
+    // A required finding in an untouched file neither shows nor fails.
+    let run = ws.run_changed(&["crates/a/src/small.rs"], &["--format", "markdown"]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(
+        run.stdout,
+        "### archcheck: no findings in the changed files (2 production Rust files checked; 1 \
+         finding elsewhere in the tree not shown)\n"
+    );
+    assert_eq!(ws.run(&[]).code, 1);
+
+    // An empty list shows nothing, and a touched file fails as before.
+    let run = ws.run_changed(&[], &[]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert!(
+        run.stdout
+            .starts_with("archcheck: no findings in the changed files")
+    );
+    assert_eq!(ws.run_changed(&["crates/a/src/untouched.rs"], &[]).code, 1);
+}
+
+/// A deleted or renamed listed file is matched by its old path, which both
+/// GitHub's file list (`previous_filename`) and `git diff --no-renames` give.
+#[test]
+fn changed_files_match_baseline_entries_by_their_old_path() {
+    let ws = Workspace::new("advisory");
+    ws.baseline(&[
+        ("crates/a/src/deleted.rs", 6),
+        ("crates/a/src/old.rs", 6),
+        ("crates/b/src/stale.rs", 9),
+    ]);
+    ws.rust_file("crates/a/src/new.rs", 6);
+    ws.rust_file("crates/b/src/stale.rs", 7);
+
+    let run = ws.run_changed(
+        &[
+            "crates/a/src/deleted.rs",
+            "crates/a/src/old.rs",
+            "crates/a/src/new.rs",
+        ],
+        &[],
+    );
+
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    let paths: Vec<&str> = run
+        .findings()
+        .iter()
+        .map(|finding| finding.split_once(':').unwrap().0)
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            "crates/a/src/new.rs",
+            "crates/a/src/deleted.rs",
+            "crates/a/src/old.rs"
+        ],
+        "{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout
+            .contains("; 1 finding elsewhere in the tree not shown)\n")
+    );
+}
+
+/// A change to the rules or the baseline changes what every file is checked
+/// against, so it is shown everything.
+#[test]
+fn changing_the_rules_reports_the_whole_tree() {
+    let ws = Workspace::new("advisory");
+    ws.rust_file("crates/a/src/one.rs", LIMIT + 1);
+    ws.rust_file("crates/b/src/two.rs", LIMIT + 1);
+
+    for rules in ["ARCHITECTURE.toml", "architecture-baseline.toml"] {
+        let run = ws.run_changed(&[rules, "crates/a/src/one.rs"], &[]);
+        assert_eq!(run.code, 0, "{}", run.stderr);
+        assert_eq!(run.findings().len(), 2, "{rules}: {}", run.stdout);
+        assert!(
+            run.stdout
+                .ends_with("(2 advisory, 0 required; 2 production Rust files checked)\n"),
+            "{rules}: {}",
+            run.stdout
+        );
+    }
+}
+
+#[test]
+fn changed_file_list_errors_exit_2() {
+    let ws = Workspace::new("advisory");
+    let missing = ws.root().join("no-such-list");
+    let run = ws.run(&["--changed-files", missing.to_str().unwrap()]);
+    assert_eq!(run.code, 2);
+    assert!(
+        run.stderr.contains("could not read the changed-file list"),
+        "{}",
+        run.stderr
+    );
+
+    let list = tempfile::tempdir().unwrap();
+    let path = list.path().join("changed-files");
+    fs::write(&path, b"crates/a/src/\xff.rs\n").unwrap();
+    let run = ws.run(&["--changed-files", path.to_str().unwrap()]);
+    assert_eq!(run.code, 2);
+    assert!(run.stderr.contains("is not valid UTF-8"), "{}", run.stderr);
+}
+
 #[test]
 fn usage_errors_exit_2() {
     let ws = Workspace::new("advisory");
@@ -832,6 +1029,8 @@ fn usage_errors_exit_2() {
         &["--bogus"],
         &["--summary"],
         &["--write-baseline", "--summary", "summary.md"],
+        &["--write-baseline", "--changed-files", "changed-files"],
+        &["--changed-files"],
     ] {
         assert_eq!(ws.run(args).code, 2, "{args:?}");
     }

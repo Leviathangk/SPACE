@@ -6,7 +6,7 @@
 //! escaped and long paths shortened; other text is backslash-escaped; no raw HTML is emitted; and at
 //! most [`MAX_FINDINGS_SHOWN`] findings are listed.
 
-use super::summary;
+use super::{Report, summary};
 use crate::{
     escape::{escape_where, is_format, is_line_separator},
     finding::Finding,
@@ -25,8 +25,9 @@ const FOOTER: &str = "Advisory findings are reported but do not block merging; r
 /// A heading with the summary line, then up to [`MAX_FINDINGS_SHOWN`] findings
 /// grouped by rule and behaviour, then a footer. With no findings, the report
 /// is the heading alone.
-pub fn render(findings: &[Finding], files_checked: usize) -> String {
-    let mut out = format!("### {}\n", text(&summary(findings, files_checked)));
+pub fn render(report: &Report<'_>) -> String {
+    let findings = report.findings;
+    let mut out = format!("### {}\n", text(&summary(report)));
     if findings.is_empty() {
         return out;
     }

@@ -35,9 +35,19 @@ impl FromStr for Format {
     }
 }
 
-/// `findings` are expected in [`crate::check`] order, which keeps each
-/// rule's behaviours contiguous.
-pub fn render(format: Format, findings: &[Finding], files_checked: usize) -> String {
+/// What a report shows.
+#[derive(Debug, Clone, Copy)]
+pub struct Report<'a> {
+    /// In [`crate::check`] order, which keeps each rule's behaviours
+    /// contiguous.
+    pub findings: &'a [Finding],
+    /// Findings left out because they are in files the change did not touch.
+    pub hidden: usize,
+    pub files_checked: usize,
+}
+
+pub fn render(format: Format, report: &Report<'_>) -> String {
+    let findings = report.findings;
     let mut out = String::new();
     match format {
         Format::Human => {
@@ -77,24 +87,39 @@ pub fn render(format: Format, findings: &[Finding], files_checked: usize) -> Str
                 ));
             }
         }
-        Format::Markdown => return markdown::render(findings, files_checked),
+        Format::Markdown => return markdown::render(report),
     }
-    out.push_str(&log_line(&summary(findings, files_checked)));
+    out.push_str(&log_line(&summary(report)));
     out.push('\n');
     out
 }
 
-fn summary(findings: &[Finding], files_checked: usize) -> String {
+fn summary(report: &Report<'_>) -> String {
+    let Report {
+        findings,
+        hidden,
+        files_checked,
+    } = *report;
+    let checked = format!("{files_checked} production Rust files checked");
+    let elsewhere = match hidden {
+        0 => String::new(),
+        1 => "; 1 finding elsewhere in the tree not shown".to_owned(),
+        _ => format!("; {hidden} findings elsewhere in the tree not shown"),
+    };
     if findings.is_empty() {
-        return format!("archcheck: no findings ({files_checked} production Rust files checked)");
+        let scope = if hidden == 0 {
+            ""
+        } else {
+            " in the changed files"
+        };
+        return format!("archcheck: no findings{scope} ({checked}{elsewhere})");
     }
     let required = findings
         .iter()
         .filter(|finding| finding.mode.is_required())
         .count();
     format!(
-        "archcheck: {} finding{} ({} advisory, {required} required; {files_checked} production \
-         Rust files checked)",
+        "archcheck: {} finding{} ({} advisory, {required} required; {checked}{elsewhere})",
         findings.len(),
         if findings.len() == 1 { "" } else { "s" },
         findings.len() - required,
