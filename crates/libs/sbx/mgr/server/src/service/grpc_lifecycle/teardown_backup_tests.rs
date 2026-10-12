@@ -169,3 +169,43 @@ async fn teardown_reuses_ready_backup_but_waits_for_active_local_upload() {
     stop.cancel();
     server.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn failed_teardown_defers_repeated_polls_without_holding_driver_capacity() {
+    use crate::service::tests::service_tests::insert_stranded_teardown_suspend_sandbox;
+    use pplx_space_common_core::types::ExecutionGeneration;
+    let conn = crate::db::test_conn();
+    let sandbox = SandboxId::new();
+    let generation = ExecutionGeneration::new(7).unwrap();
+    insert_stranded_teardown_suspend_sandbox(&conn, sandbox, generation);
+    let service = SandboxManagerService::new(conn);
+    service
+        .drive_teardown_suspend(sandbox, generation, SandboxEventTrigger::System)
+        .await
+        .unwrap_err();
+    let capacity = service.teardown_suspend_driver_sem.available_permits();
+    for _ in 0..4 {
+        service.spawn_teardown_suspend_driver(sandbox, generation, SandboxEventTrigger::System);
+        assert!(
+            service.teardown_suspend_drivers.is_empty(),
+            "a failed operation must defer repeated polls"
+        );
+        assert_eq!(
+            service.teardown_suspend_driver_sem.available_permits(),
+            capacity
+        );
+    }
+    {
+        let db = service.db.lock().unwrap();
+        db.execute("UPDATE jobs SET next_attempt_at=datetime('now','-1 second') WHERE subject_id=?1 AND kind='teardown_suspend'", [sandbox.to_string()]).unwrap();
+    }
+    service.spawn_teardown_suspend_driver(sandbox, generation, SandboxEventTrigger::System);
+    assert_eq!(
+        service.teardown_suspend_drivers.len(),
+        1,
+        "expired backoff must allow another attempt"
+    );
+    service.shutdown_token.cancel();
+    service.task_tracker.close();
+    service.task_tracker.wait().await;
+}

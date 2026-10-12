@@ -52,9 +52,9 @@ mod quarantine_scan;
 mod sandbox_row;
 mod teardown_jobs;
 pub(crate) use teardown_jobs::{
-    TeardownSuspendFailure, fail_teardown_suspend_backup_operation,
+    TeardownSuspendFailure, defer_teardown_suspend_retry, fail_teardown_suspend_backup_operation,
     fail_teardown_suspend_operation, reconcile_terminal_teardown_suspend_jobs,
-    teardown_suspend_retry_admissible,
+    teardown_suspend_retry_admissible, teardown_suspend_retry_due,
 };
 #[cfg(test)]
 mod test_schema_image_cache;
