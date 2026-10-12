@@ -1,18 +1,17 @@
 # Bound each credential-manager client dial: report
 
-Status: **PARTIAL, blocked again on Docker-root disk space.**
+Status: **COMPLETE.** All four validation steps have run.
 
 - **Code and tests:** the change and the follow-up test revision are pushed.
-- **Done:** steps 1 and 2, and step 3 runs 1–2, both passing.
-- **Blocked:** step 3 run 3 and step 4. Each needs a bring-up, and the
-  20 GiB Docker-root floor stops them: free space after the run-2 teardown was
-  13.7 GiB.
-- **Disk history:**
-  - Run 2 first hit the floor (14.3 GiB) after run 1.
-  - The box owner then authorized one `docker builder prune -af` plus
-    `docker image prune -f`. That freed space to 25.1 GiB.
-  - Run 2 was a cold rebuild, which used it up again.
-  - Volumes were never touched. No other prune was run.
+- **Done:** steps 1–2, step 3 (three natural bring-ups, all passing; run 3
+  hit the race), and step 4 (full typed Kind suite: 98 passed and 1 failed;
+  that one passed on rerun and is classified PRE-EXISTING).
+- **Disk history:** the 20 GiB Docker-root floor blocked the work twice. The
+  box owner authorized two cleanups (details in the disk section):
+  1. `docker builder prune -af` and `docker image prune -f`;
+  2. removing superseded `space-*` `tilt-*` image tags, then
+     `docker image prune -f`.
+  Build cache (after the first cleanup) and volumes were not touched again.
 - **Change:** `refs/heads/ac/credmgr-dial-timeout` at
   `270775ae0ec709c687eb517fa74f3f359e4cb71a`, two commits on `main` at
   `a8b5df675d8526bedbc2a1939b1748bafa317ef3`:
@@ -247,17 +246,84 @@ Service was created.
 |---|---|---|---|---|---|---|---|---|---|
 | 1 | `2b25606` | rc 0 | 395 s (first image builds) | 16:02:03Z | 13, 13, 4, 5 s | 0 ×4 | — | no | **pass** |
 | 2 | `270775a` | rc 0 | 259 s (cold rebuild after the prune) | 16:40:38Z | 14, 13, 16, 11 s | 0 ×4 | — | no | **pass** |
-| 3 | — | not started | — | — | — | — | — | — | **BLOCKED**: 13.7 GiB free after teardown |
+| 3 | `270775a` | rc 0 | 114 s (images reused) | 16:48:44Z | 29, 8, 35, 5 s | 2, 1, 2, 1 | `Error/1` ×4 (see below) | **yes**: on worker, worker4 (twice) and worker5 | **pass** |
 
-Neither completed run hit the race, so the natural-run evidence shows no
-regression rather than a measured improvement. The deterministic repro in
-step 2 is the proof for the race itself.
+Runs 1 and 2 did not hit the race. **Run 3 did.** About 1.3 s after the
+authority Service appeared, the watcher caught un-NATed
+`SYN_SENT … [UNREPLIED] src=10.96.86.30 dst=<node IP>` entries:
+- worker5 at +1.3 s (sport 57384);
+- worker4 at +1.3 s (sport 40118), and again at +4.2 s (sport 40120), so
+  kube-proxy on that node was still unprogrammed when the 3 s bound forced a
+  redial;
+- worker at +2.2 s (sport 38224).
+
+In run 3 the agent pods started about 21–23 s before the Service existed. That
+is why all four restarted. The cause was the agent's exit-on-failure startup
+(follow-up 1), never a stuck dial. Each container's last exit, from the
+previous-container logs:
+
+| Node | Previous run (relative to the Service) | Exit cause | Current run started | Ready |
+|---|---|---|---|---|
+| worker5 | −19 → −6 s | `dns error: failed to lookup address information` (Service not yet in DNS; 12 attempts, 9.1 s budget) | −5 s | +5 s, despite a pinned SYN at +1.3 s |
+| worker2 | −21 → −8 s | `dns error` (13 attempts, 10.0 s) | −7 s | +8 s |
+| worker4 | −6 → +11 s | `tcp connect error: deadline has elapsed` (the 3 s bound cutting the two pinned dials, then the budget ran out) | +32 s (crash-loop back-off) | +35 s |
+| worker | −7 → +6 s | `tcp connect error: Connection refused` (Service had no ready authority endpoint yet; 12 attempts, 9.2 s) | +25 s | +29 s |
+
+With the bound, the worst pod was Ready 35 s after the Service, within the
+60 s rule. Without it, each pinned dial on worker, worker4 and worker5 would
+have hung for about 130 s, as the base repro in step 2 shows.
 
 ### 4. Full typed Kind smoke suite
 
-**Not run.** I planned to run it on run 3's cluster after that run's baseline
-smoke (`SKIP_BOOTSTRAP=1`, as CI does). Run 3 could not start, so step 4 has no
-cluster.
+**What ran.** `bash scripts/tests/smoke-kind-typed.sh all`, unsharded, on run
+3's cluster right after its baseline smoke, as CI does.
+
+**Env**, from the kind-ci.yml shard step and job:
+- `SKIP_BOOTSTRAP=1`, `SPACE_KIND_OBSERVABILITY=off`,
+  `SPACE_KIND_TELEMETRY_MODE=datadog`;
+- `SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE` (from the `root@local` session login);
+- `SPACE_SMOKE_KIND_COLD_RECEIPTS` (a 0700 directory);
+- `uv` from `ci/scripts/ensure-uv.sh`;
+- the same data-plane `/healthz` wait.
+
+**Not set:** `SPACE_CI_IMAGE_MIRROR=ghcr`, `SPACE_KIND_RUST_ARTIFACTS=prebuilt`
+and the prebuilt image ID/SHA. They only affect the bootstrap or artifact
+handoff, which `SKIP_BOOTSTRAP=1` skips, and the GHCR mirror needs CI
+credentials.
+
+**Prerequisites.** The host's `dm_crypt` and `dm_snapshot` modules were already
+loaded for the BYOK scenarios.
+
+**Result: rc 1, wall time 2946 s.**
+- ECW API surface: **76 passed**, 0 warned, 0 failed, 0 inconclusive.
+- Native API surface: **22 passed**, 0 warned, **1 failed**, 0 inconclusive.
+- No scenario was quarantined.
+- The OCI template-build scenario (`local.ecw_template_build_from_oci_boots`)
+  **passed** on this box, along with `local.private_template_build_isolation`.
+  So the known builder-storage admission failure did not occur, and there is
+  no admission message to quote.
+
+**The one failure**, `native.stopped_restart_preserves_rootfs` ("deleted stopped
+sandbox was not reclaimed by node reconciliation"):
+- **First attempt.** Both stop/restart cycles kept the rootfs payload. The last
+  phase, "delete stopped sandbox and verify node cleanup", gave up after 188 s
+  on `space-local-worker2`. node-manager's `cleanup_sandbox` ran and completed
+  within a second of the delete. sandbox-manager's snapshot reaper then logged
+  "unreadable subtree retained for a later sweep" (Permission denied) for that
+  sandbox's directory under `/space/cache/firecracker/sandboxes/`, so the
+  sandbox was not reclaimed within the scenario's wait.
+- **Rerun once** (same env as the suite's native pass; the script's
+  `prepare_native_kind` exports): **pass**. Same worker; the delete phase
+  completed in 47.9 s.
+- **Classification: PRE-EXISTING** (intermittent).
+  - It is in the snapshot-reaper / node-reconciliation cleanup path, and it
+    passed on rerun with the same binaries.
+  - The change only touches the credmgr client's `Tcp`/`Tls` endpoints. The
+    node services on that path (sandbox-manager, node-manager) reach credmgr
+    through the node-local UDS endpoint, which the change does not touch.
+  - It is not CHANGE-INDUCED, so the protocol needs no base comparison.
+- **Agent stability.** The credential-manager agents' restart counts did not
+  change during the 49-minute suite.
 
 ## Disk: why the floor was reached
 
@@ -275,27 +341,42 @@ Docker-root free space is the separate Docker volume, read with
 | Before run 2 (after teardown) | 25.1 GiB |
 | After the run-2 teardown | **13.7 GiB** (run 3 blocked) |
 
-**Why it fell again.** Emptying the build cache made run 2's bring-up a cold
-Docker build:
-- a new `space-rust-chef-base:local` (3.4 GB),
-- a new `space-rust-build-kind:local`,
-- a full new set of Tilt images,
-- 11.4 GB of build cache regenerated.
+**Why it fell again.** With the build cache empty, run 2 was a cold build: a
+new `space-rust-chef-base` (3.4 GB), artifact image and Tilt image set, and
+11.4 GB of build cache. The older tagged image sets stayed, because `docker
+image prune -f` removes only dangling images. About 2.4 GiB of the run-1 drop
+was my mistake: I reverted the client crate in the Tilt-watched worktree for
+the base swap. I restored it at once and built base outside Tilt, but Tilt
+still rebuilt (identical images, no rollout).
 
-The earlier image sets remain, because they are tagged and `docker image prune
--f` removes only dangling images. After teardown, `docker system df` shows
-images 28.5 GB (21.6 GB reclaimable) and build cache 11.4 GB.
+**Second owner-authorized cleanup.** After the run-2 teardown, free space was
+13.7 GiB. I listed the removal set first, then ran `docker rmi` without `-f`:
+- **Removed:** 133 older `tilt-*` tags in the `space-*` repositories, across
+  63 images. 61 images were deleted; the other 2 also carry a `:local` tag,
+  which is kept.
+- **Kept, per repository, the newest image's tags:**
+  - the set run 2 built from this HEAD: `space-worker 493656df`,
+    `space-api 4ca6f23f`, `space-ui 6e8727de`, `space-seed-publish fb21fad8`,
+    `space-data-plane 971f5c57`, `space-cluster-controller b5dc3799`,
+    `space-kind-key-broker aaa530c9`;
+  - `space-node-stack f87d863d`, the newest of a repository this build does
+    not use, kept under the "newest tag of each" rule.
+- **Also kept:**
+  - the single `space-rust-chef-base:local` and `space-rust-build-kind:local`
+    images, both referenced by the current build, so neither was superseded;
+  - all `:local` tags;
+  - third-party and base images (kindest/node, the SPACE Kind node image, uv
+    and so on);
+  - the build cache and volumes.
+- `docker image prune -f` reclaimed 0 B.
+- Free space went from 13.7 to **26.3 GiB**.
 
-**Earlier loss.** About 2.4 GiB of the run-1 drop came from my mistake: I began
-the base swap by reverting the client crate in the Tilt-watched worktree, then
-restored the source at once and built the base binary outside Tilt instead.
-Tilt still rebuilt; it produced identical images and no rollout, but used the
-space.
-
-**To finish.** One more owner-authorized `docker builder prune -af` would bring
-free space back above 20 GiB. Run 3 and step 4 can then share one bring-up: the
-natural run, then the typed suite on that cluster with `SKIP_BOOTSTRAP=1`, as
-CI does. That needs no further bring-up.
+| Point | Free |
+|---|---|
+| After the second cleanup | 26.3 GiB |
+| Before run 3 (after teardown) | 26.3 GiB (images reused, so no rebuild) |
+| During the typed suite | 18.9 GiB (cluster up) |
+| After the final teardown | 26.3 GiB |
 
 ## Cleanup done
 
@@ -303,6 +384,8 @@ CI does. That needs no further bring-up.
   `kubectl port-forward` processes remain.
 - The task's base source and target directories are deleted, and so is the
   `space-worker:credmgr-base-a8b5df6` image I built. Nothing else was removed.
+- After step 4, the run-3 cluster was deleted with `teardown.sh`. No Kind
+  cluster, Tilt or port-forward remains.
 - The task checkout is on `ac/credmgr-dial-timeout` at its pushed HEAD,
   `270775a`, and is clean.
 
@@ -313,7 +396,9 @@ CI does. That needs no further bring-up.
    then restarts it with back-off. With this bound a pinned dial costs about
    3 s instead of the whole budget, but a longer outage still turns into
    restarts. Keeping the agent retrying, or connecting lazily, is a separate
-   change.
+   change. Run 3 shows the cost: agents started before the authority Service
+   existed, exited on DNS or connection-refused errors, and two of them waited
+   out crash-loop back-off until about 30 s after the Service.
 2. **The TLS handshake is not bounded per dial.** `connect_timeout` covers
    TCP only. A peer that accepts TCP but stalls TLS would still hold a dial
    past the budget. That is not the observed mechanism, but a per-attempt
@@ -321,6 +406,10 @@ CI does. That needs no further bring-up.
 3. **Pre-existing net-gateway test failure.**
    `tls_interception::interception_exemptions_relay_original_tls_only_after_admission`
    fails on base in this environment and should be looked at separately.
+4. **Intermittent snapshot-reaper retention.** In
+   `native.stopped_restart_preserves_rootfs`, the reaper hit "Permission
+   denied" on a deleted stopped sandbox's snapshot subtree and retained it for
+   a later sweep. The node-cleanup wait timed out once and passed on rerun.
 
 ## Results
 
@@ -330,13 +419,18 @@ CI does. That needs no further bring-up.
 | Unit test | Added. Deterministic (paused time, loopback full accept queue), covers both arms. The lower bound is now `CONNECT_TIMEOUT` (`270775a`). Fails without the fix on each arm, re-checked after the revision. 0 flaky runs in 1600 |
 | 1. fmt / clippy / nextest | Workspace clippy pass. Nextest over 20 packages: 5662 pass, 19 ENVIRONMENTAL (root-only ignored tests), 1 PRE-EXISTING (fails on base). After `270775a`: fmt pass, crate clippy pass, crate nextest 28/28 |
 | 2. Pinned-SYN repro | Fix **7.1 s and 6.5 s, 0 restarts** vs base **146.5 s, 1 restart** (`os error 110`). PREROUTING clean |
-| 3. Natural bring-ups | Run 1 **pass** (≤ 13 s after the Service, 0 restarts). Run 2 **pass** (≤ 16 s, 0 restarts). Race not hit in either. Run 3 **BLOCKED** (13.7 GiB < 20 GiB) |
-| 4. Typed Kind suite | **Not run** (needs run 3's cluster; same disk block) |
+| 3. Natural bring-ups | Run 1 **pass** (≤ 13 s after the Service, 0 restarts, race not hit). Run 2 **pass** (≤ 16 s, 0 restarts, race not hit). Run 3 **pass** (≤ 35 s; **race hit** on 3 nodes, and the bound cut the pinned dials; 1–2 restarts each, from DNS / connection-refused / exhausted-budget startup exits, not stuck dials) |
+| 4. Typed Kind suite | ECW **76/76 pass**. Native **22/23 pass**. `native.stopped_restart_preserves_rootfs` failed once (snapshot-reaper retention during node cleanup), passed on rerun: **PRE-EXISTING**. The OCI template-build scenario passed |
 
-**Verdict: PARTIAL.** The fix and the revised test are landed and pushed.
-Unit tests and the deterministic Kind repro show that a pinned SYN now costs
-one 3 s dial: a worker credential-manager pod is Ready in about 7 s with no
-restart, instead of about 147 s with one restart. Two natural bring-ups pass
-the 60 s rule with wide margin (worst case 16 s). Run 3 and the full typed suite
-are still blocked by the 20 GiB Docker-root floor. They need one more
-authorized build-cache prune, and then can share a single bring-up.
+**Verdict: PASS, with the pre-existing items noted.**
+- The per-dial 3 s bound (A) is landed on `ac/credmgr-dial-timeout` at
+  `270775a`.
+- The deterministic Kind repro shows that a pinned SYN now costs one 3 s
+  dial: Ready in about 7 s with no restart, instead of about 147 s with one
+  restart.
+- All three natural bring-ups meet the 60 s rule (worst 35 s). That includes
+  run 3, which hit the race on three nodes, where base would have stalled each
+  for about two minutes.
+- The full typed suite shows no change-induced failure.
+- The remaining restarts come from the agent's exit-on-failure startup, a
+  separate follow-up.
