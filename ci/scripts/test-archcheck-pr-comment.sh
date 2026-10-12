@@ -126,6 +126,23 @@ output="$(run --report "${clean}" --dry-run)" || fail "the clean run without a c
 [[ "${output}" == *"nothing to post"* ]] || fail "the clean run without a comment printed '${output}'"
 grep -v -- '--paginate' "${FAKE_GH_LOG}" | grep -q . && fail "the clean run without a comment sent a request"
 
+# archcheck could not run, with a comment: say so as of the head, without the
+# old findings or any error text.
+RUN_URL=https://github.com/example/repo/actions/runs/42
+comments existing
+body="$(dry_run_body "PATCH repos/example/repo/issues/comments/222" --could-not-run --run-url "${RUN_URL}")"
+[ "$(head -n 1 <<<"${body}")" = "${MARKER}" ] || fail "the could-not-run body does not start with the marker"
+grep -qF '### archcheck could not run' <<<"${body}" || fail "the could-not-run body is '${body}'"
+grep -qF "archcheck could not check \`${SHA}\`" <<<"${body}" || fail "the could-not-run body lacks the SHA: ${body}"
+grep -qF "[job log](${RUN_URL})" <<<"${body}" || fail "the could-not-run body lacks the job log link: ${body}"
+grep -qF 'code lines' <<<"${body}" && fail "the could-not-run body kept findings: ${body}"
+
+# archcheck could not run, without a comment: post nothing.
+comments none
+output="$(run --could-not-run --run-url "${RUN_URL}" --dry-run)" || fail "the could-not-run run without a comment failed"
+[[ "${output}" == *"nothing to post"* ]] || fail "the could-not-run run without a comment printed '${output}'"
+grep -v -- '--paginate' "${FAKE_GH_LOG}" | grep -q . && fail "the could-not-run run without a comment sent a request"
+
 # A real run sends exactly the dry run's request.
 comments existing
 expected="$(run --report "${findings}" --dry-run | tail -n +2)"
@@ -167,7 +184,12 @@ for args in \
     "--repo example/repo --pr 7x --sha ${SHA} --report ${findings}" \
     "--repo example --pr 7 --sha ${SHA} --report ${findings}" \
     "--repo example/repo --pr 7 --sha ${SHA} --report ${not_report}" \
-    "--repo example/repo --pr 7 --sha ${SHA} --report"; do
+    "--repo example/repo --pr 7 --sha ${SHA} --report" \
+    "--repo example/repo --pr 7 --sha ${SHA} --could-not-run" \
+    "--repo example/repo --pr 7 --sha ${SHA} --could-not-run --run-url https://github.com/other/repo/actions/runs/42" \
+    "--repo example/repo --pr 7 --sha ${SHA} --could-not-run --run-url https://github.com/example/repo/actions/runs/42x" \
+    "--repo example/repo --pr 7 --sha ${SHA} --could-not-run --run-url https://github.com/example/repo/actions/runs/42 --report ${findings}" \
+    "--repo example/repo --pr 7 --sha ${SHA} --run-url https://github.com/example/repo/actions/runs/42 --report ${findings}"; do
     status=0
     # shellcheck disable=SC2086 # split the argument list on purpose
     bash "${SCRIPT}" ${args} >/dev/null 2>&1 || status=$?

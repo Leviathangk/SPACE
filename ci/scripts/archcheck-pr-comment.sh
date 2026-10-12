@@ -2,12 +2,17 @@
 # Keep one comment on a pull request that lists its archcheck findings.
 #
 # usage: archcheck-pr-comment.sh --repo <owner/name> --pr <number> --sha <head sha>
-#            --report <report.md> [--dry-run]
+#            (--report <report.md> | --could-not-run --run-url <url>) [--dry-run]
 #
 # <report.md> is `archcheck --format markdown` output for the pull request head.
 # The comment is the first one by github-actions[bot] whose body starts with the
 # marker below. With findings, it is created or updated in place. With none, an
 # existing comment is edited to say so, and no comment is created.
+#
+# --could-not-run is for an archcheck run that exited 2. An existing comment is
+# edited to say that the check could not run at <head sha> and to see the job
+# log at <url>; no comment is created. The comment never quotes archcheck's
+# error, which can contain text from the pull request.
 #
 # --dry-run still reads the comment list but prints the request it would send
 # instead of sending it. Needs gh, authenticated through GH_TOKEN, and jq.
@@ -36,18 +41,25 @@ repo=""
 pr=""
 sha=""
 report=""
+run_url=""
+could_not_run=false
 dry_run=false
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --repo | --pr | --sha | --report)
+        --repo | --pr | --sha | --report | --run-url)
             [ "$#" -ge 2 ] || usage
             case "$1" in
                 --repo) repo="$2" ;;
                 --pr) pr="$2" ;;
                 --sha) sha="$2" ;;
                 --report) report="$2" ;;
+                --run-url) run_url="$2" ;;
             esac
             shift 2
+            ;;
+        --could-not-run)
+            could_not_run=true
+            shift
             ;;
         --dry-run)
             dry_run=true
@@ -60,8 +72,15 @@ done
 [[ "${repo}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "--repo must be owner/name"
 [[ "${pr}" =~ ^[1-9][0-9]*$ ]] || die "--pr must be a pull request number"
 [[ "${sha}" =~ ^[0-9a-f]{40}$ ]] || die "--sha must be a full commit SHA"
-[ -f "${report}" ] || die "--report ${report} is not a file"
-[[ "$(head -n 1 "${report}")" == '### archcheck: '* ]] || die "${report} is not an archcheck report"
+if [ "${could_not_run}" = true ]; then
+    [ -z "${report}" ] || die "--report and --could-not-run are exclusive"
+    [[ "${run_url}" =~ ^https://[A-Za-z0-9.-]+/"${repo}"/actions/runs/[0-9]+(/attempts/[0-9]+)?$ ]] ||
+        die "--run-url must be this repository's workflow run URL"
+else
+    [ -z "${run_url}" ] || die "--run-url needs --could-not-run"
+    [ -f "${report}" ] || die "--report ${report} is not a file"
+    [[ "$(head -n 1 "${report}")" == '### archcheck: '* ]] || die "${report} is not an archcheck report"
+fi
 
 work="$(mktemp -d)"
 trap 'rm -rf "${work}"' EXIT
@@ -81,7 +100,20 @@ footer="_Evaluated at \`${sha}\` with this pull request's \`ARCHITECTURE.toml\` 
 This comment is updated on every push._"
 
 body="${work}/body.md"
-if [[ "$(head -n 1 "${report}")" == "${CLEAN_HEADING}"* ]]; then
+if [ "${could_not_run}" = true ]; then
+    if [ -z "${comment_id}" ]; then
+        echo "archcheck-pr-comment: archcheck could not run and there is no earlier comment; nothing to post."
+        exit 0
+    fi
+    {
+        printf '%s\n' "${MARKER}"
+        printf '### archcheck could not run\n\n'
+        # shellcheck disable=SC2016 # Markdown backticks, not a command substitution
+        printf 'archcheck could not check `%s`: it stopped with a configuration, usage or I/O error. See the [job log](%s) for the error. The findings this comment listed before may be out of date.\n\n' \
+            "${sha}" "${run_url}"
+        printf '_This comment is updated on every push._\n'
+    } >"${body}"
+elif [[ "$(head -n 1 "${report}")" == "${CLEAN_HEADING}"* ]]; then
     if [ -z "${comment_id}" ]; then
         echo "archcheck-pr-comment: no findings and no earlier comment; nothing to post."
         exit 0
