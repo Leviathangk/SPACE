@@ -19,10 +19,6 @@ const NO_CROSSING: &str = "no_crossing";
 const LISTED_NO_GROWTH: &str = "listed_no_growth";
 
 impl Rule for FileSize {
-    fn id(&self) -> &'static str {
-        RULE
-    }
-
     fn check(&self, ctx: &Context) -> Vec<Finding> {
         let config = &ctx.config.rules.file_size;
         let limit = config.limit;

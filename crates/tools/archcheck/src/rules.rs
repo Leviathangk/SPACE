@@ -4,10 +4,9 @@ mod file_size;
 
 use crate::{baseline::Baseline, context::Context, finding::Finding};
 
+/// A rule reads its `[rules.<name>]` table from `ctx.config` and names
+/// itself in each [`Finding`] it returns.
 pub trait Rule {
-    /// Matches the rule's `[rules.<id>]` table in `ARCHITECTURE.toml`.
-    fn id(&self) -> &'static str;
-
     fn check(&self, ctx: &Context) -> Vec<Finding>;
 
     /// Fills this rule's table for `--write-baseline`. Rules without a

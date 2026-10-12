@@ -117,7 +117,8 @@ Entries should only be removed or have their caps lowered. The
 ## Adding a rule
 
 1. Add a module under `src/rules/` with a type that implements `Rule`. Its
-   `id()` is the name of its `[rules.<id>]` table.
+   findings carry the rule's name, which is also the name of its
+   `[rules.<name>]` table.
 2. Add the rule's configuration struct as a field of `RulesConfig` in
    `src/config.rs`, with one `BehaviourConfig` per behaviour, and add the table
    to `ARCHITECTURE.toml`.

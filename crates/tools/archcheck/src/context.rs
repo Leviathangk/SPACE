@@ -58,12 +58,10 @@ pub struct ProductionFile {
 
 #[derive(Debug)]
 pub struct Context {
-    pub root: PathBuf,
     pub config: ArchitectureConfig,
     pub baseline: Baseline,
-    /// `[workspace] members` from the root `Cargo.toml`, in manifest order.
-    pub members: Vec<String>,
-    /// Every production Rust file, sorted by path.
+    /// Every production Rust file of the root `Cargo.toml`'s workspace
+    /// members, sorted by path.
     pub files: Vec<ProductionFile>,
 }
 
@@ -78,10 +76,8 @@ impl Context {
         let members = load_members(&root.join("Cargo.toml"))?;
         let files = production_files(root, &members)?;
         Ok(Self {
-            root: root.to_path_buf(),
             config,
             baseline,
-            members,
             files,
         })
     }
