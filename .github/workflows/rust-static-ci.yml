@@ -124,6 +124,9 @@ jobs:
             cargo arch --format github --summary "${SUMMARY}" || status=$?
           if [[ -f "${GITHUB_WORKSPACE}/${SUMMARY}" ]]; then
             cat "${GITHUB_WORKSPACE}/${SUMMARY}" >>"${GITHUB_STEP_SUMMARY}"
+            echo "Added the archcheck report ($(wc -l <"${GITHUB_WORKSPACE}/${SUMMARY}") lines) to the job summary."
+          elif [[ "${status}" -ne 2 ]]; then
+            echo "::warning title=archcheck::archcheck exited ${status} without writing ${SUMMARY}."
           fi
           exit "${status}"
 
