@@ -14,10 +14,11 @@ cargo arch --write-baseline    # regenerate architecture-baseline.toml
 cargo arch --root <path>       # check another checkout
 ```
 
-`cargo arch` is an alias in `.cargo/config.toml`. It builds into
-`target/archcheck` so it does not wait on the lock held by a concurrent
-workspace build. Without `--root`, the tool checks the Cargo workspace that
-contains the current directory.
+`cargo arch` is an alias in `.cargo/config.toml`. It builds into the
+workspace target directory, wherever it is run from. A caller that must not
+wait on the build lock of a concurrent workspace build, such as an editor hook,
+can set `CARGO_TARGET_DIR` to a directory of its own. Without `--root`, the
+tool checks the Cargo workspace that contains the current directory.
 
 ## Modes and exit status
 
