@@ -399,3 +399,61 @@ Before widening enablement, use a small canary and matched controls to verify:
 Broad enablement remains pending these measurements. Disabling new captures
 stops further accumulation; existing bundles and leases still follow their
 normal ownership and retirement rules.
+
+## Backup registration authority
+
+An artifact ID identifies immutable kind, origin, and optional snapshot name.
+Each backup attempt has its own object prefix and an immutable source node.
+For Kubernetes workers the source also includes the Node UID recorded when
+that execution first acquired its node binding. Warm-pool promotion records the
+UID in the slot, and adoption copies it into execution history. A later lookup
+by node name must not fill an unknown historical UID.
+
+| Request and evidence | Admission and durable outcome |
+| --- | --- |
+| First registration, current execution bound to the same registered Node UID | Register the execution's source identity and a new attempt. Active and target-only placement use the same check. |
+| First registration after retirement, even with matching inventory or a current-artifact pin | Refuse permanently; neither record grants backup authority. Keep existing catalog and local evidence unchanged. |
+| Fresh attempt, exact prior registration from this source incarnation | Admit without inventory, even after retirement, relocation, or a newer artifact pin. The new attempt inherits the earlier registration timestamp, so retrying old bytes does not refresh markerless restore evidence. |
+| Replay of an existing attempt | Keep its stored source and immutable artifact identity; changed placement cannot transfer ownership. |
+| Same-name node replacement | Refuse new registration, replay, and finalize when the recorded source UID differs from the registry. |
+| Historical Kubernetes execution or attempt with unknown UID | Refuse; do not backfill from today's node registry. |
+| Unscheduled active execution awaiting its first binding | Return `Unavailable`; the existing snapshot worker owns bounded retries while placement observation binds the execution. |
+| Changed kind, origin, or snapshot name for the same artifact | Refuse the new attempt; preserve history. |
+| All earlier registrations removed, or only deleting registrations remain | No retry grant remains. A retired artifact stays refused. |
+| Direct worker | Preserve registered node/address authorization; Kubernetes UIDs do not apply. |
+
+Registration and finalization lock the sandbox before node registration rows.
+The source UID and registered address remain locked through the catalog write,
+so an observed registry replacement cannot race past authorization. Finalize
+only accepts the existing attempt's allowed terminal transition; a failed
+attempt cannot be converted to Ready. Admission proves authority, not readable
+local files, successful transfer, or successful restore.
+
+`FailedPrecondition` and `PermissionDenied` are permanent in the existing upload
+worker; waiting for another census does not repair them. `Unavailable` consumes
+that worker's configured exponential retry budget. On exhaustion its normal
+failure handling owns the attempt; this policy introduces no automatic fresh
+attempt loop. Preserve files and diagnostics for owner review when historical
+identity or first-registration authority is absent.
+
+### Rollout and limitations
+
+Apply the additive schema migrations first, then deploy both execution writers
+(API and warm-pool controller), then admission enforcement. Old writers remain
+schema-compatible but leave unknown identity. Allow old in-flight uploads to
+finish before enforcement: old attempts with NULL source UIDs will be refused
+by the new finalizer. Existing Ready backup lookup and restore remain supported. Deploy the worker
+change that reuses exact Ready artifacts before enforcing this policy; older
+workers may request an unnecessary backup of a restored artifact and be refused.
+A mixed fleet of old and new internal API servers does not provide consistent
+incarnation enforcement. Rolling back application enforcement restores the old
+policy; retain the additive columns and recorded evidence.
+
+The UID is control-plane evidence captured at observation time, not a proof
+carried by the backup caller. Internal API authorization still uses a registered
+source address after service authentication. Delayed node observation and
+same-address replacement before registry convergence remain limitations.
+Credential vending separately needs incarnation-aware policy across active
+placement, target placement, snapshot source, and execution history, while
+preserving authorized restore destinations. This admission policy does not
+claim to close those authentication or credential-vending boundaries.

@@ -5,6 +5,7 @@ use super::{
 };
 use jiff::Timestamp;
 use pplx_space_common_core::sql;
+use pplx_space_common_core::types::K8sNodeUid;
 use pplx_space_common_core::types::{
     Arch, ArtifactKind, ArtifactOrigin, Digest, ExactStorageUri, ExecutionGeneration,
     ExecutionMetadata, LocalArtifactId, NodeId, OrgId, SandboxId,
@@ -189,6 +190,9 @@ async fn snapshot_catalog_store_contract() -> TestResult {
             storage_uri,
         )
         .with_source_node_id(Some(source_node_id))
+        .with_source_node_uid(Some(
+            K8sNodeUid::parse("original-uid").expect("synthetic UID"),
+        ))
         .with_resources(Some(4), Some(8192))
         .with_template(
             Some(TemplateName::parse("seed").expect("valid template name")),
@@ -210,8 +214,15 @@ async fn snapshot_catalog_store_contract() -> TestResult {
     insert_tx.commit().await?;
 
     let mut retry_tx = db.pool.begin().await?;
-    let retried = insert(&mut retry_tx, &snapshot).await?;
+    let replay = make_snapshot(expected_uri.clone())
+        .with_source_node_id(Some(NodeId::new()))
+        .with_source_node_uid(Some(K8sNodeUid::parse("replacement-uid")?));
+    let retried = insert(&mut retry_tx, &replay).await?;
     assert_eq!(retried, inserted);
+    assert_eq!(
+        retried.source_node_uid().map(K8sNodeUid::as_str),
+        Some("original-uid")
+    );
     retry_tx.commit().await?;
 
     let mut location_conflict_tx = db.pool.begin().await?;
