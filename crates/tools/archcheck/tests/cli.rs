@@ -463,6 +463,46 @@ fn markdown_report_keeps_paths_inside_code_spans() {
     );
 }
 
+/// Unicode format characters (general category Cf) are invisible and can
+/// hide or reorder text, so the report shows each of them escaped.
+#[test]
+fn markdown_report_escapes_format_characters() {
+    let format_characters = [
+        '\u{00AD}',
+        '\u{0600}',
+        '\u{061C}',
+        '\u{200B}',
+        '\u{200E}',
+        '\u{202E}',
+        '\u{2066}',
+        '\u{FEFF}',
+        '\u{FFF9}',
+        '\u{FFFB}',
+        '\u{1D173}',
+        '\u{E0001}',
+        '\u{E0041}',
+        '\u{E007F}',
+    ];
+    let ws = Workspace::new("advisory");
+    let name: String = format_characters.iter().collect();
+    ws.rust_file(&format!("crates/a/src/{name}.rs"), LIMIT + 1);
+
+    let run = ws.run(&["--format", "markdown"]);
+
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    let escaped: String = format_characters
+        .iter()
+        .map(|c| c.escape_unicode().to_string())
+        .collect();
+    assert!(
+        run.stdout
+            .contains(&format!("- `crates/a/src/{escaped}.rs`: 6 code lines")),
+        "{}",
+        run.stdout
+    );
+    assert!(!run.stdout.contains(format_characters), "{:?}", run.stdout);
+}
+
 #[test]
 fn markdown_report_caps_the_findings_shown() {
     let ws = Workspace::new("advisory");

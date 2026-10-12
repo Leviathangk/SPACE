@@ -2,13 +2,13 @@
 //!
 //! On a pull request the checked tree, and so every path, is controlled by the
 //! pull request's author. Paths are rendered only inside inline code spans,
-//! with control and invisible formatting characters escaped and long paths
-//! shortened; other text is backslash-escaped; no raw HTML is emitted; and at
+//! with control characters, line separators and Unicode format characters
+//! escaped and long paths shortened; other text is backslash-escaped; no raw HTML is emitted; and at
 //! most [`MAX_FINDINGS_SHOWN`] findings are listed.
 
 use super::summary;
 use crate::{
-    escape::{escape_where, is_line_separator},
+    escape::{escape_where, is_format, is_line_separator},
     finding::Finding,
 };
 
@@ -106,19 +106,11 @@ fn text(value: &str) -> String {
 }
 
 /// Escapes control characters, which could end a line or a code span, line
-/// separators, characters that reorder or hide text, and the `[` of every
-/// `##[`, as `\u{…}` (`\n`, `\t` and `\r` keep their short forms).
+/// separators, Unicode format characters, which can hide or reorder text, and
+/// the `[` of every `##[`, as `\u{…}` (`\n`, `\t` and `\r` keep their short
+/// forms).
 fn visible(value: &str) -> String {
     escape_where(value, |c| {
-        c.is_control()
-            || is_line_separator(c)
-            || matches!(
-                c,
-                '\u{061C}'
-                    | '\u{200B}'..='\u{200F}'
-                    | '\u{202A}'..='\u{202E}'
-                    | '\u{2060}'..='\u{2069}'
-                    | '\u{FEFF}'
-            )
+        c.is_control() || is_line_separator(c) || is_format(c)
     })
 }

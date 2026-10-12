@@ -47,3 +47,33 @@ pub(crate) fn escape_where(value: &str, escape: impl Fn(char) -> bool) -> String
 pub(crate) fn is_line_separator(c: char) -> bool {
     matches!(c, '\u{2028}' | '\u{2029}')
 }
+
+/// Unicode format characters (general category Cf, as of Unicode 15.0), which
+/// are invisible and can hide or reorder text: the soft hyphen, bidi controls,
+/// zero-width characters, interlinear annotation marks and the tag block.
+/// U+E0000 is unassigned but escaped with the rest of the tag block.
+pub(crate) fn is_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E007F}'
+    )
+}

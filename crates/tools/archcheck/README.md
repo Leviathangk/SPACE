@@ -70,9 +70,11 @@ requires.
 
 The Markdown report also treats paths as untrusted. A path appears only inside
 an inline code span whose backtick fence is longer than any backtick run in the
-path. Control and invisible formatting characters, line separators and the `[`
-of `##[` are escaped as `\n` or `\u{…}`, and paths longer than 200 characters
-are shortened to their end. Other text is
+path. Control characters, line separators, Unicode format characters (general
+category Cf, such as bidi controls, zero-width characters, U+00AD,
+U+FFF9–U+FFFB and the tag characters U+E0000–U+E007F) and the `[` of `##[` are
+escaped as `\n` or `\u{…}`, and paths longer than 200 characters are shortened
+to their end. Other text is
 backslash-escaped, and the report contains no raw HTML. At most 50 findings
 are listed, followed by how many were left out.
 
