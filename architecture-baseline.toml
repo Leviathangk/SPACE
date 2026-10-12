@@ -7,14 +7,15 @@
 [file_size]
 "crates/apps/local/node-mgr/svc/src/service.rs" = 1242
 "crates/libs/api/src/controllers/sandbox/lifecycle.rs" = 1825
-"crates/libs/api/src/controllers/sandbox/mod.rs" = 1191
-"crates/libs/api/src/controllers/sandbox/queries.rs" = 2553
+"crates/libs/api/src/controllers/sandbox/mod.rs" = 1193
+"crates/libs/api/src/controllers/sandbox/queries.rs" = 2571
 "crates/libs/api/src/controllers/sandbox/spaced.rs" = 1113
 "crates/libs/api/src/controllers/sandbox/updates.rs" = 1008
 "crates/libs/api/src/controllers/substrate/direct.rs" = 3907
-"crates/libs/api/src/controllers/substrate/kubernetes/adapter/substrate_adapter.rs" = 2442
+"crates/libs/api/src/controllers/substrate/kubernetes/adapter/substrate_adapter.rs" = 2467
 "crates/libs/api/src/controllers/substrate/kubernetes/execution.rs" = 1670
 "crates/libs/api/src/controllers/substrate/kubernetes/pod_ops/ensure_pod.rs" = 1111
+"crates/libs/api/src/controllers/substrate/kubernetes/support.rs" = 1020
 "crates/libs/api/src/controllers/substrate/mod.rs" = 2771
 "crates/libs/api/src/fork_operation_executor.rs" = 1755
 "crates/libs/api/src/public_operations.rs" = 1787
@@ -26,13 +27,12 @@
 "crates/libs/api/src/routes/public/sandboxes.rs" = 1245
 "crates/libs/build/mgr/src/lib.rs" = 2058
 "crates/libs/build/mgr/src/oci/containerd.rs" = 1084
-"crates/libs/cluster/controller/server/src/leader_election/tests/mod.rs" = 1154
 "crates/libs/cluster/controller/server/src/node_drain/mod.rs" = 1686
 "crates/libs/cluster/controller/server/src/node_drain/store.rs" = 1893
 "crates/libs/cluster/controller/server/src/orphaned_sandboxes.rs" = 1581
 "crates/libs/cluster/controller/server/src/transient_lifecycle_sweeper/mod.rs" = 1843
 "crates/libs/cluster/controller/server/src/warm_pool.rs" = 2385
-"crates/libs/cluster/pool/src/store.rs" = 1701
+"crates/libs/cluster/pool/src/store.rs" = 1700
 "crates/libs/common/core/src/k8s.rs" = 1147
 "crates/libs/common/core/src/types/sandbox.rs" = 1953
 "crates/libs/common/jobs/src/worker.rs" = 1621
@@ -41,7 +41,7 @@
 "crates/libs/data/plane/server/src/ecw_files.rs" = 1521
 "crates/libs/data/plane/server/src/ecw_process.rs" = 1615
 "crates/libs/data/plane/server/src/lib.rs" = 1550
-"crates/libs/data/plane/server/src/native.rs" = 3042
+"crates/libs/data/plane/server/src/native.rs" = 3046
 "crates/libs/data/plane/server/src/state.rs" = 1830
 "crates/libs/db/migrator/src/bootstrap_roles.rs" = 1202
 "crates/libs/internal/api/server/src/adapter.rs" = 1514
@@ -61,7 +61,7 @@
 "crates/libs/node/mgr/server/src/firewall.rs" = 1497
 "crates/libs/node/mgr/server/src/service/cleanup_helpers.rs" = 1279
 "crates/libs/node/mgr/server/src/service/runtime.rs" = 1124
-"crates/libs/node/mgr/server/src/service/snapshots.rs" = 1064
+"crates/libs/node/mgr/server/src/service/snapshots.rs" = 1063
 "crates/libs/node/mgr/server/src/slot_pool.rs" = 1822
 "crates/libs/node/mgr/server/src/slot_pool/worker.rs" = 1404
 "crates/libs/node/runtime/core/src/runtime_inventory/diagnostic.rs" = 1122
