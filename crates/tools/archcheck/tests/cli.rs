@@ -376,6 +376,25 @@ fn only_required_findings_fail_the_check() {
     assert!(growth_required.stdout.contains("(1 advisory, 1 required;"));
 }
 
+/// Workflow commands need `%`, CR and LF escaped in the message, and also `:`
+/// and `,` in properties such as `file=`.
+#[test]
+fn github_annotations_escape_the_path_and_message() {
+    let ws = Workspace::new("advisory");
+    ws.rust_file("crates/a/src/p%25,q:r\r\ns.rs", LIMIT + 1);
+
+    let run = ws.run(&["--format", "github"]);
+
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    assert_eq!(
+        run.stdout.lines().next().unwrap(),
+        "::warning file=crates/a/src/p%2525%2Cq%3Ar%0D%0As.rs,line=1,title=archcheck \
+         file_size.no_crossing (advisory)::crates/a/src/p%2525,q:r%0D%0As.rs: 6 code lines, over \
+         the 5-line limit (comments and blank lines are not counted). Split it into submodules \
+         by responsibility."
+    );
+}
+
 #[test]
 fn markdown_report_groups_findings_by_behaviour() {
     let ws = Workspace::new("advisory");
