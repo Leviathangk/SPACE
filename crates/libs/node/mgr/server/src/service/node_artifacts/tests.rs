@@ -61,8 +61,23 @@ fn publication_failures_map_to_what_a_caller_can_do() {
             tonic::Code::InvalidArgument,
         ),
         (
-            PublishError::TargetDiffers { path: path.clone() },
+            PublishError::ExistingArtifact(
+                pplx_space_node_runtime_core::artifact_store::VerifyError::InvalidFile {
+                    path: path.clone(),
+                    problem: "size differs from pin",
+                },
+            ),
             tonic::Code::FailedPrecondition,
+        ),
+        (
+            PublishError::ExistingArtifact(
+                pplx_space_node_runtime_core::artifact_store::VerifyError::Io {
+                    action: "read",
+                    path: path.clone(),
+                    source: std::io::ErrorKind::Other.into(),
+                },
+            ),
+            tonic::Code::Internal,
         ),
         (
             PublishError::Io {
@@ -119,4 +134,141 @@ fn execution_roots_must_not_alias_the_managed_store() {
     std::fs::remove_file(&paths.vendor).unwrap();
     paths.kernels = paths.store.kernels.clone();
     assert!(separate_store(&paths).is_err());
+}
+
+#[tokio::test]
+async fn compiled_environment_removal_is_refused_even_without_inventory() {
+    use crate::service::tests::service_tests::{root_request, service_for_unit_tests};
+    let initial = InitialEnvironment::for_architecture(host_arch().unwrap()).unwrap();
+    let runtime = NodeArtifact {
+        artifact: Some(node_artifact::Artifact::RuntimeRelease(
+            RuntimeReleaseArtifact {
+                runtime_kind: pplx_space_execution_common::proto::RuntimeKind::Firecracker as i32,
+                version: initial.release().release.version.to_string(),
+                digest: initial.release().digest().to_string(),
+            },
+        )),
+    };
+    let kernel = NodeArtifact {
+        artifact: Some(node_artifact::Artifact::Component(ComponentArtifact {
+            kind: pplx_space_execution_common::proto::ArtifactComponentKind::Kernel as i32,
+            version: initial.kernel().version.to_string(),
+            digest: initial.kernel().sha256.to_string(),
+        })),
+    };
+    // Independent service instances represent restart; neither has a discovered
+    // inventory or any artifact files. The binding still protects removal.
+    for artifact in [runtime, kernel] {
+        let service = service_for_unit_tests().await;
+        let status = service
+            .remove_artifact(root_request(RemoveArtifactRequest {
+                artifact: Some(artifact),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains("compiled E0"));
+    }
+    let candidate = RuntimeCatalog::compiled()
+        .unwrap()
+        .releases(
+            pplx_space_common_core::types::RuntimeKind::Firecracker,
+            host_arch().unwrap(),
+        )
+        .find(|pin| pin.release.version.as_str() == "1.17.0")
+        .unwrap()
+        .clone();
+    Artifact::Release(candidate.release.clone(), candidate.digest())
+        .check_removal(&initial)
+        .unwrap();
+}
+
+#[test]
+fn prototype_overlap_keeps_external_execution_but_refuses_mutations() {
+    use crate::service::tests::service_tests::installed_runtime;
+    use pplx_space_node_runtime_core::runtime_inventory::ExecutionSelectionMode;
+    let (_fixture, mut paths) = installed_runtime();
+    paths.store.releases = paths.vendor.clone();
+    assert!(separate_store(&paths).is_err());
+    let inventory = execution_inventory(&paths).unwrap();
+    let selected = inventory
+        .resolve(
+            None,
+            pplx_space_common_core::types::RuntimeKind::Firecracker,
+            ExecutionSelectionMode::NewColdBoot,
+        )
+        .unwrap();
+    assert_eq!(selected.execution.runtime().version.as_str(), "1.16.0");
+}
+
+#[tokio::test]
+async fn publication_preserves_available_inventory_until_replacement_is_ready() {
+    use crate::service::tests::service_tests::{installed_runtime, service_for_unit_tests};
+    use pplx_space_common_core::types::RuntimeKind;
+    use pplx_space_node_runtime_core::runtime_inventory::{
+        RuntimeInstallationRoot, RuntimeInventory,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+    let initial = InitialEnvironment::for_architecture(host_arch().unwrap()).unwrap();
+    let candidate = RuntimeCatalog::compiled()
+        .unwrap()
+        .releases(RuntimeKind::Firecracker, host_arch().unwrap())
+        .find(|pin| pin.release.version.as_str() == "1.17.0")
+        .unwrap()
+        .clone();
+    for pin in [initial.release().clone(), candidate] {
+        let is_candidate = pin.release.version.as_str() == "1.17.0";
+        let (_fixture, paths) = installed_runtime();
+        let mut service = service_for_unit_tests().await;
+        service.runtime_paths = paths;
+        let inventory = Arc::new(
+            RuntimeInventory::discover(
+                [RuntimeInstallationRoot::new(
+                    RuntimeKind::Firecracker,
+                    &service.runtime_paths.vendor,
+                )],
+                &service.runtime_paths.assets,
+                &service.runtime_paths.kernels,
+            )
+            .unwrap(),
+        );
+        service.runtime_inventory.store(Some(inventory.clone()));
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let (finish, release) = std::sync::mpsc::channel();
+        let publisher = service.clone();
+        let task = tokio::spawn(async move {
+            publisher
+                .publish_artifact_work(
+                    Artifact::Release(pin.release.clone(), pin.digest()),
+                    move || {
+                        started.send(()).unwrap();
+                        release.recv_timeout(Duration::from_secs(5)).unwrap();
+                        Ok(Publication {
+                            outcome: PublishOutcome::Published,
+                            path: "synthetic-publication".into(),
+                            digest: pin.digest(),
+                        })
+                    },
+                )
+                .await
+        });
+        entered.await.unwrap();
+        let concurrent =
+            tokio::time::timeout(Duration::from_secs(1), service.runtime_inventory()).await;
+        finish.send(()).unwrap();
+        task.await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(
+            &concurrent
+                .expect("publication must not stall usable execution")
+                .unwrap(),
+            &inventory
+        ));
+        let after = service.runtime_inventory.load_full().unwrap();
+        assert_eq!(
+            Arc::ptr_eq(&after, &inventory),
+            is_candidate,
+            "only an E0 publication replaces executable inventory"
+        );
+    }
 }

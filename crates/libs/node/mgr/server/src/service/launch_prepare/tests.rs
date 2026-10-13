@@ -241,8 +241,23 @@ impl AdmittedSandbox {
         let (runtime, runtime_paths) = installed_runtime();
         let mut service = service_for_unit_tests().await;
         service.runtime_paths = runtime_paths;
-        // Discovery is itself blocking work; cache it before refusing host work.
-        service.runtime_inventory().await.unwrap();
+        // These tests own request/lease validation, not E0 byte qualification.
+        // Inject the synthetic external inventory before refusing host work.
+        let inventory =
+            pplx_space_node_runtime_core::runtime_inventory::RuntimeInventory::discover(
+                [
+                    pplx_space_node_runtime_core::runtime_inventory::RuntimeInstallationRoot::new(
+                        RuntimeKind::Firecracker,
+                        &service.runtime_paths.vendor,
+                    ),
+                ],
+                &service.runtime_paths.assets,
+                &service.runtime_paths.kernels,
+            )
+            .unwrap();
+        service
+            .runtime_inventory
+            .store(Some(std::sync::Arc::new(inventory)));
         refuse_host_work(&mut service).await;
         let id = SandboxId::new().to_string();
         let fence = bind_test_execution(&service, &id);

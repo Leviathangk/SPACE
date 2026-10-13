@@ -7,9 +7,9 @@ import "execution/v1/execution.proto";
 //
 // It reports the runtime releases and guest kernels on the node and installs
 // and removes them. It does not own selection, and launches do not depend on
-// it: an install makes a release or kernel present, never selected. Existing
-// execution continues to use the existing image-provided roots. Managed
-// artifacts are excluded from launch, build, restore and placement discovery.
+// it: an install makes a release or kernel present, never selected. Node-manager
+// binds new work and stock legacy fallback to compiled E0. Its verified managed
+// copies can supply execution; other installed candidates remain unselected.
 service RuntimeManager {
   // Diagnostic listing of the configured vendor and cache layouts. Never
   // downloads, repairs aliases, adopts ownership, writes descriptors, or runs
@@ -25,8 +25,9 @@ service RuntimeManager {
   // Stage and verify bytes, then ask node-manager to publish them. Durable;
   // disconnecting does not cancel the operation. Requires root/operator.
   rpc InstallArtifact(InstallArtifactRequest) returns (InstallArtifactResponse);
-  // Delete this immutable identity from the managed store only. Existing
-  // execution/image artifacts cannot be addressed. Requires root/operator.
+  // Delete this immutable identity from the managed store only. Node-manager
+  // refuses removal of compiled E0; external image files cannot be addressed.
+  // Requires root/operator.
   rpc UninstallArtifact(UninstallArtifactRequest) returns (UninstallArtifactResponse);
 
   rpc GetOperation(GetOperationRequest) returns (GetOperationResponse);
