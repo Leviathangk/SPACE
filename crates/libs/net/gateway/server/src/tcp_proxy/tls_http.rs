@@ -23,6 +23,7 @@ use tokio_util::task::TaskTracker;
 use tracing::Instrument;
 
 use super::accounting::{Attempt, Outcome};
+use super::flow::{Flow, Side};
 use super::http_host::HostBinding;
 use super::routing_headers::{SanitizedBody, SanitizedRequest};
 use super::tls::{HttpProtocol, TlsTransportError};
@@ -32,6 +33,7 @@ mod connect;
 mod credentials;
 mod forward;
 mod leg;
+mod response_body;
 mod upgrade;
 
 type Body = Either<ForwardingBody, Empty<Bytes>>;
@@ -151,6 +153,7 @@ struct Session<F> {
     upgrades: TaskTracker,
     shutdown: CancellationToken,
     draining: CancellationToken,
+    flow: Flow,
 }
 
 /// Serve inspected HTTP on an established guest TLS stream.
@@ -167,6 +170,7 @@ pub(super) async fn serve<C, F, Fut, U>(
     guest: C,
     binding: HostBinding,
     lease: Arc<CertificateLease>,
+    flow: Flow,
     connect: F,
 ) -> Result<(), TlsTransportError>
 where
@@ -187,17 +191,22 @@ where
         upgrades: TaskTracker::new(),
         shutdown,
         draining: CancellationToken::new(),
+        flow,
     });
     let service = service_fn(|request: Request<Incoming>| {
         let session = session.clone();
         let protocol = HttpProtocol::of(request.version());
         tracing::Span::current().record("protocol", protocol.as_str());
+        let progress = session.flow.request();
         let request = SanitizedRequest::try_from(request);
         async move {
-            Ok::<_, Infallible>(match request {
+            let response = match request {
                 Ok(request) => session.forward(request).await,
                 Err(_) => session.refuse(protocol, "invalid_headers", StatusCode::BAD_REQUEST),
-            })
+            };
+            Ok::<_, Infallible>(
+                response.map(|body| response_body::ResponseBody::new(body, progress)),
+            )
         }
     });
     let builder = guest_http_builder();
@@ -215,7 +224,11 @@ where
     session.shutdown.cancel();
     session.tasks.close();
     session.tasks.wait().await;
-    result.map_err(TlsTransportError::from)
+    result.map_err(|error| {
+        let error = TlsTransportError::from(error);
+        session.flow.http_failed(&error, Side::Downstream);
+        error
+    })
 }
 
 fn guest_http_builder() -> auto::Builder<TokioExecutor> {
@@ -300,6 +313,7 @@ where
 
     fn drive(&self, connection: impl Future<Output = Result<(), hyper::Error>> + Send + 'static) {
         let shutdown = self.shutdown.clone();
+        let flow = self.flow.clone();
         self.tasks.spawn(
             async move {
                 tokio::select! {
@@ -319,6 +333,7 @@ where
                                 h2_origin = failure.h2_origin,
                                 "inspected HTTP connection ended"
                             );
+                            flow.http_failed(&TlsTransportError::Http(error), Side::Upstream);
                         }
                     }
                 }

@@ -61,6 +61,8 @@ where
             Ok(sender) => sender,
             Err(error) => {
                 forwarding.finish(Outcome::Error, "origin_setup");
+                self.flow
+                    .http_failed(&error, super::super::flow::Side::Upstream);
                 error.record("upstream_setup");
                 return self.refuse(protocol, error.as_str(), StatusCode::BAD_GATEWAY);
             }
@@ -70,7 +72,10 @@ where
             Err(error) => {
                 forwarding.finish(Outcome::Error, "upstream_http");
                 self.draining.cancel();
-                TlsTransportError::Http(error).record("upstream_request");
+                let error = TlsTransportError::Http(error);
+                self.flow
+                    .http_failed(&error, super::super::flow::Side::Upstream);
+                error.record("upstream_request");
                 return self.refuse(protocol, "upstream_http_error", StatusCode::BAD_GATEWAY);
             }
         };
@@ -127,7 +132,10 @@ where
             Err(error) => {
                 forwarding.finish(Outcome::Error, "upstream_http");
                 self.draining.cancel();
-                TlsTransportError::Http(error).record("upstream_request");
+                let error = TlsTransportError::Http(error);
+                self.flow
+                    .http_failed(&error, super::super::flow::Side::Upstream);
+                error.record("upstream_request");
                 self.refuse(protocol, "upstream_http_error", StatusCode::BAD_GATEWAY)
             }
         }

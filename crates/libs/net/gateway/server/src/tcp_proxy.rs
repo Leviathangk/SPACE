@@ -33,6 +33,7 @@ use crate::tls_interception::{TlsInterception, TlsInterceptionError};
 
 mod accounting;
 mod admission;
+mod flow;
 mod http_host;
 mod relay;
 mod reserved_dns;
@@ -382,6 +383,7 @@ impl TcpProxy {
 
         self.stats.tcp_active.fetch_add(1, Ordering::Relaxed);
         let shutdown = self.shutdown_token.child_token();
+        let flow = flow::Flow::default();
         // Biased, with the connection polled first: on shutdown both arms are
         // ready, and an unbiased select would pick between them at random, so
         // the same event could report either this generic cancellation or the
@@ -390,10 +392,10 @@ impl TcpProxy {
         // cancellation itself.
         let (host, outcome) = tokio::select! {
             biased;
-            outcome = self.handle(client, dst, &shutdown) => outcome,
+            outcome = self.handle(client, dst, &shutdown, &flow) => outcome,
             _ = shutdown.cancelled() => (None, FlowOutcome::Cancelled),
         };
-        self.record(dst, host.as_ref(), outcome);
+        self.record(dst, host.as_ref(), outcome, &flow);
         self.stats.tcp_active.fetch_sub(1, Ordering::Relaxed);
     }
 
@@ -402,6 +404,7 @@ impl TcpProxy {
         client: TcpStream,
         dst: SocketAddr,
         shutdown: &CancellationToken,
+        flow: &flow::Flow,
     ) -> (Option<DomainName>, FlowOutcome) {
         abort_on_close(&client);
         if let Some(resolver) = self.reserved_dns.resolver_for(dst.ip()) {
@@ -550,7 +553,7 @@ impl TcpProxy {
             crate::tls_interception::InterceptionAction::Terminate(lease) => {
                 inspection.finish(accounting::Outcome::Success, "admitted");
                 match self
-                    .terminate_tls(client, admitted, lease, client_alpn)
+                    .terminate_tls(client, admitted, lease, client_alpn, flow)
                     .await
                 {
                     Ok(()) => FlowOutcome::InspectedTls,
@@ -646,8 +649,27 @@ impl TcpProxy {
         }
     }
 
-    fn record(&self, dst: SocketAddr, host: Option<&DomainName>, outcome: FlowOutcome) -> bool {
+    fn record(
+        &self,
+        dst: SocketAddr,
+        host: Option<&DomainName>,
+        outcome: FlowOutcome,
+        flow: &flow::Flow,
+    ) -> bool {
         let (status, detail) = outcome.metric_tags();
+        if let Some(failure) = flow.failure() {
+            info!(
+                sandbox_id = self.sandbox_id,
+                destination_port = dst.port(),
+                phase = failure.phase.as_str(),
+                side = failure.side.as_str(),
+                active_rq = failure.requests.active_rq(),
+                in_flight = failure.requests.in_flight,
+                completed = failure.requests.completed,
+                outcome = failure.outcome,
+                "TCP flow ended"
+            );
+        }
         pplx_space_metrics::gateway::tcp_connection(status, detail);
         let reported = if let (Some(host), Some(reason)) = (host, outcome.failure_reason()) {
             self.known_egress_state

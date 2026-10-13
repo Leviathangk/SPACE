@@ -127,6 +127,8 @@ where
             }
             Err(error) => {
                 forwarding.finish(Outcome::Error, "origin_setup");
+                self.flow
+                    .http_failed(&error, super::super::flow::Side::Upstream);
                 error.record("connect_proxy_setup");
                 return self.refuse(protocol, error.as_str(), StatusCode::BAD_GATEWAY);
             }
@@ -144,7 +146,10 @@ where
             Ok(response) => response,
             Err(error) => {
                 forwarding.finish(Outcome::Error, "upstream_http");
-                TlsTransportError::Http(error).record("connect_proxy_request");
+                let error = TlsTransportError::Http(error);
+                self.flow
+                    .http_failed(&error, super::super::flow::Side::Upstream);
+                error.record("connect_proxy_request");
                 return self.refuse(protocol, "upstream_http_error", StatusCode::BAD_GATEWAY);
             }
         };

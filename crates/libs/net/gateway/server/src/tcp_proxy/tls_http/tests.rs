@@ -358,12 +358,18 @@ async fn credential_refusal_before_origin(
     let origin_connects = Arc::new(AtomicUsize::new(0));
     let observed = origin_connects.clone();
     let (guest, guest_peer) = tokio::io::duplex(4096);
-    let gateway = tokio::spawn(serve(guest, binding, lease, move |_| async move {
-        observed.fetch_add(1, Ordering::SeqCst);
-        Err::<(tokio::io::DuplexStream, HttpProtocol), _>(TlsTransportError::Upstream(
-            std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
-        ))
-    }));
+    let gateway = tokio::spawn(serve(
+        guest,
+        binding,
+        lease,
+        Flow::default(),
+        move |_| async move {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Err::<(tokio::io::DuplexStream, HttpProtocol), _>(TlsTransportError::Upstream(
+                std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+            ))
+        },
+    ));
     let (mut sender, connection) = http1::handshake(TokioIo::new(guest_peer)).await.unwrap();
     let client = tokio::spawn(connection);
     let mut request = credential_request(http::Method::GET, "/v1/items");
@@ -428,10 +434,16 @@ async fn concurrent_http2_streams_keep_credential_decisions_request_local() {
         ),
     );
     let (guest, guest_peer) = tokio::io::duplex(4096);
-    let gateway = tokio::spawn(serve(guest, binding, lease, move |protocol| async move {
-        assert_eq!(protocol, HttpProtocol::Http2);
-        Ok((origin, HttpProtocol::Http2))
-    }));
+    let gateway = tokio::spawn(serve(
+        guest,
+        binding,
+        lease,
+        Flow::default(),
+        move |protocol| async move {
+            assert_eq!(protocol, HttpProtocol::Http2);
+            Ok((origin, HttpProtocol::Http2))
+        },
+    ));
     let (sender, connection) = http2::handshake(TokioExecutor::new(), TokioIo::new(guest_peer))
         .await
         .unwrap();
@@ -489,11 +501,17 @@ async fn policy_change_during_origin_setup_never_forwards_buffered_credentials()
     let (connect_started_tx, connect_started_rx) = tokio::sync::oneshot::channel();
     let (connect_release_tx, connect_release_rx) = tokio::sync::oneshot::channel();
     let (guest, guest_peer) = tokio::io::duplex(4096);
-    let gateway = tokio::spawn(serve(guest, binding, lease, move |_| async move {
-        let _ = connect_started_tx.send(());
-        let _ = connect_release_rx.await;
-        Ok((origin, HttpProtocol::Http1))
-    }));
+    let gateway = tokio::spawn(serve(
+        guest,
+        binding,
+        lease,
+        Flow::default(),
+        move |_| async move {
+            let _ = connect_started_tx.send(());
+            let _ = connect_release_rx.await;
+            Ok((origin, HttpProtocol::Http1))
+        },
+    ));
     let (mut sender, connection) = http1::handshake(TokioIo::new(guest_peer)).await.unwrap();
     let client = tokio::spawn(connection);
     let request = credential_request(http::Method::GET, "/v1/items").map(|_| Empty::<Bytes>::new());
@@ -588,9 +606,13 @@ async fn inspected_tls_drops_fastly_routing_headers_before_forwarding() {
             }
         });
         let (guest, guest_peer) = tokio::io::duplex(4096);
-        let gateway = tokio::spawn(serve(guest, binding, lease, move |_| async move {
-            Ok((origin, origin_protocol))
-        }));
+        let gateway = tokio::spawn(serve(
+            guest,
+            binding,
+            lease,
+            Flow::default(),
+            move |_| async move { Ok((origin, origin_protocol)) },
+        ));
         let mut request = Request::get("https://allowed.test/")
             .header("fastly-host", "forbidden.test")
             .header("fastly-service", "forbidden-service")
@@ -785,17 +807,23 @@ async fn upstream_failure_or_closure_never_leaves_a_poisoned_guest_connection() 
         });
         let (guest, guest_peer) = tokio::io::duplex(4096);
         let connect_started = started.clone();
-        let gateway = tokio::spawn(serve(guest, binding, lease, move |_| async move {
-            connect_started.notify_one();
-            match ending {
-                UpstreamEnd::SetupFailed => Err(TlsTransportError::Upstream(std::io::Error::from(
-                    std::io::ErrorKind::ConnectionRefused,
-                ))),
-                UpstreamEnd::SetupCancelled => std::future::pending().await,
-                UpstreamEnd::Http1Close => Ok((origin, HttpProtocol::Http1)),
-                UpstreamEnd::H2Goaway => Ok((origin, HttpProtocol::Http2)),
-            }
-        }));
+        let gateway = tokio::spawn(serve(
+            guest,
+            binding,
+            lease,
+            Flow::default(),
+            move |_| async move {
+                connect_started.notify_one();
+                match ending {
+                    UpstreamEnd::SetupFailed => Err(TlsTransportError::Upstream(
+                        std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+                    )),
+                    UpstreamEnd::SetupCancelled => std::future::pending().await,
+                    UpstreamEnd::Http1Close => Ok((origin, HttpProtocol::Http1)),
+                    UpstreamEnd::H2Goaway => Ok((origin, HttpProtocol::Http2)),
+                }
+            },
+        ));
         let request = || {
             Request::get("https://allowed.test/")
                 .header(header::HOST, "allowed.test")
@@ -940,10 +968,16 @@ async fn connect_relays_private_ca_tls_without_inspecting_the_inner_request() {
         stream.flush().await.unwrap();
     });
     let (guest, guest_peer) = tokio::io::duplex(128);
-    let gateway = tokio::spawn(serve(guest, binding, lease, move |protocol| async move {
-        assert_eq!(protocol, HttpProtocol::Http1);
-        Ok((origin, HttpProtocol::Http1))
-    }));
+    let gateway = tokio::spawn(serve(
+        guest,
+        binding,
+        lease,
+        Flow::default(),
+        move |protocol| async move {
+            assert_eq!(protocol, HttpProtocol::Http1);
+            Ok((origin, HttpProtocol::Http1))
+        },
+    ));
     let (mut sender, connection) = http1::handshake(TokioIo::new(guest_peer)).await.unwrap();
     let client = tokio::spawn(connection.with_upgrades());
     let mut phase = "CONNECT response";
@@ -1018,6 +1052,7 @@ async fn upstream_upgrade_completion_preserves_the_guest_handshake_and_stream() 
             guest,
             binding.clone(),
             lease.clone(),
+            Flow::default(),
             move |_| async move { Ok((origin, HttpProtocol::Http1)) },
         ));
         let (mut sender, connection) = http1::handshake(TokioIo::new(guest_peer)).await.unwrap();
@@ -1118,4 +1153,123 @@ async fn guest_http2_accepts_backpressured_small_frame_uploads() {
 #[tokio::test]
 async fn guest_http2_still_rejects_tiny_frame_floods() {
     assert!(!small_frame_upload(1, 1_000_000, Duration::from_secs(2)).await);
+}
+
+#[tokio::test]
+async fn guest_reset_preserves_response_progress() {
+    use super::super::flow::{Phase, Side};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    for (length, expected_phase, in_flight, completed) in [
+        (1, Phase::HttpIdle, 0, 1),
+        (1024 * 1024, Phase::HttpExchange, 1, 0),
+    ] {
+        let (state, provider) = credential_provider(false).await;
+        let lease = provider
+            .get("allowed.test".parse().unwrap(), 443)
+            .await
+            .unwrap();
+        let binding = HostBinding::new(
+            "test",
+            "192.0.2.1:443".parse().unwrap(),
+            state,
+            Default::default(),
+        );
+        let (origin, mut peer) = tokio::io::duplex(4096);
+        let origin_task = tokio::spawn(async move {
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(peer.read_u8().await.unwrap());
+            }
+            peer.write_all(
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\n\r\nx").as_bytes(),
+            )
+            .await
+            .unwrap();
+            // Hold the origin open: only the guest terminates this exchange.
+            let mut rest = Vec::new();
+            peer.read_to_end(&mut rest).await.unwrap();
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, guest) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let mut client = client.unwrap();
+        let flow = Flow::default();
+        let gateway = tokio::spawn(serve(
+            super::super::tls::TlsIo::new(
+                guest.unwrap().0,
+                crate::tls_interception::TlsHandshakeLeg::ClientToNetgw,
+                flow.clone(),
+            ),
+            binding,
+            lease,
+            flow.clone(),
+            move |_| async move { Ok((origin, HttpProtocol::Http1)) },
+        ));
+        client
+            .write_all(b"GET /public HTTP/1.1\r\nHost: allowed.test\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        while !response.ends_with(b"\r\n\r\nx") {
+            response.push(client.read_u8().await.unwrap());
+        }
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        client.set_zero_linger().unwrap();
+        drop(client);
+        let _connection_result = tokio::time::timeout(Duration::from_secs(3), gateway)
+            .await
+            .unwrap()
+            .unwrap();
+        let failure = flow.failure().unwrap();
+        assert_eq!(failure.side, Side::Downstream);
+        assert_eq!(failure.phase, expected_phase);
+        assert_eq!(failure.requests.in_flight, in_flight);
+        assert_eq!(failure.requests.completed, completed);
+        origin_task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn untrusted_guest_ca_ends_during_the_tls_handshake() {
+    use super::super::flow::{Phase, Side};
+    let (_, provider) = credential_provider(false).await;
+    let lease = provider
+        .get("allowed.test".parse().unwrap(), 443)
+        .await
+        .unwrap();
+    let interception = crate::tls_interception::TlsInterception::default();
+    let flow = Flow::default();
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(rustls::RootCertStore::empty())
+    .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let (guest, gateway) = tokio::io::duplex(16384);
+    let (guest_result, gateway_result) = tokio::join!(
+        connector.connect("allowed.test".try_into().unwrap(), guest),
+        super::super::tls::accept(gateway, &lease, &interception, &flow),
+    );
+    guest_result.unwrap_err();
+    let Err(TlsTransportError::Downstream(error)) = gateway_result else {
+        panic!("guest must reject the interception CA")
+    };
+    assert!(matches!(
+        error
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<rustls::Error>()),
+        Some(rustls::Error::AlertReceived(
+            rustls::AlertDescription::UnknownCA
+        ))
+    ));
+    let failure = flow.failure().unwrap();
+    assert_eq!(failure.phase, Phase::TlsHandshake);
+    assert_eq!(failure.side, Side::Downstream);
+    assert_eq!(failure.requests.in_flight, 0);
 }

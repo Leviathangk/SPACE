@@ -85,7 +85,7 @@ async fn interception_wiring_preserves_admission_and_never_falls_back_to_relay()
         let shutdown = CancellationToken::new();
         let (host, outcome) = tokio::time::timeout(
             Duration::from_secs(3),
-            proxy.handle(connection, dst, &shutdown),
+            proxy.handle(connection, dst, &shutdown, &flow::Flow::default()),
         )
         .await
         .expect(name);
@@ -126,7 +126,7 @@ async fn interception_wiring_preserves_admission_and_never_falls_back_to_relay()
                     .with(layer)
                     .with(warning_layer.with_filter(tracing::level_filters::LevelFilter::WARN)),
                 || {
-                    proxy.record(dst, host.as_ref(), outcome);
+                    proxy.record(dst, host.as_ref(), outcome, &flow::Flow::default());
                 },
             );
             let events = events.events();
@@ -369,7 +369,8 @@ async fn interception_exemptions_relay_original_tls_only_after_admission() {
         guest.write_all(&bytes).await.unwrap();
         guest.shutdown().await.unwrap();
         let shutdown = CancellationToken::new();
-        let handled = proxy.handle(accepted.unwrap().0, dst, &shutdown);
+        let flow = flow::Flow::default();
+        let handled = proxy.handle(accepted.unwrap().0, dst, &shutdown, &flow);
         if passes {
             let origin = async {
                 let (mut stream, _) = upstream.accept().await.unwrap();

@@ -15,6 +15,7 @@ use tracing::Instrument;
 
 use super::accounting::{Attempt, Outcome};
 use super::admission::AdmittedTcp;
+use super::flow::{Flow, Phase, Side};
 use super::http_host::{HostBinding, MeteredIo};
 use super::{TcpProxy, relay, tls_http};
 use crate::certificates::{CertificateError, CertificateLease};
@@ -393,6 +394,7 @@ impl TcpProxy {
         admitted: AdmittedTcp,
         lease: Arc<CertificateLease>,
         client_alpn: ClientAlpnOffer,
+        flow: &Flow,
     ) -> Result<(), TlsInterceptionError> {
         let span = tracing::info_span!(
             "tls.server",
@@ -419,7 +421,7 @@ impl TcpProxy {
                 // version from the guest's first bytes and records `protocol`
                 // once the first request arrives.
                 let (downstream, negotiated) =
-                    accept(client, &lease, &self.tls_interception).await?;
+                    accept(client, &lease, &self.tls_interception, flow).await?;
                 tracing::Span::current().record("negotiated", negotiated.as_str());
                 let binding = HostBinding::new(
                     self.sandbox_id,
@@ -431,6 +433,7 @@ impl TcpProxy {
                 let upstream_lease = lease.clone();
                 let wire_read = accounting.read.clone();
                 let wire_written = accounting.written.clone();
+                let upstream_flow = flow.clone();
                 let connect = move |guest_protocol| async move {
                     let origin = async {
                         Ok(MeteredIo {
@@ -440,9 +443,16 @@ impl TcpProxy {
                         })
                     };
                     let offer = upstream_alpn_offer(client_alpn, guest_protocol);
-                    connect(origin, &upstream_lease, &interception, offer).await
+                    connect(
+                        origin,
+                        &upstream_lease,
+                        &interception,
+                        offer,
+                        &upstream_flow,
+                    )
+                    .await
                 };
-                tls_http::serve(downstream, binding, lease.clone(), connect).await
+                tls_http::serve(downstream, binding, lease.clone(), flow.clone(), connect).await
             };
             let result = tokio::select! {
                 biased;
@@ -457,6 +467,7 @@ impl TcpProxy {
             if result.is_ok() {
                 tracing::Span::current().record("otel.status_code", "OK");
             } else if let Err(error) = &result {
+                flow.http_failed(error, Side::Downstream);
                 error.record("tls_session");
             }
             result.map_err(Into::into)
@@ -490,6 +501,7 @@ pub(super) async fn accept<S>(
     stream: S,
     lease: &CertificateLease,
     interception: &TlsInterception,
+    flow: &Flow,
 ) -> Result<(TlsIo<tokio_rustls::server::TlsStream<S>>, HttpProtocol), TlsTransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -525,12 +537,15 @@ where
         }
         let protocol = HttpProtocol::negotiated(downstream.get_ref().1.alpn_protocol())?;
         Ok((
-            TlsIo::new(downstream, TlsHandshakeLeg::ClientToNetgw),
+            TlsIo::new(downstream, TlsHandshakeLeg::ClientToNetgw, flow.clone()),
             protocol,
         ))
     }
     .await;
     attempt.finish(&result);
+    if let Err(error) = &result {
+        flow.failed(error, Phase::TlsHandshake, Side::Downstream);
+    }
     result
 }
 
@@ -542,6 +557,7 @@ pub(super) async fn connect<S>(
     lease: &CertificateLease,
     interception: &TlsInterception,
     client_alpn: ClientAlpnOffer,
+    flow: &Flow,
 ) -> Result<(TlsIo<tokio_rustls::client::TlsStream<S>>, HttpProtocol), TlsTransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -585,7 +601,9 @@ where
                 dial.finish("error");
             }
         }
-        let stream = stream?;
+        let stream = stream.inspect_err(|error| {
+            flow.failed(error, Phase::TcpConnect, Side::Upstream);
+        })?;
 
         let mut attempt = HandshakeAttempt::new(TlsHandshakeLeg::NetgwToOrigin);
         let result = match tokio::time::timeout_at(deadline, async {
@@ -603,7 +621,7 @@ where
             }
             tracing::Span::current().record("otel.status_code", "OK");
             Ok((
-                TlsIo::new(upstream, TlsHandshakeLeg::NetgwToOrigin),
+                TlsIo::new(upstream, TlsHandshakeLeg::NetgwToOrigin, flow.clone()),
                 upstream_protocol,
             ))
         })
@@ -613,6 +631,9 @@ where
             Err(_) => Err(TlsTransportError::Timeout),
         };
         attempt.finish(&result);
+        if let Err(error) = &result {
+            flow.failed(error, Phase::TlsHandshake, Side::Upstream);
+        }
         result
     }
     .instrument(upstream_span(lease.host(), lease.port()))
@@ -799,14 +820,16 @@ pub(super) struct TlsIo<T> {
     inner: T,
     leg: TlsHandshakeLeg,
     error_reported: bool,
+    flow: Flow,
 }
 
 impl<T> TlsIo<T> {
-    fn new(inner: T, leg: TlsHandshakeLeg) -> Self {
+    pub(super) fn new(inner: T, leg: TlsHandshakeLeg, flow: Flow) -> Self {
         Self {
             inner,
             leg,
             error_reported: false,
+            flow,
         }
     }
 
@@ -814,6 +837,11 @@ impl<T> TlsIo<T> {
         if self.error_reported {
             return;
         }
+        let side = match self.leg {
+            TlsHandshakeLeg::ClientToNetgw => Side::Downstream,
+            TlsHandshakeLeg::NetgwToOrigin => Side::Upstream,
+        };
+        self.flow.http_io_failed(error, side);
         let Some(failure) = tls_failure_from_io(error) else {
             return;
         };
