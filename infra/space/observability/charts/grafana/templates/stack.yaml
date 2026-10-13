@@ -26,6 +26,7 @@ datasources:
   {{- end }}
   {{- end }}
 {{- end }}
+{{- if include "common.otlpSelected" . }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -153,3 +154,4 @@ spec:
           {{- else }}
           emptyDir: {sizeLimit: {{ .Values.persistence.emptyDirSizeLimit }}}
           {{- end }}
+{{- end }}

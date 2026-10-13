@@ -1,3 +1,4 @@
+{{- if include "common.otlpSelected" . }}
 {{- include "common.profileGuard" . }}
 {{- include "common.sharedGuards" . }}
 {{- if not (or .Values.datasources.prometheus.enabled .Values.datasources.loki.enabled .Values.datasources.tempo.enabled) }}
@@ -18,5 +19,6 @@
 {{- end }}
 {{- if .Values.persistence.enabled }}
 {{- include "common.sharedStorageGuard" (dict "storage" .Values.persistence "key" "persistence") }}
+{{- end }}
 {{- end }}
 {{- end }}

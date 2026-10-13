@@ -9,6 +9,12 @@ storage:
   storageClassName: null
   existingClaim: ""
   retain: true
+  # Explicit opt-in to the cluster's default StorageClass (storageClassName
+  # left null). Shared installs otherwise require a named class or claim.
+  useDefaultStorageClass: false
+  # emptyDir instead of a claim, for clusters without a usable StorageClass.
+  # All stored data is lost whenever the pod leaves its node.
+  ephemeral: false
 # Applies to the Loki backend Deployment only; the collector is a DaemonSet.
 scheduling:
   nodeSelector: {}

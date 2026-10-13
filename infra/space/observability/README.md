@@ -1,5 +1,12 @@
 # Opt-in SPACE observability
 
+For a working default on any cluster, install the
+[`space-observability`](charts/space-observability/README.md) umbrella chart:
+one `global.observability.mode` value (`off`, `datadog` or `otlp`) installs
+nothing, a Datadog Agent, or every chart below plus a gateway Collector, with
+default-StorageClass storage, generated Grafana credentials and NetworkPolicies.
+The rest of this page covers installing each chart on its own.
+
 These Helm charts support private, single-replica canaries on Kubernetes.
 Operators choose the target environment and integrate each release with their
 deployment process. Installing a backend does **not** select a SPACE sink or
@@ -61,7 +68,9 @@ limits, bounded queues, and readiness probes are in each chart. Read its
    they are **not** sized for whole-cluster ingestion. Inspect pending pods and
    pressure rather than raising limits without a capacity check.
 4. Choose an explicitly named RWO storage class, or a pre-provisioned
-   `storage.existingClaim`. Verify its zone/scheduling constraints, permissions,
+   `storage.existingClaim`. `storage.useDefaultStorageClass: true` opts in to
+   the cluster's default class instead; `storage.ephemeral: true` uses an
+   `emptyDir` that loses its data whenever the pod moves. Verify its zone/scheduling constraints, permissions,
    expansion/reclaim policy, and sufficient capacity. New shared PVCs have
    Helm's `keep` annotation. An existing claim is never owned by the chart.
 5. Verify that the cluster CNI actually enforces NetworkPolicy. The shared
