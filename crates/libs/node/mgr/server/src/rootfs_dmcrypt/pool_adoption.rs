@@ -278,28 +278,5 @@ async fn suspend_device(composite: &str) -> Result<(), DmCryptError> {
     }
 }
 
-pub(crate) async fn adopt_plain_pool_rootfs(
-    _sandbox_id: SandboxId,
-    origin_path: PathBuf,
-    plain_path: PathBuf,
-) -> Result<PreparedRootfs, DmCryptError> {
-    let path = origin_path.clone();
-    device_backing::blocking(move || {
-        if Backing::open(&plain_path, false)?.is_some()
-            || Backing::open(&path.with_file_name(POOL_ROOTFS_FILE), false)?.is_some()
-        {
-            return Err(std::io::Error::other(
-                "pool disk requires encryption recovery or replacement",
-            ));
-        }
-        Backing::require(Backing::open(&path, false)?)?;
-        device_backing::unlink(&path.with_file_name(POOL_ORIGIN_FILE))
-    })
-    .await?;
-    Ok(PreparedRootfs {
-        mapper_path: origin_path,
-    })
-}
-
 #[cfg(test)]
 mod tests;

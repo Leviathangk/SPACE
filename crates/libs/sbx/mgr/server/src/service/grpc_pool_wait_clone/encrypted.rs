@@ -9,25 +9,20 @@ impl SandboxManagerService {
         let claimed = req.claimed_sandbox.as_ref().ok_or_else(|| {
             Status::invalid_argument("encrypted adoption requires an exact sandbox and claim")
         })?;
-        let encryption = req.encryption.as_ref().ok_or_else(|| {
-            Status::invalid_argument(
-                "targeted adoption requires an organization and encryption mode",
-            )
-        })?;
         let sandbox_id = claimed
             .sandbox_id
             .parse::<SandboxId>()
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let claim_id = Uuid::parse_str(&claimed.claim_id)
             .map_err(|_| Status::invalid_argument("invalid claim ID"))?;
-        let org_id = encryption
+        let org_id = claimed
             .expected_org_id
             .parse::<pplx_space_common_core::types::OrgId>()
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let claim = crate::db::pool_adoption::PoolClaim {
             id: claim_id,
             org_id,
-            volume_encryption: encryption.enabled,
+            volume_encryption: claimed.volume_encryption,
         };
         let id = sandbox_id.to_string();
         let _wake =
@@ -57,7 +52,7 @@ impl SandboxManagerService {
         let response = AdoptPoolSandboxResponse {
             sandbox_id: id.clone(),
             claim_id: Some(claim_id.to_string()),
-            volume_encryption: encryption.enabled,
+            volume_encryption: claimed.volume_encryption,
             route_identity: space_api_route_identity_to_wire(&sandbox.space_api_route_identity),
         };
         if !crate::db::pool_adoption::guest_access_blocked(&*self.db_conn()?, &id)
@@ -71,44 +66,35 @@ impl SandboxManagerService {
             }))
             .await?;
         }
-        let fence = super::super::cleanup_support::read_node_execution_fence(&self.db, &id)?
-            .ok_or_else(|| Status::failed_precondition("pool member has no node execution"))?;
-        let mut node = pplx_space_node_mgr_client::connect()
-            .await
-            .map_err(|e| Status::unavailable(format!("connect node manager: {e}")))?;
-        let adoption = Some(pplx_space_node_mgr_client::proto::PoolRootfsAdoption {
-            claim_id: claim_id.to_string(),
-            expected_org_id: org_id.to_string(),
-        });
-        let acknowledged = if encryption.enabled {
+        if claimed.volume_encryption {
+            let fence = super::super::cleanup_support::read_node_execution_fence(&self.db, &id)?
+                .ok_or_else(|| Status::failed_precondition("pool member has no node execution"))?;
+            let mut node = self
+                .node_manager
+                .connect()
+                .await
+                .map_err(|e| Status::unavailable(format!("connect node manager: {e}")))?;
             let prepared = node
                 .prepare_encrypted_rootfs(
                     pplx_space_node_mgr_client::proto::PrepareEncryptedRootfsRequest {
                         sandbox_id: id.clone(),
                         execution_fence: Some(fence.into()),
                         restore_cow_source: None,
-                        pool_adoption: adoption,
+                        pool_adoption: Some(
+                            pplx_space_node_mgr_client::proto::PoolRootfsAdoption {
+                                claim_id: claim_id.to_string(),
+                                expected_org_id: org_id.to_string(),
+                            },
+                        ),
                     },
                 )
                 .await?
                 .into_inner();
-            prepared.adopted_claim_id
-        } else {
-            node.prepare_snapshot_rootfs(
-                pplx_space_node_mgr_client::proto::PrepareSnapshotRootfsRequest {
-                    sandbox_id: id.clone(),
-                    execution_fence: Some(fence.into()),
-                    pool_adoption: adoption,
-                },
-            )
-            .await?
-            .into_inner()
-            .adopted_claim_id
-        };
-        if acknowledged.as_deref() != Some(claimed.claim_id.as_str()) {
-            return Err(Status::failed_precondition(
-                "node manager did not acknowledge pool adoption",
-            ));
+            if prepared.adopted_claim_id.as_deref() != Some(claimed.claim_id.as_str()) {
+                return Err(Status::failed_precondition(
+                    "node manager did not acknowledge pool adoption",
+                ));
+            }
         }
         {
             let db = self.db_conn()?;

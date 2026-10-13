@@ -3177,7 +3177,6 @@ impl SubstrateAdapter for DirectSubstrate {
             let response = client
                 .adopt_pool_sandbox(pplx_space_sbx_mgr_client::proto::AdoptPoolSandboxRequest {
                     claimed_sandbox: None,
-                    encryption: None,
                     template: request.template.to_string(),
                     owner: request.actor.sandbox_owner.to_string(),
                     env: request

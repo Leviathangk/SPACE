@@ -169,7 +169,7 @@ impl SandboxManagerService {
         request: Request<AdoptPoolSandboxRequest>,
     ) -> Result<Response<AdoptPoolSandboxResponse>, Status> {
         let peer = self.authorize_peer(&request, "AdoptPoolSandbox", ALLOW_SANDBOX_POOL_ADOPT)?;
-        if request.get_ref().claimed_sandbox.is_some() || request.get_ref().encryption.is_some() {
+        if request.get_ref().claimed_sandbox.is_some() {
             let owner = Self::authorize_sandbox_owner_label(&peer, &request.get_ref().owner)?;
             return self
                 .adopt_claimed_pool_sandbox(request.into_inner(), owner)

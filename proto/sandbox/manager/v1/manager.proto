@@ -1358,17 +1358,16 @@ message AdoptPoolSandboxRequest {
   space.net.policy.v1.PolicyAuthority auto_lifecycle_authority = 12;
   // Identity assigned to the claimed sandbox; idle pool donors have none.
   optional space.net.gateway.v1.SpaceApiRouteIdentity route_identity = 14;
+  // Exact pool claim, including its organization and immutable storage mode.
   optional ClaimedPoolSandbox claimed_sandbox = 15;
-  // Required for an exact claim; binds organization and immutable storage mode.
-  optional PoolSandboxEncryption encryption = 16;
+  reserved 16;
+  reserved "encryption";
 }
 message ClaimedPoolSandbox {
   string sandbox_id = 1;
   string claim_id = 2;
-}
-message PoolSandboxEncryption {
-  string expected_org_id = 1;
-  bool enabled = 2;
+  string expected_org_id = 3;
+  bool volume_encryption = 4;
 }
 message AdoptPoolSandboxResponse {
   string sandbox_id = 1;

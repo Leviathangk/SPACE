@@ -245,12 +245,10 @@ impl KubernetesSubstrate {
                             pplx_space_sbx_mgr_client::proto::ClaimedPoolSandbox {
                                 sandbox_id: sandbox_id.to_string(),
                                 claim_id: claim.claim_id.to_string(),
+                                expected_org_id: org_id.to_string(),
+                                volume_encryption,
                             },
                         ),
-                        encryption: Some(pplx_space_sbx_mgr_client::proto::PoolSandboxEncryption {
-                            expected_org_id: org_id.to_string(),
-                            enabled: volume_encryption,
-                        }),
                         ..Default::default()
                     },
                     WARM_POOL_SETUP_RPC_TIMEOUT,

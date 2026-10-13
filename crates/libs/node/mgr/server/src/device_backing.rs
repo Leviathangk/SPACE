@@ -21,19 +21,6 @@ pub(crate) fn error(source: io::Error) -> DmCryptError {
     }
 }
 
-pub(crate) fn unlink(path: &Path) -> io::Result<()> {
-    let parent = trusted_paths::open_directory(path.parent().ok_or(io::ErrorKind::InvalidInput)?)
-        .map_err(path_error)?;
-    match nix::unistd::unlinkat(
-        &parent,
-        path.file_name().ok_or(io::ErrorKind::InvalidInput)?,
-        nix::unistd::UnlinkatFlags::NoRemoveDir,
-    ) {
-        Ok(()) | Err(nix::errno::Errno::ENOENT) => Ok(()),
-        Err(e) => Err(e.into()),
-    }
-}
-
 pub(crate) fn remove_empty_directory(path: &Path) -> io::Result<()> {
     let parent =
         match trusted_paths::open_directory(path.parent().ok_or(io::ErrorKind::InvalidInput)?) {

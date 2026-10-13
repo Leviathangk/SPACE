@@ -126,7 +126,6 @@ pub(crate) async fn prepare_snapshot_rootfs(
     let prepared = node
         .prepare_snapshot_rootfs(
             pplx_space_node_mgr_client::proto::PrepareSnapshotRootfsRequest {
-                pool_adoption: None,
                 execution_fence: Some(execution_fence.into()),
                 sandbox_id: sandbox_id.to_string(),
             },

@@ -84,7 +84,8 @@ const (
 	sandboxOwnerAnnotation                       = "space.pplx.net/sandbox-owner"
 	sandboxUserAnnotation                        = "space.pplx.net/sandbox-user"
 	sandboxVolumeEncryptionAnnotation            = "space.pplx.net/volume-encryption"
-	sandboxEncryptablePoolMemberAnnotation       = "space.pplx.net/encryptable-pool-member"
+	sandboxPoolSlotIDAnnotation                  = "space.pplx.net/pool-slot-id"
+	sandboxPoolConfigIDAnnotation                = "space.pplx.net/pool-config-id"
 	kubernetesPodUIDAnnotation                   = "io.kubernetes.pod.uid"
 	kubernetesCriSandboxUIDAnnotation            = "io.kubernetes.cri.sandbox-uid"
 
@@ -611,9 +612,9 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 		emitShimStepError("create", "parse_volume_encryption", "parse_volume_encryption", err)
 		return nil, status.Errorf(codes.InvalidArgument, "parse sandbox volume encryption: %v", err)
 	}
-	encryptablePoolMember, err := spec.booleanAnnotation(sandboxEncryptablePoolMemberAnnotation)
+	encryptablePoolMember, err := spec.sandboxPoolMember()
 	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "parse encryptable pool member: %v", err)
+		return nil, status.Errorf(codes.InvalidArgument, "parse pool member: %v", err)
 	}
 	createReq := &pb.CreateRequest{
 		EncryptablePoolMember:   encryptablePoolMember,
@@ -2214,24 +2215,34 @@ func sandboxCreateBootMode(rootfsSizeMb *uint32) pb.BootMode {
 	return pb.BootMode_BOOT_MODE_UNSPECIFIED
 }
 
+func (s *ociSpec) sandboxPoolMember() (bool, error) {
+	_, hasSlot := s.Annotations[sandboxPoolSlotIDAnnotation]
+	_, hasConfig := s.Annotations[sandboxPoolConfigIDAnnotation]
+	if !hasSlot && !hasConfig {
+		return false, nil
+	}
+	for _, key := range []string{sandboxPoolSlotIDAnnotation, sandboxPoolConfigIDAnnotation} {
+		if _, err := uuid.Parse(strings.TrimSpace(s.Annotations[key])); err != nil {
+			return false, fmt.Errorf("%s must be a UUID: %w", key, err)
+		}
+	}
+	return true, nil
+}
+
 // sandboxVolumeEncryption reads the BYOK immutable encrypted-volumes flag.
 // Absent/empty means plaintext (every pod predating the annotation reads as
 // plaintext); only exact "true"/"false" are accepted otherwise, so a
 // malformed value fails the create instead of silently downgrading an
 // encrypted sandbox to plaintext.
 func (s *ociSpec) sandboxVolumeEncryption() (bool, error) {
-	return s.booleanAnnotation(sandboxVolumeEncryptionAnnotation)
-}
-
-func (s *ociSpec) booleanAnnotation(key string) (bool, error) {
-	value := strings.TrimSpace(s.Annotations[key])
+	value := strings.TrimSpace(s.Annotations[sandboxVolumeEncryptionAnnotation])
 	switch value {
 	case "", "false":
 		return false, nil
 	case "true":
 		return true, nil
 	default:
-		return false, fmt.Errorf("%s must be \"true\" or \"false\", got %q", key, value)
+		return false, fmt.Errorf("%s must be \"true\" or \"false\", got %q", sandboxVolumeEncryptionAnnotation, value)
 	}
 }
 

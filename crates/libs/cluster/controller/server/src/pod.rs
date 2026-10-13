@@ -45,7 +45,6 @@ pub fn build_pool_pod(
                 traceparent: None,
             },
             pool: SandboxPoolPodMetadata {
-                encryptable: true,
                 slot_id: slot.id,
                 config_id: slot.config_id,
                 vcpu: slot.vcpu,

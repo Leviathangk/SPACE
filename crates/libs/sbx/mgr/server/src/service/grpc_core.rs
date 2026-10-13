@@ -134,7 +134,6 @@ pub(super) fn pool_adoption_request(
 ) -> AdoptPoolSandboxRequest {
     AdoptPoolSandboxRequest {
         claimed_sandbox: None,
-        encryption: None,
         template,
         owner,
         env: req.env.clone(),

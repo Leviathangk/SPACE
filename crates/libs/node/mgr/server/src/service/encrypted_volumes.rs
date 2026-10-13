@@ -226,9 +226,7 @@ impl NodeManagerService {
                     request.get_ref().execution_fence.as_ref(),
                     false,
                 )?;
-                service
-                    .prepare_snapshot_rootfs_inner(sandbox_id, request.into_inner().pool_adoption)
-                    .await
+                service.prepare_snapshot_rootfs_inner(sandbox_id).await
             },
         )
         .await
@@ -237,35 +235,15 @@ impl NodeManagerService {
     async fn prepare_snapshot_rootfs_inner(
         &self,
         sandbox_id: SandboxId,
-        adoption: Option<crate::proto::PoolRootfsAdoption>,
     ) -> Result<Response<PrepareSnapshotRootfsResponse>, Status> {
         let metric = DeviceOpMetric::prepare(pplx_space_metrics::byok::OP_POOL_ROOTFS);
         let instance_dir = PathBuf::from(paths::sandbox_instance_dir(&sandbox_id.to_string()));
 
         let origin_path = instance_dir.join(ROOTFS_ORIGIN_FILE);
-        let cow_path = instance_dir.join(rootfs_dmcrypt::POOL_COW_FILE);
-        let encrypted_cow_path = instance_dir.join(ROOTFS_COW_FILE);
-        let claim_id = adoption
-            .map(|claim| {
-                uuid::Uuid::parse_str(&claim.claim_id)
-                    .map_err(|_| Status::invalid_argument("invalid pool claim ID"))
-            })
-            .transpose()?;
-        let result = if claim_id.is_some() {
-            require_paused_pool_vm(&sandbox_id).await?;
-            if encrypted_cow_path.exists() {
-                return Err(Status::failed_precondition(
-                    "encrypted COW cannot be adopted as plaintext",
-                ));
-            }
-            rootfs_dmcrypt::adopt_plain_pool_rootfs(sandbox_id, origin_path, cow_path).await
-        } else {
-            rootfs_dmcrypt::retain_pool_origin(origin_path).await
-        };
+        let result = rootfs_dmcrypt::retain_pool_origin(origin_path).await;
         let prepared = record_outcome(&metric, result)?;
 
         Ok(Response::new(PrepareSnapshotRootfsResponse {
-            adopted_claim_id: claim_id.map(|id| id.to_string()),
             mapper_path: prepared.mapper_path.to_string_lossy().into_owned(),
         }))
     }

@@ -184,7 +184,6 @@ fn build_sandbox_pod_merges_extra_node_selector_labels() {
         SandboxPodRequest::Pooled {
             common: test_common("space-sbx-pool-g1", TEST_POOL_SANDBOX_ID, 1, &env),
             pool: SandboxPoolPodMetadata {
-                encryptable: false,
                 slot_id: TEST_POOL_SLOT_ID,
                 config_id: TEST_POOL_CONFIG_ID,
                 vcpu: VcpuCount::try_from_u32(2).unwrap(),
@@ -1156,7 +1155,6 @@ fn sandbox_pod_shapes_render_expected_yaml() {
         SandboxPodRequest::Pooled {
             common: pooled_common,
             pool: SandboxPoolPodMetadata {
-                encryptable: false,
                 slot_id: TEST_POOL_SLOT_ID,
                 config_id: TEST_POOL_CONFIG_ID,
                 vcpu: VcpuCount::try_from_u32(2).unwrap(),
@@ -1279,7 +1277,6 @@ fn sandbox_pod_shapes_render_expected_yaml() {
                 2,
             ),
             pool: SandboxPoolPodMetadata {
-                encryptable: false,
                 slot_id: TEST_POOL_SLOT_ID,
                 config_id: TEST_POOL_CONFIG_ID,
                 vcpu: VcpuCount::try_from_u32(2).unwrap(),
@@ -1486,7 +1483,6 @@ fn every_sandbox_pod_shape_requests_one_network_slot() {
             SandboxPodRequest::Pooled {
                 common: common("space-sbx-pooled-g1", TEST_POOL_SANDBOX_ID, 1),
                 pool: SandboxPoolPodMetadata {
-                    encryptable: false,
                     slot_id: TEST_POOL_SLOT_ID,
                     config_id: TEST_POOL_CONFIG_ID,
                     vcpu: VcpuCount::try_from_u32(2).unwrap(),
@@ -2485,7 +2481,6 @@ fn pooled_pod_renders_node_group_placement() {
                 activation_attempt_id: None,
             },
             pool: SandboxPoolPodMetadata {
-                encryptable: false,
                 slot_id: TEST_POOL_SLOT_ID,
                 config_id: TEST_POOL_CONFIG_ID,
                 vcpu: VcpuCount::try_from_u32(2).unwrap(),
@@ -2813,7 +2808,6 @@ fn pooled_pod_never_renders_dedicated_toleration_or_preference() {
                 activation_attempt_id: None,
             },
             pool: SandboxPoolPodMetadata {
-                encryptable: false,
                 slot_id: TEST_POOL_SLOT_ID,
                 config_id: TEST_POOL_CONFIG_ID,
                 vcpu: VcpuCount::try_from_u32(2).unwrap(),

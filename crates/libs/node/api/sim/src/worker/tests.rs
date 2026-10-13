@@ -279,7 +279,6 @@ async fn internal_adopt_pool_sandbox_claims_paused_member() {
     let adopted = internal
         .adopt_pool_sandbox(Request::new(sbx::AdoptPoolSandboxRequest {
             claimed_sandbox: None,
-            encryption: None,
             template: "seed".into(),
             owner: "user:00000000-0000-0000-0000-000000000020".into(),
             env: env.clone().into_iter().collect(),

@@ -321,9 +321,9 @@ service NodeManager {
       returns (ReleaseEncryptedVolumeResponse);
 
   // Retain a pre-boot reflink for later claim-time encryption. The warm VM
-  // boots the ordinary rootfs file without a device-mapper stack. A plaintext
-  // adoption discards the retained origin; encrypted adoption switches the
-  // paused VM's drive through PrepareEncryptedRootfs.
+  // boots the ordinary rootfs file without a device-mapper stack. Plaintext
+  // claims retain this origin until sandbox cleanup; encrypted adoption switches
+  // the paused VM's drive through PrepareEncryptedRootfs.
   rpc PrepareSnapshotRootfs(PrepareSnapshotRootfsRequest)
       returns (PrepareSnapshotRootfsResponse);
 
@@ -1153,7 +1153,7 @@ message PrepareEncryptedRootfsRequest {
   // fresh create and on a same-node restore (the COW was kept in place).
   optional string restore_cow_source = 2;
   ExecutionFence execution_fence = 3;
-  // Convert a paused pool member's existing COW; mutually exclusive with restore.
+  // Convert a paused pool member's disk; mutually exclusive with restore.
   optional PoolRootfsAdoption pool_adoption = 4;
 }
 
@@ -1171,14 +1171,11 @@ message PrepareEncryptedRootfsResponse {
 message PrepareSnapshotRootfsRequest {
   string sandbox_id = 1;
   ExecutionFence execution_fence = 2;
-  // Discard the retained origin for a plaintext adopter.
-  optional PoolRootfsAdoption pool_adoption = 3;
 }
 
 message PrepareSnapshotRootfsResponse {
   // Legacy field name: the ordinary rootfs path, not a block device.
   string mapper_path = 1;
-  optional string adopted_claim_id = 2;
 }
 
 message PrepareEncryptedVolumeRequest {

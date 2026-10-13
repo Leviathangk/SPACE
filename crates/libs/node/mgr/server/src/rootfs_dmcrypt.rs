@@ -74,8 +74,7 @@ use pplx_space_common_core::types::SandboxId;
 
 mod pool_adoption;
 pub(crate) use pool_adoption::{
-    POOL_ROOTFS_FILE, adopt_plain_pool_rootfs, encrypt_pool_rootfs, prepare_pool_drive_switch,
-    retain_pool_origin,
+    POOL_ROOTFS_FILE, encrypt_pool_rootfs, prepare_pool_drive_switch, retain_pool_origin,
 };
 
 /// Bytes of the *decrypted* COW mapper zeroed before a FRESH dm-snapshot is
