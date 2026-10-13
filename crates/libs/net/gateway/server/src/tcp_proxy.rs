@@ -33,6 +33,7 @@ use crate::tls_interception::{TlsInterception, TlsInterceptionError};
 
 mod accounting;
 mod admission;
+mod flow;
 mod http_host;
 mod leg;
 mod relay;
@@ -373,6 +374,13 @@ impl TcpProxy {
         }
     }
 
+    #[tracing::instrument(name = "tcp.connection", skip_all, fields(
+        sandbox_id = self.sandbox_id,
+        connection_id = tracing::field::Empty,
+        destination_ip = %accepted.dst.ip(),
+        destination_port = accepted.dst.port(),
+        sni = tracing::field::Empty,
+    ))]
     async fn serve(self, accepted: Accepted) {
         let Accepted {
             client,
@@ -383,18 +391,25 @@ impl TcpProxy {
 
         self.stats.tcp_active.fetch_add(1, Ordering::Relaxed);
         let shutdown = self.shutdown_token.child_token();
+        let flow = flow::Flow::default();
+        tracing::Span::current().record("connection_id", tracing::field::display(flow.id));
         // Biased, with the connection polled first: on shutdown both arms are
         // ready, and an unbiased select would pick between them at random, so
         // the same event could report either this generic cancellation or the
         // specific cause the inspected session names. The inner boundary owns
         // the cause; this arm only covers a connection that cannot observe
         // cancellation itself.
+        let operation = self.handle(client, dst, &shutdown, &flow);
+        tokio::pin!(operation);
         let (host, outcome) = tokio::select! {
             biased;
-            outcome = self.handle(client, dst, &shutdown) => outcome,
-            _ = shutdown.cancelled() => (None, FlowOutcome::Cancelled),
+            outcome = &mut operation => outcome,
+            _ = shutdown.cancelled() => {
+                flow.cancelled();
+                (None, FlowOutcome::Cancelled)
+            },
         };
-        self.record(dst, host.as_ref(), outcome);
+        self.record(dst, host.as_ref(), outcome, &flow);
         self.stats.tcp_active.fetch_sub(1, Ordering::Relaxed);
     }
 
@@ -403,6 +418,7 @@ impl TcpProxy {
         client: TcpStream,
         dst: SocketAddr,
         shutdown: &CancellationToken,
+        flow: &flow::Flow,
     ) -> (Option<DomainName>, FlowOutcome) {
         abort_on_close(&client);
         if let Some(resolver) = self.reserved_dns.resolver_for(dst.ip()) {
@@ -546,12 +562,13 @@ impl TcpProxy {
                     pplx_space_net_common::TlsInterception::On => "plaintext",
                 };
                 inspection.finish(accounting::Outcome::Skipped, reason);
-                self.relay(client, admitted).await
+                self.relay(client, admitted, flow).await
             }
             crate::tls_interception::InterceptionAction::Terminate(lease) => {
+                tracing::Span::current().record("sni", lease.host().as_str());
                 inspection.finish(accounting::Outcome::Success, "admitted");
                 match self
-                    .terminate_tls(client, admitted, lease, client_alpn)
+                    .terminate_tls(client, admitted, lease, client_alpn, flow)
                     .await
                 {
                     Ok(()) => FlowOutcome::InspectedTls,
@@ -587,9 +604,14 @@ impl TcpProxy {
         }
     }
 
-    async fn relay(&self, client: TcpStream, admitted: AdmittedTcp) -> FlowOutcome {
+    async fn relay(
+        &self,
+        client: TcpStream,
+        admitted: AdmittedTcp,
+        flow: &flow::Flow,
+    ) -> FlowOutcome {
         match admitted {
-            AdmittedTcp::Tunnel(destination) => self.pass_through(client, destination).await,
+            AdmittedTcp::Tunnel(destination) => self.pass_through(client, destination, flow).await,
             AdmittedTcp::HostBoundHttp(destination) => {
                 self.host_bound_http(client, destination, relay::connect)
                     .await
@@ -597,8 +619,13 @@ impl TcpProxy {
         }
     }
 
-    async fn pass_through(&self, client: TcpStream, dst: SocketAddr) -> FlowOutcome {
-        match relay::run(client, dst).await {
+    async fn pass_through(
+        &self,
+        client: TcpStream,
+        dst: SocketAddr,
+        flow: &flow::Flow,
+    ) -> FlowOutcome {
+        match relay::run(client, dst, flow).await {
             Ok((wire_tx, wire_rx)) => FlowOutcome::Relayed(Relay::Tunnelled { wire_tx, wire_rx }),
             Err(relay::Failure::Connect(error)) => {
                 FlowOutcome::RelayFailed(RelayFailure::Connect(error))
@@ -647,9 +674,102 @@ impl TcpProxy {
         }
     }
 
-    fn record(&self, dst: SocketAddr, host: Option<&DomainName>, outcome: FlowOutcome) -> bool {
+    fn record(
+        &self,
+        dst: SocketAddr,
+        host: Option<&DomainName>,
+        outcome: FlowOutcome,
+        flow: &flow::Flow,
+    ) -> bool {
         let (status, detail) = outcome.metric_tags();
-        pplx_space_metrics::gateway::tcp_connection(status, detail);
+        if let FlowOutcome::RelayFailed(RelayFailure::Connect(error)) = &outcome {
+            flow.io_failed(error, Some(flow::Phase::TcpConnect), flow::Side::Upstream);
+        }
+        let locally_closed = matches!(
+            outcome,
+            FlowOutcome::Cancelled
+                | FlowOutcome::Rejected(Rejection::Admission(_) | Rejection::PolicyMissing(_))
+        );
+        let failure = flow.failure();
+        let (phase, closed_by) = flow.ending();
+        let codes = failure.map(|failure| failure.codes);
+        let errno = codes
+            .and_then(|codes| codes.errno)
+            .map(|errno| format!("{errno:?}"));
+        let error_type = codes.map(|codes| codes.error_type());
+        let termination = pplx_space_metrics::gateway::Termination {
+            phase: failure
+                .map(|failure| failure.phase.as_str())
+                .or(phase.map(flow::Phase::as_str)),
+            side: failure
+                .map(|failure| failure.side.as_str())
+                .or(closed_by.map(flow::Side::as_str))
+                .or(locally_closed.then_some("downstream")),
+            close: codes
+                .and_then(|codes| codes.close)
+                .map(flow::codes::Close::as_str)
+                .or((failure.is_none() && closed_by.is_some()).then_some("normal"))
+                .or(locally_closed.then_some("local_reset")),
+            tls_alert: codes.and_then(|codes| codes.tls_alert),
+            tls_alert_dir: codes.and_then(|codes| codes.tls_alert_dir),
+            tls_cert_error: codes.and_then(|codes| codes.tls_cert_error),
+            errno: errno.as_deref(),
+            http_lib_reason: codes.and_then(|codes| codes.http_lib_reason),
+            error_type: error_type.as_deref(),
+        };
+        let specific_outcome = failure.map_or_else(
+            || match &outcome {
+                FlowOutcome::Rejected(Rejection::TlsInterception(error)) => error.as_str(),
+                _ => detail,
+            },
+            |failure| failure.outcome,
+        );
+        let guardrail_id = match &outcome {
+            FlowOutcome::Rejected(Rejection::Admission(TcpAdmissionDenial::DnsAttribution(
+                pplx_space_net_common::DenyReason::PlatformGuardrail { guardrail_id },
+            ))) => Some(*guardrail_id),
+            _ => None,
+        };
+        let (log, suppressed, sample_rate) = match &outcome {
+            FlowOutcome::Rejected(Rejection::PolicyMissing(_) | Rejection::Admission(_)) => {
+                let (log, suppressed) = self.refusal_warnings.sample("tcp_denied", Some(detail));
+                (log, suppressed, 1.0)
+            }
+            FlowOutcome::RelayFailed(RelayFailure::Transfer(_)) => {
+                // Sample independently of the error fields; all terminal
+                // metrics remain unsampled.
+                (rand::random_ratio(1, 100), 0, 0.01)
+            }
+            FlowOutcome::Relayed(_) | FlowOutcome::HandledDns { .. } => (false, 0, 1.0),
+            _ => (true, 0, 1.0),
+        };
+        if log {
+            // Snapshot before request owners unwind on a connection failure.
+            // A clean inspected close retains the final completion counts.
+            let requests = failure.map_or_else(|| flow.requests(), |failure| failure.requests);
+            info!(
+                sandbox_id = self.sandbox_id,
+                connection_id = %flow.id,
+                destination_ip = %dst.ip(),
+                destination_port = dst.port(),
+                status, detail, outcome = specific_outcome, guardrail_id,
+                phase = termination.phase, side = termination.side, close = termination.close,
+                in_flight = requests.in_flight, completed = requests.completed, aborted = requests.aborted,
+                tls_alert = termination.tls_alert, tls_alert_dir = termination.tls_alert_dir,
+                tls_cert_error = termination.tls_cert_error,
+                errno = termination.errno, http_lib_reason = termination.http_lib_reason,
+                error.type = termination.error_type,
+                sample_rate, suppressed,
+                "TCP flow ended"
+            );
+        }
+        pplx_space_metrics::gateway::tcp_connection(
+            status,
+            detail,
+            specific_outcome,
+            guardrail_id,
+            &termination,
+        );
         let reported = if let (Some(host), Some(reason)) = (host, outcome.failure_reason()) {
             self.known_egress_state
                 .report_tcp_failure(self.sandbox_id, dst, host, reason.as_ref())
@@ -696,12 +816,6 @@ impl TcpProxy {
                 );
             }
             FlowOutcome::Rejected(Rejection::PolicyMissing(reason)) => {
-                debug!(
-                    sandbox_id = self.sandbox_id,
-                    %dst,
-                    reason = reason.as_str(),
-                    "denied TCP egress while network policy is not ready"
-                );
                 // `evaluate_egress` meters every other verdict, but it cannot
                 // run without a policy. No policy also means no version to tag.
                 pplx_space_metrics::gateway::policy_decision(
@@ -714,13 +828,7 @@ impl TcpProxy {
                 );
                 self.stats.tcp_denied.fetch_add(1, Ordering::Relaxed);
             }
-            FlowOutcome::Rejected(Rejection::Admission(reason)) => {
-                debug!(
-                    sandbox_id = self.sandbox_id,
-                    %dst,
-                    reason = reason.label(),
-                    "denied TCP egress"
-                );
+            FlowOutcome::Rejected(Rejection::Admission(_)) => {
                 self.stats.tcp_denied.fetch_add(1, Ordering::Relaxed);
             }
             FlowOutcome::Rejected(Rejection::TlsInterception(error)) => {

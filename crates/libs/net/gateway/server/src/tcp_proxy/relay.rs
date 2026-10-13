@@ -4,7 +4,10 @@ use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use tokio::io::copy_bidirectional;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+
+use super::flow::{Flow, Phase, Side};
+use super::leg::RelayWitness;
 use tokio::net::TcpStream;
 
 use crate::orig_dst;
@@ -19,11 +22,52 @@ pub(super) enum Failure {
 
 /// Dial `dst` and shuttle bytes until both directions close. Returns the wire
 /// bytes carried, guest-to-destination first.
-pub(super) async fn run(mut client: TcpStream, dst: SocketAddr) -> Result<(u64, u64), Failure> {
-    let mut upstream = connect(dst).await.map_err(Failure::Connect)?;
-    copy_bidirectional(&mut client, &mut upstream)
+pub(super) async fn run(
+    client: TcpStream,
+    dst: SocketAddr,
+    flow: &Flow,
+) -> Result<(u64, u64), Failure> {
+    flow.at_phase(Phase::TcpConnect);
+    let upstream = connect(dst)
+        .await
+        .inspect_err(|error| flow.io_failed(error, Some(Phase::TcpConnect), Side::Upstream))
+        .map_err(Failure::Connect)?;
+    transfer(client, upstream, flow)
         .await
         .map_err(Failure::Copy)
+}
+
+async fn transfer(
+    mut client: TcpStream,
+    mut upstream: TcpStream,
+    flow: &Flow,
+) -> io::Result<(u64, u64)> {
+    flow.at_phase(Phase::Relay);
+    // Borrowed TCP halves avoid the mutex in tokio::io::split. Each EOF shuts
+    // down only the opposite writer; the reverse direction continues draining.
+    let (client_read, client_write) = client.split();
+    let (upstream_read, upstream_write) = upstream.split();
+    let witness = RelayWitness::default();
+    let result = tokio::try_join!(
+        copy(witness.guest(client_read), witness.origin(upstream_write)),
+        copy(witness.origin(upstream_read), witness.guest(client_write)),
+    );
+    if let (Err(error), Some(fault)) = (&result, witness.fault()) {
+        flow.io_failed(error, Some(Phase::Relay), fault.side().into());
+    }
+    if let Some(side) = witness.first_close() {
+        flow.closed(side.into());
+    }
+    result
+}
+
+async fn copy<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    mut read: R,
+    mut write: W,
+) -> io::Result<u64> {
+    let bytes = tokio::io::copy(&mut read, &mut write).await?;
+    write.shutdown().await?;
+    Ok(bytes)
 }
 
 /// `SO_MARK` keeps the reply from being re-captured by this gateway's own TPROXY
@@ -60,3 +104,6 @@ fn connect_in_progress(error: &io::Error) -> bool {
         Some(libc::EINPROGRESS) | Some(libc::EALREADY)
     ) || error.kind() == io::ErrorKind::WouldBlock
 }
+
+#[cfg(test)]
+mod tests;

@@ -13,9 +13,13 @@ where
     Fut: Future<Output = Result<(U, HttpProtocol), TlsTransportError>> + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    pub(super) async fn forward(&self, mut request: SanitizedRequest<Incoming>) -> Response<Body> {
+    pub(super) async fn forward(
+        &self,
+        mut request: SanitizedRequest<Incoming>,
+        progress: &mut super::super::flow::Request,
+    ) -> Response<Body> {
         if request.method() == http::Method::CONNECT {
-            return self.connect_request(request).await;
+            return self.connect_request(request, progress).await;
         }
 
         let protocol = HttpProtocol::of(request.version());
@@ -61,6 +65,7 @@ where
             Ok(sender) => sender,
             Err(error) => {
                 forwarding.finish(Outcome::Error, "origin_setup");
+                progress.failed(&error, super::super::flow::Side::Upstream);
                 error.record("upstream_setup");
                 return self.refuse(protocol, error.as_str(), StatusCode::BAD_GATEWAY);
             }
@@ -70,7 +75,9 @@ where
             Err(error) => {
                 forwarding.finish(Outcome::Error, "upstream_http");
                 self.draining.cancel();
-                TlsTransportError::Http(error).record("upstream_request");
+                let error = TlsTransportError::Http(error);
+                progress.failed(&error, super::super::flow::Side::Upstream);
+                error.record("upstream_request");
                 return self.refuse(protocol, "upstream_http_error", StatusCode::BAD_GATEWAY);
             }
         };
@@ -84,11 +91,16 @@ where
                 return self.refuse(protocol, error.as_str(), error.status());
             }
         };
+        progress.injected(!headers.is_empty());
         inject(&mut request, headers);
         if sender.is_http1() {
             translate_to_http1(&mut request);
         }
-        let request = request.map(|body| Self::forwarding_body(protocol, body, "request_body"));
+        let request = request.map(|body| {
+            let mut body = Self::forwarding_body(protocol, body, "request_body");
+            body.request_errors = Some(progress.errors());
+            body
+        });
         let response = sender.send(request).await;
 
         match response {
@@ -105,6 +117,7 @@ where
                     websocket_response_headers(response.headers_mut());
                 }
                 Self::record(protocol, handshake.as_str(), response.status());
+                self.flow.at_phase(super::super::flow::Phase::Relay);
                 self.upgrades.spawn(
                     upgrade::relay(guest, origin, self.shutdown.clone(), protocol.as_str())
                         .in_current_span(),
@@ -124,7 +137,9 @@ where
             Err(error) => {
                 forwarding.finish(Outcome::Error, "upstream_http");
                 self.draining.cancel();
-                TlsTransportError::Http(error).record("upstream_request");
+                let error = TlsTransportError::Http(error);
+                progress.failed(&error, super::super::flow::Side::Upstream);
+                error.record("upstream_request");
                 self.refuse(protocol, "upstream_http_error", StatusCode::BAD_GATEWAY)
             }
         }

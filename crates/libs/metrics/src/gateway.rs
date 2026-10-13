@@ -1,3 +1,21 @@
+//! Gateway counters use two denominators: `tcp.connection` ends once per
+//! accepted flow; `http.request.started` and `http.request` count individual
+//! inspected requests, including HTTP/2 streams. An aborted stream need not
+//! end its connection. Passthrough tunnels have no request-level observations.
+//!
+//! Request completion is response-body EOS at the gateway, not acknowledgement
+//! by the remote application. Completed responses retain HTTP error statuses.
+//! Successful CONNECT/upgrade handshakes complete the HTTP request; the opaque
+//! relay that follows has connection observations only.
+//! For a finite drained workload, started = completed + aborted; live windows
+//! can also contain requests still in flight. Exact per-flow counts and IDs
+//! belong in terminal logs, never metric tags. Failure logs snapshot request
+//! counts when the transport failure or local cancellation is observed.
+//!
+//! Missing side/close means the cause is unknown. A dropped body alone cannot
+//! identify a reset sender. Hyper predicates are used without inspecting its
+//! diagnostic source chain, so HTTP/2 reset and GOAWAY codes are not exposed.
+
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -542,14 +560,95 @@ pub fn tcp_in_flight(active: usize) {
     );
 }
 
-/// Emitted exactly once for every TCP connection that reaches the proxy's
-/// per-connection handler. `detail` is the bounded detail within `status`.
-pub fn tcp_connection(status: &str, detail: &str) {
+/// Bounded protocol/library attributes. Identifiers and exact request counts belong in logs.
+#[derive(Debug, Default)]
+pub struct Termination<'a> {
+    pub phase: Option<&'a str>,
+    pub side: Option<&'a str>,
+    pub close: Option<&'a str>,
+    pub tls_alert: Option<&'a str>,
+    pub tls_alert_dir: Option<&'a str>,
+    pub tls_cert_error: Option<&'a str>,
+    pub errno: Option<&'a str>,
+    pub http_lib_reason: Option<&'a str>,
+    pub error_type: Option<&'a str>,
+}
+
+impl Termination<'_> {
+    fn tags(&self) -> Vec<String> {
+        [
+            ("phase", self.phase),
+            ("side", self.side),
+            ("close", self.close),
+            ("tls_alert", self.tls_alert),
+            ("tls_alert_dir", self.tls_alert_dir),
+            ("tls_cert_error", self.tls_cert_error),
+            ("errno", self.errno),
+            ("http_lib_reason", self.http_lib_reason),
+            ("error.type", self.error_type),
+        ]
+        .into_iter()
+        .filter_map(|(key, value)| value.map(|value| tag(key, value)))
+        .collect()
+    }
+}
+
+/// Emitted exactly once per accepted TCP flow. Legacy `status`/`detail` remain
+/// unchanged for existing queries; `outcome` retains the specific transport or
+/// admission result. No sandbox, destination, or request-count tags are emitted.
+pub fn tcp_connection(
+    status: &str,
+    detail: &str,
+    outcome: &str,
+    guardrail_id: Option<&str>,
+    termination: &Termination<'_>,
+) {
+    let mut tags = termination.tags();
+    tags.extend([
+        tag("status", status),
+        tag("detail", detail),
+        tag("outcome", outcome),
+    ]);
+    if let Some(guardrail_id) = guardrail_id {
+        tags.push(tag("guardrail_id", guardrail_id));
+    }
+    counter("gateway.tcp.connection", 1, &tags);
+}
+
+/// One start per inspected HTTP request, including requests refused by the gateway.
+pub fn http_request_started(protocol: &str) {
     counter(
-        "gateway.tcp.connection",
+        "gateway.http.request.started",
         1,
-        &[tag("status", status), tag("detail", detail)],
+        &[tag("protocol", protocol)],
     );
+}
+
+/// Exactly one ending per started request. Completion means the response body
+/// reached end-of-stream; an HTTP error status is still a completed response.
+/// Cancellation before headers and dropped response bodies count as aborted.
+/// Status source and credential injection are request-local, including on h2.
+pub fn http_request(
+    protocol: &str,
+    outcome: &str,
+    status: Option<u16>,
+    status_source: Option<&str>,
+    injected: bool,
+    termination: &Termination<'_>,
+) {
+    let mut tags = termination.tags();
+    tags.extend([
+        tag("protocol", protocol),
+        tag("outcome", outcome),
+        tag("injected", injected),
+    ]);
+    if let Some(status) = status {
+        tags.push(tag("http.response.status_code", status));
+    }
+    if let Some(source) = status_source {
+        tags.push(tag("status_source", source));
+    }
+    counter("gateway.http.request", 1, &tags);
 }
 
 /// One terminal inspection-admission outcome per accepted non-DNS TCP flow.

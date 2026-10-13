@@ -86,6 +86,7 @@ where
     pub(super) async fn connect_request(
         &self,
         mut request: SanitizedRequest<Incoming>,
+        progress: &mut super::super::flow::Request,
     ) -> Response<Body> {
         let protocol = HttpProtocol::of(request.version());
         let mut authorization = Attempt::http_authorization(protocol.as_str());
@@ -127,6 +128,7 @@ where
             }
             Err(error) => {
                 forwarding.finish(Outcome::Error, "origin_setup");
+                progress.failed(&error, super::super::flow::Side::Upstream);
                 error.record("connect_proxy_setup");
                 return self.refuse(protocol, error.as_str(), StatusCode::BAD_GATEWAY);
             }
@@ -137,14 +139,20 @@ where
             return self.refuse(protocol, "lease_invalidated", StatusCode::FORBIDDEN);
         }
         let mut response = match request
-            .map(|body| Self::forwarding_body(protocol, body, "request_body"))
+            .map(|body| {
+                let mut body = Self::forwarding_body(protocol, body, "request_body");
+                body.request_errors = Some(progress.errors());
+                body
+            })
             .send_http1(&mut sender)
             .await
         {
             Ok(response) => response,
             Err(error) => {
                 forwarding.finish(Outcome::Error, "upstream_http");
-                TlsTransportError::Http(error).record("connect_proxy_request");
+                let error = TlsTransportError::Http(error);
+                progress.failed(&error, super::super::flow::Side::Upstream);
+                error.record("connect_proxy_request");
                 return self.refuse(protocol, "upstream_http_error", StatusCode::BAD_GATEWAY);
             }
         };
@@ -159,6 +167,7 @@ where
         }
         let origin = hyper::upgrade::on(&mut response);
         response.headers_mut().remove(header::CONTENT_LENGTH);
+        self.flow.at_phase(super::super::flow::Phase::Relay);
         self.upgrades
             .spawn(relay(guest, origin, self.shutdown.clone()).in_current_span());
         Self::record(protocol, "connect_forwarded", response.status());

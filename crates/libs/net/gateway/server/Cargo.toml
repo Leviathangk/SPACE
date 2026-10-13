@@ -36,8 +36,10 @@ http-body-util = { workspace = true }
 hyper = { workspace = true, features = ["client", "server", "http1", "http2"] }
 hyper-util = { workspace = true, features = ["tokio", "server", "server-auto", "http1", "http2"] }
 libc = { workspace = true }
+nix = { workspace = true }
 lru = { workspace = true }
 parking_lot = { workspace = true }
+rand = { workspace = true }
 socket2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "sync", "rt", "time"] }
@@ -46,6 +48,7 @@ tokio-rustls = { workspace = true, features = ["aws_lc_rs", "tls12"] }
 tokio-util = { workspace = true, features = ["codec"] }
 tonic = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
 webpki-roots = { workspace = true }
 
 # internal

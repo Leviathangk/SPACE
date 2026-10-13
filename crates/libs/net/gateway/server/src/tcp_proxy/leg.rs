@@ -81,6 +81,10 @@ impl RelayWitness {
 
     /// `none` until one peer reaches end-of-stream, so a relay torn down by
     /// shutdown is not misreported as a peer-initiated close.
+    pub(super) fn first_close(&self) -> Option<Side> {
+        self.closed_by.get().copied()
+    }
+
     pub(super) fn closed_by(&self) -> &'static str {
         self.closed_by.get().map_or("none", |side| side.as_str())
     }

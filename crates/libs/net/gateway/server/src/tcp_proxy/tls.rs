@@ -15,6 +15,7 @@ use tracing::Instrument;
 
 use super::accounting::{Attempt, Outcome};
 use super::admission::AdmittedTcp;
+use super::flow::{Flow, Phase, Side};
 use super::http_host::{HostBinding, MeteredIo};
 use super::{TcpProxy, relay, tls_http};
 use crate::certificates::{CertificateError, CertificateLease};
@@ -138,23 +139,23 @@ impl TlsTransportError {
 /// public predicates define HTTP diagnostic categories.
 pub(super) fn http_error_reason(error: &hyper::Error) -> &'static str {
     if error.is_parse() {
-        "parse"
+        "is_parse"
     } else if error.is_timeout() {
-        "timeout"
+        "is_timeout"
     } else if error.is_canceled() {
-        "cancelled"
+        "is_canceled"
     } else if error.is_incomplete_message() {
-        "incomplete_message"
+        "is_incomplete_message"
     } else if error.is_closed() {
-        "closed"
+        "is_closed"
     } else if error.is_body_write_aborted() {
-        "body_write_aborted"
+        "is_body_write_aborted"
     } else if error.is_shutdown() {
-        "shutdown"
+        "is_shutdown"
     } else if error.is_user() {
-        "user"
+        "is_user"
     } else {
-        "other"
+        "_OTHER"
     }
 }
 
@@ -311,6 +312,7 @@ impl TcpProxy {
         admitted: AdmittedTcp,
         lease: Arc<CertificateLease>,
         client_alpn: ClientAlpnOffer,
+        flow: &Flow,
     ) -> Result<(), TlsInterceptionError> {
         let span = tracing::info_span!(
             "tls.server",
@@ -337,7 +339,7 @@ impl TcpProxy {
                 // version from the guest's first bytes and records `protocol`
                 // once the first request arrives.
                 let (downstream, negotiated) =
-                    accept(client, &lease, &self.tls_interception).await?;
+                    accept(client, &lease, &self.tls_interception, flow).await?;
                 tracing::Span::current().record("negotiated", negotiated.as_str());
                 let binding = HostBinding::new(
                     self.sandbox_id,
@@ -349,6 +351,7 @@ impl TcpProxy {
                 let upstream_lease = lease.clone();
                 let wire_read = accounting.read.clone();
                 let wire_written = accounting.written.clone();
+                let upstream_flow = flow.clone();
                 let connect = move |guest_protocol| async move {
                     let origin = async {
                         Ok(MeteredIo {
@@ -358,23 +361,38 @@ impl TcpProxy {
                         })
                     };
                     let offer = upstream_alpn_offer(client_alpn, guest_protocol);
-                    connect(origin, &upstream_lease, &interception, offer).await
+                    connect(
+                        origin,
+                        &upstream_lease,
+                        &interception,
+                        offer,
+                        &upstream_flow,
+                    )
+                    .await
                 };
-                tls_http::serve(downstream, binding, lease.clone(), connect).await
+                tls_http::serve(downstream, binding, lease.clone(), flow.clone(), connect).await
             };
+            tokio::pin!(operation);
             let result = tokio::select! {
                 biased;
                 // These look identical to a client but have different
                 // operators: shutdown is ours to schedule, while an
                 // invalidated lease is the policy, identity or CA layer
                 // changing underneath a live session.
-                () = self.shutdown_token.cancelled() => Err(TlsTransportError::Withdrawn),
-                () = lease.invalidated() => Err(TlsTransportError::Invalidated),
-                result = operation => result,
+                () = self.shutdown_token.cancelled() => {
+                    flow.failed(&TlsTransportError::Withdrawn, None, Side::Downstream);
+                    Err(TlsTransportError::Withdrawn)
+                },
+                () = lease.invalidated() => {
+                    flow.failed(&TlsTransportError::Invalidated, None, Side::Downstream);
+                    Err(TlsTransportError::Invalidated)
+                },
+                result = &mut operation => result,
             };
             if result.is_ok() {
                 tracing::Span::current().record("otel.status_code", "OK");
             } else if let Err(error) = &result {
+                flow.failed(error, None, Side::Downstream);
                 error.record("tls_session");
             }
             result.map_err(Into::into)
@@ -408,12 +426,16 @@ pub(super) async fn accept<S>(
     stream: S,
     lease: &CertificateLease,
     interception: &TlsInterception,
+    flow: &Flow,
 ) -> Result<(TlsIo<tokio_rustls::server::TlsStream<S>>, HttpProtocol), TlsTransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    flow.at_phase(Phase::TlsHandshake);
     let deadline = tokio::time::Instant::now() + HANDSHAKE_BUDGET;
-    let _permit = admit_handshake(interception, TlsHandshakeLeg::ClientToNetgw, deadline).await?;
+    let _permit = admit_handshake(interception, TlsHandshakeLeg::ClientToNetgw, deadline)
+        .await
+        .inspect_err(|error| flow.failed(error, Some(Phase::TlsHandshake), Side::Downstream))?;
     let mut attempt = HandshakeAttempt::new(TlsHandshakeLeg::ClientToNetgw);
     let result = async {
         let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
@@ -442,13 +464,17 @@ where
             return Err(TlsTransportError::Target);
         }
         let protocol = HttpProtocol::negotiated(downstream.get_ref().1.alpn_protocol())?;
+        flow.at_phase(Phase::HttpIdle);
         Ok((
-            TlsIo::new(downstream, TlsHandshakeLeg::ClientToNetgw),
+            TlsIo::new(downstream, TlsHandshakeLeg::ClientToNetgw, flow.clone()),
             protocol,
         ))
     }
     .await;
     attempt.finish(&result);
+    if let Err(error) = &result {
+        flow.failed(error, Some(Phase::TlsHandshake), Side::Downstream);
+    }
     result
 }
 
@@ -460,14 +486,16 @@ pub(super) async fn connect<S>(
     lease: &CertificateLease,
     interception: &TlsInterception,
     client_alpn: ClientAlpnOffer,
+    flow: &Flow,
 ) -> Result<(TlsIo<tokio_rustls::client::TlsStream<S>>, HttpProtocol), TlsTransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     async {
         let deadline = tokio::time::Instant::now() + HANDSHAKE_BUDGET;
-        let _permit =
-            admit_handshake(interception, TlsHandshakeLeg::NetgwToOrigin, deadline).await?;
+        let _permit = admit_handshake(interception, TlsHandshakeLeg::NetgwToOrigin, deadline)
+            .await
+            .inspect_err(|error| flow.failed(error, Some(Phase::TlsHandshake), Side::Upstream))?;
         // TCP setup is not a TLS attempt. Start TLS telemetry only after the
         // transport connects, while retaining the original shared deadline.
         let mut tcp_attempt = Attempt::origin_tcp();
@@ -503,7 +531,9 @@ where
                 dial.finish("error");
             }
         }
-        let stream = stream?;
+        let stream = stream.inspect_err(|error| {
+            flow.failed(error, Some(Phase::TcpConnect), Side::Upstream);
+        })?;
 
         let mut attempt = HandshakeAttempt::new(TlsHandshakeLeg::NetgwToOrigin);
         let result = match tokio::time::timeout_at(deadline, async {
@@ -521,7 +551,7 @@ where
             }
             tracing::Span::current().record("otel.status_code", "OK");
             Ok((
-                TlsIo::new(upstream, TlsHandshakeLeg::NetgwToOrigin),
+                TlsIo::new(upstream, TlsHandshakeLeg::NetgwToOrigin, flow.clone()),
                 upstream_protocol,
             ))
         })
@@ -531,6 +561,9 @@ where
             Err(_) => Err(TlsTransportError::Timeout),
         };
         attempt.finish(&result);
+        if let Err(error) = &result {
+            flow.failed(error, Some(Phase::TlsHandshake), Side::Upstream);
+        }
         result
     }
     .instrument(upstream_span(lease.host(), lease.port()))
@@ -717,14 +750,16 @@ pub(super) struct TlsIo<T> {
     inner: T,
     leg: TlsHandshakeLeg,
     error_reported: bool,
+    flow: Flow,
 }
 
 impl<T> TlsIo<T> {
-    fn new(inner: T, leg: TlsHandshakeLeg) -> Self {
+    fn new(inner: T, leg: TlsHandshakeLeg, flow: Flow) -> Self {
         Self {
             inner,
             leg,
             error_reported: false,
+            flow,
         }
     }
 
@@ -732,6 +767,11 @@ impl<T> TlsIo<T> {
         if self.error_reported {
             return;
         }
+        let side = match self.leg {
+            TlsHandshakeLeg::ClientToNetgw => Side::Downstream,
+            TlsHandshakeLeg::NetgwToOrigin => Side::Upstream,
+        };
+        self.flow.io_failed(error, None, side);
         let Some(failure) = tls_failure_from_io(error) else {
             return;
         };
@@ -757,7 +797,16 @@ impl<T: AsyncRead + Unpin> AsyncRead for TlsIo<T> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let capacity = buf.remaining();
         let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(result, Poll::Ready(Ok(()))) && capacity > 0 && before == buf.filled().len() {
+            let side = match self.leg {
+                TlsHandshakeLeg::ClientToNetgw => Side::Downstream,
+                TlsHandshakeLeg::NetgwToOrigin => Side::Upstream,
+            };
+            self.flow.closed(side);
+        }
         if let Poll::Ready(Err(error)) = &result {
             self.record_error("read", error);
         }

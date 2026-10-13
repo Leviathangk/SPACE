@@ -22,6 +22,7 @@ use tokio_util::task::TaskTracker;
 use tracing::Instrument;
 
 use super::accounting::{Attempt, Outcome};
+use super::flow::{Flow, RequestErrors, Side, StatusSource};
 use super::http_host::HostBinding;
 use super::routing_headers::{SanitizedBody, SanitizedRequest};
 use super::tls::{HttpProtocol, TlsTransportError};
@@ -99,16 +100,36 @@ impl ReadySender<'_> {
 #[derive(Default)]
 struct ForwardingBody {
     inner: Option<(Incoming, Attempt)>,
+    request_errors: Option<RequestErrors>,
+    request: Option<super::flow::Request>,
 }
 
 impl ForwardingBody {
     fn new(inner: Incoming, protocol: &'static str, operation: &'static str) -> Self {
-        let mut attempt = Attempt::forwarding(protocol, operation);
-        if inner.is_end_stream() {
+        let mut body = Self {
+            inner: Some((inner, Attempt::forwarding(protocol, operation))),
+            ..Self::default()
+        };
+        if body.is_end_stream() {
+            body.complete();
+        }
+        body
+    }
+
+    fn with_request(mut self, mut request: super::flow::Request) -> Self {
+        if self.is_end_stream() {
+            request.complete();
+        }
+        self.request = Some(request);
+        self
+    }
+
+    fn complete(&mut self) {
+        if let Some((_, attempt)) = &mut self.inner {
             attempt.finish(Outcome::Success, "body_complete");
         }
-        Self {
-            inner: Some((inner, attempt)),
+        if let Some(request) = &mut self.request {
+            request.complete();
         }
     }
 }
@@ -124,14 +145,21 @@ impl HttpBody for ForwardingBody {
         let Some((inner, attempt)) = self.inner.as_mut() else {
             return Poll::Ready(None);
         };
-        let result = Pin::new(&mut *inner).poll_frame(context);
+        let result = Pin::new(inner).poll_frame(context);
         match &result {
-            Poll::Ready(Some(Err(_))) => attempt.finish(Outcome::Error, "body_error"),
-            Poll::Ready(None) => attempt.finish(Outcome::Success, "body_complete"),
-            Poll::Ready(Some(Ok(_))) if inner.is_end_stream() => {
-                attempt.finish(Outcome::Success, "body_complete");
+            Poll::Ready(Some(Err(error))) => {
+                attempt.finish(Outcome::Error, "body_error");
+                if let Some(errors) = &self.request_errors {
+                    errors.observe(error, Side::Downstream);
+                }
+                if let Some(request) = &mut self.request {
+                    request.errors().observe(error, Side::Upstream);
+                    request.abort();
+                }
             }
-            Poll::Ready(Some(Ok(_))) | Poll::Pending => {}
+            Poll::Ready(None) => self.complete(),
+            Poll::Ready(Some(Ok(_))) if self.is_end_stream() => self.complete(),
+            _ => {}
         }
         result
     }
@@ -159,6 +187,7 @@ struct Session<F> {
     upgrades: TaskTracker,
     shutdown: CancellationToken,
     draining: CancellationToken,
+    flow: Flow,
 }
 
 /// Serve inspected HTTP on an established guest TLS stream.
@@ -175,6 +204,7 @@ pub(super) async fn serve<C, F, Fut, U>(
     guest: C,
     binding: HostBinding,
     lease: Arc<CertificateLease>,
+    flow: Flow,
     connect: F,
 ) -> Result<(), TlsTransportError>
 where
@@ -183,6 +213,7 @@ where
     Fut: Future<Output = Result<(U, HttpProtocol), TlsTransportError>> + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    flow.at_phase(super::flow::Phase::HttpIdle);
     let shutdown = CancellationToken::new();
     // Dropping this future on revocation also closes every origin socket.
     let _cancel = shutdown.clone().drop_guard();
@@ -195,17 +226,28 @@ where
         upgrades: TaskTracker::new(),
         shutdown,
         draining: CancellationToken::new(),
+        flow,
     });
     let service = service_fn(|request: Request<Incoming>| {
         let session = session.clone();
         let protocol = HttpProtocol::of(request.version());
         tracing::Span::current().record("protocol", protocol.as_str());
+        let mut progress = session.flow.request(protocol);
         let request = SanitizedRequest::try_from(request);
         async move {
-            Ok::<_, Infallible>(match request {
-                Ok(request) => session.forward(request).await,
+            let response = match request {
+                Ok(request) => session.forward(request, &mut progress).await,
                 Err(_) => session.refuse(protocol, "invalid_headers", StatusCode::BAD_REQUEST),
-            })
+            };
+            progress.response(
+                response.status(),
+                response
+                    .extensions()
+                    .get::<StatusSource>()
+                    .copied()
+                    .unwrap_or(StatusSource::Upstream),
+            );
+            Ok::<_, Infallible>(response.map(|body| body.with_request(progress)))
         }
     });
     let builder = guest_http_builder();
@@ -223,7 +265,11 @@ where
     session.shutdown.cancel();
     session.tasks.close();
     session.tasks.wait().await;
-    result.map_err(TlsTransportError::from)
+    result.map_err(|error| {
+        let error = TlsTransportError::from(error);
+        session.flow.failed(&error, None, Side::Downstream);
+        error
+    })
 }
 
 fn guest_http_builder() -> auto::Builder<TokioExecutor> {
@@ -308,6 +354,7 @@ where
 
     fn drive(&self, connection: impl Future<Output = Result<(), hyper::Error>> + Send + 'static) {
         let shutdown = self.shutdown.clone();
+        let flow = self.flow.clone();
         self.tasks.spawn(
             async move {
                 tokio::select! {
@@ -323,6 +370,7 @@ where
                                 http_reason = super::tls::http_error_reason(&error),
                                 "inspected HTTP connection ended"
                             );
+                            flow.failed(&TlsTransportError::Http(error), None, Side::Upstream);
                         }
                     }
                 }
@@ -340,6 +388,7 @@ where
         Self::record(protocol, reason, status);
         let mut response = Response::new(Body::default());
         *response.status_mut() = status;
+        response.extensions_mut().insert(StatusSource::Gateway);
         if protocol == HttpProtocol::Http1 {
             response
                 .headers_mut()
