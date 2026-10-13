@@ -168,9 +168,21 @@ fn starting_to_started() {
     assert!(Starting.can_transition_to(Started));
 }
 
+/// A stop or fatal kill supersedes any state whose VM is live or launching,
+/// mid-operation included, and nothing a delete or quarantine owns. Settled
+/// states without a VM, and cleanup and failure states, are not stoppable.
 #[test]
-fn started_to_stopping() {
-    assert!(Started.can_transition_to(Stopping));
+fn stopping_is_reachable_exactly_from_live_states() {
+    for state in super::SandboxState::all() {
+        let stoppable = match state {
+            Starting | Started | Stopping | Pausing | Paused | Resuming | Checkpointing
+            | Suspending | Restoring => true,
+            Creating | Created | Stopped | Deleting | Suspended | CleanupRequired
+            | CleanupFailed | Quarantined | Failed => false,
+        };
+        assert_eq!(state.can_transition_to(Stopping), stoppable, "{state}");
+        assert_eq!(state.transition(Stopping).is_ok(), stoppable, "{state}");
+    }
 }
 
 #[test]

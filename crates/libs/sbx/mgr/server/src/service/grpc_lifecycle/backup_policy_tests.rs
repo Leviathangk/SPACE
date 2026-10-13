@@ -1089,7 +1089,8 @@ async fn kill_refuses_signals_it_cannot_deliver_before_cleanup_admission() {
     };
 
     for state in SandboxState::all() {
-        let deliverable = matches!(state, SandboxState::Started | SandboxState::Paused);
+        let deliverable =
+            crate::service::tests::stop_kill_admission_tests::fatal_kill_admits(state);
         for signal in [9, 15] {
             let (service, id) = service_with(Some(state));
             let case = format!("{state} signal {signal}");

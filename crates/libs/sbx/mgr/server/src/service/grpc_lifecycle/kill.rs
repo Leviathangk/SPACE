@@ -24,18 +24,18 @@ impl SandboxManagerService {
             return Err(Status::invalid_argument("signal must be non-zero"));
         }
 
-        // Must be running or paused to receive a signal
-        if !matches!(sandbox.state, SandboxState::Started | SandboxState::Paused) {
-            return Err(Status::failed_precondition(format!(
-                "cannot kill: sandbox is {}, not started or paused",
-                sandbox.state
-            )));
-        }
-
         // Only fatal signals (SIGKILL=9, SIGTERM=15) trigger state transition and cleanup.
         // Non-fatal signals (e.g. SIGHUP, SIGUSR1) are just forwarded to the process.
         let is_fatal = signal == 9 || signal == 15;
         if !is_fatal {
+            // A forwarded signal starts no cleanup, so it never supersedes an
+            // in-flight operation.
+            if !matches!(sandbox.state, SandboxState::Started | SandboxState::Paused) {
+                return Err(Status::failed_precondition(format!(
+                    "cannot kill: sandbox is {}, not started or paused",
+                    sandbox.state
+                )));
+            }
             let mut node_client = connect_node(&self.node_manager)
                 .await
                 .map_err(|e| Status::internal(format!("cannot connect to node-manager: {e}")))?;
@@ -51,10 +51,14 @@ impl SandboxManagerService {
             return Ok(Response::new(KillResponse {}));
         }
 
-        sandbox
-            .state
-            .transition(SandboxState::Stopping)
-            .map_err(Status::from)?;
+        // A fatal signal stops the sandbox, so it is admitted exactly where a
+        // stop may supersede the current state.
+        if !sandbox.state.can_transition_to(SandboxState::Stopping) {
+            return Err(Status::failed_precondition(format!(
+                "cannot kill: sandbox is {}, which cannot stop",
+                sandbox.state
+            )));
+        }
 
         let (sandbox_id, uuid8) = Self::cleanup_identity(id, Some(&sandbox.uuid8))?;
         let completion = CleanupCompletion::MarkStopped;

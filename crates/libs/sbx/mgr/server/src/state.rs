@@ -40,6 +40,9 @@ impl SandboxState {
         if target == SandboxState::Quarantined {
             return *self != SandboxState::Failed;
         }
+        if target == SandboxState::Stopping {
+            return self.can_stop();
+        }
 
         use SandboxState::*;
         matches!(
@@ -50,7 +53,6 @@ impl SandboxState {
             | (Created, Deleting)
             // Start/Stop lifecycle
             | (Starting, Started)
-            | (Started, Stopping)
             | (Stopping, Stopped)
             | (Stopped, Starting)
             | (Stopped, Deleting)
@@ -59,7 +61,6 @@ impl SandboxState {
             | (Pausing, Paused)
             | (Paused, Resuming)
             | (Resuming, Started)
-            | (Paused, Stopping)      // stop/kill from paused
             // Checkpoint lifecycle (VM keeps running, or from paused for migration)
             | (Started, Checkpointing)
             | (Paused, Checkpointing)
@@ -94,6 +95,26 @@ impl SandboxState {
             | (CleanupFailed, CleanupRequired)
             | (Quarantined, Deleting)
         )
+    }
+
+    /// Whether a stop or fatal kill may supersede this state: the VM is live
+    /// or launching, including mid-operation, and no delete or quarantine owns
+    /// the row. The superseded operation's own completion write then races the
+    /// stop's cleanup.
+    ///
+    /// Settled states without a VM, and cleanup and failure states whose VM
+    /// may already be gone, are excluded: superseding them would replace their
+    /// pending cleanup or erase-safety evidence with a stop. The Stop RPC also
+    /// cleans up a live runtime found under those rows; that runtime-gated
+    /// admission is Stop's own and does not go through this rule.
+    const fn can_stop(self) -> bool {
+        use SandboxState::*;
+        match self {
+            Starting | Started | Stopping | Pausing | Paused | Resuming | Checkpointing
+            | Suspending | Restoring => true,
+            Creating | Created | Stopped | Deleting | Suspended | CleanupRequired
+            | CleanupFailed | Quarantined | Failed => false,
+        }
     }
 
     pub fn transition(self, target: SandboxState) -> Result<SandboxState, StateTransitionError> {
@@ -286,7 +307,10 @@ impl SandboxState {
         use SandboxState::*;
         match self {
             Starting | Started => "created, stopped, or suspended",
-            Stopping | Stopped => "started or paused",
+            Stopping => {
+                "started, paused, or starting, stopping, pausing, resuming, checkpointing, suspending, or restoring"
+            }
+            Stopped => "started or paused",
             Pausing | Paused => "started",
             Resuming => "paused",
             Checkpointing => "started or paused",

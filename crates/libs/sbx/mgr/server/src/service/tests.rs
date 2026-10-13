@@ -245,6 +245,9 @@ mod local_backup_inventory_tests;
 pub(crate) mod node_manager_transport_tests;
 
 #[cfg(test)]
+pub(crate) mod stop_kill_admission_tests;
+
+#[cfg(test)]
 pub(crate) mod service_tests {
     use super::start_support::*;
     use super::*;
