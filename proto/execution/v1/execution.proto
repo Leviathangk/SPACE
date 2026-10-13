@@ -93,3 +93,93 @@ message NodeExecutionInventory {
   repeated RuntimeInstallation runtimes = 1;
   repeated ArtifactComponentInstallation components = 2;
 }
+
+// Environment definitions are additive data contracts. Sending one to a peer
+// requires explicit support for its schema and reference; legacy inventory and
+// ExecutionMetadata do not imply that support. New required semantics must bump
+// schema_version, including semantics added through new fields or oneof members.
+enum HostOperatingSystem {
+  HOST_OPERATING_SYSTEM_UNSPECIFIED = 0;
+  HOST_OPERATING_SYSTEM_LINUX = 1;
+  HOST_OPERATING_SYSTEM_WINDOWS = 2;
+  HOST_OPERATING_SYSTEM_MACOS = 3;
+}
+
+message HostPlatform {
+  HostOperatingSystem os = 1;
+  CpuArchitecture architecture = 2;
+}
+
+enum HypervisorBackend {
+  HYPERVISOR_BACKEND_UNSPECIFIED = 0;
+  HYPERVISOR_BACKEND_KVM = 1;
+}
+
+enum IsolationClass {
+  ISOLATION_CLASS_UNSPECIFIED = 0;
+  // A separate hardware VM boundary for each sandbox; not an ordered strength.
+  ISOLATION_CLASS_HARDWARE_VM = 1;
+}
+
+enum RuntimePayloadLayout {
+  RUNTIME_PAYLOAD_LAYOUT_UNSPECIFIED = 0;
+  RUNTIME_PAYLOAD_LAYOUT_FIRECRACKER_RELEASE_V1 = 1;
+}
+
+message ManagedRuntimeRelease {
+  RuntimeIdentity runtime = 1;
+  // Digest over pinned binaries, never the source archive checksum.
+  string digest = 2;
+  HostPlatform target = 3;
+  RuntimePayloadLayout layout = 4;
+}
+
+message RuntimeBinding {
+  oneof provider {
+    ManagedRuntimeRelease managed_release = 1;
+  }
+}
+
+message LinuxDirectBootV1 {
+  // All identity fields are required. Target is EnvironmentDescriptor.guest.
+  EnvironmentComponent kernel = 1;
+}
+
+message EnvironmentComponent {
+  ArtifactComponentKind kind = 1;
+  string version = 2;
+  string digest = 3;
+}
+
+message BootProfile {
+  oneof profile {
+    LinuxDirectBootV1 linux_direct_v1 = 1;
+  }
+}
+
+message FirecrackerSnapshotCompatibilityV1 {
+  StateFormatIdentity state_format = 1;
+}
+
+message ExecutionCompatibilityProfile {
+  oneof profile {
+    FirecrackerSnapshotCompatibilityV1 firecracker_snapshot_v1 = 1;
+  }
+}
+
+message EnvironmentDescriptor {
+  HostPlatform host = 1;
+  GuestPlatform guest = 2;
+  RuntimeBinding runtime = 3;
+  HypervisorBackend backend = 4;
+  BootProfile boot = 5;
+  IsolationClass isolation = 6;
+  ExecutionCompatibilityProfile compatibility = 7;
+}
+
+message EnvironmentDefinition {
+  uint32 schema_version = 1;
+  // SHA-256 over versioned canonical semantic fields, not protobuf wire bytes.
+  string reference = 2;
+  EnvironmentDescriptor descriptor = 3;
+}
