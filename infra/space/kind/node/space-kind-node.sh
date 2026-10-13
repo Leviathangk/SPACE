@@ -13,7 +13,7 @@
 #   space-kind-devices.service     Kind-only /dev/kvm and vhost permission widening
 #   space-cgroup.service           /sys/fs/cgroup/space   (packer 07-sysctl.sh)
 #   space-layout.service           SPACE accounts, /space skeleton, Firecracker
-#                                  links, sandbox.toml    (packer 04-firecracker.sh,
+#                                  copies/links, sandbox.toml    (packer 04-firecracker.sh,
 #                                                          07-sysctl.sh)
 #   space-cache.service            btrfs /space/cache     (packer 01-partitions.sh,
 #                                                          11-nvme-cache.sh)
@@ -114,6 +114,69 @@ ensure_identities() {
 }
 
 # ── /space skeleton ──────────────────────────────────────────────────────────
+# The developer's read-only vendor mount is a download cache, not executable
+# root-owned state. Copy the bootstrap E0 runtime to the node's /space/bin
+# hostPath; node-manager verifies its compiled pins before admitting execution.
+# Never rewrite an installed runtime: a live supervisor may still be using it.
+stage_runtime() (
+  local version=v1.15.1 root=/space/bin/runtime/firecracker
+  local source="/space/vendor/firecracker/$version" path binary staged=""
+  for path in /space/bin/runtime "$root"; do
+    if [[ ! -e $path && ! -L $path ]]; then
+      mkdir -m 0755 "$path"
+    fi
+    [[ -d $path && ! -L $path && $(stat -c %u "$path") == 0 ]] ||
+      die "runtime directory is not root-owned: $path"
+    (( (8#$(stat -c %a "$path") & 0022) == 0 )) ||
+      die "runtime directory is writable by another account: $path"
+  done
+  exec 9>"$root/.stage.lock"
+  flock -x 9
+  for path in "$source" "$source/bin"; do
+    [[ -d $path && ! -L $path ]] || die "missing or linked runtime source: $path"
+  done
+  for binary in firecracker jailer; do
+    path="$source/bin/$binary"
+    [[ -f $path && ! -L $path ]] || die "missing or linked runtime binary: $path"
+  done
+  if [[ -e $root/$version || -L $root/$version ]]; then
+    for path in "$root/$version" "$root/$version/bin" \
+        "$root/$version/bin/firecracker" "$root/$version/bin/jailer"; do
+      [[ ! -L $path && $(stat -c %u "$path") == 0 ]] ||
+        die "unprotected installed runtime: $path"
+      (( (8#$(stat -c %a "$path") & 0022) == 0 )) ||
+        die "installed runtime is writable by another account: $path"
+    done
+    for binary in firecracker jailer; do
+      if [[ ! -f $root/$version/bin/$binary || ! -x $root/$version/bin/$binary ]] ||
+          ! cmp -s "$source/bin/$binary" "$root/$version/bin/$binary"; then
+        die "installed $version differs from the download cache; recreate the Kind node"
+      fi
+    done
+  else
+    staged="$(mktemp -d "$root/.incoming.XXXXXXXX")"
+    trap '[[ -z $staged ]] || rm -rf -- "$staged"' EXIT
+    mkdir -m 0755 "$staged/bin"
+    for binary in firecracker jailer; do
+      cp -P -- "$source/bin/$binary" "$staged/bin/$binary"
+      [[ -f $staged/bin/$binary && ! -L $staged/bin/$binary ]] ||
+        die "runtime source changed during staging: $binary"
+      chmod 0755 "$staged/bin/$binary"
+    done
+    chmod 0755 "$staged"
+    sync -f "$staged"
+    mv -T -- "$staged" "$root/$version"
+    sync -f "$root"
+    staged=""
+  fi
+  if [[ ! -e $root/default && ! -L $root/default ]]; then
+    ln -s "$version" "$root/default"
+  fi
+  [[ -L $root/default && $(readlink "$root/default") == "$version" ]] ||
+    die "unexpected Kind runtime default: $root/default"
+  log "protected $version runtime staged on the node; admission verifies catalog pins"
+)
+
 # The host state directories, Firecracker links and per-VM defaults packer
 # bakes into the node image, on the hostPaths the node-service pods mount. The
 # directories only a service's own init container creates in production
@@ -143,12 +206,11 @@ layout() {
   install -d -m 0755 -o "$SPACE_SBXMGR_UID" -g "$SPACE_SBXMGR_GID" /space/run/sandbox-host-control
   install -d -m 0750 -o "$SPACE_TMPLMGR_UID" -g "$(space_expected_gid_for_group space-tmplclients)" \
     /space/run/template-manager
-  # The canonical binary paths the runtime inventory and the jailer launch
-  # use, onto the vendor tree kind-cluster.yaml.tmpl bind-mounts (packer
-  # 04-firecracker.sh). node-manager's init container stages the SPACE host
-  # binaries beside them.
-  ln -sfn ../vendor/firecracker/default/bin/firecracker /space/bin/firecracker
-  ln -sfn ../vendor/firecracker/default/bin/jailer /space/bin/jailer
+  stage_runtime
+  # The host supervisor and node-manager see the same protected runtime path.
+  # The production init container stages SPACE's service binaries beside it.
+  ln -sfn runtime/firecracker/default/bin/firecracker /space/bin/firecracker
+  ln -sfn runtime/firecracker/default/bin/jailer /space/bin/jailer
   # Per-VM defaults sandbox-manager reads; packer writes its sizing knobs here,
   # and Kind sets none of them.
   printf '%s\n' "# Generated by the Kind node layer (infra/space/kind/node/space-kind-node.sh)" \

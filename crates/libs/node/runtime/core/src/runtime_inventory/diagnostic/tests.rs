@@ -1199,6 +1199,37 @@ fn managed_release_identity_is_measured_without_catalog_pins_and_respects_limits
     let listing = run(&roots);
     assert_eq!(find(&listing, FC_RELEASE, "v9.9.9").digest, Some(expected));
     assert!(listing.is_complete());
+    for digest in [expected, Digest::sha256([0; 32])] {
+        let directory = ManagedDirectoryName::release(
+            &RuntimeIdentity {
+                kind: RuntimeKind::Firecracker,
+                version: "9.9.9".parse().unwrap(),
+            },
+            digest,
+        )
+        .to_string();
+        std::fs::rename(
+            fc_releases(&roots).join("v9.9.9"),
+            fc_releases(&roots).join(&directory),
+        )
+        .unwrap();
+        let listing = run(&roots);
+        let artifact = find(&listing, FC_RELEASE, &directory);
+        assert_eq!(artifact.digest, Some(expected));
+        assert_eq!(
+            artifact.status,
+            if digest == expected {
+                ArtifactStatus::Unsupported
+            } else {
+                ArtifactStatus::Invalid
+            }
+        );
+        std::fs::rename(
+            fc_releases(&roots).join(&directory),
+            fc_releases(&roots).join("v9.9.9"),
+        )
+        .unwrap();
+    }
     let limited = scan(
         &roots,
         ScanLimits {

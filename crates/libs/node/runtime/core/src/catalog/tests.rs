@@ -67,6 +67,14 @@ fn every_known_release_is_pinned_for_both_architectures() {
         kernel.sha256.to_string(),
         "sha256:e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2"
     );
+    // E0 is a durable legacy binding, not an alias to the current catalog tip.
+    let initial = InitialEnvironment::for_architecture(Arch::X86_64).unwrap();
+    assert_eq!(initial.release.release.version.as_str(), "1.15.1");
+    assert_eq!(
+        initial.release.digest().to_string(),
+        "sha256:7225701e6d651bb351c6858e3587994fb75a9932fb16d744dfec30fb8bfdd027"
+    );
+    assert_eq!(initial.kernel, *kernel);
 }
 
 #[test]
@@ -196,4 +204,19 @@ fn a_catalog_another_account_could_write_is_refused() {
     std::os::unix::fs::symlink(elsewhere.path(), &file).unwrap();
     let error = RuntimeCatalog::load_owned_by(dir.path(), mine).unwrap_err();
     assert!(matches!(error, CatalogError::Unsafe { .. }), "{error}");
+}
+
+#[test]
+fn managed_directory_names_retain_labels_and_digests() {
+    let digest = Digest::sha256([0xab; 32]);
+    for label in ["v1.15.1", "6.1.155", "custom--build"] {
+        let text = format!("{label}--{}", digest.hex_string());
+        let name: ManagedDirectoryName = text.parse().unwrap();
+        assert_eq!(name.label(), label);
+        assert_eq!(name.digest(), digest);
+        assert_eq!(name.to_string(), text);
+    }
+    for name in ["1.15.1", "--", "../v1--", "v1--not-a-digest"] {
+        name.parse::<ManagedDirectoryName>().unwrap_err();
+    }
 }
