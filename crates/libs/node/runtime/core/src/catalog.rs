@@ -338,10 +338,121 @@ pub fn release_digest<'a>(binaries: impl IntoIterator<Item = (&'a str, Digest)>)
     Digest::sha256(Sha256::digest(text.as_bytes()).into())
 }
 
+/// A managed directory retains both its diagnostic label and content identity.
+/// This naming scheme is not used by external execution roots.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedDirectoryName {
+    label: String,
+    digest: Digest,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("invalid managed artifact directory name {0:?}; expected <label>--<sha256>")]
+pub struct ManagedDirectoryNameParseError(String);
+
+impl ManagedDirectoryName {
+    pub fn release(release: &RuntimeIdentity, digest: Digest) -> Self {
+        Self {
+            label: format!("v{}", release.version),
+            digest,
+        }
+    }
+
+    pub fn kernel(version: &ArtifactVersion, digest: Digest) -> Self {
+        Self {
+            label: version.to_string(),
+            digest,
+        }
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+    pub fn digest(&self) -> Digest {
+        self.digest
+    }
+}
+
+impl std::fmt::Display for ManagedDirectoryName {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}--{}", self.label, self.digest.hex_string())
+    }
+}
+
+impl std::str::FromStr for ManagedDirectoryName {
+    type Err = ManagedDirectoryNameParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let invalid = || ManagedDirectoryNameParseError(value.to_owned());
+        let (label, digest) = value.rsplit_once("--").ok_or_else(invalid)?;
+        if ArtifactVersion::parse(label).is_err()
+            && !label
+                .strip_prefix('v')
+                .is_some_and(|version| RuntimeVersion::parse(version).is_ok())
+        {
+            return Err(invalid());
+        }
+        if digest.len() != 64 {
+            return Err(invalid());
+        }
+        let digest = format!("sha256:{digest}").parse().map_err(|_| invalid())?;
+        Ok(Self {
+            label: label.to_string(),
+            digest,
+        })
+    }
+}
+
+/// The immutable stock environment. Selection does not depend on mutable
+/// aliases or on which other approved artifacts happen to be installed.
+#[derive(Clone, Debug)]
+pub struct InitialEnvironment {
+    release: PinnedRelease,
+    kernel: PinnedKernel,
+}
+
+impl InitialEnvironment {
+    pub fn release(&self) -> &PinnedRelease {
+        &self.release
+    }
+    pub fn kernel(&self) -> &PinnedKernel {
+        &self.kernel
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(release: PinnedRelease, kernel: PinnedKernel) -> Self {
+        Self { release, kernel }
+    }
+
+    pub fn for_architecture(architecture: Arch) -> Result<Self, CatalogError> {
+        use pplx_space_common_core::types::{
+            INITIAL_FIRECRACKER_KERNEL_VERSION, INITIAL_FIRECRACKER_RUNTIME_VERSION,
+        };
+        let catalog = RuntimeCatalog::compiled()?;
+        let release = catalog
+            .releases(RuntimeKind::Firecracker, architecture)
+            .find(|pin| pin.release.version.as_str() == INITIAL_FIRECRACKER_RUNTIME_VERSION);
+        let kernel = catalog.kernels.iter().find(|pin| {
+            pin.architecture == architecture
+                && pin.runtime == RuntimeKind::Firecracker
+                && pin.version.as_str() == INITIAL_FIRECRACKER_KERNEL_VERSION
+        });
+        match (release, kernel) {
+            (Some(release), Some(kernel)) => Ok(Self {
+                release: release.clone(),
+                kernel: kernel.clone(),
+            }),
+            _ => Err(CatalogError::UnsupportedInitialArchitecture(architecture)),
+        }
+    }
+}
+
 /// Why the catalog could not be loaded. Loading fails closed: a catalog
 /// directory or file another account could write is refused, not skipped.
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
+    #[error("the initial environment has no pins for host architecture {0}")]
+    UnsupportedInitialArchitecture(Arch),
     #[error("compiled catalog entry {entry} is invalid: {field} {value:?}")]
     Compiled {
         entry: String,
