@@ -31,7 +31,6 @@ bytes = { workspace = true }
 base64 = { workspace = true }
 futures-util = { workspace = true }
 hickory-resolver = { workspace = true }
-h2 = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true, features = ["client", "server", "http1", "http2"] }
@@ -64,6 +63,7 @@ pplx-space-net-gateway-client = { workspace = true }
 pplx-space-spaced-common = { workspace = true }
 
 [dev-dependencies]
+h2 = { workspace = true }
 pplx-space-test-env.workspace = true
 prost = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

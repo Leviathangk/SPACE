@@ -33,7 +33,6 @@ use crate::tls_interception::{TlsInterception, TlsInterceptionError};
 
 mod accounting;
 mod admission;
-mod error;
 mod http_host;
 mod leg;
 mod relay;

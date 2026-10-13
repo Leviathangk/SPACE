@@ -15,7 +15,6 @@ use tracing::Instrument;
 
 use super::accounting::{Attempt, Outcome};
 use super::admission::AdmittedTcp;
-use super::error::ErrorDetails;
 use super::http_host::{HostBinding, MeteredIo};
 use super::{TcpProxy, relay, tls_http};
 use crate::certificates::{CertificateError, CertificateLease};
@@ -76,18 +75,21 @@ impl From<Box<dyn std::error::Error + Send + Sync>> for TlsTransportError {
 
 impl TlsTransportError {
     pub(super) fn record(&self, stage: &'static str) {
-        let failure = ErrorDetails::from(self);
+        let failure = self.failure();
+        let http = match self {
+            Self::Http(error) => http_error_reason(error),
+            _ => "not_http",
+        };
+        let io_kind = self.io_error().map(io::Error::kind);
         tracing::error!(
             telemetry_type = "gateway_boundary_failure",
             stage,
             outcome = self.as_str(),
-            reason = self.reason(&failure),
-            io_kind = ?failure.io.map(io::Error::kind),
-            tls_alert = failure.tls_alert_name(),
-            certificate_validation_reason = failure.certificate_reason(),
-            http_reason = failure.http_reason(),
-            h2_reason = failure.h2_reason(),
-            h2_origin = failure.h2_origin(),
+            reason = failure.reason,
+            io_kind = ?io_kind,
+            tls_alert = failure.alert,
+            certificate_validation_reason = failure.certificate,
+            http_reason = http,
             "inspected connection failed"
         );
     }
@@ -107,19 +109,129 @@ impl TlsTransportError {
         }
     }
 
-    fn reason(&self, details: &ErrorDetails<'_>) -> &'static str {
+    fn io_error(&self) -> Option<&io::Error> {
         match self {
-            Self::Capacity => "capacity",
-            Self::Timeout => "timeout",
-            Self::Invalidated => "invalidated",
-            Self::Withdrawn => "gateway_shutdown",
-            Self::Target => "target_mismatch",
-            Self::Protocol => "alpn_mismatch",
-            Self::Certificate(_) => "certificate_material",
-            Self::Configuration(_) => "configuration",
-            Self::Downstream(_) | Self::Upstream(_) => details.tls_reason().unwrap_or("io"),
-            Self::Http(_) => "http",
+            Self::Downstream(error) | Self::Upstream(error) => Some(error),
+            _ => None,
         }
+    }
+
+    fn failure(&self) -> TlsFailure {
+        match self {
+            Self::Capacity => TlsFailure::new("capacity"),
+            Self::Timeout => TlsFailure::new("timeout"),
+            Self::Invalidated => TlsFailure::new("invalidated"),
+            Self::Withdrawn => TlsFailure::new("gateway_shutdown"),
+            Self::Target => TlsFailure::new("target_mismatch"),
+            Self::Protocol => TlsFailure::new("alpn_mismatch"),
+            Self::Certificate(_) => TlsFailure::new("certificate_material"),
+            Self::Configuration(_) => TlsFailure::new("configuration"),
+            Self::Downstream(error) | Self::Upstream(error) => {
+                tls_failure_from_io(error).unwrap_or_else(|| TlsFailure::new("io"))
+            }
+            Self::Http(_) => TlsFailure::new("http"),
+        }
+    }
+}
+
+/// Hyper does not guarantee concrete types in its source chain. Only its
+/// public predicates define HTTP diagnostic categories.
+pub(super) fn http_error_reason(error: &hyper::Error) -> &'static str {
+    if error.is_parse() {
+        "parse"
+    } else if error.is_timeout() {
+        "timeout"
+    } else if error.is_canceled() {
+        "cancelled"
+    } else if error.is_incomplete_message() {
+        "incomplete_message"
+    } else if error.is_closed() {
+        "closed"
+    } else if error.is_body_write_aborted() {
+        "body_write_aborted"
+    } else if error.is_shutdown() {
+        "shutdown"
+    } else if error.is_user() {
+        "user"
+    } else {
+        "other"
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TlsFailure {
+    reason: &'static str,
+    alert: Option<&'static str>,
+    /// Bounded alert class for metrics. The full `alert` name stays in logs.
+    alert_class: &'static str,
+    certificate: Option<&'static str>,
+}
+
+impl TlsFailure {
+    const fn new(reason: &'static str) -> Self {
+        Self {
+            reason,
+            alert: None,
+            alert_class: "none",
+            certificate: None,
+        }
+    }
+}
+
+/// A peer's alert is the only signal that separates a guest refusing the
+/// interception CA from every other handshake failure, so the classes that
+/// name a trust decision have to reach metrics rather than logs alone.
+const fn alert_class(alert: rustls::AlertDescription) -> &'static str {
+    match alert {
+        rustls::AlertDescription::UnknownCA => "unknown_ca",
+        rustls::AlertDescription::BadCertificate => "bad_certificate",
+        rustls::AlertDescription::CertificateUnknown => "certificate_unknown",
+        rustls::AlertDescription::CertificateExpired => "certificate_expired",
+        rustls::AlertDescription::CertificateRevoked => "certificate_revoked",
+        rustls::AlertDescription::HandshakeFailure => "handshake_failure",
+        rustls::AlertDescription::ProtocolVersion => "protocol_version",
+        _ => "other",
+    }
+}
+
+fn tls_failure_from_io(error: &io::Error) -> Option<TlsFailure> {
+    error
+        .get_ref()?
+        .downcast_ref::<rustls::Error>()
+        .map(tls_failure_from_rustls)
+}
+
+fn tls_failure_from_rustls(error: &rustls::Error) -> TlsFailure {
+    match error {
+        rustls::Error::AlertReceived(alert) => TlsFailure {
+            reason: "peer_alert",
+            alert: alert.as_str().or(Some("unknown")),
+            alert_class: alert_class(*alert),
+            certificate: None,
+        },
+        rustls::Error::InvalidCertificate(certificate) => TlsFailure {
+            reason: certificate_reason(certificate),
+            alert: None,
+            alert_class: "none",
+            certificate: Some(certificate_reason(certificate)),
+        },
+        rustls::Error::NoApplicationProtocol => TlsFailure::new("alpn_mismatch"),
+        _ => TlsFailure::new("protocol"),
+    }
+}
+
+fn certificate_reason(error: &rustls::CertificateError) -> &'static str {
+    match error {
+        rustls::CertificateError::UnknownIssuer => "unknown_issuer",
+        rustls::CertificateError::Expired | rustls::CertificateError::ExpiredContext { .. } => {
+            "expired"
+        }
+        rustls::CertificateError::NotValidYet
+        | rustls::CertificateError::NotValidYetContext { .. } => "not_valid_yet",
+        rustls::CertificateError::NotValidForName
+        | rustls::CertificateError::NotValidForNameContext { .. } => "name_mismatch",
+        rustls::CertificateError::Revoked => "revoked",
+        _ => "invalid_certificate",
     }
 }
 
@@ -387,7 +499,7 @@ where
                 dial.finish("cancelled");
             }
             Err(error) => {
-                tcp_attempt.finish(Outcome::Error, error.reason(&ErrorDetails::from(error)));
+                tcp_attempt.finish(Outcome::Error, error.failure().reason);
                 dial.finish("error");
             }
         }
@@ -550,8 +662,7 @@ impl HandshakeAttempt {
     }
 
     fn record_failure(leg: TlsHandshakeLeg, error: &TlsTransportError) -> &'static str {
-        let failure = ErrorDetails::from(error);
-        let reason = error.reason(&failure);
+        let failure = error.failure();
         let boundary = match leg {
             TlsHandshakeLeg::ClientToNetgw => "guest_tls",
             TlsHandshakeLeg::NetgwToOrigin => "origin_tls",
@@ -567,21 +678,18 @@ impl HandshakeAttempt {
         pplx_space_metrics::gateway::tls_handshake(
             leg.as_str(),
             outcome,
-            reason,
-            failure.tls_alert_class(),
+            failure.reason,
+            failure.alert_class,
         );
         tracing::warn!(
             telemetry_type = "tls_handshake_error",
             boundary,
             leg = leg.as_str(),
             outcome,
-            reason,
-            io_kind = ?match error {
-                TlsTransportError::Downstream(error) | TlsTransportError::Upstream(error) => Some(error.kind()),
-                _ => None,
-            },
-            tls_alert = failure.tls_alert_name(),
-            certificate_validation_reason = failure.certificate_reason(),
+            reason = failure.reason,
+            io_kind = ?error.io_error().map(io::Error::kind),
+            tls_alert = failure.alert,
+            certificate_validation_reason = failure.certificate,
             "TLS handshake failed"
         );
         outcome
@@ -624,21 +732,20 @@ impl<T> TlsIo<T> {
         if self.error_reported {
             return;
         }
-        let failure = ErrorDetails::from(error);
-        let Some(reason) = failure.tls_reason() else {
+        let Some(failure) = tls_failure_from_io(error) else {
             return;
         };
         self.error_reported = true;
-        pplx_space_metrics::gateway::tls_connection_error(self.leg.as_str(), reason);
+        pplx_space_metrics::gateway::tls_connection_error(self.leg.as_str(), failure.reason);
         tracing::warn!(
             telemetry_type = "tls_connection_error",
             boundary = "forwarding",
             leg = self.leg.as_str(),
             operation,
-            reason,
+            reason = failure.reason,
             io_kind = ?error.kind(),
-            tls_alert = failure.tls_alert_name(),
-            certificate_validation_reason = failure.certificate_reason(),
+            tls_alert = failure.alert,
+            certificate_validation_reason = failure.certificate,
             "established TLS connection failed"
         );
     }

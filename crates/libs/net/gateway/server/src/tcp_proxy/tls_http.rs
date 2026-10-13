@@ -316,15 +316,11 @@ where
                     result = connection => {
                         if let Err(error) = result {
                             // Hyper Display can contain peer-supplied text.
-                            let failure = super::error::ErrorDetails::from(&error);
                             tracing::info!(
                                 stage = "upstream_http",
                                 parse = error.is_parse(),
                                 closed = error.is_closed(),
-                                http_reason = failure.http_reason(),
-                                io_kind = ?failure.io.map(io::Error::kind),
-                                h2_reason = failure.h2_reason(),
-                                h2_origin = failure.h2_origin(),
+                                http_reason = super::tls::http_error_reason(&error),
                                 "inspected HTTP connection ended"
                             );
                         }
