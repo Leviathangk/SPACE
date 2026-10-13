@@ -4,27 +4,10 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use super::*;
 
 #[test]
-fn a_missing_guest_kernel_is_a_terminal_failed_precondition() {
-    let error = RuntimeInventoryError::IncompleteKernelInstallation(PathBuf::from(
-        "/space/cache/firecracker/assets/default/kernel",
-    ));
-    let rendered = error.to_string();
-
-    assert!(
-        !error.is_transient(),
-        "no amount of retrying installs a guest kernel"
-    );
-    let status = error.into_status();
-    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-    assert_eq!(status.message(), rendered);
-}
-
-#[test]
 fn an_absent_or_inaccessible_inventory_path_is_terminal() {
     // These describe the installation, not the read: the path is not there,
     // or cannot be opened at all. A retry re-reads the same missing or
-    // unreadable path, which is the same condition
-    // `IncompleteKernelInstallation` already reports terminally.
+    // unreadable path; provisioning must repair it.
     let cases = [
         RuntimeInventoryError::ReadDir {
             path: PathBuf::from("/space/firecracker"),
@@ -75,6 +58,23 @@ fn only_version_named_entries_are_kernel_candidates() {
             "{name:?} is a legal artifact version"
         );
     }
+}
+
+#[test]
+fn external_directory_names_do_not_discard_identity_suffixes() {
+    let label = format!("1.15.1--{}", "a".repeat(64));
+    assert_eq!(
+        version_from_dir(Path::new(&format!("v{label}")))
+            .unwrap()
+            .as_str(),
+        label
+    );
+    assert_eq!(
+        kernel_candidate_version(std::ffi::OsStr::new(&label))
+            .unwrap()
+            .as_str(),
+        label
+    );
 }
 
 #[test]
@@ -211,6 +211,10 @@ fn inventory(runtimes: Vec<RuntimeInstallation>) -> RuntimeInventory {
         runtimes,
         components: vec![kernel("vmlinux-6.1.158", 0x42, true, true)],
         defaults: Vec::new(),
+        fingerprints: Vec::new(),
+        #[cfg(feature = "artifact-store")]
+        unavailable: Vec::new(),
+        retry_after: None,
     }
 }
 
@@ -278,34 +282,35 @@ fn compatible_release_is_selected_by_state_generation() {
     ));
 }
 
-/// Without a `default` alias the newest release is used.
+/// Discovery alone does not select an installed candidate.
 #[test]
-fn latest_release_and_default_kernel_are_used_for_unpinned_starts() {
+fn missing_default_rejects_unpinned_and_template_cold_boots() {
     let inventory = inventory(vec![
         installation("1.16.0", "10.0.0"),
         installation("1.15.1", "9.0.0"),
     ]);
-    let selected = inventory
-        .resolve(
-            None,
-            RuntimeKind::Firecracker,
-            ExecutionSelectionMode::NewColdBoot,
-        )
-        .unwrap();
-    assert_eq!(selected.execution.runtime().version.as_str(), "1.16.0");
-    assert_eq!(
-        selected_kernel_path(&selected),
-        Path::new("/kernels/vmlinux-6.1.158/vmlinux.bin")
-    );
+    let template = requested("1.15.1", "9.0.0", vec![]);
+    for requested in [None, Some(&template)] {
+        inventory
+            .resolve(
+                requested,
+                RuntimeKind::Firecracker,
+                ExecutionSelectionMode::NewColdBoot,
+            )
+            .unwrap_err();
+    }
 }
 
-/// Without a `default` alias the newest release is used.
+/// Cold boot uses the selected release regardless of the template snapshot format.
 #[test]
-fn new_cold_boot_uses_latest_release_without_snapshot_format_gating() {
-    let inventory = inventory(vec![
-        installation("1.16.0", "10.0.0"),
-        installation("1.15.1", "9.0.0"),
-    ]);
+fn new_cold_boot_uses_selected_release_without_snapshot_format_gating() {
+    let inventory = with_default(
+        inventory(vec![
+            installation("1.16.0", "10.0.0"),
+            installation("1.15.1", "9.0.0"),
+        ]),
+        "1.16.0",
+    );
     let template_execution = requested("1.15.1", "9.0.0", vec![]);
 
     let selected = inventory
@@ -376,14 +381,21 @@ fn persisted_state_restore_reports_invalid_driver_version_metadata() {
 
 #[test]
 fn pinned_starts_select_the_exact_kernel_digest() {
-    let inventory = RuntimeInventory {
-        runtimes: vec![installation("1.16.0", "10.0.0")],
-        components: vec![
-            kernel("vmlinux-6.1.158", 0x42, true, true),
-            kernel("vmlinux-6.6.92", 0x43, false, false),
-        ],
-        defaults: Vec::new(),
-    };
+    let inventory = with_default(
+        RuntimeInventory {
+            runtimes: vec![installation("1.16.0", "10.0.0")],
+            components: vec![
+                kernel("vmlinux-6.1.158", 0x42, true, true),
+                kernel("vmlinux-6.6.92", 0x43, false, false),
+            ],
+            defaults: Vec::new(),
+            fingerprints: Vec::new(),
+            #[cfg(feature = "artifact-store")]
+            unavailable: Vec::new(),
+            retry_after: None,
+        },
+        "1.16.0",
+    );
     let requested_kernel = kernel("vmlinux-6.6.92", 0x43, false, false).metadata;
     let requested = requested("1.16.0", "10.0.0", vec![requested_kernel]);
 
@@ -414,6 +426,10 @@ fn digest_matches_even_when_kernel_labels_differ() {
         runtimes: vec![installation("1.16.0", "10.0.0")],
         components: vec![kernel("legacy-424242424242", 0x42, true, true)],
         defaults: Vec::new(),
+        fingerprints: Vec::new(),
+        #[cfg(feature = "artifact-store")]
+        unavailable: Vec::new(),
+        retry_after: None,
     };
     let requested_kernel = kernel("vmlinux-6.1.158", 0x42, false, false).metadata;
     let requested = requested("1.16.0", "10.0.0", vec![requested_kernel]);
@@ -445,6 +461,10 @@ fn persisted_restore_does_not_require_the_recorded_kernel_to_be_installed() {
         runtimes: vec![installation("1.16.0", "10.0.0")],
         components: vec![kernel("vmlinux-6.1.158", 0x42, true, true)],
         defaults: Vec::new(),
+        fingerprints: Vec::new(),
+        #[cfg(feature = "artifact-store")]
+        unavailable: Vec::new(),
+        retry_after: None,
     };
     let requested_kernel = kernel("vmlinux-6.6.92", 0x43, false, false).metadata;
     let requested = requested("1.16.0", "10.0.0", vec![requested_kernel.clone()]);
@@ -502,6 +522,10 @@ fn runtime_and_component_inventories_are_independent() {
             kernel("vmlinux-6.6.92", 0x43, false, false),
         ],
         defaults: Vec::new(),
+        fingerprints: Vec::new(),
+        #[cfg(feature = "artifact-store")]
+        unavailable: Vec::new(),
+        retry_after: None,
     };
 
     let published = inventory.to_proto();
@@ -527,6 +551,10 @@ fn legacy_metadata_uses_the_pinned_legacy_kernel() {
             kernel("vmlinux-6.6.92", 0x43, true, false),
         ],
         defaults: Vec::new(),
+        fingerprints: Vec::new(),
+        #[cfg(feature = "artifact-store")]
+        unavailable: Vec::new(),
+        retry_after: None,
     };
     let legacy = requested("1.15.1", "9.0.0", vec![]);
 
@@ -712,7 +740,7 @@ fn discovery_skips_malformed_runtime_and_kernel_candidates() {
 }
 
 #[test]
-fn discovery_errors_on_complete_firecracker_with_unknown_snapshot_format() {
+fn discovery_skips_complete_firecracker_with_unknown_snapshot_format() {
     let temp = tempfile::tempdir().unwrap();
     let assets = tempfile::tempdir().unwrap();
     let kernels = tempfile::tempdir().unwrap();
@@ -733,19 +761,16 @@ fn discovery_errors_on_complete_firecracker_with_unknown_snapshot_format() {
     symlink("vmlinux-6.1.158", kernels.path().join("default")).unwrap();
     symlink("vmlinux-6.1.158", kernels.path().join("legacy-default")).unwrap();
 
-    assert!(matches!(
-        RuntimeInventory::discover(
-            [RuntimeInstallationRoot::new(
-                RuntimeKind::Firecracker,
-                temp.path(),
-            )],
-            assets.path(),
-            kernels.path(),
-        ),
-        Err(RuntimeInventoryError::UnknownFirecrackerSnapshotFormat(
-            version
-        )) if version.as_str() == "9.99.0"
-    ));
+    let inventory = RuntimeInventory::discover(
+        [RuntimeInstallationRoot::new(
+            RuntimeKind::Firecracker,
+            temp.path(),
+        )],
+        assets.path(),
+        kernels.path(),
+    )
+    .unwrap();
+    assert!(inventory.to_proto().runtimes.is_empty());
 }
 
 fn write_executable(path: &Path, contents: &str) {
@@ -879,24 +904,23 @@ fn discovery_records_each_roots_default_release() {
         .unwrap();
     assert_eq!(selected.execution.runtime().version.as_str(), "1.15.1");
 
-    // Without the alias, the newest release is used, as before.
+    // Removing selection cannot select the newer installed release.
     std::fs::remove_file(temp.path().join("default")).unwrap();
     let inventory = RuntimeInventory::discover([root()], assets.path(), kernels.path()).unwrap();
-    let selected = inventory
+    inventory
         .resolve(
             None,
             RuntimeKind::Firecracker,
             ExecutionSelectionMode::NewColdBoot,
         )
-        .unwrap();
-    assert_eq!(selected.execution.runtime().version.as_str(), "1.16.0");
+        .unwrap_err();
 }
 
 /// A `default` alias that exists but names no listed release fails
 /// discovery rather than falling back to the newest release: installing a
 /// release beside a broken alias must not change what new sandboxes boot.
 #[test]
-fn a_broken_default_alias_fails_discovery() {
+fn a_broken_default_alias_cannot_select_another_release() {
     let temp = tempfile::tempdir().unwrap();
     let assets = tempfile::tempdir().unwrap();
     let kernels = tempfile::tempdir().unwrap();
@@ -918,12 +942,98 @@ fn a_broken_default_alias_fails_discovery() {
     for target in ["v1.17.0", "notes"] {
         let _ = std::fs::remove_file(temp.path().join("default"));
         symlink(target, temp.path().join("default")).unwrap();
-        let error =
-            RuntimeInventory::discover([root()], assets.path(), kernels.path()).expect_err(target);
+        let inventory =
+            RuntimeInventory::discover([root()], assets.path(), kernels.path()).unwrap();
         assert!(
-            matches!(error, RuntimeInventoryError::InvalidDefaultRelease { .. }),
-            "{target}: {error}"
+            inventory
+                .resolve(
+                    None,
+                    RuntimeKind::Firecracker,
+                    ExecutionSelectionMode::NewColdBoot
+                )
+                .is_err(),
+            "{target}"
         );
-        assert!(!error.is_transient(), "{target}");
+        assert!(!inventory.runtimes.is_empty());
+    }
+}
+
+#[test]
+fn discovery_observes_installations_after_an_empty_scan() {
+    #[derive(Clone, Copy, Debug)]
+    enum Layout {
+        Absent,
+        Empty,
+        Incomplete,
+    }
+    for layout in [Layout::Absent, Layout::Empty, Layout::Incomplete] {
+        let temp = tempfile::tempdir().unwrap();
+        let vendor = temp.path().join("vendor");
+        let kernels = temp.path().join("kernels");
+        let assets = temp.path().join("assets");
+        let binaries = vendor.join("v1.15.1/bin");
+        let image = kernels.join("6.1.155/vmlinux.bin");
+        match layout {
+            Layout::Absent => {}
+            Layout::Empty => {
+                std::fs::create_dir_all(&vendor).unwrap();
+                std::fs::create_dir_all(&kernels).unwrap();
+            }
+            Layout::Incomplete => {
+                std::fs::create_dir_all(&binaries).unwrap();
+                std::fs::create_dir_all(image.parent().unwrap()).unwrap();
+                symlink("v1.15.1", vendor.join("default")).unwrap();
+                for alias in ["default", "legacy-default"] {
+                    symlink("6.1.155", kernels.join(alias)).unwrap();
+                }
+            }
+        }
+        let discover = || {
+            RuntimeInventory::discover(
+                [RuntimeInstallationRoot::new(
+                    RuntimeKind::Firecracker,
+                    &vendor,
+                )],
+                &assets,
+                &kernels,
+            )
+            .unwrap()
+        };
+        let empty = discover();
+        assert!(empty.runtimes.is_empty());
+        assert!(empty.components.is_empty());
+        assert!(empty.check_files_unchanged(), "{layout:?}");
+
+        std::fs::create_dir_all(image.parent().unwrap()).unwrap();
+        std::fs::write(&image, b"synthetic guest kernel").unwrap();
+        assert!(
+            !empty.check_files_unchanged(),
+            "kernel installation: {layout:?}"
+        );
+        let with_kernel = discover();
+        assert_eq!(with_kernel.components.len(), 1);
+        assert!(with_kernel.check_files_unchanged(), "{layout:?}");
+
+        std::fs::create_dir_all(&binaries).unwrap();
+        for name in ["firecracker", "jailer"] {
+            write_executable(&binaries.join(name), "#!/bin/sh\nexit 42\n");
+        }
+        assert!(
+            !with_kernel.check_files_unchanged(),
+            "runtime installation: {layout:?}"
+        );
+        if !matches!(layout, Layout::Incomplete) {
+            symlink("v1.15.1", vendor.join("default")).unwrap();
+            for alias in ["default", "legacy-default"] {
+                symlink("6.1.155", kernels.join(alias)).unwrap();
+            }
+        }
+        discover()
+            .resolve(
+                None,
+                RuntimeKind::Firecracker,
+                ExecutionSelectionMode::NewColdBoot,
+            )
+            .unwrap();
     }
 }

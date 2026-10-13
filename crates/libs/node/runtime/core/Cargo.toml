@@ -53,4 +53,4 @@ tonic-prost-build = { workspace = true }
 [dev-dependencies]
 pplx-space-test-env = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "macros"] }
+tokio = { workspace = true, features = ["io-util", "macros", "test-util"] }
