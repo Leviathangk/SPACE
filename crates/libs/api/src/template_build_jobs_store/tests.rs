@@ -65,6 +65,7 @@ async fn records_e2b_build_on_the_pending_job(
             Some(&client_build_id),
             daemon_job_id,
             Some(fixture.builder_nodes[0]),
+            None,
         )
         .await?;
     let job = fixture
@@ -100,6 +101,7 @@ async fn records_admin_build_with_the_daemon_job_id_as_its_build_id(
             None,
             daemon_job_id,
             Some(fixture.builder_nodes[0]),
+            None,
         )
         .await?;
     let job = fixture
@@ -128,6 +130,7 @@ async fn recording_unknown_builder_node_is_atomic(
             None,
             daemon_job_id,
             Some(NodeId::new()),
+            None,
         )
         .await
         .unwrap_err();
@@ -161,6 +164,7 @@ async fn deleting_builder_node_keeps_job_for_unpinned_fallback(
             None,
             daemon_job_id,
             Some(fixture.builder_nodes[0]),
+            None,
         )
         .await?;
 
@@ -205,11 +209,11 @@ async fn job_writes_preserve_owner_and_legacy_nulls(
         .await;
     fixture
         .store
-        .record_accepted_build(TEST_ORG, &name, Some("owned"), job, None)
+        .record_accepted_build(TEST_ORG, &name, Some("owned"), job, None, None)
         .await?;
     fixture
         .store
-        .record_accepted_build(TEST_ORG, &name, Some("legacy"), job, None)
+        .record_accepted_build(TEST_ORG, &name, Some("legacy"), job, None, None)
         .await?;
 
     assert!(matches!(
@@ -398,5 +402,48 @@ async fn legacy_build_reads_respect_a_registered_template_owner(
             .await?
             .is_some()
     );
+    Ok(())
+}
+
+/// Each system build submission records a fresh grant of its own, grants past
+/// ClusterApi's freshness window are swept on the way, and withdrawing one
+/// submission's grant leaves the others alone.
+#[rstest]
+#[tokio::test]
+async fn system_publication_grants_are_per_submission_and_swept_when_stale(
+    #[future] store_fixture: TestDbResult<StoreFixture>,
+) -> TestDbResult<()> {
+    let fixture = store_fixture.await?;
+    let pool = &fixture.db.pool;
+    let seed = TemplateName::parse("seed").unwrap();
+    sqlx::query(sql!(
+        "INSERT INTO template_system_publication_grants (id, template_name, granted_at)
+         VALUES ($1, 'seed', NOW() - INTERVAL '8 days')"
+    ))
+    .bind(uuid::Uuid::now_v7())
+    .execute(pool)
+    .await?;
+
+    let first = fixture.store.record_system_publication_grant(&seed).await?;
+    let second = fixture.store.record_system_publication_grant(&seed).await?;
+    let grants: Vec<(uuid::Uuid, bool)> = sqlx::query_as(sql!(
+        "SELECT id, granted_at > NOW() - INTERVAL '1 minute'
+         FROM template_system_publication_grants
+         WHERE template_name = 'seed'
+         ORDER BY granted_at, id"
+    ))
+    .fetch_all(pool)
+    .await?;
+    assert_eq!(
+        grants,
+        vec![(first.as_uuid(), true), (second.as_uuid(), true)]
+    );
+
+    fixture.store.revoke_system_publication_grant(first).await?;
+    let remaining: Vec<uuid::Uuid> =
+        sqlx::query_scalar(sql!("SELECT id FROM template_system_publication_grants"))
+            .fetch_all(pool)
+            .await?;
+    assert_eq!(remaining, vec![second.as_uuid()]);
     Ok(())
 }

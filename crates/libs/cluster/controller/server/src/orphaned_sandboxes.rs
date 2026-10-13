@@ -26,7 +26,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use k8s_openapi::api::core::v1::{ContainerStatus, Pod, PodStatus};
 use pplx_space_common_core::types::{
     PodUid, SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction,
     SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
@@ -54,7 +53,7 @@ use uuid::Uuid;
 use pplx_space_api::reconcile_queue::ReconcileElementRef;
 
 use pplx_space_api::controllers::substrate::kubernetes::{
-    K8sBlockingDeleteError, K8sBlockingDeleteOutcome, KubernetesSubstrate,
+    K8sBlockingDeleteError, K8sBlockingDeleteOutcome, KubernetesSubstrate, SandboxPodView,
 };
 
 use crate::env_config;
@@ -68,6 +67,30 @@ const DEFAULT_MAX_CLASSIFICATIONS_PER_MINUTE: u32 = 60;
 const DEFAULT_MAX_ACTIVE_QUARANTINES: u32 = 50;
 const DEFAULT_MAX_NEW_QUARANTINES_PER_SWEEP: u32 = 20;
 const DEFAULT_MAX_QUARANTINE_PERCENTAGE: u32 = 25;
+// Ceilings on the reconciler's safety limits. They exist so a typo can't
+// switch a limit off: an over-ceiling value clamps, so each ceiling has to be
+// a value at which its limit still bites. Raising a limit for a known cleanup
+// stays possible within the ceiling; the percentage ceiling deliberately caps
+// a cleanup that is almost all quarantines.
+
+/// 10× the default.
+const MAX_ACTIVE_QUARANTINES_CEILING: u32 = 10 * DEFAULT_MAX_ACTIVE_QUARANTINES;
+/// 10× the default, and below the rate ceiling: a small table's sweep fits in
+/// one tick, where the rate limit would stop it first.
+const MAX_NEW_QUARANTINES_PER_SWEEP_CEILING: u32 = 10 * DEFAULT_MAX_NEW_QUARANTINES_PER_SWEEP;
+const _: () =
+    assert!(MAX_NEW_QUARANTINES_PER_SWEEP_CEILING < MAX_CLASSIFICATIONS_PER_MINUTE_CEILING);
+/// 5× the default, and below [`DEFAULT_BATCH_SIZE`]. The limit counts live
+/// actions, and one tick a minute acts on at most one batch of candidates, so
+/// a limit at or above the batch size can't bind within a tick. It could bind
+/// only on the previous tick's actions, when they're still inside the window,
+/// which depends on how late each tick wakes.
+const MAX_CLASSIFICATIONS_PER_MINUTE_CEILING: u32 = 5 * DEFAULT_MAX_CLASSIFICATIONS_PER_MINUTE;
+const _: () = assert!(MAX_CLASSIFICATIONS_PER_MINUTE_CEILING < DEFAULT_BATCH_SIZE);
+/// 3× the default. A sweep's planned quarantines never exceed its planned
+/// dispositions, so at 100 the percentage breaker could never trip.
+const MAX_QUARANTINE_PERCENTAGE_CEILING: u32 = 3 * DEFAULT_MAX_QUARANTINE_PERCENTAGE;
+const _: () = assert!(MAX_QUARANTINE_PERCENTAGE_CEILING < 100);
 const QUARANTINE_PERCENTAGE_MIN_PLANS: u32 = 20;
 
 const RATE_LIMIT_WINDOW: Duration = Duration::from_mins(1);
@@ -175,25 +198,26 @@ impl ReconcilerConfig {
             batch_size: DEFAULT_BATCH_SIZE,
             // A safety rate limit that non-production clusters deliberately
             // lower, so it stays configurable.
-            max_classifications_per_minute: config.positive_u32(
+            max_classifications_per_minute: config.bounded_u32(
                 "SPACE_API_RECONCILER_MAX_CLASSIFICATIONS_PER_MINUTE",
                 DEFAULT_MAX_CLASSIFICATIONS_PER_MINUTE,
+                MAX_CLASSIFICATIONS_PER_MINUTE_CEILING,
             ),
             // Safety ceilings: `0` stops new quarantines.
             max_active_quarantines: config.bounded_u32_allow_zero(
                 "SPACE_API_RECONCILER_MAX_ACTIVE_QUARANTINES",
                 DEFAULT_MAX_ACTIVE_QUARANTINES,
-                u32::MAX,
+                MAX_ACTIVE_QUARANTINES_CEILING,
             ),
             max_new_quarantines_per_sweep: config.bounded_u32_allow_zero(
                 "SPACE_API_RECONCILER_MAX_NEW_QUARANTINES_PER_SWEEP",
                 DEFAULT_MAX_NEW_QUARANTINES_PER_SWEEP,
-                u32::MAX,
+                MAX_NEW_QUARANTINES_PER_SWEEP_CEILING,
             ),
             max_quarantine_percentage: config.bounded_u32_allow_zero(
                 "SPACE_API_RECONCILER_MAX_QUARANTINE_PERCENTAGE",
                 DEFAULT_MAX_QUARANTINE_PERCENTAGE,
-                100,
+                MAX_QUARANTINE_PERCENTAGE_CEILING,
             ),
             // Dry-run defaults to true so a fresh deployment gets
             // observability before any writes happen.
@@ -972,55 +996,28 @@ impl PodPresence for ReflectorPresence {
     }
 }
 
-pub(crate) fn classify_pod_presence(pod: &Pod) -> PodPresenceStatus {
-    if pod.metadata.deletion_timestamp.is_some() {
+pub(crate) fn classify_pod_presence(pod: &SandboxPodView) -> PodPresenceStatus {
+    if pod.is_deleting() {
         return PodPresenceStatus::Unready;
     }
 
-    let Some(status) = pod.status.as_ref() else {
-        return PodPresenceStatus::Unready;
-    };
-    if status.phase.as_deref() == Some("Running") && status.pod_ip.is_some() {
+    if pod.phase() == Some("Running") && pod.pod_ip().is_some() {
         return PodPresenceStatus::Present;
     }
-    match status.phase.as_deref() {
-        Some("Succeeded") if pod_status_all_containers_terminated(status) => {
+    match pod.phase() {
+        Some("Succeeded") if pod_all_containers_terminated(pod) => {
             PodPresenceStatus::TerminalSucceeded
         }
-        Some("Failed") if pod_status_all_containers_terminated(status) => {
-            PodPresenceStatus::TerminalFailed
-        }
+        Some("Failed") if pod_all_containers_terminated(pod) => PodPresenceStatus::TerminalFailed,
         _ => PodPresenceStatus::Unready,
     }
 }
 
-fn pod_status_all_containers_terminated(status: &PodStatus) -> bool {
-    let Some(container_statuses) = status.container_statuses.as_deref() else {
-        return false;
-    };
-    if container_statuses.is_empty() {
-        return false;
-    }
-    container_statuses.iter().all(container_status_terminated)
-        && status
-            .init_container_statuses
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .all(container_status_terminated)
-        && status
-            .ephemeral_container_statuses
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .all(container_status_terminated)
-}
-
-fn container_status_terminated(status: &ContainerStatus) -> bool {
-    status
-        .state
-        .as_ref()
-        .is_some_and(|state| state.terminated.is_some())
+/// Every app, init and ephemeral container has terminated, and there is at
+/// least one app container status to say so.
+fn pod_all_containers_terminated(pod: &SandboxPodView) -> bool {
+    let statuses = pod.container_statuses();
+    !statuses.containers.is_empty() && statuses.all().all(|state| state.terminated.is_some())
 }
 
 /// Real `OrphanActionSink` that joins the candidate scan against
@@ -1371,7 +1368,9 @@ impl SubstrateActionSink {
                     sandbox_id,
                     SandboxEventType::CleanupFailed,
                     reason,
-                    details_for_guard(guard).result(outcome.as_str()),
+                    details_for_guard(guard)
+                        .result(outcome.as_str())
+                        .logged_by_caller(),
                 );
                 false
             }
@@ -1386,7 +1385,9 @@ impl SubstrateActionSink {
                     sandbox_id,
                     SandboxEventType::CleanupFailed,
                     reason,
-                    details_for_guard(guard).error(err.to_string()),
+                    details_for_guard(guard)
+                        .error(err.to_string())
+                        .logged_by_caller(),
                 );
                 false
             }
@@ -1939,5 +1940,7 @@ pub async fn run(
     }
 }
 
+#[cfg(test)]
+mod lifecycle_writer_tests;
 #[cfg(test)]
 mod tests;

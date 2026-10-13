@@ -9,8 +9,8 @@ use futures_util::{FutureExt, TryStream, TryStreamExt};
 use prost::Message;
 
 use pplx_space_build_mgr::{
-    BuildError, BuildOutcome, BuildPhase, PublishError, TemplateBuilder, TemplateOrg, blob,
-    publish_build,
+    BuildError, BuildOutcome, BuildPhase, PublishError, SystemPublicationGrantId,
+    TemplateBuildErrorKind, TemplateBuilder, TemplateOrg, TemplatePublication, blob, publish_build,
     recipe::{CopyPayload, Recipe, Step},
     register_build_template,
 };
@@ -23,6 +23,7 @@ use pplx_space_build_mgr_client::proto::{
 use pplx_space_common_jobs::{
     BackgroundWorker, Job, JobError, JobExecutor, LeaseConfig, WorkerConfig,
 };
+use pplx_space_metrics::jobs::JobCompletedResult;
 use rusqlite::{Connection, params};
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
@@ -268,13 +269,13 @@ trait BuildBackend: Send + Sync {
     async fn ensure_cluster_template(
         &self,
         template_id: &str,
-        template_org: Option<TemplateOrg>,
+        publication: TemplatePublication,
     ) -> Result<(), PublishError>;
 
     async fn build(
         &self,
         recipe_label: &str,
-        recipe: Recipe,
+        recipe: pplx_space_build_mgr::PreparedRecipe,
         template_id: &str,
         job_id: &pplx_space_common_jobs::JobId,
         template_org: Option<TemplateOrg>,
@@ -285,7 +286,7 @@ trait BuildBackend: Send + Sync {
         template_id: &str,
         content_hash: &str,
         publish_tags: &[String],
-        template_org: Option<TemplateOrg>,
+        publication: TemplatePublication,
     ) -> Result<(), PublishError>;
 
     /// Deletes the node's superseded local builds of the template, keeping
@@ -301,22 +302,22 @@ impl BuildBackend for RuntimeBuildBackend {
     async fn ensure_cluster_template(
         &self,
         template_id: &str,
-        template_org: Option<TemplateOrg>,
+        publication: TemplatePublication,
     ) -> Result<(), PublishError> {
-        register_build_template(template_id, template_org).await
+        register_build_template(template_id, publication).await
     }
 
     async fn build(
         &self,
         recipe_label: &str,
-        recipe: Recipe,
+        recipe: pplx_space_build_mgr::PreparedRecipe,
         template_id: &str,
         job_id: &pplx_space_common_jobs::JobId,
         template_org: Option<TemplateOrg>,
     ) -> Result<BuildOutcome, BuildError> {
         TemplateBuilder::new()
             .with_caller_org(template_org.map(TemplateOrg::org_id))
-            .build(recipe_label, recipe, template_id, job_id)
+            .build_prepared(recipe_label, recipe, template_id, job_id)
             .await
     }
 
@@ -325,9 +326,9 @@ impl BuildBackend for RuntimeBuildBackend {
         template_id: &str,
         content_hash: &str,
         publish_tags: &[String],
-        template_org: Option<TemplateOrg>,
+        publication: TemplatePublication,
     ) -> Result<(), PublishError> {
-        publish_build(template_id, content_hash, publish_tags, template_org).await
+        publish_build(template_id, content_hash, publish_tags, publication).await
     }
 
     async fn prune_replaced_builds(&self, template_id: &str, keep_hash: &str) {
@@ -365,8 +366,10 @@ impl JobExecutor for BuildExecutor {
         let recipe: Recipe = proto_recipe
             .try_into()
             .map_err(|error| JobError::permanent(format!("invalid recipe payload: {error}")))?;
+        let recipe = pplx_space_build_mgr::PreparedRecipe::new(recipe)
+            .map_err(|error| JobError::permanent(error.to_string()))?;
         let mut materialized = HashSet::new();
-        for step in &recipe.steps {
+        for step in &recipe.recipe().steps {
             let Step::Copy {
                 payload: CopyPayload::BlobSha256(sha256),
                 ..
@@ -388,6 +391,10 @@ impl JobExecutor for BuildExecutor {
         let recipe_label = payload.recipe_label.clone();
         let publish_tags = payload.publish_tags.clone();
         let template_org = payload.template_org;
+        let publication = match template_org {
+            Some(org) => TemplatePublication::Tenant(org),
+            None => TemplatePublication::System(payload.system_publication_grant_id),
+        };
         let build_span = tracing::info_span!(
             "template.build.job",
             otel.kind = "internal",
@@ -409,16 +416,21 @@ impl JobExecutor for BuildExecutor {
                 "build job started"
             );
 
-            let build_result = if let Err(error) = backend
-                .ensure_cluster_template(&template_id, template_org)
+            // The failure's bounded cause, classified here while the error is
+            // still typed: the stored result keeps only its message.
+            let (build_result, error_kind) = if let Err(error) = backend
+                .ensure_cluster_template(&template_id, publication)
                 .await
             {
-                BuildJobResult {
-                    template_id: template_id.clone(),
-                    state: BuildTerminalState::PublishFailed,
-                    content_hash: None,
-                    error: Some(error.to_string()),
-                }
+                (
+                    BuildJobResult {
+                        template_id: template_id.clone(),
+                        state: BuildTerminalState::PublishFailed,
+                        content_hash: None,
+                        error: Some(error.to_string()),
+                    },
+                    Some(error.error_kind()),
+                )
             } else {
                 let build_backend = Arc::clone(&backend);
                 let runtime = tokio::runtime::Handle::current();
@@ -459,7 +471,7 @@ impl JobExecutor for BuildExecutor {
                                 "build phase started"
                             );
                             let result = backend
-                                .publish(&template_id, &hash, &publish_tags, template_org)
+                                .publish(&template_id, &hash, &publish_tags, publication)
                                 .await;
                             let step_result = pplx_space_metrics::template::TemplateBuildStepResult::from_ok(result.is_ok());
                             let result_tag = step_result.as_str();
@@ -467,6 +479,7 @@ impl JobExecutor for BuildExecutor {
                                 &template_id,
                                 BuildPhase::Publish.as_str(),
                                 step_result,
+                                result.as_ref().err().map(PublishError::error_kind),
                                 publish_started_at,
                             );
                             let duration_ms = publish_started_at.elapsed().as_millis() as u64;
@@ -492,52 +505,75 @@ impl JobExecutor for BuildExecutor {
                         .instrument(publish_span)
                         .await;
                         match publish_result {
-                            Ok(()) => BuildJobResult {
-                                template_id: template_id.clone(),
-                                state: BuildTerminalState::Succeeded,
-                                content_hash: Some(hash),
-                                error: None,
-                            },
-                            Err(error) => BuildJobResult {
-                                template_id: template_id.clone(),
-                                state: BuildTerminalState::PublishFailed,
-                                content_hash: Some(hash),
-                                error: Some(error.to_string()),
-                            },
+                            Ok(()) => (
+                                BuildJobResult {
+                                    template_id: template_id.clone(),
+                                    state: BuildTerminalState::Succeeded,
+                                    content_hash: Some(hash),
+                                    error: None,
+                                },
+                                None,
+                            ),
+                            Err(error) => (
+                                BuildJobResult {
+                                    template_id: template_id.clone(),
+                                    state: BuildTerminalState::PublishFailed,
+                                    content_hash: Some(hash),
+                                    error: Some(error.to_string()),
+                                },
+                                Some(error.error_kind()),
+                            ),
                         }
                     }
-                    None => BuildJobResult {
+                    None => (
+                        BuildJobResult {
+                            template_id: template_id.clone(),
+                            state: BuildTerminalState::Failed,
+                            content_hash: None,
+                            error: Some(String::from(
+                                "build completed but template-manager registration did not return a content hash",
+                            )),
+                        },
+                        Some(TemplateBuildErrorKind::Other),
+                    ),
+                },
+                Ok(Ok(Err(error))) => (
+                    BuildJobResult {
                         template_id: template_id.clone(),
                         state: BuildTerminalState::Failed,
                         content_hash: None,
-                        error: Some(String::from(
-                            "build completed but template-manager registration did not return a content hash",
-                        )),
+                        error: Some(error.to_string()),
                     },
-                },
-                Ok(Ok(Err(error))) => BuildJobResult {
-                    template_id: template_id.clone(),
-                    state: BuildTerminalState::Failed,
-                    content_hash: None,
-                    error: Some(error.to_string()),
-                },
-                Ok(Err(_)) => BuildJobResult {
-                    template_id: template_id.clone(),
-                    state: BuildTerminalState::Failed,
-                    content_hash: None,
-                    error: Some(String::from("build task panicked")),
-                },
-                Err(error) => BuildJobResult {
-                    template_id: template_id.clone(),
-                    state: BuildTerminalState::Failed,
-                    content_hash: None,
-                    error: Some(format!("build task failed: {error}")),
-                },
+                    Some(error.error_kind()),
+                ),
+                Ok(Err(_)) => (
+                    BuildJobResult {
+                        template_id: template_id.clone(),
+                        state: BuildTerminalState::Failed,
+                        content_hash: None,
+                        error: Some(String::from("build task panicked")),
+                    },
+                    Some(TemplateBuildErrorKind::Other),
+                ),
+                Err(error) => (
+                    BuildJobResult {
+                        template_id: template_id.clone(),
+                        state: BuildTerminalState::Failed,
+                        content_hash: None,
+                        error: Some(format!("build task failed: {error}")),
+                    },
+                    Some(TemplateBuildErrorKind::Other),
+                ),
                 }
             };
 
             let result = build_result.state.as_metric_result();
-            pplx_space_metrics::template::build_completed(&template_id, result, started_at);
+            pplx_space_metrics::template::build_completed(
+                &template_id,
+                result,
+                error_kind,
+                started_at,
+            );
             let result = result.as_str();
             let duration_ms = started_at.elapsed().as_millis() as u64;
             match &build_result.error {
@@ -546,6 +582,7 @@ impl JobExecutor for BuildExecutor {
                     template_id = %template_id,
                     duration_ms,
                     result,
+                    error_kind = error_kind.map(TemplateBuildErrorKind::as_str),
                     error = %error,
                     "build job completed with failure"
                 ),
@@ -581,6 +618,32 @@ impl JobExecutor for BuildExecutor {
         self.prune_replaced_builds_if_no_siblings(&job.job_id, &build_result)
             .await;
         Ok(0)
+    }
+
+    /// A failed build still completes its job, because callers read the
+    /// failure from the stored result; this keeps it from counting as a
+    /// successful job.
+    fn completed_result(&self, job: &Job) -> JobCompletedResult {
+        let stored = match self.db.lock() {
+            Ok(conn) => {
+                jobs::get_build_result(&conn, &job.job_id).map_err(|error| error.to_string())
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        match stored {
+            Ok(Some(result)) if result.state != BuildTerminalState::Succeeded => {
+                JobCompletedResult::Failed
+            }
+            Ok(_) => JobCompletedResult::Success,
+            Err(error) => {
+                tracing::warn!(
+                    job_id = %job.job_id,
+                    %error,
+                    "build result unreadable after completion; counting the job as a success"
+                );
+                JobCompletedResult::Success
+            }
+        }
     }
 }
 
@@ -711,6 +774,7 @@ impl BuildManager for BuildManagerDaemonService {
             request.get_ref().org_id.as_deref(),
         )?;
         let StartBuildRequest {
+            system_publication_grant_id,
             recipe,
             template_id,
             options,
@@ -731,6 +795,16 @@ impl BuildManager for BuildManagerDaemonService {
         };
         let options = options.unwrap_or_default();
         let template_org = parse_template_org(org_id)?;
+        let system_publication_grant_id = system_publication_grant_id
+            .as_deref()
+            .map(str::parse::<SystemPublicationGrantId>)
+            .transpose()
+            .map_err(|_| Status::invalid_argument("invalid system publication grant ID"))?;
+        if template_org.is_some() && system_publication_grant_id.is_some() {
+            return Err(Status::invalid_argument(
+                "tenant builds cannot carry a system publication grant",
+            ));
+        }
         if template_id.is_empty() {
             return Err(Status::invalid_argument("template_id is required"));
         }
@@ -752,6 +826,7 @@ impl BuildManager for BuildManagerDaemonService {
             force: options.force,
             publish_tags: options.publish_tags,
             template_org,
+            system_publication_grant_id,
         };
         // Every submission gets its own job (no dedup key); the worker's
         // serialized-subjects lease claim queues same-template jobs FIFO

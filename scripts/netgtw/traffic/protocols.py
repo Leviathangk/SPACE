@@ -144,8 +144,85 @@ async def connect_server(
             return
 
 
+async def connect_alpn_probe(spec, body):
+    """Reproduce Go's h2 proxy ALPN followed by an HTTP/1.1 CONNECT."""
+    outer = ssl.create_default_context(cafile=spec["certificate"])
+    outer.set_alpn_protocols(spec["alpn"])
+    inner = ssl.create_default_context(cafile=spec["tunnel_certificate"])
+    inner.set_alpn_protocols(["http/1.1"])
+    host = spec.get("tunnel_host", "inner.test")
+    async with asyncio.timeout(spec["timeout"]):
+        reader, writer = await asyncio.open_connection(
+            spec["target"], spec["port"], ssl=outer, server_hostname=spec["host"]
+        )
+        try:
+            negotiated = writer.get_extra_info("ssl_object").selected_alpn_protocol()
+            token = base64.b64encode(b"traffic:proxy-token").decode()
+            writer.write(
+                (
+                    f"CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n"
+                    f"Proxy-Authorization: Basic {token}\r\n\r\n"
+                ).encode()
+            )
+            await writer.drain()
+            try:
+                headers = await reader.readuntil(b"\r\n\r\n")
+            except asyncio.IncompleteReadError as error:
+                raise ConnectionError(
+                    "proxy closed before completing CONNECT response"
+                ) from error
+            check(
+                headers.split(b"\r\n", 1)[0].split()[:2] == [b"HTTP/1.1", b"200"],
+                "proxy did not accept HTTP/1.1 CONNECT",
+            )
+            await writer.start_tls(inner, server_hostname=host)
+            connection = h11.Connection(h11.CLIENT)
+            writer.write(
+                connection.send(
+                    h11.Request(
+                        method="POST",
+                        target="/echo",
+                        headers=[("host", host), ("content-length", str(len(body)))],
+                    )
+                )
+            )
+            writer.write(connection.send(h11.Data(data=body)))
+            writer.write(connection.send(h11.EndOfMessage()))
+            await writer.drain()
+            status, received = None, bytearray()
+            while True:
+                event = connection.next_event()
+                if event is h11.NEED_DATA:
+                    connection.receive_data(await reader.read(65536))
+                elif isinstance(event, h11.Response):
+                    status = event.status_code
+                elif isinstance(event, h11.Data):
+                    received.extend(event.data)
+                    check(
+                        len(received) <= len(body), "CONNECT echo exceeded request size"
+                    )
+                elif isinstance(event, h11.EndOfMessage):
+                    break
+                elif isinstance(event, h11.ConnectionClosed):
+                    raise ValueError("CONNECT peer closed before replying")
+            check(
+                status == 200 and received == body,
+                "CONNECT inner HTTPS reply was corrupted",
+            )
+            return {
+                "received": True,
+                "protocol": "https-connect",
+                "downstream_alpn": negotiated,
+            }
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+
 def connect_probe(spec):
     body = payload(spec["nonce"], 0, 96 * 1024)
+    if "alpn" in spec:
+        return asyncio.run(connect_alpn_probe(spec, body))
     command = [
         "curl",
         "--silent",
@@ -691,19 +768,19 @@ def grpc_probe(spec):
         }
 
 
-async def quic_server(address, certificate, key, record):
+async def quic_server(address, certificate, key, record, port=443):
     class ReceiptServer(QuicServer):
         def datagram_received(self, data, remote):
             # Log before parsing: even a leaked Initial which never establishes
             # TLS must fail a deny probe. Decrypted stream bytes are logged below.
-            record("datagram", address, 443, bytes=len(data))
+            record("datagram", address, port, bytes=len(data))
             # Preserve the existing raw UDP/443 probes on this same endpoint.
             # QUIC Initial packets have a binary long header, never this prefix.
             if data.startswith((b"traffic-", b"health-")):
                 record(
                     "data",
                     address,
-                    443,
+                    port,
                     data=data.decode("ascii", errors="replace"),
                     connection=f"{remote[0]}:{remote[1]}",
                 )
@@ -719,7 +796,7 @@ async def quic_server(address, certificate, key, record):
                 record(
                     "data",
                     address,
-                    443,
+                    port,
                     data=event.data.decode("ascii", errors="replace"),
                     connection=f"{id(self)}:{event.stream_id}",
                 )
@@ -733,7 +810,7 @@ async def quic_server(address, certificate, key, record):
     configuration.load_cert_chain(certificate, key)
     transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
         lambda: ReceiptServer(configuration=configuration, create_protocol=Echo),
-        local_addr=(address, 443),
+        local_addr=(address, port),
     )
     return transport
 

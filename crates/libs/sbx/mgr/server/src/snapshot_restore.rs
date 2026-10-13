@@ -281,6 +281,48 @@ pub enum RestoreError {
 }
 
 impl RestoreError {
+    /// What failed, for a stage-in failure reported as `stage_failed`. Every
+    /// variant is listed so a new one is classified rather than defaulted.
+    /// The variants a restore reports under a reason of their own map to
+    /// `Other`: they never reach that label.
+    pub(crate) fn stage_error_kind(&self) -> pplx_space_metrics::snapshot::RestoreStageErrorKind {
+        use pplx_space_metrics::snapshot::RestoreStageErrorKind as Kind;
+        match self {
+            Self::RestoreOperationBusy { .. } => Kind::Busy,
+            Self::SnapshotIdentityMismatch { .. }
+            | Self::InvalidSandboxId { .. }
+            | Self::InvalidRestoreSource { .. }
+            | Self::ArtifactSnapshotUriMismatch { .. }
+            | Self::ArtifactSourceUriMismatch { .. }
+            | Self::MissingSandboxOwnershipMetadata => Kind::SourceMismatch,
+            Self::CreateDirectory { .. }
+            | Self::RemoveFile { .. }
+            | Self::RemoveDirectory { .. }
+            | Self::RenamePath { .. } => Kind::Filesystem,
+            Self::ReadSandboxRow { .. }
+            | Self::PersistRestoringRow { .. }
+            | Self::InvalidRecoveredSandboxRow { .. }
+            | Self::AdvanceRestorePhase { .. }
+            | Self::SandboxDatabaseMutexPoisoned => Kind::SandboxDb,
+            Self::RestorePhaseTransitionLost { .. } => Kind::TransitionLost,
+            Self::QuarantineRecoveryClaimSuperseded { .. }
+            | Self::ReadQuarantineRecoveryClaim { .. }
+            | Self::RenewQuarantineRecoveryClaim { .. }
+            | Self::PersistOrphanQuarantineRecovery { .. }
+            | Self::QuarantineRecoveryPlanRpc { .. }
+            | Self::QuarantineRecoveryAbandonedAtShutdown { .. } => Kind::QuarantineRecovery,
+            Self::QuarantineRecoveryTimedOut { .. } => Kind::QuarantineRecoveryTimeout,
+            Self::ParentTemplateLookup { .. } => Kind::ParentTemplate,
+            Self::BtrfsReceive { .. } => Kind::BtrfsReceive,
+            Self::ClusterApiUnconfigured(_)
+            | Self::SnapshotNotRegistered(_)
+            | Self::AdmissionRejected(_)
+            | Self::RootfsPolicy(_)
+            | Self::CanonicalRootConflict { .. }
+            | Self::Other(_) => Kind::Other,
+        }
+    }
+
     /// The error's own message, for the variants that carry no external text.
     ///
     /// Redact-by-default, because the alternative was tried and leaked. A
@@ -1256,6 +1298,8 @@ pub async fn prepare_restore_dir(
     sandbox_id: &str,
     execution_fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence,
     transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
+    templates: &dyn crate::template_resolver::TemplateResolver,
 ) -> Result<RestorePrepared, RestoreError> {
     let latest = latest_ready_snapshot(sandbox_id).await?;
     let staged = restore_pull_metadata_from_source(
@@ -1264,7 +1308,7 @@ pub async fn prepare_restore_dir(
         RestoreMetadataDestination::InPlace(transfer_scope_id),
     )
     .await?;
-    restore_pull_rootfs(&staged, execution_fence).await?;
+    restore_pull_rootfs(&staged, execution_fence, node_manager, templates).await?;
     Ok(RestorePrepared {
         snapshot_dir: staged.snapshot_dir,
         storage_uri: staged.storage_uri,
@@ -1278,6 +1322,8 @@ pub async fn prepare_restore_dir_from_uri(
     execution_fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence,
     storage_uri: &str,
     transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
+    templates: &dyn crate::template_resolver::TemplateResolver,
 ) -> Result<RestorePrepared, RestoreError> {
     let config = SnapshotUploadConfig::from_uri(storage_uri)
         .map_err(|e| RestoreError::Other(format!("parse storage_uri: {e}")))?;
@@ -1290,7 +1336,7 @@ pub async fn prepare_restore_dir_from_uri(
         RestoreMetadataDestination::InPlace(transfer_scope_id),
     )
     .await?;
-    restore_pull_rootfs(&staged, execution_fence).await?;
+    restore_pull_rootfs(&staged, execution_fence, node_manager, templates).await?;
     Ok(RestorePrepared {
         snapshot_dir: staged.snapshot_dir,
         storage_uri: staged.storage_uri,
@@ -1762,8 +1808,30 @@ async fn restore_pull_metadata_from_source_for_identity(
     let meta_path = snapshot_dir.join("snapshot.json");
     let meta_bytes = std::fs::read(&meta_path)
         .map_err(|e| RestoreError::Other(format!("read {}: {e}", meta_path.display())))?;
-    let meta: crate::snapshot_upload::SnapshotMeta = serde_json::from_slice(&meta_bytes)
+    let mut meta: crate::snapshot_upload::SnapshotMeta = serde_json::from_slice(&meta_bytes)
         .map_err(|e| RestoreError::Other(format!("parse {}: {e}", meta_path.display())))?;
+    // A retained source identity is node-local. Uploads no longer carry one,
+    // but a restored artifact never has the bundle it would name, and its
+    // local sidecar must describe the pulled stream. Volume-manager wrote the
+    // pulled file under its own identity, so replace it through a sibling and
+    // a rename rather than opening it for writing.
+    if meta.rootfs_send_source_id.take().is_some() {
+        // The durable replacement syncs a file and its directory, so it runs
+        // off the async workers. The staging guard travels with it: a
+        // cancelled restore cannot remove the directory mid-replacement.
+        let dir = snapshot_dir.clone();
+        let (guard, rewritten) = tokio::task::spawn_blocking(move || {
+            let rewritten = replace_restored_sidecar(&dir, &meta).map(|()| meta);
+            (sandbox_dir_guard, rewritten)
+        })
+        .await
+        .map_err(|source| {
+            RestoreError::Other(format!("join rewrite of {}: {source}", meta_path.display()))
+        })?;
+        sandbox_dir_guard = guard;
+        meta = rewritten
+            .map_err(|e| RestoreError::Other(format!("rewrite {}: {e}", meta_path.display())))?;
+    }
     validate_restore_metadata_identity(&meta, sandbox_id, expected_source_sandbox_id)?;
     let codec = codec_from_meta(&meta).map_err(|error| RestoreError::Other(error.to_string()))?;
     tracing::info!(
@@ -1788,6 +1856,23 @@ async fn restore_pull_metadata_from_source_for_identity(
     })
 }
 
+/// Replace a pulled `snapshot.json` with `meta` through a sibling and a
+/// rename. The pulled file belongs to volume-manager's identity and is not
+/// writable by this service; the snapshot directory is.
+pub(crate) fn replace_restored_sidecar(
+    snapshot_dir: &Path,
+    meta: &crate::snapshot_upload::SnapshotMeta,
+) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(meta)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    crate::snapshot_upload::replace_file_durably(
+        snapshot_dir,
+        ".snapshot.json.restore",
+        crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME,
+        &bytes,
+    )
+}
+
 fn preserve_attributed_metadata_retry(
     sandbox_dir_guard: &mut SandboxCacheDirGuard,
     sandbox_row_exists: bool,
@@ -1810,6 +1895,8 @@ fn preserve_attributed_metadata_retry(
 pub async fn restore_pull_rootfs(
     stage: &RestoreMetadataStaged,
     execution_fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence,
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
+    templates: &dyn crate::template_resolver::TemplateResolver,
 ) -> Result<(), RestoreError> {
     use pplx_space_node_mgr_client::execution_fence::InstanceTarget;
     let target = stage.filesystem_scope_id.map_or(
@@ -1840,7 +1927,7 @@ pub async fn restore_pull_rootfs(
         )
         .await;
         if let Err(ref e) = stage_result {
-            handle_restore_stage_failure(stage, target, e).await;
+            handle_restore_stage_failure(stage, target, e, node_manager).await;
         }
         return stage_result;
     }
@@ -1855,6 +1942,8 @@ pub async fn restore_pull_rootfs(
                 crate::snapshot_upload::artifact_kind_from_meta(&stage.meta),
                 stage.transfer_scope_id,
                 target,
+                node_manager,
+                templates,
             )
             .await
         }
@@ -1880,7 +1969,7 @@ pub async fn restore_pull_rootfs(
     };
 
     if let Err(ref e) = stage_result {
-        handle_restore_stage_failure(stage, target, e).await;
+        handle_restore_stage_failure(stage, target, e, node_manager).await;
     }
     stage_result
 }
@@ -1889,6 +1978,7 @@ async fn handle_restore_stage_failure(
     stage: &RestoreMetadataStaged,
     target: pplx_space_node_mgr_client::execution_fence::InstanceTarget,
     error: &RestoreError,
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
 ) {
     if matches!(error, RestoreError::AdmissionRejected(_)) {
         preserve_completed_restore_artifacts(stage);
@@ -1905,7 +1995,13 @@ async fn handle_restore_stage_failure(
         snapshot_dir = %stage.snapshot_dir.display(),
         "cross-node restore staging failed; removing partial artifacts"
     );
-    cleanup_partial_restore_artifacts(&stage.sandbox_dir, &stage.meta.sandbox_id, target).await;
+    cleanup_partial_restore_artifacts(
+        &stage.sandbox_dir,
+        &stage.meta.sandbox_id,
+        target,
+        node_manager,
+    )
+    .await;
 }
 
 fn preserve_completed_restore_artifacts(stage: &RestoreMetadataStaged) {
@@ -1951,6 +2047,7 @@ async fn cleanup_partial_restore_artifacts(
     sandbox_dir: &Path,
     sandbox_id: &str,
     target: pplx_space_node_mgr_client::execution_fence::InstanceTarget,
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
 ) {
     use pplx_space_node_mgr_client::execution_fence::InstanceTarget;
     let scope = match target {
@@ -1961,7 +2058,7 @@ async fn cleanup_partial_restore_artifacts(
         sandbox_dir,
         sandbox_id,
         scope,
-        crate::btrfs_via_nodemgr::delete_sandbox_instance(sandbox_id, target),
+        crate::btrfs_via_nodemgr::delete_sandbox_instance(sandbox_id, target, node_manager),
     )
     .await;
 }
@@ -2078,6 +2175,19 @@ async fn pull_artifact_inner(
     transfer_scope_id: Option<pplx_space_common_core::types::TransferScopeId>,
 ) -> Result<(), RestoreError> {
     let sandbox_id = identity.sandbox_id;
+    let parent = local_path
+        .parent()
+        .ok_or_else(|| RestoreError::Other("snapshot pull destination has no parent".to_owned()))?;
+    let prepare_parent = parent.to_owned();
+    tokio::task::spawn_blocking(move || crate::transfer_directory::prepare(&prepare_parent))
+        .await
+        .map_err(|source| {
+            RestoreError::Other(format!("join transfer directory preparation: {source}"))
+        })?
+        .map_err(|source| RestoreError::CreateDirectory {
+            path: parent.to_owned(),
+            source,
+        })?;
     let s3_uri = restore_artifact_uri(config, file_name);
     let local_path_str = local_path.to_string_lossy().into_owned();
     let adopted = adopt_completed_replacement_temp(sandbox_id, &local_path, &s3_uri);
@@ -2440,6 +2550,10 @@ async fn stage_encrypted_restore(
 /// deterministic `received_uuid`. Failure on any of these surfaces as
 /// `RestoreError::Other` with a precise diagnostic — the caller is
 /// responsible for cleanup of the partial staging directory.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent restore input; the node-manager and template-manager clients are injected"
+)]
 async fn stage_btrfs_send_restore(
     identity: RestoreTransferIdentity<'_>,
     config: &SnapshotUploadConfig,
@@ -2448,6 +2562,8 @@ async fn stage_btrfs_send_restore(
     artifact_kind: ArtifactKind,
     transfer_scope_id: Option<pplx_space_common_core::types::TransferScopeId>,
     target: pplx_space_node_mgr_client::execution_fence::InstanceTarget,
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
+    templates: &dyn crate::template_resolver::TemplateResolver,
 ) -> Result<(), RestoreError> {
     let sandbox_id = identity.sandbox_id;
     let sidecar_bytes = std::fs::read(sidecar_path).map_err(|e| {
@@ -2466,10 +2582,9 @@ async fn stage_btrfs_send_restore(
         ))
     })?;
 
-    // Materialize the template and pull the artifacts concurrently. The
-    // template is only a prerequisite of the `btrfs receive` below — not
-    // of the downloads — so a cold-node template pull hides behind the
-    // large artifact transfers instead of preceding them serially.
+    // Template and rootfs availability gate receive; runtime-state downloads
+    // are independent. Keep them running while node-manager reconstructs the
+    // filesystem, then join all work before publishing or cleaning staging.
     //
     // tmplmgr's `GetTemplate` transparently triggers an on-demand S3
     // pull when the template isn't cached, so this works the first time
@@ -2482,45 +2597,51 @@ async fn stage_btrfs_send_restore(
     // additionally carry binfile + memfile; disk artifacts cold-boot and must
     // not require runtime-state blobs. metadata.json was pulled by the
     // dispatcher.
-    let pulls = btrfs_restore_artifacts(artifact_kind)
-        .into_iter()
-        .map(|(artifact, local_name)| -> BoxFuture<'_, _> {
-            Box::pin(pull_artifact(
-                identity,
-                config,
-                snapshot_dir.join(local_name),
-                artifact,
-                transfer_scope_id,
-            ))
-        })
-        .collect::<Vec<_>>();
-    run_staging_transfers(
-        Some(Box::pin(async {
-            ensure_local_template(sandbox_id, template_name, content_hash)
+    let mut rootfs_pulls = Vec::with_capacity(1);
+    let mut runtime_pulls = Vec::with_capacity(2);
+    for (artifact, local_name) in btrfs_restore_artifacts(artifact_kind) {
+        let pull: BoxFuture<'_, _> = Box::pin(pull_artifact(
+            identity,
+            config,
+            snapshot_dir.join(local_name),
+            artifact,
+            transfer_scope_id,
+        ));
+        if artifact == SnapshotArtifact::RootfsBtrfsSend {
+            rootfs_pulls.push(pull);
+        } else {
+            runtime_pulls.push(pull);
+        }
+    }
+    run_btrfs_staging(
+        Box::pin(async {
+            ensure_local_template(templates, sandbox_id, template_name, content_hash)
                 .await
                 .map(drop)
-        })),
-        pulls,
+        }),
+        rootfs_pulls,
+        runtime_pulls,
+        Box::pin(async {
+            // Node-manager retains privileged receive and execution fencing.
+            crate::btrfs_via_nodemgr::receive_instance(
+                sandbox_id,
+                template_name,
+                content_hash,
+                target,
+                node_manager,
+            )
+            .instrument(tracing::info_span!(
+                "sbxmgr.start.stage",
+                sandbox_id,
+                stage = "restore.snapshot.btrfs_receive",
+                otel.name = "restore.snapshot.btrfs_receive",
+                codec = RestoreCodec::BtrfsSendV1.as_str(),
+            ))
+            .await
+            .map_err(|source| RestoreError::BtrfsReceive { source })
+        }),
     )
     .await?;
-
-    // Delegate the btrfs portion to node-manager (the privileged
-    // daemon — sbxmgr lacks CAP_SYS_ADMIN). nodemgr-side this verifies
-    // the local template has the matching deterministic
-    // `received_uuid`, cleans up stale instance / instance.ro, runs
-    // `btrfs receive`, renames the received subvolume to `instance/`,
-    // toggles RW. Failures (template missing / stamp mismatch /
-    // receive aborted) preserve the status as `RestoreError::BtrfsReceive`.
-    crate::btrfs_via_nodemgr::receive_instance(sandbox_id, template_name, content_hash, target)
-        .instrument(tracing::info_span!(
-            "sbxmgr.start.stage",
-            sandbox_id,
-            stage = "restore.snapshot.btrfs_receive",
-            otel.name = "restore.snapshot.btrfs_receive",
-            codec = RestoreCodec::BtrfsSendV1.as_str(),
-        ))
-        .await
-        .map_err(|source| RestoreError::BtrfsReceive { source })?;
 
     tracing::info!(
         sandbox_id,
@@ -2550,35 +2671,65 @@ fn btrfs_restore_artifacts(artifact_kind: ArtifactKind) -> Vec<(SnapshotArtifact
     artifacts
 }
 
+async fn run_btrfs_staging<'a>(
+    template: BoxFuture<'a, Result<(), RestoreError>>,
+    rootfs_pulls: Vec<BoxFuture<'a, Result<(), RestoreError>>>,
+    runtime_pulls: Vec<BoxFuture<'a, Result<(), RestoreError>>>,
+    receive: BoxFuture<'a, Result<(), RestoreError>>,
+) -> Result<(), RestoreError> {
+    let rootfs = async {
+        let (template_result, pulls) = tokio::join!(template, join_all(rootfs_pulls));
+        let rootfs_result: Result<(), RestoreError> = pulls.into_iter().collect();
+        let receive_result = if template_result.is_ok() && rootfs_result.is_ok() {
+            receive.await
+        } else {
+            Ok(())
+        };
+        (template_result, rootfs_result, receive_result)
+    };
+    // Do not cancel sibling downloads or receive on failure: cleanup must only
+    // run after all staging work finishes. Preserve the previous error order,
+    // including which failure decides whether completed files survive retry.
+    let ((template, rootfs, receive), runtime) = tokio::join!(rootfs, join_all(runtime_pulls));
+    template?;
+    runtime.into_iter().collect::<Result<(), RestoreError>>()?;
+    rootfs?;
+    receive
+}
+
 /// Ensure `(template_name, content_hash)` is locally cached by asking
 /// tmplmgr — same RPC the sandbox-create path uses. Returns the local
 /// directory the template lives at.
 async fn ensure_local_template(
+    templates: &dyn crate::template_resolver::TemplateResolver,
     sandbox_id: &str,
     template_name: &str,
     content_hash: &str,
 ) -> Result<String, RestoreError> {
+    use crate::template_resolver::TemplateLookupError;
     async {
-        let mut client = pplx_space_template_mgr_client::connect()
+        let resp = templates
+            .get_template(tonic::Request::new(
+                pplx_space_template_mgr_client::proto::GetTemplateRequest {
+                    caller_org_id: None,
+                    template: Some(pplx_space_template_mgr_client::proto::TemplateRef {
+                        name: template_name.to_string(),
+                        content_hash: Some(content_hash.to_string()),
+                        tag: None,
+                    }),
+                    vcpu: None,
+                    memory_mib: None,
+                },
+            ))
             .await
-            .map_err(|e| {
-                RestoreError::Other(format!(
+            .map_err(|error| match error {
+                TemplateLookupError::Connect(e) => RestoreError::Other(format!(
                     "tmplmgr connect for GetTemplate({template_name}): {e}"
-                ))
-            })?;
-        let resp = client
-            .get_template(pplx_space_template_mgr_client::proto::GetTemplateRequest {
-                caller_org_id: None,
-                template: Some(pplx_space_template_mgr_client::proto::TemplateRef {
-                    name: template_name.to_string(),
-                    content_hash: Some(content_hash.to_string()),
-                    tag: None,
-                }),
-                vcpu: None,
-                memory_mib: None,
-            })
-            .await
-            .map_err(|error| template_pull_error(template_name, content_hash, error))?
+                )),
+                TemplateLookupError::Rpc(error) => {
+                    template_pull_error(template_name, content_hash, error)
+                }
+            })?
             .into_inner();
         if resp.template_dir.is_empty() {
             return Err(RestoreError::Other(format!(

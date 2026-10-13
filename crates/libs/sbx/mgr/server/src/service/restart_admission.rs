@@ -13,6 +13,7 @@ use super::SandboxManagerService;
 use super::drain::{DrainState, acquire_state_writer, with_state_writer};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
+use tracing::Instrument;
 
 tokio::task_local! {
     static CALLER_CANCELLED: CancellationToken;
@@ -54,6 +55,36 @@ pub(super) async fn wait_for_activation_admission<T>(
                 "sandbox {sandbox_id} activation admission is busy; retry"
             )))
         }
+    }
+}
+
+/// How a guest process start ended.
+#[derive(Debug)]
+pub(super) enum GuestStartOutcome<T> {
+    Opened(T),
+    Failed(tonic::Status),
+    /// The caller disconnected first; nothing failed in the guest.
+    CallerGone,
+}
+
+/// Abandon a guest process start whose caller has disconnected.
+///
+/// The guest accepts a start only at its idempotency `begin()`. A start
+/// dropped before then releases its reservation and never runs; one already
+/// begun keeps running and is recovered by the caller's same-key retry. So the
+/// start call itself is safe to abandon. Waking the sandbox before it is not,
+/// and stays owned.
+pub(super) async fn abandon_start_if_caller_cancelled<T>(
+    start: impl Future<Output = Result<T, tonic::Status>>,
+) -> GuestStartOutcome<T> {
+    let cancelled = CALLER_CANCELLED.try_with(Clone::clone).unwrap_or_default();
+    tokio::select! {
+        biased;
+        _ = cancelled.cancelled() => GuestStartOutcome::CallerGone,
+        result = start => match result {
+            Ok(opened) => GuestStartOutcome::Opened(opened),
+            Err(status) => GuestStartOutcome::Failed(status),
+        },
     }
 }
 
@@ -163,7 +194,6 @@ restart_rpcs! {
     SandboxStop => ("/space.sandbox.manager.v1.SandboxManager/Stop", StateWriter),
     SandboxKill => ("/space.sandbox.manager.v1.SandboxManager/Kill", StateWriter),
     SandboxDelete => ("/space.sandbox.manager.v1.SandboxManager/Delete", StateWriter),
-    SandboxReleaseExecution => ("/space.sandbox.manager.v1.SandboxManager/ReleaseExecution", StateWriter),
     SandboxListAutoLifecycleDeleteReceipts => ("/space.sandbox.manager.v1.SandboxManager/ListAutoLifecycleDeleteReceipts", ReadOnlyWithNarrowStateWrites),
     SandboxAcknowledgeAutoLifecycleDeleteReceipts => ("/space.sandbox.manager.v1.SandboxManager/AcknowledgeAutoLifecycleDeleteReceipts", StateWriter),
     SandboxListPendingLocalBackups => ("/space.sandbox.manager.v1.SandboxManager/ListPendingLocalBackups", ReadOnly),
@@ -180,6 +210,7 @@ restart_rpcs! {
     SandboxResume => ("/space.sandbox.manager.v1.SandboxManager/Resume", StateWriter),
     SandboxWake => ("/space.sandbox.manager.v1.SandboxManager/Wake", StateWriter),
     SandboxCreateSnapshot => ("/space.sandbox.manager.v1.SandboxManager/CreateSnapshot", StateWriter),
+    SandboxWaitTemplateApps => ("/space.sandbox.manager.v1.SandboxManager/WaitTemplateApps", StateWriter),
     SandboxCreateTemplateBaseSnapshot => ("/space.sandbox.manager.v1.SandboxManager/CreateTemplateBaseSnapshot", StateWriter),
     SandboxSuspend => ("/space.sandbox.manager.v1.SandboxManager/Suspend", StateWriter),
     SandboxPrepareTeardownSuspend => ("/space.sandbox.manager.v1.SandboxManager/PrepareTeardownSuspend", StateWriter),
@@ -336,10 +367,14 @@ where
                 // dropped by the transport still cancels its queued admission.
                 let cancelled = CancellationToken::new();
                 let cancel_on_drop = cancelled.clone().drop_guard();
-                let task = self.task_tracker.spawn(with_state_writer(
-                    writer,
-                    CALLER_CANCELLED.scope(cancelled, response),
-                ));
+                // The outer trace layer enters the request span only while it
+                // polls its own future. The handler now runs on a spawned task,
+                // so carry the request span explicitly; otherwise outbound
+                // client spans from state-writer handlers start new root traces.
+                let task = self.task_tracker.spawn(
+                    with_state_writer(writer, CALLER_CANCELLED.scope(cancelled, response))
+                        .in_current_span(),
+                );
                 Box::pin(async move {
                     let _cancel_on_drop = cancel_on_drop;
                     task.await.map_err(BoxError::from)?

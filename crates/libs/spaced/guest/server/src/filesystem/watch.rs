@@ -69,6 +69,7 @@ pub(crate) struct WatchManager {
     inner: Arc<Mutex<WatchManagerState>>,
     shutdown: CancellationToken,
     tasks: tokio_util::task::TaskTracker,
+    scan_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl WatchManager {
@@ -77,6 +78,7 @@ impl WatchManager {
             inner: Arc::default(),
             shutdown,
             tasks: tokio_util::task::TaskTracker::new(),
+            scan_slots: paths::new_watch_directory_scan_slots(),
         }
     }
 
@@ -307,7 +309,13 @@ impl WatchManager {
                 filter_config: filter_config.backend_config(),
             };
             let backend_filter = WatchFilter::compile(key.filter_config.clone())?;
-            let plan = plan_watch_registration(&key.root, key.recursive, &backend_filter).await?;
+            let plan = plan_watch_registration(
+                &key.root,
+                key.recursive,
+                &backend_filter,
+                &self.scan_slots,
+            )
+            .await?;
             planned_directories += plan.len();
             if planned_directories > MAX_WATCHED_DIRECTORIES {
                 return Err(Status::resource_exhausted(
@@ -320,7 +328,9 @@ impl WatchManager {
 
         let mut state = self.inner.lock().await;
         if self.shutdown.is_cancelled() {
-            return Err(Status::unavailable("file watching shut down"));
+            return Err(crate::refused(Status::unavailable(
+                "file watching shut down",
+            )));
         }
         if state.ledger_generation != generation {
             return Err(Status::aborted(
@@ -428,12 +438,14 @@ impl WatchManager {
         {
             let mut state = self.inner.lock().await;
             if self.shutdown.is_cancelled() {
-                return Err(Status::unavailable("file watching shut down"));
+                return Err(crate::refused(Status::unavailable(
+                    "file watching shut down",
+                )));
             }
             if active_consumer_count(&state) >= MAX_ACTIVE_WATCHER_CONSUMERS {
-                return Err(Status::resource_exhausted(
+                return Err(crate::refused(Status::resource_exhausted(
                     "too many active file watcher consumers",
-                ));
+                )));
             }
             let backend_key = key.clone();
             if state.roots.contains_key(&backend_key) {
@@ -443,7 +455,8 @@ impl WatchManager {
         }
 
         let registration_plan =
-            plan_watch_registration(&key.root, key.recursive, &backend_filter).await?;
+            plan_watch_registration(&key.root, key.recursive, &backend_filter, &self.scan_slots)
+                .await?;
         let registration = RegisteredWatch::prepare(registration_plan).await?;
         let mut state = self.inner.lock().await;
         self.add_consumer_locked(&mut state, key, consumer, backend_filter, registration)
@@ -458,13 +471,15 @@ impl WatchManager {
         registration: RegisteredWatch,
     ) -> Result<(WatchRootKey, u64), Status> {
         if self.shutdown.is_cancelled() {
-            return Err(Status::unavailable("file watching shut down"));
+            return Err(crate::refused(Status::unavailable(
+                "file watching shut down",
+            )));
         }
         let directory_count = registration.directory_count();
         if active_consumer_count(state) >= MAX_ACTIVE_WATCHER_CONSUMERS {
-            return Err(Status::resource_exhausted(
+            return Err(crate::refused(Status::resource_exhausted(
                 "too many active file watcher consumers",
-            ));
+            )));
         }
         let backend_key = key.clone();
         if state.roots.contains_key(&backend_key) {
@@ -472,9 +487,9 @@ impl WatchManager {
             return Ok((backend_key, consumer_id));
         }
         if directory_budget_exceeded(state, directory_count) {
-            return Err(Status::resource_exhausted(
+            return Err(crate::refused(Status::resource_exhausted(
                 "file watcher directory budget exceeded",
-            ));
+            )));
         }
 
         let shutdown = self.shutdown.child_token();
@@ -493,6 +508,7 @@ impl WatchManager {
                 registration,
                 shutdown: shutdown.clone(),
             },
+            Arc::clone(&self.scan_slots),
             move |event| {
                 let manager = manager.clone();
                 let task_key = task_key.clone();

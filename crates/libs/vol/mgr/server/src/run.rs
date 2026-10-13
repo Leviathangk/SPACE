@@ -29,7 +29,7 @@ pub const SERVICE_NAME: &str = "space-volume-manager";
 const SOCKET_GROUP: &str = group_names::SPACE_SBXCLIENTS;
 // Hard-coded so two instances on the same host cannot be configured to use
 // different mutex files and both acquire concurrently.
-const SERVICE_MUTEX_PATH: &str = "/space/run/volume-manager/service.mutex";
+pub const SERVICE_MUTEX_PATH: &str = "/space/run/volume-manager/service.mutex";
 const UNEXPECTED_SERVER_EXIT_CODE: i32 = 1;
 
 static VOLUME_MANAGER_MIGRATOR: sqlx::migrate::Migrator =
@@ -37,7 +37,6 @@ static VOLUME_MANAGER_MIGRATOR: sqlx::migrate::Migrator =
 static COMMON_SCHEMA_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../../../../db/common");
 
 pub(crate) async fn migrate_volume_manager_db(path: &Path) -> Result<(), SqliteError> {
-    let store = pplx_space_common_svc::sql::baselines::VOLUME_MANAGER;
     pplx_space_common_svc::sql::sqlite::migrate_embedded(
         "volume-manager",
         path,
@@ -45,20 +44,20 @@ pub(crate) async fn migrate_volume_manager_db(path: &Path) -> Result<(), SqliteE
             service: &VOLUME_MANAGER_MIGRATOR,
             common: Some(&COMMON_SCHEMA_MIGRATOR),
         },
-        Some(store.baseline_version),
-        store.migration_failure_policy,
-        Some(pplx_space_volmgr_migrations::prepare_common_jobs_migrations),
     )
     .await
 }
 
 // Static S3 credential escape hatch, resolved here at the deployment boundary
-// (not inside the platform library). When these are set — e.g. a local kind +
-// SeaweedFS stack where credmgr's STS/IRSA exchange isn't available — they are
+// (not inside the platform library). When these are set — e.g. a local kind
+// stack with its S3-compatible object store, where credmgr's STS/IRSA exchange isn't available — they are
 // injected into the service and used directly instead of the credmgr exchange.
 // Production leaves them unset and volume-manager uses credmgr as before.
 const STATIC_ACCESS_KEY_ID_ENV: &str = "SPACE_OBJECT_STORE_STATIC_ACCESS_KEY_ID";
 const STATIC_SECRET_ACCESS_KEY_ENV: &str = "SPACE_OBJECT_STORE_STATIC_SECRET_ACCESS_KEY";
+/// Session token for temporary static credentials (STS, SSO). Without it an
+/// `ASIA…` key is rejected by S3 as an unknown access key.
+const STATIC_SESSION_TOKEN_ENV: &str = "SPACE_OBJECT_STORE_STATIC_SESSION_TOKEN";
 pub const DEFAULT_PUSH_CONCURRENCY: usize = 8;
 pub const DEFAULT_PULL_CONCURRENCY: usize = 24;
 pub const DEFAULT_CODEC_CONCURRENCY: usize = 0;
@@ -168,10 +167,16 @@ fn build_static_credentials(
 
 /// Resolve static S3 credentials from the deployment environment, or `None`.
 fn static_credentials_from_env() -> Option<ObjectCredentials> {
+    static_credentials_from(|name| std::env::var(name).ok())
+}
+
+/// Static credentials from `lookup`, which answers for the three documented
+/// variables; the session token is optional and carried when present.
+fn static_credentials_from(lookup: impl Fn(&str) -> Option<String>) -> Option<ObjectCredentials> {
     build_static_credentials(
-        std::env::var(STATIC_ACCESS_KEY_ID_ENV).ok(),
-        std::env::var(STATIC_SECRET_ACCESS_KEY_ENV).ok(),
-        None,
+        lookup(STATIC_ACCESS_KEY_ID_ENV),
+        lookup(STATIC_SECRET_ACCESS_KEY_ENV),
+        lookup(STATIC_SESSION_TOKEN_ENV),
     )
 }
 
@@ -255,6 +260,8 @@ pub struct VolmgrRunConfig {
     pub transfer_drain_timeout: Duration,
     /// Compress snapshot files with zstd before uploading to S3.
     pub compress: bool,
+    /// Deployment upload policy for ordinary and LUKS snapshots.
+    pub snapshot_upload_mode: crate::SnapshotUploadMode,
     /// Decode zstd pulls inline with the ranged download (one pass) instead of
     /// a separate read-back decompress step.
     pub stream_decode_pulls: bool,
@@ -498,6 +505,7 @@ pub async fn run(
             max_attempts: config.transfer_max_attempts,
             executor: TransferExecutorConfig {
                 compress: config.compress,
+                snapshot_upload_mode: config.snapshot_upload_mode.clone(),
                 stream_decode_pulls: config.stream_decode_pulls,
                 codec_concurrency: config.codec_concurrency,
                 codec_priority_reserve: config.codec_priority_reserve,
@@ -525,6 +533,12 @@ pub async fn run(
     let transfer_admission = service.transfer_admission();
     let service_for_drain = service.clone();
     worker.recover_and_log("vol-mgr.transfer");
+    let source_cleanup_token = shutdown_token.child_token();
+    let source_cleanup = tokio::spawn(
+        service
+            .clone()
+            .run_btrfs_source_cleanup(source_cleanup_token.clone()),
+    );
     let pruner_token = shutdown_token.child_token();
     let pruner_handle = tokio::spawn(
         worker
@@ -562,6 +576,7 @@ pub async fn run(
         server_drain_timeout_secs = config.server_drain_timeout.as_secs(),
         transfer_drain_timeout_secs = config.transfer_drain_timeout.as_secs(),
         compress = config.compress,
+        stream_push_buffer_budget_bytes = config.snapshot_upload_mode.buffer_budget_bytes(),
         stream_decode_pulls = config.stream_decode_pulls,
         service_mutex_timeout_secs = config.service_mutex_timeout.as_secs(),
         "volume manager active; listening on production socket"
@@ -601,6 +616,10 @@ pub async fn run(
             timeout_secs = config.server_drain_timeout.as_secs(),
             "state-mutation admission exceeded its warning deadline; retaining ownership"
         );
+    }
+    source_cleanup_token.cancel();
+    if let Err(error) = source_cleanup.await {
+        tracing::warn!(%error, "send source cleanup task failed");
     }
     pruner_token.cancel();
     queue_metrics_token.cancel();

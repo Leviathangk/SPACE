@@ -91,6 +91,8 @@ message WaitReadyResponse {
   google.protobuf.Duration guest_uptime = 1;
   optional uint64 mem_total_bytes = 2;
   optional uint32 vcpu_count = 3;
+  // Identity from the same guest observation that established readiness.
+  VersionInfo guest_version = 4;
 }
 
 message ConfigureProcessEnvRequest {

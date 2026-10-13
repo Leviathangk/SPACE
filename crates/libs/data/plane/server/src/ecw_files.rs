@@ -1,8 +1,6 @@
 use std::{
     convert::Infallible,
-    io::SeekFrom,
     pin::Pin,
-    sync::Arc,
     task::{Context, Poll},
     time::Duration as StdDuration,
 };
@@ -34,7 +32,7 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::{
     AttachedStreamPermit, DataPlaneState, ECW_FILE_WATCH_STREAM_KIND, EcwProxyError,
@@ -46,10 +44,13 @@ use crate::runtime_route::{
     EcwRouteAttemptError, bounded_ecw_route_transfer, bounded_node_api_unary,
     retryable_bounded_node_api_unary,
 };
+use multipart::{multipart_boundary, resolve_multipart_uploads, spool_multipart_uploads};
 
 const E2B_FILE_CONTENT_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 const E2B_FILE_WRITE_CHUNK_BYTES: usize = 3 * 1024 * 1024;
 const E2B_PROTO_BODY_LIMIT: usize = 1024 * 1024;
+/// Stated as "1 MiB" in `json_file_write_body_too_large_error`.
+const E2B_JSON_FILE_WRITE_BODY_LIMIT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub(super) struct FileReadQueryE2b {
@@ -134,12 +135,6 @@ pub(super) struct FileWriteInfoE2b {
     #[serde(rename = "type")]
     file_type: &'static str,
     path: String,
-}
-
-#[derive(Debug)]
-struct MultipartUploadPartE2b {
-    filename: Option<String>,
-    data: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Message, Deserialize)]
@@ -262,7 +257,7 @@ pub(super) async fn read_file(
         let chunk = chunk.map_err(|status| std::io::Error::other(status.to_string()))?;
         bytes_read = checked_file_content_len(bytes_read, chunk.data.len())
             .map_err(|err| std::io::Error::other(err.message))?;
-        Ok::<Bytes, std::io::Error>(Bytes::from(chunk.data))
+        Ok::<Bytes, std::io::Error>(chunk.data)
     });
 
     Ok((
@@ -284,88 +279,157 @@ pub(super) async fn write_file(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/json");
     let user = extract_write_user(query.username.as_deref(), &headers)?;
-    if is_octet_stream_content_type(content_type) {
-        reject_oversized_content_length(&headers)?;
-        let Some(path) = query.path else {
+    // Reject what the headers and query alone can before admission, so a
+    // malformed request never waits for or holds an upload permit.
+    let (write_body, declared_len) = if is_octet_stream_content_type(content_type) {
+        let declared_len = reject_oversized_content_length(
+            &headers,
+            E2B_FILE_CONTENT_LIMIT_BYTES,
+            file_too_large_error,
+        )?;
+        let Some(path) = query.path.as_deref() else {
             return Err(EcwProxyError::bad_request(
                 "path query parameter is required for octet-stream uploads",
             ));
         };
-        let path = e2b_request_root(&path, user.as_ref())?;
-        spaced_write_body_stream(&state, route, path.clone(), body, user).await?;
-        return Ok(Json(vec![FileWriteInfoE2b {
-            name: path_basename(&path).to_string(),
-            file_type: "file",
-            path,
-        }]));
-    }
-
-    let body = to_bytes(body, E2B_FILE_CONTENT_LIMIT_BYTES)
-        .await
-        .map_err(|_| EcwProxyError::bad_request("Invalid request body"))?;
-
-    let writes = if is_json_content_type(content_type) {
-        let request: FileWriteRequestE2b = serde_json::from_slice(&body)
-            .map_err(|_| EcwProxyError::bad_request("Invalid JSON file write request"))?;
-        vec![(
-            e2b_request_root(&request.path, user.as_ref())?,
-            file_write_content_to_bytes(request.content)?,
-        )]
+        let path = e2b_request_root(path, user.as_ref())?;
+        (WriteBody::OctetStream(path), declared_len)
+    } else if is_json_content_type(content_type) {
+        let declared_len = reject_oversized_content_length(
+            &headers,
+            E2B_JSON_FILE_WRITE_BODY_LIMIT_BYTES,
+            json_file_write_body_too_large_error,
+        )?;
+        (WriteBody::Json, declared_len)
     } else if content_type.starts_with("multipart/form-data") {
-        let boundary = multipart_boundary(content_type).ok_or_else(|| {
-            EcwProxyError::bad_request("multipart/form-data boundary is required")
-        })?;
-        let uploads = parse_multipart_uploads(&body, boundary)?;
-        if query.path.is_some() && uploads.len() > 1 {
-            return Err(EcwProxyError::bad_request(
-                "path query parameter only supports a single multipart upload",
-            ));
+        let declared_len = reject_oversized_content_length(
+            &headers,
+            E2B_FILE_CONTENT_LIMIT_BYTES,
+            file_too_large_error,
+        )?;
+        // A query path names the destination, so check it before reading the
+        // body rather than after spooling the upload.
+        if let Some(path) = &query.path {
+            e2b_request_root(path, user.as_ref())?;
         }
-        uploads
-            .into_iter()
-            .map(|upload| {
-                let path = query.path.clone().or(upload.filename).ok_or_else(|| {
-                    EcwProxyError::bad_request("multipart uploads require a filename or path query")
-                })?;
-                Ok((e2b_request_root(&path, user.as_ref())?, upload.data))
-            })
-            .collect::<Result<Vec<_>, _>>()?
+        let boundary = multipart_boundary(content_type).ok_or_else(|| {
+            EcwProxyError::bad_request(
+                "multipart/form-data boundary of 1 to 70 characters is required",
+            )
+        })?;
+        (WriteBody::Multipart(boundary), declared_len)
     } else {
         return Err(EcwProxyError::bad_request(
             "Unsupported Content-Type for file write",
         ));
     };
+    // Admit after authentication so unauthenticated requests can't queue for
+    // upload slots, and before the body is read so a rejected upload costs
+    // the pod no body bytes.
+    let _upload_permit = match &state.uploads {
+        Some(uploads) => {
+            // Every write path stops reading at its limit, so an undeclared
+            // length reserves the whole of it.
+            let reserve = declared_len.unwrap_or_else(|| write_body.body_limit());
+            Some(uploads.admit(reserve as u64).await?)
+        }
+        None => None,
+    };
 
-    let mut written = Vec::with_capacity(writes.len());
-    let mut route = route;
-    for (path, data) in writes {
-        route = spaced_write_bytes(&state, route, path.clone(), data, user.clone()).await?;
-        written.push(FileWriteInfoE2b {
-            name: path_basename(&path).to_string(),
-            file_type: "file",
-            path,
-        });
+    match write_body {
+        WriteBody::OctetStream(path) => {
+            // Create the parent before reading the body, so a destination whose
+            // parent can't be created fails without spooling the upload. Other
+            // write failures still surface after spooling.
+            let route = ensure_parent_dir(&state, route, &path, user.clone()).await?;
+            let mut spool = SpoolFiles::default();
+            let upload = spool_body_upload(body, &mut spool).await?;
+            spaced_write_spooled(&state, route, path.clone(), &upload, user).await?;
+            Ok(Json(vec![file_write_info(path)]))
+        }
+        WriteBody::Json => {
+            let request = read_json_file_write_request(&headers, body).await?;
+            let path = e2b_request_root(&request.path, user.as_ref())?;
+            spaced_write_bytes(
+                &state,
+                route,
+                path.clone(),
+                file_write_content_to_bytes(request.content)?,
+                user,
+            )
+            .await?;
+            Ok(Json(vec![file_write_info(path)]))
+        }
+        WriteBody::Multipart(boundary) => {
+            // Owns every staged file until the request ends, however it ends.
+            let mut spool = SpoolFiles::default();
+            let uploads =
+                spool_multipart_uploads(body, boundary, query.path.is_none(), &mut spool).await?;
+            let writes = resolve_multipart_uploads(uploads, query.path, user.as_ref())?;
+            let mut written = Vec::with_capacity(writes.len());
+            let mut route = route;
+            for (path, upload) in writes {
+                route = ensure_parent_dir(&state, route, &path, user.clone()).await?;
+                route = spaced_write_spooled(&state, route, path.clone(), &upload, user.clone())
+                    .await?;
+                written.push(file_write_info(path));
+            }
+            Ok(Json(written))
+        }
     }
-
-    Ok(Json(written))
 }
 
-fn reject_oversized_content_length(headers: &HeaderMap) -> Result<(), EcwProxyError> {
+/// How a `POST /files` body is carried, decided from headers alone.
+enum WriteBody<'a> {
+    /// Spooled to disk, then streamed to the guest; carries the validated
+    /// destination path.
+    OctetStream(String),
+    /// Buffered in memory, up to the JSON write limit.
+    Json,
+    /// Spooled to disk part by part; carries the boundary.
+    Multipart(&'a str),
+}
+
+impl WriteBody<'_> {
+    /// The most body this write path reads.
+    fn body_limit(&self) -> usize {
+        match self {
+            Self::OctetStream(_) | Self::Multipart(_) => E2B_FILE_CONTENT_LIMIT_BYTES,
+            Self::Json => E2B_JSON_FILE_WRITE_BODY_LIMIT_BYTES,
+        }
+    }
+}
+
+fn file_write_info(path: String) -> FileWriteInfoE2b {
+    FileWriteInfoE2b {
+        name: path_basename(&path).to_string(),
+        file_type: "file",
+        path,
+    }
+}
+
+/// Rejects a declared `Content-Length` that is unparsable or over `limit`, and
+/// returns the declared length, if any.
+fn reject_oversized_content_length(
+    headers: &HeaderMap,
+    limit: usize,
+    too_large: fn() -> EcwProxyError,
+) -> Result<Option<usize>, EcwProxyError> {
     let Some(content_length) = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
-        return Ok(());
+        return Ok(None);
     };
     let content_length = content_length
         .parse::<usize>()
         .map_err(|_| EcwProxyError::bad_request("Invalid Content-Length"))?;
-    if content_length > E2B_FILE_CONTENT_LIMIT_BYTES {
-        return Err(file_too_large_error());
+    if content_length > limit {
+        return Err(too_large());
     }
-    Ok(())
+    Ok(Some(content_length))
 }
 
 fn extract_write_user(
@@ -704,26 +768,34 @@ async fn ensure_parent_dir(
     Ok(route)
 }
 
-async fn spaced_write_body_stream(
-    state: &DataPlaneState,
-    route: EcwResolvedRoute,
-    path: String,
+async fn spool_body_upload(
     mut body: Body,
-    user: Option<GuestUserName>,
-) -> Result<(), EcwProxyError> {
-    let route = ensure_parent_dir(state, route, &path, user.clone()).await?;
-
-    let mut upload = SpooledUpload::new().await?;
+    spool: &mut SpoolFiles,
+) -> Result<StagedUpload, EcwProxyError> {
+    let mut upload = spool.create().await?;
     while let Some(frame) = body.frame().await {
         let frame = frame.map_err(|_| EcwProxyError::bad_request("Invalid request body"))?;
         if let Some(data) = frame.data_ref() {
             upload.write_chunk(data).await?;
         }
     }
-    upload.rewind().await?;
-    let upload_path = upload._path.to_path_buf();
+    upload.finish().await
+}
 
-    let _ = bounded_ecw_route_transfer(
+/// Streams a staged upload to the guest. Fails, rather than reporting
+/// success, if the spool file can't be read to the end or the guest
+/// acknowledges fewer bytes than were staged.
+async fn spaced_write_spooled(
+    state: &DataPlaneState,
+    route: EcwResolvedRoute,
+    path: String,
+    upload: &StagedUpload,
+    user: Option<GuestUserName>,
+) -> Result<EcwResolvedRoute, EcwProxyError> {
+    // Callers create the parent directory first. The spool file stays on disk
+    // until the request's `SpoolFiles` drops, so every attempt can reopen it.
+    let upload_path = upload.path.clone();
+    let (response, route) = bounded_ecw_route_transfer(
         state,
         route,
         "filesystem_write",
@@ -741,47 +813,157 @@ async fn spaced_write_body_stream(
                     .await
                     .map_err(EcwRouteAttemptError::Proxy)?;
                 let mut client = WorkerApiClient::new(wrap_grpc_client_channel(channel));
-                let stream = spooled_write_requests(route.sandbox_id, path, file, user);
-                client
-                    .spaced_write(node_api_request_with_route_token_state(
-                        stream,
-                        route.space_api_route_token.as_ref(),
-                    )?)
-                    .await
-                    .map(|response| response.into_inner())
-                    .map_err(EcwRouteAttemptError::Status)
+                let (read_failed, read_failure) = tokio::sync::oneshot::channel();
+                let stream =
+                    spooled_write_requests(route.sandbox_id, path, file, user, read_failed);
+                let write = client.spaced_write(node_api_request_with_route_token_state(
+                    stream,
+                    route.space_api_route_token.as_ref(),
+                )?);
+                fail_on_spool_read_failure(write, read_failure).await
             }
         },
         raw_file_write_error,
     )
     .await?;
-    Ok(())
+    check_spooled_write_len(response.bytes_written, upload.len)?;
+    Ok(route)
 }
 
-struct SpooledUpload {
+/// Runs the write call until it finishes or `spooled_write_requests` reports
+/// a spool read failure. On a read failure the call is dropped and the HTTP
+/// request fails, instead of the stream ending cleanly, which would make the
+/// guest finalize the prefix as a complete write. A dropped call still doesn't
+/// guarantee the guest discards that prefix: it writes the target in place,
+/// and the sandbox manager can end the guest's input cleanly once its own
+/// request stream fails.
+async fn fail_on_spool_read_failure<W>(
+    write: W,
+    read_failure: tokio::sync::oneshot::Receiver<()>,
+) -> Result<spaced_ops::WriteResponse, EcwRouteAttemptError>
+where
+    W: std::future::Future<
+            Output = Result<tonic::Response<spaced_ops::WriteResponse>, tonic::Status>,
+        >,
+{
+    tokio::select! {
+        response = write => response
+            .map(tonic::Response::into_inner)
+            .map_err(EcwRouteAttemptError::Status),
+        // A dropped sender (the stream finished) disables this arm.
+        Ok(()) = read_failure => Err(EcwRouteAttemptError::Proxy(
+            EcwProxyError::internal("Failed to read staged upload"),
+        )),
+    }
+}
+
+fn check_spooled_write_len(bytes_written: u64, staged_len: usize) -> Result<(), EcwProxyError> {
+    if u64::try_from(staged_len).is_ok_and(|staged_len| staged_len == bytes_written) {
+        return Ok(());
+    }
+    tracing::warn!(
+        bytes_written,
+        staged_len,
+        "guest acknowledged a different length than the staged upload"
+    );
+    Err(EcwProxyError::internal(
+        "Staged upload was not written completely",
+    ))
+}
+
+/// Spool files staged by one request, removed when this guard drops: on
+/// success, error, and cancellation alike. Removal normally runs in one
+/// blocking task, so a request that staged many parts doesn't unlink them all
+/// on a runtime thread; it runs inline only while unwinding or without a
+/// runtime.
+#[derive(Debug, Default)]
+pub(super) struct SpoolFiles {
+    paths: Vec<tempfile::TempPath>,
+    dir: Option<std::path::PathBuf>,
+}
+
+impl SpoolFiles {
+    #[cfg(test)]
+    pub(super) fn in_dir(dir: std::path::PathBuf) -> Self {
+        Self {
+            paths: Vec::new(),
+            dir: Some(dir),
+        }
+    }
+
+    /// Creates a spool file this guard owns from the start, so even a part
+    /// abandoned mid-write is removed with the rest.
+    pub(super) async fn create(&mut self) -> Result<SpooledUpload, EcwProxyError> {
+        let dir = self.dir.clone().unwrap_or_else(std::env::temp_dir);
+        // Creating the file is a blocking syscall; keep it off the runtime.
+        let tempfile = tokio::task::spawn_blocking(move || {
+            tempfile::Builder::new()
+                .prefix("space-ecw-upload-")
+                .tempfile_in(dir)
+        })
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "ECW upload spool file creation task failed");
+            EcwProxyError::internal("Failed to stage upload")
+        })?
+        .map_err(|error| {
+            tracing::warn!(%error, "failed to create ECW upload spool file");
+            EcwProxyError::internal("Failed to stage upload")
+        })?;
+        let (file, path) = tempfile.into_parts();
+        let upload = SpooledUpload {
+            file: tokio::fs::File::from_std(file),
+            path: path.to_path_buf(),
+            bytes_written: 0,
+        };
+        self.paths.push(path);
+        Ok(upload)
+    }
+}
+
+impl Drop for SpoolFiles {
+    fn drop(&mut self) {
+        let paths = std::mem::take(&mut self.paths);
+        if paths.is_empty() {
+            return;
+        }
+        let remove = move || {
+            for path in paths {
+                if let Err(error) = path.close() {
+                    tracing::warn!(%error, "failed to remove ECW upload spool file");
+                }
+            }
+        };
+        // While unwinding, a failure to spawn the blocking task would panic
+        // again and abort, so remove inline instead.
+        if std::thread::panicking() {
+            remove();
+            return;
+        }
+        match tokio::runtime::Handle::try_current() {
+            // Detached: removal needs nothing from the request that dropped it.
+            Ok(runtime) => drop(runtime.spawn_blocking(remove)),
+            Err(_) => remove(),
+        }
+    }
+}
+
+/// A finished spool file: its path, owned by a `SpoolFiles`, and its length.
+#[derive(Debug)]
+pub(super) struct StagedUpload {
+    pub(super) path: std::path::PathBuf,
+    pub(super) len: usize,
+}
+
+#[derive(Debug)]
+pub(super) struct SpooledUpload {
     file: tokio::fs::File,
-    _path: tempfile::TempPath,
+    path: std::path::PathBuf,
     bytes_written: usize,
 }
 
 impl SpooledUpload {
-    async fn new() -> Result<Self, EcwProxyError> {
-        let tempfile = tempfile::Builder::new()
-            .prefix("space-ecw-upload-")
-            .tempfile()
-            .map_err(|error| {
-                tracing::warn!(%error, "failed to create ECW upload spool file");
-                EcwProxyError::internal("Failed to stage upload")
-            })?;
-        let (file, path) = tempfile.into_parts();
-        Ok(Self {
-            file: tokio::fs::File::from_std(file),
-            _path: path,
-            bytes_written: 0,
-        })
-    }
-
-    async fn write_chunk(&mut self, data: &[u8]) -> Result<(), EcwProxyError> {
+    pub(super) async fn write_chunk(&mut self, data: &[u8]) -> Result<(), EcwProxyError> {
         self.bytes_written = checked_file_content_len(self.bytes_written, data.len())?;
         self.file.write_all(data).await.map_err(|error| {
             tracing::warn!(%error, "failed to write ECW upload spool file");
@@ -789,40 +971,53 @@ impl SpooledUpload {
         })
     }
 
-    async fn rewind(&mut self) -> Result<(), EcwProxyError> {
+    /// Flushes and closes the spool file, keeping only its path and length.
+    /// Writers reopen it by path, and a request staging many parts must not
+    /// hold a descriptor for each one.
+    pub(super) async fn finish(mut self) -> Result<StagedUpload, EcwProxyError> {
         self.file.flush().await.map_err(|error| {
             tracing::warn!(%error, "failed to flush ECW upload spool file");
             EcwProxyError::internal("Failed to stage upload")
         })?;
-        self.file.seek(SeekFrom::Start(0)).await.map_err(|error| {
-            tracing::warn!(%error, "failed to rewind ECW upload spool file");
-            EcwProxyError::internal("Failed to stage upload")
-        })?;
-        Ok(())
+        Ok(StagedUpload {
+            path: self.path,
+            len: self.bytes_written,
+        })
     }
 }
 
-struct SpooledWriteState {
+struct SpooledWriteState<R> {
     sandbox_id: SandboxId,
     path: String,
     user: Option<GuestUserName>,
-    file: tokio::fs::File,
+    file: R,
+    read_failed: Option<tokio::sync::oneshot::Sender<()>>,
     open_sent: bool,
     done: bool,
 }
 
-fn spooled_write_requests(
+/// The open message, then the spool file in `E2B_FILE_WRITE_CHUNK_BYTES`
+/// chunks. A read error signals `read_failed` and leaves the stream pending
+/// instead of ending it, so the write fails through
+/// `fail_on_spool_read_failure` rather than ending as if the file were
+/// complete.
+fn spooled_write_requests<R>(
     sandbox_id: SandboxId,
     path: String,
-    file: tokio::fs::File,
+    file: R,
     user: Option<GuestUserName>,
-) -> impl Stream<Item = SpacedWriteRequest> + Send + 'static {
+    read_failed: tokio::sync::oneshot::Sender<()>,
+) -> impl Stream<Item = SpacedWriteRequest> + Send + 'static
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
     stream::unfold(
         SpooledWriteState {
             sandbox_id,
             path,
             user,
             file,
+            read_failed: Some(read_failed),
             open_sent: false,
             done: false,
         },
@@ -851,7 +1046,13 @@ fn spooled_write_requests(
                 Ok(read) => read,
                 Err(error) => {
                     tracing::warn!(%error, "failed to read ECW upload spool file");
-                    return None;
+                    if let Some(read_failed) = state.read_failed.take()
+                        && read_failed.send(()).is_err()
+                    {
+                        // The receiver is gone only once the call has finished.
+                        tracing::debug!("ECW upload write finished before the spool read failed");
+                    }
+                    return std::future::pending().await;
                 }
             };
             if read == 0 {
@@ -884,7 +1085,7 @@ fn checked_file_content_len(current_len: usize, chunk_len: usize) -> Result<usiz
 struct ReplayableSpacedWrite {
     sandbox_id: SandboxId,
     path: String,
-    data: Arc<[u8]>,
+    data: Bytes,
     user: Option<GuestUserName>,
 }
 
@@ -898,7 +1099,7 @@ impl ReplayableSpacedWrite {
         Self {
             sandbox_id,
             path,
-            data: data.into(),
+            data: Bytes::from(data),
             user,
         }
     }
@@ -906,7 +1107,7 @@ impl ReplayableSpacedWrite {
     fn stream(&self) -> impl Stream<Item = SpacedWriteRequest> + Send + 'static {
         let sandbox_id = self.sandbox_id.to_string();
         let path = self.path.clone();
-        let data = Arc::clone(&self.data);
+        let data = self.data.clone();
         let user = self.user.clone();
         let chunk_count = data.len().div_ceil(E2B_FILE_WRITE_CHUNK_BYTES);
         stream::iter(0..=chunk_count).map(move |index| {
@@ -942,6 +1143,43 @@ fn file_too_large_error() -> EcwProxyError {
     )
 }
 
+fn json_file_write_body_too_large_error() -> EcwProxyError {
+    EcwProxyError::new(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "JSON file writes are limited to 1 MiB; use multipart/form-data or application/octet-stream for larger files",
+        ResponseOrigin::Client,
+        ResponseKind::Validation,
+    )
+}
+
+async fn read_json_file_write_request(
+    headers: &HeaderMap,
+    body: Body,
+) -> Result<FileWriteRequestE2b, EcwProxyError> {
+    reject_oversized_content_length(
+        headers,
+        E2B_JSON_FILE_WRITE_BODY_LIMIT_BYTES,
+        json_file_write_body_too_large_error,
+    )?;
+    let body = buffer_json_file_write_body(body).await?;
+    serde_json::from_slice(&body)
+        .map_err(|_| EcwProxyError::bad_request("Invalid JSON file write request"))
+}
+
+async fn buffer_json_file_write_body(body: Body) -> Result<Bytes, EcwProxyError> {
+    to_bytes(body, E2B_JSON_FILE_WRITE_BODY_LIMIT_BYTES)
+        .await
+        .map_err(|error| {
+            let exceeded_limit = std::error::Error::source(&error)
+                .is_some_and(|source| source.is::<http_body_util::LengthLimitError>());
+            if exceeded_limit {
+                json_file_write_body_too_large_error()
+            } else {
+                EcwProxyError::bad_request("Invalid request body")
+            }
+        })
+}
+
 fn file_write_content_to_bytes(content: Value) -> Result<Vec<u8>, EcwProxyError> {
     match content {
         Value::String(value) => Ok(value.into_bytes()),
@@ -966,122 +1204,6 @@ fn is_json_content_type(content_type: &str) -> bool {
 
 fn is_octet_stream_content_type(content_type: &str) -> bool {
     content_type.starts_with("application/octet-stream")
-}
-
-fn multipart_boundary(content_type: &str) -> Option<&str> {
-    content_type
-        .split(';')
-        .skip(1)
-        .find_map(|part| part.trim().strip_prefix("boundary="))
-        .map(|boundary| boundary.trim_matches('"'))
-        .filter(|boundary| !boundary.is_empty())
-}
-
-fn parse_multipart_uploads(
-    body: &[u8],
-    boundary: &str,
-) -> Result<Vec<MultipartUploadPartE2b>, EcwProxyError> {
-    let marker = format!("--{boundary}").into_bytes();
-    let mut cursor = find_subsequence(body, &marker)
-        .ok_or_else(|| EcwProxyError::bad_request("Invalid multipart body"))?;
-    let mut uploads = Vec::new();
-
-    loop {
-        let remaining = body
-            .get(cursor..)
-            .ok_or_else(|| EcwProxyError::bad_request("Invalid multipart body"))?;
-        if !remaining.starts_with(&marker) {
-            return Err(EcwProxyError::bad_request("Invalid multipart boundary"));
-        }
-        cursor += marker.len();
-        if body.get(cursor..cursor + 2) == Some(b"--".as_slice()) {
-            break;
-        }
-        if body.get(cursor..cursor + 2) != Some(b"\r\n".as_slice()) {
-            return Err(EcwProxyError::bad_request("Invalid multipart body"));
-        }
-        cursor += 2;
-
-        let remaining = body
-            .get(cursor..)
-            .ok_or_else(|| EcwProxyError::bad_request("Invalid multipart body"))?;
-        let next = find_subsequence(remaining, &marker)
-            .map(|offset| cursor + offset)
-            .ok_or_else(|| EcwProxyError::bad_request("Invalid multipart body"))?;
-        let mut part = body
-            .get(cursor..next)
-            .ok_or_else(|| EcwProxyError::bad_request("Invalid multipart body"))?;
-        if part.ends_with(b"\r\n") {
-            part = part
-                .get(..part.len() - 2)
-                .ok_or_else(|| EcwProxyError::bad_request("Invalid multipart body"))?;
-        }
-
-        if let Some(upload) = parse_multipart_upload_part(part)? {
-            uploads.push(upload);
-        }
-
-        cursor = next;
-    }
-
-    Ok(uploads)
-}
-
-fn parse_multipart_upload_part(
-    part: &[u8],
-) -> Result<Option<MultipartUploadPartE2b>, EcwProxyError> {
-    let header_separator = find_subsequence(part, b"\r\n\r\n")
-        .ok_or_else(|| EcwProxyError::bad_request("Invalid multipart part"))?;
-    let header_bytes = part
-        .get(..header_separator)
-        .ok_or_else(|| EcwProxyError::bad_request("Invalid multipart part"))?;
-    let headers = std::str::from_utf8(header_bytes)
-        .map_err(|_| EcwProxyError::bad_request("Invalid multipart headers"))?;
-    let data = part
-        .get(header_separator + 4..)
-        .ok_or_else(|| EcwProxyError::bad_request("Invalid multipart part"))?
-        .to_vec();
-    let disposition = headers
-        .lines()
-        .find(|line| {
-            line.to_ascii_lowercase()
-                .starts_with("content-disposition:")
-        })
-        .ok_or_else(|| EcwProxyError::bad_request("Missing multipart Content-Disposition"))?;
-    let disposition = disposition
-        .split_once(':')
-        .map(|(_, value)| value.trim())
-        .ok_or_else(|| EcwProxyError::bad_request("Invalid multipart Content-Disposition"))?;
-
-    let mut field_name = None;
-    let mut filename = None;
-    for part in disposition.split(';').skip(1) {
-        let Some((key, value)) = part.trim().split_once('=') else {
-            continue;
-        };
-        let value = value.trim_matches('"');
-        match key {
-            "name" => field_name = Some(value.to_string()),
-            "filename" => filename = (!value.is_empty()).then(|| value.to_string()),
-            _ => {}
-        }
-    }
-
-    if field_name.as_deref() != Some("file") {
-        return Ok(None);
-    }
-
-    Ok(Some(MultipartUploadPartE2b { filename, data }))
-}
-
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
 }
 
 fn file_info_to_connect_entry(info: SpacedFileInfo) -> FilesystemEntryInfoE2b {
@@ -1580,5 +1702,6 @@ fn raw_file_write_error(status: tonic::Status) -> EcwProxyError {
     raw_file_read_error(status)
 }
 
+mod multipart;
 #[cfg(test)]
 mod tests;

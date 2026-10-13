@@ -1,3 +1,4 @@
+mod prefetch_catalog;
 use pplx_space_common_core::types::{LocalArtifactId, NodeId, OrgId, SnapshotId, UserId};
 
 use super::metadata::*;
@@ -317,6 +318,7 @@ async fn register_template_with_org(
 ) -> Result<(), tonic::Status> {
     service
         .register_template(publisher_request(RegisterTemplateRequest {
+            system_publication_grant_id: None,
             name: name.to_string(),
             description: None,
             org_id: org_id.map(|org_id| org_id.to_string()),
@@ -347,6 +349,7 @@ async fn register_release(
 ) -> Result<RegisterTemplateReleaseResponse, tonic::Status> {
     Ok(service
         .register_template_release(publisher_request(RegisterTemplateReleaseRequest {
+            system_publication_grant_id: None,
             template_name: "code-runtime".to_string(),
             runtime: "fc".to_string(),
             hash: hash.to_string(),
@@ -369,6 +372,7 @@ async fn register_release_with_execution(
 ) -> Result<RegisterTemplateReleaseResponse, tonic::Status> {
     Ok(service
         .register_template_release(publisher_request(RegisterTemplateReleaseRequest {
+            system_publication_grant_id: None,
             template_name: "code-runtime".to_string(),
             runtime: "fc".to_string(),
             hash: hash.to_string(),
@@ -438,6 +442,7 @@ async fn scoped_release_lookup_hides_private_bases(
                     service
                         .find_template_release_by_hash(Request::new(
                             FindTemplateReleaseByHashRequest {
+                                generic_only: false,
                                 template_name: name,
                                 hash,
                                 caller_org_id: org,
@@ -447,6 +452,7 @@ async fn scoped_release_lookup_hides_private_bases(
                 } else {
                     service
                         .find_template_release(Request::new(FindTemplateReleaseRequest {
+                            generic_only: false,
                             template_name: name,
                             runtime: "firecracker".into(),
                             tag: "stable".into(),
@@ -779,6 +785,7 @@ async fn build_release_keeps_the_submitting_org_and_rejects_another_owner() -> T
     let name = format!("owned-build-{}", Uuid::now_v7());
     register_template_with_org(&fixture.service, &name, Some(OrgId::from_uuid(owner))).await?;
     let request = RegisterTemplateReleaseRequest {
+        system_publication_grant_id: None,
         template_name: name.clone(),
         runtime: "fc".into(),
         hash: format!("sha256:{}", "a".repeat(64)),
@@ -805,6 +812,148 @@ async fn build_release_keeps_the_submitting_org_and_rejects_another_owner() -> T
         "SELECT t.org_id, r.org_id FROM templates t JOIN template_releases r ON r.template_name = t.name WHERE t.name = $1"
     )).bind(&name).fetch_one(&fixture.service.pool).await?;
     assert_eq!((template_org, release_org), (Some(owner), Some(owner)));
+    Ok(())
+}
+
+/// A release registered before the `sha256:` prefix was required is stored
+/// bare. Registering the same digest in canonical form, as build-manager does
+/// when it republishes tags for an already published release, must attach the
+/// tags to that row rather than create a second, artifact-less release beside
+/// it and move the tags there.
+#[tokio::test(flavor = "current_thread")]
+async fn register_template_release_reuses_a_bare_hash_release() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    register_template(&fixture.service, "code-runtime").await?;
+    let bare = "c".repeat(64);
+    let canonical = format!("sha256:{bare}");
+    let storage = format!("s3://bucket/templates/code-runtime/{canonical}?region=us-east-1");
+    let legacy_id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO template_releases (id, template_name, type, hash)
+         VALUES ($1, 'code-runtime', 'fc', $2)"
+    ))
+    .bind(legacy_id)
+    .bind(&bare)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_release_tags (template_name, template_release_id, tag)
+         VALUES ('code-runtime', $1, 'stable')"
+    ))
+    .bind(legacy_id)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_release_storage_locations
+             (template_release_id, storage_connection_string)
+         VALUES ($1, $2)"
+    ))
+    .bind(legacy_id)
+    .bind(&storage)
+    .execute(pool)
+    .await?;
+
+    // A tags-only republication of the canonical spelling.
+    let republished = register_release(&fixture.service, &canonical, &["latest"], &[]).await?;
+    assert_eq!(
+        republished.release.expect("release").id,
+        legacy_id.to_string()
+    );
+    let releases: i64 = sqlx::query_scalar(sql!(
+        "SELECT COUNT(*) FROM template_releases WHERE template_name = 'code-runtime'"
+    ))
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(
+        releases, 1,
+        "no second release may appear beside the bare row"
+    );
+
+    let latest = fixture
+        .service
+        .find_template_release(Request::new(FindTemplateReleaseRequest {
+            generic_only: false,
+            caller_org_id: None,
+            template_name: "code-runtime".to_string(),
+            runtime: "firecracker".to_string(),
+            tag: "latest".to_string(),
+        }))
+        .await?
+        .into_inner();
+    assert_eq!(latest.release.expect("latest").id, legacy_id.to_string());
+    assert_eq!(latest.storage_locations.len(), 1);
+    assert_eq!(latest.storage_locations[0].connection_string, storage);
+    Ok(())
+}
+
+/// When a digest already exists under both spellings, registration must land
+/// on the row that owns the recorded artifacts, whichever spelling and
+/// whichever age that is. Tags attached to the artifact-less duplicate would
+/// resolve to a release nothing can pull.
+#[tokio::test(flavor = "current_thread")]
+async fn register_template_release_prefers_the_duplicate_that_owns_a_location() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    register_template(&fixture.service, "code-runtime").await?;
+
+    // The older row is always the bare one; the location sits on the older
+    // row in one arrangement and on the newer canonical row in the other.
+    for (digit, location_on_older) in [('d', false), ('e', true)] {
+        let bare = digit.to_string().repeat(64);
+        let canonical = format!("sha256:{bare}");
+        let storage = format!("s3://bucket/templates/code-runtime/{canonical}?region=us-east-1");
+        let older = Uuid::now_v7();
+        let newer = Uuid::now_v7();
+        sqlx::query(sql!(
+            "INSERT INTO template_releases (id, template_name, type, hash, created_at)
+             VALUES ($1, 'code-runtime', 'fc', $2, NOW() - INTERVAL '1 day'),
+                    ($3, 'code-runtime', 'fc', $4, NOW())"
+        ))
+        .bind(older)
+        .bind(&bare)
+        .bind(newer)
+        .bind(&canonical)
+        .execute(pool)
+        .await?;
+        let owner = if location_on_older { older } else { newer };
+        sqlx::query(sql!(
+            "INSERT INTO template_release_storage_locations
+                 (template_release_id, storage_connection_string)
+             VALUES ($1, $2)"
+        ))
+        .bind(owner)
+        .bind(&storage)
+        .execute(pool)
+        .await?;
+
+        let tag = format!("release-{digit}");
+        let republished =
+            register_release(&fixture.service, &canonical, &[tag.as_str()], &[]).await?;
+        assert_eq!(
+            republished.release.expect("release").id,
+            owner.to_string(),
+            "registration must pick the duplicate that owns the artifacts"
+        );
+        let resolved = fixture
+            .service
+            .find_template_release(Request::new(FindTemplateReleaseRequest {
+                generic_only: false,
+                caller_org_id: None,
+                template_name: "code-runtime".to_string(),
+                runtime: "firecracker".to_string(),
+                tag,
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(resolved.release.expect("tagged").id, owner.to_string());
+        assert_eq!(resolved.storage_locations.len(), 1);
+        assert_eq!(resolved.storage_locations[0].connection_string, storage);
+    }
     Ok(())
 }
 
@@ -847,6 +996,7 @@ async fn register_template_release_is_idempotent_by_hash() -> TestResult {
     let by_hash = fixture
         .service
         .find_template_release_by_hash(Request::new(FindTemplateReleaseByHashRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             hash: digest_a.to_string(),
@@ -869,6 +1019,7 @@ async fn register_template_release_is_idempotent_by_hash() -> TestResult {
     let by_tag = fixture
         .service
         .find_template_release(Request::new(FindTemplateReleaseRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             runtime: "firecracker".to_string(),
@@ -890,6 +1041,7 @@ async fn register_template_release_is_idempotent_by_hash() -> TestResult {
     let retagged = fixture
         .service
         .register_template_release(publisher_request(RegisterTemplateReleaseRequest {
+            system_publication_grant_id: None,
             template_name: "code-runtime".to_string(),
             runtime: "fc".to_string(),
             hash: digest_a.to_string(),
@@ -911,6 +1063,7 @@ async fn register_template_release_is_idempotent_by_hash() -> TestResult {
     let latest = fixture
         .service
         .find_template_release(Request::new(FindTemplateReleaseRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             runtime: "firecracker".to_string(),
@@ -976,6 +1129,7 @@ async fn storage_policy_rejects_registration_without_changing_release_or_tags() 
         let latest = fixture
             .service
             .find_template_release(Request::new(FindTemplateReleaseRequest {
+                generic_only: false,
                 template_name: "code-runtime".into(),
                 runtime: "fc".into(),
                 tag: "latest".into(),
@@ -1014,6 +1168,7 @@ async fn register_template_release_allows_no_storage_locations() -> TestResult {
     let by_hash = fixture
         .service
         .find_template_release_by_hash(Request::new(FindTemplateReleaseByHashRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             hash: digest.to_string(),
@@ -1089,6 +1244,67 @@ async fn register_template_release_persists_execution_metadata_write_once() -> T
     Ok(())
 }
 
+/// A tags-only republication, which build-manager issues when the release is
+/// already published or when Credential Manager refused the write for that
+/// reason, carries no storage location and no execution metadata, so it adds
+/// its tag and leaves the published release's locations and metadata exactly
+/// as they were, including a `NULL` metadata column.
+#[tokio::test(flavor = "current_thread")]
+async fn tags_only_republication_leaves_locations_and_metadata_unchanged() -> TestResult {
+    use pplx_space_common_core::types::{Arch, ExecutionMetadata};
+
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    register_template(&fixture.service, "code-runtime").await?;
+    let digest_a = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let digest_b = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let storage_a = "s3://bucket/templates/code-runtime/sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa?region=us-east-1";
+    let storage_b = "s3://bucket/templates/code-runtime/sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb?region=us-east-1";
+    let stored = |hash: &str| {
+        let pool = fixture.service.pool.clone();
+        let hash = hash.to_string();
+        async move {
+            sqlx::query_as::<_, (Option<String>, i64)>(sql!(
+                "SELECT r.execution_metadata->'guest'->>'architecture',
+                        (SELECT COUNT(*) FROM template_release_storage_locations l
+                          WHERE l.template_release_id = r.id)
+                 FROM template_releases r
+                 WHERE r.template_name = 'code-runtime' AND r.hash = $1"
+            ))
+            .bind(hash)
+            .fetch_one(&pool)
+            .await
+        }
+    };
+
+    // A published release with metadata and one location...
+    let x86 = ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![]);
+    register_release_with_execution(&fixture.service, digest_a, &x86).await?;
+    register_release(&fixture.service, digest_a, &["latest"], &[storage_a]).await?;
+    // ...and one published before metadata was recorded.
+    register_release(&fixture.service, digest_b, &["latest"], &[storage_b]).await?;
+    assert_eq!(stored(digest_a).await?, (Some("x86_64".to_string()), 1));
+    assert_eq!(stored(digest_b).await?, (None, 1));
+
+    for digest in [digest_a, digest_b] {
+        let republished = register_release(&fixture.service, digest, &["stable"], &[]).await?;
+        // The response lists what this call registered: the tag, no location.
+        assert!(republished.storage_locations.is_empty());
+        assert_eq!(
+            republished
+                .tags
+                .iter()
+                .map(|tag| tag.tag.as_str())
+                .collect::<Vec<_>>(),
+            vec!["stable"]
+        );
+    }
+    assert_eq!(stored(digest_a).await?, (Some("x86_64".to_string()), 1));
+    assert_eq!(stored(digest_b).await?, (None, 1));
+    Ok(())
+}
+
 /// The hash validator canonicalizes both a bare 64-hex digest and
 /// a `sha256:`-prefixed digest to the same prefixed form, and still
 /// rejects non-digest input. No DB required.
@@ -1154,6 +1370,7 @@ async fn find_template_release_by_hash_resolves_bare_hash() -> TestResult {
     let by_bare = fixture
         .service
         .find_template_release_by_hash(Request::new(FindTemplateReleaseByHashRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             hash: bare.to_string(),
@@ -1170,6 +1387,7 @@ async fn find_template_release_by_hash_resolves_bare_hash() -> TestResult {
     let by_prefixed = fixture
         .service
         .find_template_release_by_hash(Request::new(FindTemplateReleaseByHashRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             hash: prefixed.clone(),
@@ -1939,6 +2157,17 @@ async fn data_plane_route_resolve_hydrates_backend_and_bumps_generation() -> Tes
     Ok(())
 }
 
+struct UnavailableIngressActivation(std::sync::atomic::AtomicUsize);
+#[tonic::async_trait]
+impl crate::ingress_activation::IngressActivation for UnavailableIngressActivation {
+    async fn prepare(&self, _: SandboxId, _: std::time::Duration) -> Result<(), Status> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(Status::unavailable(
+            "synthetic activation owner unavailable",
+        ))
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn data_plane_route_resolve_mints_service_port_route_token_for_port_session() -> TestResult {
     if !pplx_space_test_env::enter_test_process(&[
@@ -1954,9 +2183,13 @@ async fn data_plane_route_resolve_mints_service_port_route_token_for_port_sessio
         return Ok(());
     }
 
-    let Some(fixture) = cluster_fixture().await? else {
+    let Some(mut fixture) = cluster_fixture().await? else {
         return Ok(());
     };
+    let activation = std::sync::Arc::new(UnavailableIngressActivation(
+        std::sync::atomic::AtomicUsize::new(0),
+    ));
+    fixture.service.ingress_activation = Some(activation.clone());
     let node_id = NodeId::new();
     let sandbox_id = SandboxId::new();
     let session_id = format!("port_{}", Uuid::now_v7());
@@ -1975,11 +2208,12 @@ async fn data_plane_route_resolve_mints_service_port_route_token_for_port_sessio
         "port",
     )
     .await?;
-    sqlx::query(
+    sqlx::query(sql!(
         "UPDATE data_plane_sessions
-         SET target_port = 8080, target_protocol = 'tcp'
-         WHERE session_id = $1",
-    )
+         SET target_port = 8080, target_protocol = 'tcp',
+             token_expires_at = NOW() + INTERVAL '1 hour'
+         WHERE session_id = $1"
+    ))
     .bind(&session_id)
     .execute(&fixture.service.pool)
     .await?;
@@ -1987,7 +2221,7 @@ async fn data_plane_route_resolve_mints_service_port_route_token_for_port_sessio
     let response = fixture
         .service
         .resolve_data_plane_session_route(data_plane_request(ResolveDataPlaneSessionRouteRequest {
-            session_id,
+            session_id: session_id.clone(),
             protocol_session_id: None,
             token_sha256: None,
             required_scope: None,
@@ -2010,6 +2244,31 @@ async fn data_plane_route_resolve_mints_service_port_route_token_for_port_sessio
         claims.route_identity.execution_generation(),
         ExecutionGeneration::new(13).unwrap()
     );
+
+    assert_eq!(
+        activation.0.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "healthy ingress must serve while the activation owner is unavailable"
+    );
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle = 'suspended', active_node_id = NULL WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(&fixture.service.pool)
+    .await?;
+    let error = fixture
+        .service
+        .resolve_data_plane_session_route(data_plane_request(ResolveDataPlaneSessionRouteRequest {
+            session_id,
+            protocol_session_id: None,
+            token_sha256: None,
+            required_scope: None,
+            requested_transport: Some(SandboxServiceRouteTransport::ServicePortIngress as i32),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.message(), "synthetic activation owner unavailable");
+    assert_eq!(activation.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     Ok(())
 }
 
@@ -2534,9 +2793,13 @@ async fn ecw_route_resolve_allows_service_with_traffic_token() -> TestResult {
         return Ok(());
     }
 
-    let Some(fixture) = cluster_fixture().await? else {
+    let Some(mut fixture) = cluster_fixture().await? else {
         return Ok(());
     };
+    let activation = std::sync::Arc::new(UnavailableIngressActivation(
+        std::sync::atomic::AtomicUsize::new(0),
+    ));
+    fixture.service.ingress_activation = Some(activation.clone());
     let node_id = NodeId::new();
     let sandbox_id = SandboxId::new();
 
@@ -2655,6 +2918,48 @@ async fn ecw_route_resolve_allows_service_with_traffic_token() -> TestResult {
         .await
         .expect_err("wrong traffic token should fail");
     assert_eq!(invalid.code(), Code::PermissionDenied);
+
+    assert_eq!(
+        activation.0.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "healthy ingress must serve while the activation owner is unavailable"
+    );
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle = 'suspended', active_node_id = NULL WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(&fixture.service.pool)
+    .await?;
+    for (proof, expected, calls) in [
+        (
+            sha256_hex("invalid-traffic-token"),
+            Code::PermissionDenied,
+            0,
+        ),
+        (sha256_hex(&token), Code::Unavailable, 1),
+    ] {
+        let error = fixture
+            .service
+            .unstable_resolve_sandbox_service_route(Request::new(
+                UnstableResolveSandboxServiceRouteRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                    port: 8080,
+                    route_kind: SandboxServiceRouteKind::ServicePort as i32,
+                    transport: SandboxServiceRouteTransport::ServicePortIngress as i32,
+                    credential_proofs: vec![route_credential_proof(
+                        SandboxServiceRouteCredentialKind::SandboxTrafficToken,
+                        proof,
+                    )],
+                },
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), expected);
+        assert_eq!(
+            activation.0.load(std::sync::atomic::Ordering::SeqCst),
+            calls
+        );
+    }
     Ok(())
 }
 
@@ -3037,6 +3342,899 @@ fn request_from_node<T>(message: T, node_ip: std::net::IpAddr) -> Request<T> {
     request
 }
 
+/// A node-scoped request from `node_ip`: the TCP origin plus the narrow
+/// authority every TokenReview identity carries.
+fn node_scoped_request<T>(message: T, node_ip: std::net::Ipv4Addr) -> Request<T> {
+    let mut request = request_from_node(message, std::net::IpAddr::V4(node_ip));
+    request.extensions_mut().insert(
+        pplx_space_common_svc::auth::NodeApiAuthenticatedCaller::unprivileged_workload_for_test(),
+    );
+    request
+}
+
+/// Registers an org-specific template owned by `owner` with one release that
+/// is tagged `latest` and has a storage location. Returns the release id and
+/// its hash.
+async fn seed_private_release(
+    fixture: &ClusterFixture,
+    template: &str,
+    owner: Uuid,
+) -> TestResult<(Uuid, String)> {
+    let pool = &fixture.service.pool;
+    let hash = format!("sha256:{}", "b".repeat(64));
+    register_template_with_org(&fixture.service, template, Some(OrgId::from_uuid(owner))).await?;
+    sqlx::query(sql!(
+        "UPDATE templates SET visibility = 'org_specific' WHERE name = $1"
+    ))
+    .bind(template)
+    .execute(pool)
+    .await?;
+    let release_id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO template_releases (id, template_name, type, hash, org_id)
+         VALUES ($1, $2, 'fc', $3, $4)"
+    ))
+    .bind(release_id)
+    .bind(template)
+    .bind(&hash)
+    .bind(owner)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_release_tags (template_name, template_release_id, tag)
+         VALUES ($1, $2, 'latest')"
+    ))
+    .bind(template)
+    .bind(release_id)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_release_storage_locations
+             (template_release_id, storage_connection_string, org_id)
+         VALUES ($1, 's3://private/rootfs?region=us-east-2', $2)"
+    ))
+    .bind(release_id)
+    .bind(owner)
+    .execute(pool)
+    .await?;
+    Ok((release_id, hash))
+}
+
+/// Registers a ready Kubernetes-managed node of `role` at `address`.
+async fn insert_k8s_node(
+    pool: &sqlx::PgPool,
+    address: std::net::Ipv4Addr,
+    role: &str,
+) -> TestResult<Uuid> {
+    let id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state)
+         VALUES ($1, $2::INET, $3, 'k8s', 'ready')"
+    ))
+    .bind(id)
+    .bind(address.to_string())
+    .bind(role)
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+/// Whether a node at `node_ip` can resolve `template`'s `latest` release. All
+/// three node-facing reads are issued and must agree; `NotFound` and an empty
+/// listing read as not visible, any other error fails the test.
+async fn release_visible_from(
+    fixture: &ClusterFixture,
+    template: &str,
+    hash: &str,
+    node_ip: std::net::Ipv4Addr,
+    caller_org_id: Option<Uuid>,
+) -> TestResult<bool> {
+    fn visible(
+        result: Result<tonic::Response<FindTemplateReleaseResponse>, tonic::Status>,
+    ) -> TestResult<bool> {
+        match result {
+            Ok(_) => Ok(true),
+            Err(status) if status.code() == Code::NotFound => Ok(false),
+            Err(status) => Err(status.into()),
+        }
+    }
+    let caller_org_id = caller_org_id.map(|org| org.to_string());
+    let by_tag = visible(
+        fixture
+            .service
+            .find_template_release(node_scoped_request(
+                FindTemplateReleaseRequest {
+                    generic_only: false,
+                    caller_org_id: caller_org_id.clone(),
+                    template_name: template.to_string(),
+                    runtime: "firecracker".to_string(),
+                    tag: "latest".to_string(),
+                },
+                node_ip,
+            ))
+            .await,
+    )?;
+    let by_hash = visible(
+        fixture
+            .service
+            .find_template_release_by_hash(node_scoped_request(
+                FindTemplateReleaseByHashRequest {
+                    generic_only: false,
+                    caller_org_id,
+                    template_name: template.to_string(),
+                    hash: hash.to_string(),
+                },
+                node_ip,
+            ))
+            .await,
+    )?;
+    let listed = !fixture
+        .service
+        .list_latest_template_releases(node_scoped_request(
+            ListLatestTemplateReleasesRequest {
+                template_name: template.to_string(),
+                runtime: "firecracker".to_string(),
+                limit: 5,
+            },
+            node_ip,
+        ))
+        .await?
+        .into_inner()
+        .entries
+        .is_empty();
+    assert_eq!(
+        by_tag, by_hash,
+        "tag and hash lookups must agree for {template}"
+    );
+    assert_eq!(
+        by_tag, listed,
+        "ListLatest must agree with the lookups for {template}"
+    );
+    Ok(by_tag)
+}
+
+/// Node-scoped callers (every TokenReview identity, and the static token once
+/// TokenReview is configured) do not see an org-specific release the control
+/// plane has not tied to their node, whether they are a registered worker or
+/// an address that is not a node at all, and asserting the owner's
+/// `caller_org_id` grants nothing. Generic templates stay resolvable, and a
+/// caller without the auth extension keeps the control-plane view.
+#[tokio::test(flavor = "current_thread")]
+async fn node_scoped_lookups_hide_unplaced_private_releases() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000003")?;
+    let (_, hash) = seed_private_release(&fixture, "private-base", owner).await?;
+    register_template(&fixture.service, "code-runtime").await?;
+    let generic_hash = format!("sha256:{}", "c".repeat(64));
+    register_release(
+        &fixture.service,
+        &generic_hash,
+        &[&generic_hash, "latest"],
+        &["s3://bucket/templates/code-runtime/generic?region=us-east-1"],
+    )
+    .await?;
+    let worker_ip = std::net::Ipv4Addr::new(10, 0, 0, 30);
+    insert_k8s_node(&fixture.service.pool, worker_ip, "worker").await?;
+    let unregistered_ip = std::net::Ipv4Addr::new(10, 0, 0, 99);
+
+    for node_ip in [worker_ip, unregistered_ip] {
+        for caller_org_id in [None, Some(owner)] {
+            assert!(
+                !release_visible_from(&fixture, "private-base", &hash, node_ip, caller_org_id)
+                    .await?,
+                "{node_ip} must not see an unplaced private release (asserted org {caller_org_id:?})"
+            );
+        }
+        assert!(
+            release_visible_from(&fixture, "code-runtime", &generic_hash, node_ip, None).await?,
+            "{node_ip} must still resolve generic templates"
+        );
+    }
+    fixture
+        .service
+        .find_template_release(Request::new(FindTemplateReleaseRequest {
+            generic_only: false,
+            caller_org_id: None,
+            template_name: "private-base".to_string(),
+            runtime: "firecracker".to_string(),
+            tag: "latest".to_string(),
+        }))
+        .await?;
+    Ok(())
+}
+
+/// A sandbox of the template placed on a node, by active or target
+/// placement, lets that node and only that node resolve the release.
+#[tokio::test(flavor = "current_thread")]
+async fn placed_sandbox_unlocks_private_release_for_its_node_only() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000003")?;
+    let (release_id, hash) = seed_private_release(&fixture, "private-base", owner).await?;
+    let worker_a_ip = std::net::Ipv4Addr::new(10, 0, 0, 30);
+    let worker_b_ip = std::net::Ipv4Addr::new(10, 0, 0, 31);
+    let worker_a = insert_k8s_node(pool, worker_a_ip, "worker").await?;
+    let worker_b = insert_k8s_node(pool, worker_b_ip, "worker").await?;
+
+    let sandbox_id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (
+             id, user_id, org_id, managed_by, lifecycle, placement,
+             active_node_id, target_node_id, command_ready_pending,
+             network_policy_generation, template_id
+         )
+         VALUES ($1, $2::uuid, $3::uuid, 'k8s', 'started', 'on_node', $4, $4, TRUE, 1, 'private-base')"
+    ))
+    .bind(sandbox_id)
+    .bind(SEEDED_USER_ID)
+    .bind(owner)
+    .bind(worker_a)
+    .execute(pool)
+    .await?;
+    assert!(release_visible_from(&fixture, "private-base", &hash, worker_a_ip, None).await?);
+    assert!(!release_visible_from(&fixture, "private-base", &hash, worker_b_ip, None).await?);
+    let found = fixture
+        .service
+        .find_template_release(node_scoped_request(
+            FindTemplateReleaseRequest {
+                generic_only: false,
+                caller_org_id: None,
+                template_name: "private-base".to_string(),
+                runtime: "firecracker".to_string(),
+                tag: "latest".to_string(),
+            },
+            worker_a_ip,
+        ))
+        .await?
+        .into_inner();
+    assert_eq!(
+        found.release.expect("placed release").id,
+        release_id.to_string()
+    );
+    assert_eq!(found.authorized_org_id, None);
+
+    // A pending migration is a target placement; the destination may pull
+    // before it becomes active, and the source keeps access while it still
+    // hosts the sandbox.
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET target_node_id = $2 WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(worker_b)
+    .execute(pool)
+    .await?;
+    assert!(release_visible_from(&fixture, "private-base", &hash, worker_a_ip, None).await?);
+    assert!(release_visible_from(&fixture, "private-base", &hash, worker_b_ip, None).await?);
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET active_node_id = $2 WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(worker_b)
+    .execute(pool)
+    .await?;
+    assert!(!release_visible_from(&fixture, "private-base", &hash, worker_a_ip, None).await?);
+    Ok(())
+}
+
+/// A node reads a sandbox's suspend snapshot location, exact artifact backup
+/// location and organization snapshot storage only while the sandbox is
+/// placed on it: active there, or as the target of a pending migration or
+/// restore. Another node reads `NotFound`, and a request with no remote
+/// address is refused. A former host can still ask whether an identity it
+/// holds is backed up, and learns only that.
+#[tokio::test(flavor = "current_thread")]
+async fn placed_sandbox_locations_resolve_for_its_node_only() -> TestResult {
+    use crate::proto::{
+        BackupReadinessQuery, LocalArtifactBackupIdentity, backup_readiness_query::Artifact,
+    };
+    use prost::Message as _;
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    let worker_a_ip = std::net::Ipv4Addr::new(10, 0, 0, 40);
+    let worker_b_ip = std::net::Ipv4Addr::new(10, 0, 0, 41);
+    let worker_a = insert_k8s_node(pool, worker_a_ip, "worker").await?;
+    let worker_b = insert_k8s_node(pool, worker_b_ip, "worker").await?;
+
+    let sandbox_id = SandboxId::new();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (
+             id, user_id, org_id, managed_by, lifecycle, placement,
+             active_node_id, target_node_id, command_ready_pending,
+             network_policy_generation
+         )
+         VALUES ($1, $2::uuid, $3::uuid, 'k8s', 'started', 'on_node', $4, $4, TRUE, 1)"
+    ))
+    .bind(sandbox_id)
+    .bind(SEEDED_USER_ID)
+    .bind(SEEDED_ORG_ID)
+    .bind(worker_a)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE organizations
+         SET snapshot_base_object_storage_uri = 's3://org-snapshots/base'
+         WHERE id = $1::uuid"
+    ))
+    .bind(SEEDED_ORG_ID)
+    .execute(pool)
+    .await?;
+
+    // The hosting node registers a ready suspend snapshot and a ready backup
+    // of a stopped rootfs, the two artifacts a restore looks up.
+    let suspend_attempt = SnapshotId::new();
+    let suspend_artifact = LocalArtifactId::new();
+    begin_artifact_backup_from_node(
+        &fixture.service,
+        std::net::IpAddr::V4(worker_a_ip),
+        sandbox_id,
+        suspend_artifact,
+        suspend_attempt,
+        pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+        pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend,
+    )
+    .await?;
+    finalize_ready_from_node(&fixture.service, worker_a_ip, suspend_attempt).await?;
+    let disk_artifact = LocalArtifactId::new();
+    let disk_attempt = SnapshotId::new();
+    begin_artifact_backup_from_node(
+        &fixture.service,
+        std::net::IpAddr::V4(worker_a_ip),
+        sandbox_id,
+        disk_artifact,
+        disk_attempt,
+        pplx_space_sbx_mgr_client::proto::ArtifactKind::Disk,
+        pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Stop,
+    )
+    .await?;
+    finalize_ready_from_node(&fixture.service, worker_a_ip, disk_attempt).await?;
+    // Finalizing the suspend snapshot projects the sandbox as suspended and
+    // releases its active placement. Pin it back on the hosting node so the
+    // placement under test is the one written below, not that projection.
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+         SET lifecycle = 'started', placement = 'on_node',
+             active_node_id = $2, target_node_id = $2
+         WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(worker_a)
+    .execute(pool)
+    .await?;
+
+    let reads = |node_ip: Option<std::net::Ipv4Addr>| {
+        let service = &fixture.service;
+        async move {
+            let suspend = service
+                .get_suspend_snapshot_location(maybe_from_node(
+                    GetSuspendSnapshotLocationRequest {
+                        sandbox_id: sandbox_id.to_string(),
+                    },
+                    node_ip,
+                ))
+                .await
+                .map(|response| response.into_inner().snapshot_id);
+            let backup = service
+                .get_artifact_backup_location(maybe_from_node(
+                    GetArtifactBackupLocationRequest {
+                        sandbox_id: sandbox_id.to_string(),
+                        local_artifact_id: disk_artifact.to_string(),
+                        artifact_kind: pplx_space_sbx_mgr_client::proto::ArtifactKind::Disk as i32,
+                        readiness: None,
+                    },
+                    node_ip,
+                ))
+                .await
+                .map(|response| {
+                    let response = response.into_inner();
+                    assert_eq!(
+                        response.ready, None,
+                        "a location reply is not a readiness reply"
+                    );
+                    response.backup_attempt_id
+                });
+            let storage = service
+                .get_sandbox_snapshot_storage_uri(maybe_from_node(
+                    GetSandboxSnapshotStorageUriRequest {
+                        sandbox_id: sandbox_id.to_string(),
+                    },
+                    node_ip,
+                ))
+                .await
+                .map(|response| response.into_inner().storage_uri);
+            (suspend, backup, storage)
+        }
+    };
+    /// The suspend snapshot id, the backup attempt id and the organization
+    /// storage URI, as one node read them.
+    type LocationReads = (
+        Result<String, tonic::Status>,
+        Result<String, tonic::Status>,
+        Result<Option<String>, tonic::Status>,
+    );
+    let codes = |results: &LocationReads| {
+        [
+            results.0.as_ref().err().map(tonic::Status::code),
+            results.1.as_ref().err().map(tonic::Status::code),
+            results.2.as_ref().err().map(tonic::Status::code),
+        ]
+    };
+
+    let (suspend, backup, storage) = reads(Some(worker_a_ip)).await;
+    assert_eq!(suspend?, suspend_attempt.to_string());
+    assert_eq!(backup?, disk_attempt.to_string());
+    assert_eq!(storage?.as_deref(), Some("s3://org-snapshots/base"));
+    assert_eq!(
+        codes(&reads(Some(worker_b_ip)).await),
+        [Some(tonic::Code::NotFound); 3]
+    );
+    assert_eq!(
+        codes(&reads(None).await),
+        [Some(tonic::Code::PermissionDenied); 3]
+    );
+
+    // A pending migration or restore is a target placement: the destination
+    // reads before it becomes active, and the source keeps access while it
+    // still hosts the sandbox.
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET target_node_id = $2 WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(worker_b)
+    .execute(pool)
+    .await?;
+    assert_eq!(codes(&reads(Some(worker_a_ip)).await), [None; 3]);
+    assert_eq!(codes(&reads(Some(worker_b_ip)).await), [None; 3]);
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET active_node_id = $2 WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(worker_b)
+    .execute(pool)
+    .await?;
+    assert_eq!(
+        codes(&reads(Some(worker_a_ip)).await),
+        [Some(tonic::Code::NotFound); 3]
+    );
+
+    // The former host still needs to evict its retained cache. Exact backup
+    // proofs remain available after relocation without reopening URI reads.
+    let exact = |id: LocalArtifactId, kind| {
+        Artifact::LocalArtifact(LocalArtifactBackupIdentity {
+            local_artifact_id: id.to_string(),
+            artifact_kind: kind,
+        })
+    };
+    let full = pplx_space_sbx_mgr_client::proto::ArtifactKind::Full as i32;
+    let disk = pplx_space_sbx_mgr_client::proto::ArtifactKind::Disk as i32;
+    let readiness =
+        |sandbox: SandboxId, artifact: Option<Artifact>| GetArtifactBackupLocationRequest {
+            sandbox_id: sandbox.to_string(),
+            readiness: Some(BackupReadinessQuery { artifact }),
+            ..Default::default()
+        };
+    let check = |sandbox: SandboxId, artifact: Artifact, node_ip| {
+        let service = &fixture.service;
+        let request = readiness(sandbox, Some(artifact));
+        async move {
+            let response = service
+                .get_artifact_backup_location(maybe_from_node(request, node_ip))
+                .await?
+                .into_inner();
+            // A readiness reply carries no identity, location or digests,
+            // whatever its answer.
+            assert_eq!(
+                response,
+                GetArtifactBackupLocationResponse {
+                    ready: response.ready,
+                    ..Default::default()
+                }
+            );
+            Ok::<_, tonic::Status>(response.ready.expect("a readiness reply sets ready"))
+        }
+    };
+    for artifact in [
+        exact(suspend_artifact, full),
+        exact(disk_artifact, disk),
+        Artifact::LatestReadySuspendSnapshotId(suspend_attempt.to_string()),
+    ] {
+        assert!(check(sandbox_id, artifact.clone(), Some(worker_a_ip)).await?);
+        assert!(!check(SandboxId::new(), artifact.clone(), Some(worker_a_ip)).await?);
+        for remote in [None, Some(std::net::Ipv4Addr::new(10, 0, 0, 42))] {
+            assert_eq!(
+                check(sandbox_id, artifact.clone(), remote)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::PermissionDenied,
+            );
+        }
+    }
+    for artifact in [
+        exact(LocalArtifactId::new(), full),
+        exact(suspend_artifact, disk),
+        exact(disk_artifact, full),
+        Artifact::LatestReadySuspendSnapshotId(disk_attempt.to_string()),
+        Artifact::LatestReadySuspendSnapshotId(SnapshotId::new().to_string()),
+    ] {
+        assert!(!check(sandbox_id, artifact, Some(worker_a_ip)).await?);
+    }
+    // A readiness query names its identity only inside `readiness`; mixing it
+    // with the location fields is refused, as are empty or invalid identities.
+    let mixed_id = GetArtifactBackupLocationRequest {
+        local_artifact_id: disk_artifact.to_string(),
+        ..readiness(sandbox_id, Some(exact(disk_artifact, disk)))
+    };
+    let mixed_kind = GetArtifactBackupLocationRequest {
+        artifact_kind: disk,
+        ..readiness(sandbox_id, Some(exact(disk_artifact, disk)))
+    };
+    for request in [
+        mixed_id,
+        mixed_kind,
+        readiness(sandbox_id, None),
+        readiness(sandbox_id, Some(exact(suspend_artifact, 0))),
+        readiness(
+            sandbox_id,
+            Some(Artifact::LatestReadySuspendSnapshotId(
+                "invalid".to_string(),
+            )),
+        ),
+        readiness(
+            sandbox_id,
+            Some(Artifact::LocalArtifact(LocalArtifactBackupIdentity {
+                local_artifact_id: "invalid".to_string(),
+                artifact_kind: full,
+            })),
+        ),
+    ] {
+        let status = fixture
+            .service
+            .get_artifact_backup_location(maybe_from_node(request, Some(worker_a_ip)))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    // Rolling upgrade: a server that predates `readiness` decodes only
+    // fields 1-3. A location request keeps identical bytes, and a readiness
+    // query reaches it with an empty artifact id, which its location path
+    // (the validation kept here) rejects before any lookup.
+    let location = GetArtifactBackupLocationRequest {
+        sandbox_id: sandbox_id.to_string(),
+        local_artifact_id: disk_artifact.to_string(),
+        artifact_kind: disk,
+        readiness: None,
+    };
+    assert_eq!(
+        location.encode_to_vec(),
+        LocationOnlyRequest {
+            sandbox_id: location.sandbox_id.clone(),
+            local_artifact_id: location.local_artifact_id.clone(),
+            artifact_kind: disk,
+        }
+        .encode_to_vec()
+    );
+    for artifact in [
+        exact(disk_artifact, disk),
+        Artifact::LatestReadySuspendSnapshotId(suspend_attempt.to_string()),
+    ] {
+        let wire = readiness(sandbox_id, Some(artifact)).encode_to_vec();
+        let seen_by_old_server = LocationOnlyRequest::decode(wire.as_slice())?;
+        assert_eq!(
+            seen_by_old_server,
+            LocationOnlyRequest {
+                sandbox_id: sandbox_id.to_string(),
+                ..Default::default()
+            }
+        );
+        let request = GetArtifactBackupLocationRequest::decode(
+            seen_by_old_server.encode_to_vec().as_slice(),
+        )?;
+        let status = fixture
+            .service
+            .get_artifact_backup_location(maybe_from_node(request, Some(worker_a_ip)))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    // An unpinned cache's proof must reject an older ready attempt, while an
+    // immutable pinned artifact can still use that same durable backup.
+    sqlx::query(sql!(
+        "UPDATE snapshots SET timestamp = NOW() - INTERVAL '1 hour' WHERE id = $1"
+    ))
+    .bind(suspend_attempt)
+    .execute(pool)
+    .await?;
+    let newer_attempt = SnapshotId::new();
+    let newer_artifact = LocalArtifactId::new();
+    begin_artifact_backup_from_node(
+        &fixture.service,
+        std::net::IpAddr::V4(worker_b_ip),
+        sandbox_id,
+        newer_artifact,
+        newer_attempt,
+        pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+        pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend,
+    )
+    .await?;
+    finalize_ready_from_node(&fixture.service, worker_b_ip, newer_attempt).await?;
+    assert!(
+        !check(
+            sandbox_id,
+            Artifact::LatestReadySuspendSnapshotId(suspend_attempt.to_string()),
+            Some(worker_a_ip)
+        )
+        .await?
+    );
+    assert!(check(sandbox_id, exact(suspend_artifact, full), Some(worker_a_ip)).await?);
+    assert!(
+        check(
+            sandbox_id,
+            Artifact::LatestReadySuspendSnapshotId(newer_attempt.to_string()),
+            Some(worker_a_ip)
+        )
+        .await?
+    );
+    for state in ["creating", "failed", "deleting"] {
+        sqlx::query(sql!("UPDATE snapshots SET state = $2 WHERE id = $1"))
+            .bind(newer_attempt)
+            .bind(state)
+            .execute(pool)
+            .await?;
+        assert!(!check(sandbox_id, exact(newer_artifact, full), Some(worker_a_ip)).await?);
+        assert!(
+            !check(
+                sandbox_id,
+                Artifact::LatestReadySuspendSnapshotId(newer_attempt.to_string()),
+                Some(worker_a_ip)
+            )
+            .await?
+        );
+    }
+    sqlx::query(sql!("UPDATE snapshots SET state = 'ready' WHERE id = $1"))
+        .bind(newer_attempt)
+        .execute(pool)
+        .await?;
+    sqlx::query(sql!(
+        "UPDATE snapshot_storage_locations SET orphaned_at = NOW() WHERE snapshot_id = $1"
+    ))
+    .bind(newer_attempt)
+    .execute(pool)
+    .await?;
+    assert!(!check(sandbox_id, exact(newer_artifact, full), Some(worker_a_ip)).await?);
+    assert!(
+        !check(
+            sandbox_id,
+            Artifact::LatestReadySuspendSnapshotId(suspend_attempt.to_string()),
+            Some(worker_a_ip)
+        )
+        .await?
+    );
+    assert!(
+        !check(
+            sandbox_id,
+            Artifact::LatestReadySuspendSnapshotId(newer_attempt.to_string()),
+            Some(worker_a_ip)
+        )
+        .await?
+    );
+    Ok(())
+}
+
+/// `GetArtifactBackupLocationRequest` as decoded by a server that predates
+/// its readiness query.
+#[derive(Clone, PartialEq, prost::Message)]
+struct LocationOnlyRequest {
+    #[prost(string, tag = "1")]
+    sandbox_id: String,
+    #[prost(string, tag = "2")]
+    local_artifact_id: String,
+    #[prost(int32, tag = "3")]
+    artifact_kind: i32,
+}
+
+/// A request from `node_ip` when given, otherwise one with no remote address.
+fn maybe_from_node<T>(message: T, node_ip: Option<std::net::Ipv4Addr>) -> Request<T> {
+    match node_ip {
+        Some(node_ip) => request_from_node(message, std::net::IpAddr::V4(node_ip)),
+        None => Request::new(message),
+    }
+}
+
+/// Finalize `snapshot_id` as `ready` from the node at `node_ip`.
+async fn finalize_ready_from_node(
+    service: &ClusterApiService,
+    node_ip: std::net::Ipv4Addr,
+    snapshot_id: SnapshotId,
+) -> Result<(), tonic::Status> {
+    service
+        .finalize_artifact_backup(request_from_node(
+            FinalizeArtifactBackupRequest {
+                backup_attempt_id: snapshot_id.to_string(),
+                target_state: SuspendSnapshotTerminalState::Ready as i32,
+                bytes_uploaded: 4096,
+                failure_reason: None,
+                artifact_digests: Vec::new(),
+            },
+            std::net::IpAddr::V4(node_ip),
+        ))
+        .await
+        .map(|_| ())
+}
+
+/// A pre-dispatch build grant lets registered builder nodes resolve the base
+/// it names while it is fresh, with no `template_build_jobs` row at all: the
+/// API writes the grant before `StartBuild`, and the builder that takes the
+/// job may pull the base before the API learns which builder that was. Once
+/// pinned to the accepting builder, the grant keeps covering that builder
+/// alone well past the unpinned window, so a job queued behind long builds
+/// still resolves its base when it runs, and a second build of the same
+/// target accepted on another builder has a grant of its own, so both keep
+/// access. Workers gain nothing from it, build history alone grants nothing,
+/// stale grants of either phase have expired, and another organization's
+/// grant does not cover this base.
+#[tokio::test(flavor = "current_thread")]
+async fn fresh_build_grant_unlocks_private_base_for_builders_only() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000003")?;
+    let stranger = Uuid::parse_str("00000000-0000-0000-0000-000000000002")?;
+    let (_, hash) = seed_private_release(&fixture, "private-base", owner).await?;
+    let builder_ip = std::net::Ipv4Addr::new(10, 0, 0, 40);
+    let worker_ip = std::net::Ipv4Addr::new(10, 0, 0, 30);
+    let builder = insert_k8s_node(pool, builder_ip, "builder").await?;
+    insert_k8s_node(pool, worker_ip, "worker").await?;
+
+    sqlx::query(sql!(
+        "INSERT INTO template_build_base_grants (id, template_id, base_template_name, org_id)
+         VALUES ($1, 'private-child', 'private-base', $2)"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(owner)
+    .execute(pool)
+    .await?;
+    assert!(
+        release_visible_from(&fixture, "private-base", &hash, builder_ip, None).await?,
+        "a fresh grant must cover the builder before any job row exists"
+    );
+    assert!(!release_visible_from(&fixture, "private-base", &hash, worker_ip, None).await?);
+
+    // Build history is not authorization: a recorded job for the owning
+    // organization on this builder grants nothing once the grant is gone.
+    sqlx::query(sql!("DELETE FROM template_build_base_grants"))
+        .execute(pool)
+        .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_build_jobs (template_id, build_id, org_id, builder_node_id)
+         VALUES ('private-child', 'build-1', $1, $2)"
+    ))
+    .bind(owner)
+    .bind(builder)
+    .execute(pool)
+    .await?;
+    assert!(!release_visible_from(&fixture, "private-base", &hash, builder_ip, Some(owner)).await?);
+
+    // An unpinned grant ages out after the window the pin should have closed.
+    sqlx::query(sql!(
+        "INSERT INTO template_build_base_grants
+             (id, template_id, base_template_name, org_id, granted_at)
+         VALUES ($1, 'private-child', 'private-base', $2, NOW() - INTERVAL '2 hours')"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(owner)
+    .execute(pool)
+    .await?;
+    assert!(!release_visible_from(&fixture, "private-base", &hash, builder_ip, None).await?);
+
+    // Pinned to the builder that accepted the job, the same aged grant keeps
+    // covering that builder and only that builder: a build that waited in its
+    // queue behind long jobs still resolves its base when it finally runs.
+    let other_builder_ip = std::net::Ipv4Addr::new(10, 0, 0, 41);
+    let other_builder = insert_k8s_node(pool, other_builder_ip, "builder").await?;
+    sqlx::query(sql!(
+        "UPDATE template_build_base_grants SET builder_node_id = $1
+         WHERE template_id = 'private-child'"
+    ))
+    .bind(builder)
+    .execute(pool)
+    .await?;
+    assert!(
+        release_visible_from(&fixture, "private-base", &hash, builder_ip, None).await?,
+        "a pinned grant must outlive the unpinned window for its builder"
+    );
+    assert!(!release_visible_from(&fixture, "private-base", &hash, other_builder_ip, None).await?);
+    assert!(!release_visible_from(&fixture, "private-base", &hash, worker_ip, None).await?);
+
+    // A second build of the same target accepted on the other builder has a
+    // grant of its own; accepting it takes nothing from the first builder.
+    sqlx::query(sql!(
+        "INSERT INTO template_build_base_grants
+             (id, template_id, base_template_name, org_id, builder_node_id)
+         VALUES ($1, 'private-child', 'private-base', $2, $3)"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(owner)
+    .bind(other_builder)
+    .execute(pool)
+    .await?;
+    assert!(release_visible_from(&fixture, "private-base", &hash, builder_ip, None).await?);
+    assert!(release_visible_from(&fixture, "private-base", &hash, other_builder_ip, None).await?);
+    assert!(!release_visible_from(&fixture, "private-base", &hash, worker_ip, None).await?);
+
+    // A pinned grant does not last forever either.
+    sqlx::query(sql!(
+        "UPDATE template_build_base_grants SET granted_at = NOW() - INTERVAL '8 days'
+         WHERE template_id = 'private-child'"
+    ))
+    .execute(pool)
+    .await?;
+    assert!(!release_visible_from(&fixture, "private-base", &hash, builder_ip, None).await?);
+
+    // Another organization's grant for the same base name does not apply.
+    sqlx::query(sql!(
+        "INSERT INTO template_build_base_grants (id, template_id, base_template_name, org_id)
+         VALUES ($1, 'stranger-child', 'private-base', $2)"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(stranger)
+    .execute(pool)
+    .await?;
+    assert!(!release_visible_from(&fixture, "private-base", &hash, builder_ip, None).await?);
+    Ok(())
+}
+
+/// An enabled warm pool lets registered workers resolve the pooled template,
+/// because warm slots are scheduled onto any worker before the control plane
+/// records where they landed. Builders and addresses that are not registered
+/// nodes gain nothing, and a disabled pool grants nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn enabled_warm_pool_unlocks_private_release_for_registered_workers_only() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000003")?;
+    let (release_id, hash) = seed_private_release(&fixture, "private-base", owner).await?;
+    let worker_ip = std::net::Ipv4Addr::new(10, 0, 0, 30);
+    let builder_ip = std::net::Ipv4Addr::new(10, 0, 0, 40);
+    let unregistered_ip = std::net::Ipv4Addr::new(10, 0, 0, 99);
+    insert_k8s_node(pool, worker_ip, "worker").await?;
+    insert_k8s_node(pool, builder_ip, "builder").await?;
+
+    let config_id: Uuid = sqlx::query_scalar(sql!(
+        "INSERT INTO kubernetes_pool_configs (
+             template_release_id, vcpu, memory_mib, target_ready_slots,
+             refill_per_tick, max_warming_slots, namespace, enabled, managed_by
+         )
+         VALUES ($1, 2, 4096, 1, 1, 1, 'space', FALSE, 'autoscaler')
+         RETURNING id"
+    ))
+    .bind(release_id)
+    .fetch_one(pool)
+    .await?;
+    assert!(!release_visible_from(&fixture, "private-base", &hash, worker_ip, None).await?);
+
+    sqlx::query(sql!(
+        "UPDATE kubernetes_pool_configs SET enabled = TRUE WHERE id = $1"
+    ))
+    .bind(config_id)
+    .execute(pool)
+    .await?;
+    assert!(release_visible_from(&fixture, "private-base", &hash, worker_ip, None).await?);
+    assert!(!release_visible_from(&fixture, "private-base", &hash, builder_ip, None).await?);
+    assert!(!release_visible_from(&fixture, "private-base", &hash, unregistered_ip, None).await?);
+    Ok(())
+}
+
 async fn seed_active_k8s_sandbox(
     pool: &sqlx::PgPool,
     sandbox_id: SandboxId,
@@ -3414,6 +4612,7 @@ async fn finalize(
                 target_state: target as i32,
                 bytes_uploaded: bytes,
                 failure_reason: None,
+                artifact_digests: Vec::new(),
             },
             TEST_WORKER_IP,
         ))
@@ -3421,15 +4620,19 @@ async fn finalize(
         .map(|_| ())
 }
 
-/// Helper to call `GetSuspendSnapshotLocation` for assertions.
+/// Helper to call `GetSuspendSnapshotLocation` for assertions, from the node
+/// the seeded sandboxes are placed on.
 async fn get_location(
     service: &ClusterApiService,
     sandbox_id: SandboxId,
 ) -> Result<GetSuspendSnapshotLocationResponse, tonic::Status> {
     service
-        .get_suspend_snapshot_location(Request::new(GetSuspendSnapshotLocationRequest {
-            sandbox_id: sandbox_id.to_string(),
-        }))
+        .get_suspend_snapshot_location(request_from_node(
+            GetSuspendSnapshotLocationRequest {
+                sandbox_id: sandbox_id.to_string(),
+            },
+            TEST_WORKER_IP,
+        ))
         .await
         .map(|r| r.into_inner())
 }
@@ -3532,6 +4735,7 @@ async fn finalize_artifact_backup_from_node(
                 target_state: SuspendSnapshotTerminalState::Ready as i32,
                 bytes_uploaded: 42,
                 failure_reason: None,
+                artifact_digests: Vec::new(),
             },
             node_ip,
         ))
@@ -4219,11 +5423,15 @@ async fn get_artifact_location(
     artifact_kind: pplx_space_sbx_mgr_client::proto::ArtifactKind,
 ) -> Result<GetArtifactBackupLocationResponse, tonic::Status> {
     service
-        .get_artifact_backup_location(Request::new(GetArtifactBackupLocationRequest {
-            sandbox_id: sandbox_id.to_string(),
-            local_artifact_id: local_artifact_id.to_string(),
-            artifact_kind: artifact_kind as i32,
-        }))
+        .get_artifact_backup_location(request_from_node(
+            GetArtifactBackupLocationRequest {
+                sandbox_id: sandbox_id.to_string(),
+                local_artifact_id: local_artifact_id.to_string(),
+                artifact_kind: artifact_kind as i32,
+                readiness: None,
+            },
+            TEST_WORKER_IP,
+        ))
         .await
         .map(|response| response.into_inner())
 }
@@ -4477,6 +5685,27 @@ async fn concurrent_begin_artifact_backup_is_idempotent() -> TestResult {
     .fetch_one(&fixture.service.pool)
     .await?;
     assert_eq!(storage_location_count, 1);
+    Ok(())
+}
+
+// The insert holds its transaction open while authorizing the source node.
+// Concurrent callers each hold a pooled connection, so the authorization
+// lookup must not need a second one; one connection makes that deterministic.
+#[tokio::test(flavor = "current_thread")]
+async fn begin_artifact_backup_completes_on_a_single_pooled_connection() -> TestResult {
+    let Some(fixture) = cluster_fixture_with_max_connections(1).await? else {
+        return Ok(());
+    };
+    let sandbox_id = seed_sandbox(&fixture.service.pool).await?;
+    begin_artifact_backup(
+        &fixture.service,
+        sandbox_id,
+        LocalArtifactId::new(),
+        SnapshotId::from_uuid(Uuid::now_v7()),
+        pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+        pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend,
+    )
+    .await?;
     Ok(())
 }
 
@@ -4767,6 +5996,7 @@ async fn finalize_failed_persists_failure_reason() -> TestResult {
                 target_state: SuspendSnapshotTerminalState::Failed as i32,
                 bytes_uploaded: 0,
                 failure_reason: Some(reason.to_string()),
+                artifact_digests: Vec::new(),
             },
             TEST_WORKER_IP,
         ))
@@ -4835,6 +6065,7 @@ async fn finalize_failed_blank_reason_is_treated_as_absent() -> TestResult {
                 target_state: SuspendSnapshotTerminalState::Failed as i32,
                 bytes_uploaded: 0,
                 failure_reason: Some("   \t  ".to_string()),
+                artifact_digests: Vec::new(),
             },
             TEST_WORKER_IP,
         ))
@@ -5286,6 +6517,7 @@ async fn template_visibility_degrades_to_unspecified_without_column() -> TestRes
     let by_tag = fixture
         .service
         .find_template_release(Request::new(FindTemplateReleaseRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             runtime: "firecracker".to_string(),
@@ -5302,6 +6534,7 @@ async fn template_visibility_degrades_to_unspecified_without_column() -> TestRes
     let by_hash = fixture
         .service
         .find_template_release_by_hash(Request::new(FindTemplateReleaseByHashRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             hash: VISIBILITY_TEST_DIGEST.to_string(),
@@ -5386,6 +6619,7 @@ async fn visibility_lookup_reads_from_the_visibility_pool() -> TestResult {
         .with_visibility_pool(sideline.service.pool.clone());
     let response = service
         .find_template_release(Request::new(FindTemplateReleaseRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             runtime: "firecracker".to_string(),
@@ -5410,6 +6644,7 @@ async fn visibility_lookup_reads_from_the_visibility_pool() -> TestResult {
     // one of them back to the shared pool is its own distinct bug.
     let by_hash = service
         .find_template_release_by_hash(Request::new(FindTemplateReleaseByHashRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             hash: VISIBILITY_TEST_DIGEST.to_string(),
@@ -5467,6 +6702,7 @@ async fn template_visibility_unrecognized_value_is_unspecified() -> TestResult {
     let by_tag = fixture
         .service
         .find_template_release(Request::new(FindTemplateReleaseRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             runtime: "firecracker".to_string(),
@@ -5517,6 +6753,7 @@ async fn template_visibility_maps_column_values() -> TestResult {
         async move {
             service
                 .find_template_release(Request::new(FindTemplateReleaseRequest {
+                    generic_only: false,
                     caller_org_id: None,
                     template_name: "code-runtime".to_string(),
                     runtime: "firecracker".to_string(),
@@ -5554,6 +6791,7 @@ async fn template_visibility_maps_column_values() -> TestResult {
     let by_hash = fixture
         .service
         .find_template_release_by_hash(Request::new(FindTemplateReleaseByHashRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             hash: VISIBILITY_TEST_DIGEST.to_string(),
@@ -5661,6 +6899,7 @@ async fn visibility_of_find(fixture: &ClusterFixture) -> TestResult<TemplateVisi
     Ok(fixture
         .service
         .find_template_release(Request::new(FindTemplateReleaseRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             runtime: "firecracker".to_string(),
@@ -5882,3 +7121,567 @@ async fn a_missing_templates_table_degrades_end_to_end() -> TestResult {
 }
 
 mod publication;
+
+#[tokio::test(flavor = "current_thread")]
+async fn ecw_route_resolve_enforces_key_surface_and_organization() -> TestResult {
+    if !pplx_space_test_env::enter_test_process(&[
+        (
+            "SPACE_INTERNAL_RPC_INSECURE_DEV",
+            Some(std::ffi::OsStr::new("true")),
+        ),
+        (
+            "SPACE_INTERNAL_TOKEN",
+            Some(std::ffi::OsStr::new("route-scope-test-token")),
+        ),
+    ]) {
+        return Ok(());
+    }
+    let fixture = cluster_fixture()
+        .await?
+        .expect("Postgres is required for this reproduction");
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    let key_hash = sha256_hex("route-scope-test-native-only-key");
+    insert_data_plane_worker_node(&fixture.service.pool, node_id, "192.0.2.41").await?;
+    let node_api = sim_worker_node_api(node_id).await?;
+    insert_data_plane_direct_node_endpoint(&fixture.service.pool, node_id, node_api.endpoint())
+        .await?;
+    insert_data_plane_active_sandbox(&fixture.service.pool, sandbox_id, node_id).await?;
+    insert_active_execution(&fixture.service.pool, sandbox_id, "192.0.2.42", 1).await?;
+    insert_e2b_api_key(&fixture.service.pool, &key_hash).await?;
+
+    let request = |hash: String| {
+        Request::new(UnstableResolveSandboxServiceRouteRequest {
+            sandbox_id: sandbox_id.to_string(),
+            port: 49_983,
+            route_kind: SandboxServiceRouteKind::Agent as i32,
+            transport: SandboxServiceRouteTransport::Direct as i32,
+            credential_proofs: vec![route_credential_proof(
+                SandboxServiceRouteCredentialKind::OrgApiKey,
+                hash,
+            )],
+        })
+    };
+
+    let invalid = fixture
+        .service
+        .unstable_resolve_sandbox_service_route(request(sha256_hex("wrong-key")))
+        .await
+        .expect_err("an invalid key must be rejected");
+    assert_eq!(invalid.code(), Code::Unauthenticated);
+
+    for surfaces in [vec!["ecw"], vec!["native"], vec!["ecw", "native"]] {
+        sqlx::query(pplx_space_common_core::sql!(
+            "UPDATE api_keys SET allowed_surfaces = $1 WHERE key_hash = $2"
+        ))
+        .bind(&surfaces)
+        .bind(&key_hash)
+        .execute(&fixture.service.pool)
+        .await?;
+        let result = fixture
+            .service
+            .unstable_resolve_sandbox_service_route(request(key_hash.clone()))
+            .await;
+        if surfaces.contains(&"ecw") {
+            let route = result?.into_inner();
+            assert_eq!(route.sandbox_id, sandbox_id.to_string());
+            assert!(route.space_api_route_token.is_some());
+        } else {
+            assert!(
+                matches!(result, Err(status) if status.code() == Code::Unauthenticated),
+                "native-only keys cannot control the ECW agent"
+            );
+        }
+    }
+
+    sqlx::query(pplx_space_common_core::sql!(
+        "UPDATE api_keys SET org_id = '00000000-0000-0000-0000-000000000002' WHERE key_hash = $1"
+    ))
+    .bind(&key_hash)
+    .execute(&fixture.service.pool)
+    .await?;
+    let other_org = fixture
+        .service
+        .unstable_resolve_sandbox_service_route(request(key_hash))
+        .await
+        .expect_err("a key from another organization must be rejected");
+    assert_eq!(other_org.code(), Code::Unauthenticated);
+    Ok(())
+}
+
+fn test_artifact_digests() -> Vec<crate::proto::SnapshotArtifactDigest> {
+    vec![
+        crate::proto::SnapshotArtifactDigest {
+            artifact: "memfile".to_string(),
+            digest: format!("sha256:{}", "22".repeat(32)),
+            size_bytes: 1 << 30,
+        },
+        crate::proto::SnapshotArtifactDigest {
+            artifact: "binfile".to_string(),
+            digest: format!("sha256:{}", "11".repeat(32)),
+            size_bytes: 4096,
+        },
+    ]
+}
+
+async fn finalize_ready_with_digests(
+    service: &ClusterApiService,
+    backup_attempt_id: SnapshotId,
+    artifact_digests: Vec<crate::proto::SnapshotArtifactDigest>,
+) -> Result<(), tonic::Status> {
+    service
+        .finalize_artifact_backup(request_from_node(
+            FinalizeArtifactBackupRequest {
+                backup_attempt_id: backup_attempt_id.to_string(),
+                target_state: SuspendSnapshotTerminalState::Ready as i32,
+                bytes_uploaded: 4096 + (1 << 30),
+                failure_reason: None,
+                artifact_digests,
+            },
+            TEST_WORKER_IP,
+        ))
+        .await
+        .map(|_| ())
+}
+
+/// Digests the source node reports at finalize travel with the backup to
+/// both restore lookups, ordered by artifact file name.
+#[tokio::test(flavor = "current_thread")]
+async fn finalize_to_ready_publishes_artifact_digests_to_restore_lookups() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let sandbox_id = seed_sandbox(&fixture.service.pool).await?;
+    let local_artifact_id = LocalArtifactId::new();
+    let backup_attempt_id = SnapshotId::new();
+    begin_artifact_backup(
+        &fixture.service,
+        sandbox_id,
+        local_artifact_id,
+        backup_attempt_id,
+        pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+        pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend,
+    )
+    .await?;
+    finalize_ready_with_digests(&fixture.service, backup_attempt_id, test_artifact_digests())
+        .await?;
+
+    let mut expected = test_artifact_digests();
+    expected.sort_by(|a, b| a.artifact.cmp(&b.artifact));
+    let artifact = get_artifact_location(
+        &fixture.service,
+        sandbox_id,
+        local_artifact_id,
+        pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+    )
+    .await?;
+    assert_eq!(artifact.artifact_digests, expected);
+    let suspend = get_location(&fixture.service, sandbox_id).await?;
+    assert_eq!(suspend.snapshot_id, backup_attempt_id.to_string());
+    assert_eq!(suspend.artifact_digests, expected);
+    Ok(())
+}
+
+/// Malformed digests are refused at the wire boundary and leave the attempt
+/// open for a well-formed retry.
+#[tokio::test(flavor = "current_thread")]
+async fn finalize_rejects_malformed_artifact_digests() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let sandbox_id = seed_sandbox(&fixture.service.pool).await?;
+    let backup_attempt_id = SnapshotId::new();
+    begin_artifact_backup(
+        &fixture.service,
+        sandbox_id,
+        LocalArtifactId::new(),
+        backup_attempt_id,
+        pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+        pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend,
+    )
+    .await?;
+
+    let good = test_artifact_digests();
+    let mut unknown_artifact = good.clone();
+    unknown_artifact[0].artifact = "../memfile".to_string();
+    let mut malformed_digest = good.clone();
+    malformed_digest[0].digest = "sha256:not-hex".to_string();
+    let mut duplicate_artifact = good.clone();
+    duplicate_artifact[1].artifact = "memfile".to_string();
+    for artifact_digests in [unknown_artifact, malformed_digest, duplicate_artifact] {
+        let err =
+            finalize_ready_with_digests(&fixture.service, backup_attempt_id, artifact_digests)
+                .await
+                .expect_err("malformed digests must be refused");
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+    let state: String = sqlx::query_scalar("SELECT state FROM snapshots WHERE id = $1")
+        .bind(backup_attempt_id)
+        .fetch_one(&fixture.service.pool)
+        .await?;
+    assert_eq!(state, "creating");
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn restore_locations_keep_digests_during_catalog_deletion() -> TestResult {
+    let Some(fixture) = cluster_fixture_with_max_connections(4).await? else {
+        return Ok(());
+    };
+    let mut results = Vec::new();
+    for use_artifact_lookup in [false, true] {
+        let sandbox_id = seed_sandbox(&fixture.service.pool).await?;
+        let local_artifact_id = LocalArtifactId::new();
+        let attempt = SnapshotId::new();
+        begin_artifact_backup(
+            &fixture.service,
+            sandbox_id,
+            local_artifact_id,
+            attempt,
+            pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+            pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend,
+        )
+        .await?;
+        finalize_ready_with_digests(&fixture.service, attempt, test_artifact_digests()).await?;
+
+        // Stop the digest read after the location read, then perform real
+        // teardown. Object bytes outlive the catalog until the orphan sweep.
+        let mut deletion = fixture.service.pool.begin().await?;
+        sqlx::query(sql!(
+            "LOCK TABLE snapshot_artifact_digests IN ACCESS EXCLUSIVE MODE"
+        ))
+        .execute(&mut *deletion)
+        .await?;
+        let blocker: i32 = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
+            .fetch_one(&mut *deletion)
+            .await?;
+        let lookup = async {
+            if use_artifact_lookup {
+                get_artifact_location(
+                    &fixture.service,
+                    sandbox_id,
+                    local_artifact_id,
+                    pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+                )
+                .await
+                .map(|location| location.artifact_digests)
+            } else {
+                get_location(&fixture.service, sandbox_id)
+                    .await
+                    .map(|location| location.artifact_digests)
+            }
+        };
+        let remove = async {
+            loop {
+                let blocked: bool = sqlx::query_scalar(sql!(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM pg_stat_activity
+                         WHERE datname = current_database()
+                           AND $1 = ANY(pg_blocking_pids(pid)))"
+                ))
+                .bind(blocker)
+                .fetch_one(&fixture.service.pool)
+                .await?;
+                if blocked {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            pplx_space_sandbox_teardown::finalize_sandbox_db_delete_tx(&mut deletion, sandbox_id)
+                .await?;
+            deletion.commit().await
+        };
+        let (result, removed) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(lookup, remove)
+        })
+        .await?;
+        removed?;
+        results.push((use_artifact_lookup, result));
+    }
+
+    let mut expected = test_artifact_digests();
+    expected.sort_by(|a, b| a.artifact.cmp(&b.artifact));
+    for (use_artifact_lookup, result) in results {
+        match result {
+            Ok(digests) => assert_eq!(
+                digests, expected,
+                "a selected location must retain its digests (artifact lookup: {use_artifact_lookup})"
+            ),
+            Err(status) => assert_eq!(status.code(), Code::NotFound),
+        }
+    }
+    Ok(())
+}
+
+/// The node-bound template and policy reads answer for the templates the
+/// node has a sandbox placed on, warms, or builds from, plus generic ones,
+/// and for the sandboxes placed on it: the same placement the release lookups
+/// use. Inventory is reported by the node itself, so holding a template only
+/// lets the node hear that the template is being retired.
+#[tokio::test(flavor = "current_thread")]
+async fn node_template_and_policy_reads_follow_placement() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    let owner = Uuid::parse_str("00000000-0000-0000-0000-000000000003")?;
+    let (release_id, _) = seed_private_release(&fixture, "private-base", owner).await?;
+    register_template(&fixture.service, "code-runtime").await?;
+    let host_ip = std::net::Ipv4Addr::new(10, 0, 0, 30);
+    let other_ip = std::net::Ipv4Addr::new(10, 0, 0, 31);
+    let builder_ip = std::net::Ipv4Addr::new(10, 0, 0, 40);
+    let host = insert_k8s_node(pool, host_ip, "worker").await?;
+    let other = insert_k8s_node(pool, other_ip, "worker").await?;
+    let builder = insert_k8s_node(pool, builder_ip, "builder").await?;
+    let sandbox_id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (
+             id, user_id, org_id, managed_by, lifecycle, placement,
+             active_node_id, target_node_id, command_ready_pending,
+             network_policy_generation, template_id
+         )
+         VALUES ($1, $2::uuid, $3::uuid, 'k8s', 'started', 'on_node', $4, $4, TRUE, 1, 'private-base')"
+    ))
+    .bind(sandbox_id)
+    .bind(SEEDED_USER_ID)
+    .bind(owner)
+    .bind(host)
+    .execute(pool)
+    .await?;
+
+    struct Seen {
+        policy: Vec<String>,
+        sandboxes: Vec<String>,
+        desired: Vec<(String, Option<bool>)>,
+        base: Vec<String>,
+    }
+    async fn seen_by(
+        fixture: &ClusterFixture,
+        node: Uuid,
+        node_ip: std::net::Ipv4Addr,
+        role: ProtoNodeRole,
+        sandbox_id: Uuid,
+    ) -> TestResult<Seen> {
+        let node_ip = std::net::IpAddr::V4(node_ip);
+        let templates = vec!["private-base".to_string(), "code-runtime".to_string()];
+        let role = Some(role as i32);
+        let policy = fixture
+            .service
+            .get_node_network_policy_state(request_from_node(
+                GetNodeNetworkPolicyStateRequest {
+                    node_id: node.to_string(),
+                    templates: templates.clone(),
+                    sandbox_ids: vec![sandbox_id.to_string()],
+                    role,
+                },
+                node_ip,
+            ))
+            .await?
+            .into_inner();
+        let desired = fixture
+            .service
+            .get_node_template_desired_state(request_from_node(
+                GetNodeTemplateDesiredStateRequest {
+                    node_id: node.to_string(),
+                    templates: templates.clone(),
+                    role,
+                },
+                node_ip,
+            ))
+            .await?
+            .into_inner();
+        let base = fixture
+            .service
+            .get_node_template_base_snapshot_policy_state(request_from_node(
+                GetNodeTemplateBaseSnapshotPolicyStateRequest {
+                    node_id: node.to_string(),
+                    templates,
+                    role,
+                },
+                node_ip,
+            ))
+            .await?
+            .into_inner();
+        let mut seen = Seen {
+            policy: policy.templates.into_iter().map(|t| t.template).collect(),
+            sandboxes: policy.sandboxes.into_iter().map(|s| s.sandbox_id).collect(),
+            desired: desired
+                .templates
+                .into_iter()
+                .map(|t| (t.template, t.present))
+                .collect(),
+            base: base.templates.into_iter().map(|t| t.template).collect(),
+        };
+        seen.policy.sort();
+        seen.desired.sort();
+        seen.base.sort();
+        Ok(seen)
+    }
+    fn assert_seen(seen: &Seen, templates: &[&str], sandbox: Option<Uuid>, label: &str) {
+        let templates: Vec<String> = templates.iter().map(|t| t.to_string()).collect();
+        let present: Vec<(String, Option<bool>)> =
+            templates.iter().map(|t| (t.clone(), Some(true))).collect();
+        assert_eq!(seen.policy, templates, "{label}: policy templates");
+        assert_eq!(seen.base, templates, "{label}: base-snapshot templates");
+        assert_eq!(seen.desired, present, "{label}: desired templates");
+        let sandbox: Vec<String> = sandbox.into_iter().map(|id| id.to_string()).collect();
+        assert_eq!(seen.sandboxes, sandbox, "{label}: sandboxes");
+    }
+    const BOTH: &[&str] = &["code-runtime", "private-base"];
+    const GENERIC: &[&str] = &["code-runtime"];
+    let worker = ProtoNodeRole::Worker;
+
+    let seen = seen_by(&fixture, host, host_ip, worker, sandbox_id).await?;
+    assert_seen(&seen, BOTH, Some(sandbox_id), "active host");
+    let seen = seen_by(&fixture, other, other_ip, worker, sandbox_id).await?;
+    assert_seen(&seen, GENERIC, None, "unplaced worker");
+    let seen = seen_by(
+        &fixture,
+        builder,
+        builder_ip,
+        ProtoNodeRole::Builder,
+        sandbox_id,
+    )
+    .await?;
+    assert_seen(&seen, GENERIC, None, "unplaced builder");
+
+    // A pending migration is a target placement: the destination may read
+    // before the sandbox is active there, and the source keeps reading while
+    // it still hosts the sandbox.
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET target_node_id = $1 WHERE id = $2"
+    ))
+    .bind(other)
+    .bind(sandbox_id)
+    .execute(pool)
+    .await?;
+    let seen = seen_by(&fixture, host, host_ip, worker, sandbox_id).await?;
+    assert_seen(&seen, BOTH, Some(sandbox_id), "migration source");
+    let seen = seen_by(&fixture, other, other_ip, worker, sandbox_id).await?;
+    assert_seen(&seen, BOTH, Some(sandbox_id), "migration target");
+
+    // Once the sandbox is active only on the destination, the source loses it.
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET active_node_id = $1, target_node_id = NULL WHERE id = $2"
+    ))
+    .bind(other)
+    .bind(sandbox_id)
+    .execute(pool)
+    .await?;
+    let seen = seen_by(&fixture, other, other_ip, worker, sandbox_id).await?;
+    assert_seen(&seen, BOTH, Some(sandbox_id), "active destination");
+    let seen = seen_by(&fixture, host, host_ip, worker, sandbox_id).await?;
+    assert_seen(&seen, GENERIC, None, "former host");
+
+    // Inventory is what the node reports about itself, so holding a template
+    // is not a placement.
+    sqlx::query(sql!(
+        "INSERT INTO node_template_inventory (node_id, template_name)
+         VALUES ($1, 'private-base')"
+    ))
+    .bind(host)
+    .execute(pool)
+    .await?;
+    let seen = seen_by(&fixture, host, host_ip, worker, sandbox_id).await?;
+    assert_seen(&seen, GENERIC, None, "self-reported inventory");
+
+    // An enabled warm pool covers registered workers, not builders.
+    let config_id: Uuid = sqlx::query_scalar(sql!(
+        "INSERT INTO kubernetes_pool_configs (
+             template_release_id, vcpu, memory_mib, target_ready_slots,
+             refill_per_tick, max_warming_slots, namespace, enabled, managed_by
+         )
+         VALUES ($1, 2, 4096, 1, 1, 1, 'space', FALSE, 'autoscaler')
+         RETURNING id"
+    ))
+    .bind(release_id)
+    .fetch_one(pool)
+    .await?;
+    let seen = seen_by(&fixture, host, host_ip, worker, sandbox_id).await?;
+    assert_seen(&seen, GENERIC, None, "disabled pool");
+    sqlx::query(sql!(
+        "UPDATE kubernetes_pool_configs SET enabled = TRUE WHERE id = $1"
+    ))
+    .bind(config_id)
+    .execute(pool)
+    .await?;
+    let seen = seen_by(&fixture, host, host_ip, worker, sandbox_id).await?;
+    assert_seen(&seen, BOTH, None, "enabled pool, worker");
+    let seen = seen_by(
+        &fixture,
+        builder,
+        builder_ip,
+        ProtoNodeRole::Builder,
+        sandbox_id,
+    )
+    .await?;
+    assert_seen(&seen, GENERIC, None, "enabled pool, builder");
+    sqlx::query(sql!(
+        "UPDATE kubernetes_pool_configs SET enabled = FALSE WHERE id = $1"
+    ))
+    .bind(config_id)
+    .execute(pool)
+    .await?;
+
+    // A fresh build grant covers registered builders, not workers.
+    sqlx::query(sql!(
+        "INSERT INTO template_build_base_grants (id, template_id, base_template_name, org_id)
+         VALUES ($1, 'private-child', 'private-base', $2)"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(owner)
+    .execute(pool)
+    .await?;
+    let seen = seen_by(
+        &fixture,
+        builder,
+        builder_ip,
+        ProtoNodeRole::Builder,
+        sandbox_id,
+    )
+    .await?;
+    assert_seen(&seen, BOTH, None, "fresh grant, builder");
+    let seen = seen_by(&fixture, host, host_ip, worker, sandbox_id).await?;
+    assert_seen(&seen, GENERIC, None, "fresh grant, worker");
+    sqlx::query(sql!("DELETE FROM template_build_base_grants"))
+        .execute(pool)
+        .await?;
+
+    // Retiring a template: a node that still holds it hears `present = false`
+    // and nothing else, while placement keeps serving the sandbox's host.
+    sqlx::query(sql!(
+        "UPDATE templates SET desired_state = 'deleting' WHERE name = 'private-base'"
+    ))
+    .execute(pool)
+    .await?;
+    let retiring = vec![
+        ("code-runtime".to_string(), Some(true)),
+        ("private-base".to_string(), Some(false)),
+    ];
+    let holder = seen_by(&fixture, host, host_ip, worker, sandbox_id).await?;
+    assert_eq!(holder.policy, GENERIC, "retiring holder: policy templates");
+    assert_eq!(
+        holder.base, GENERIC,
+        "retiring holder: base-snapshot templates"
+    );
+    assert_eq!(
+        holder.desired, retiring,
+        "retiring holder: desired templates"
+    );
+    assert!(holder.sandboxes.is_empty(), "retiring holder: sandboxes");
+    let active = seen_by(&fixture, other, other_ip, worker, sandbox_id).await?;
+    assert_eq!(
+        active.policy, BOTH,
+        "retiring sandbox host: policy templates"
+    );
+    assert_eq!(
+        active.base, BOTH,
+        "retiring sandbox host: base-snapshot templates"
+    );
+    assert_eq!(
+        active.desired, retiring,
+        "retiring sandbox host: desired templates"
+    );
+    assert_eq!(active.sandboxes, vec![sandbox_id.to_string()]);
+    Ok(())
+}

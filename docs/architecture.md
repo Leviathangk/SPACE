@@ -83,7 +83,12 @@ The separate command-stream path is **Application → Data plane ↔ Guest proce
 
 An operation's `state` describes the lifecycle request; the sandbox's `state` describes the environment. Neither is the exit status of a command.
 
+In Kind, sandbox pods run in their own namespace, `sandboxes`, apart from the control plane in `space`. NetworkPolicies there admit only the API and cluster controller, on the port they dial, and limit sandbox egress to the public IPv4 internet and cluster DNS; the [Kind harness README](../infra/space/kind/README.md#sandbox-namespace-and-network-policy) lists each rule's source.
+
 ## Lifecycle and persistence
+
+[Snapshot upload streaming](snapshot-upload-streaming.md) describes the worker
+transfer pipeline, memory bounds, failure ownership, and rollout behavior.
 
 Pause and suspend both stop execution, but retain state differently. Use wake to return a paused or suspended sandbox to running, and wait for its operation and readiness before issuing another command.
 
@@ -102,6 +107,13 @@ so a temporary reduction does not permanently prevent raising the quota again.
 
 By default, sandboxes created through the SPACE API suspend after six hours without access or command activity. This is an idle limit, not a maximum lifetime.
 
+A created or overwritten file that can replace its destination is published
+atomically when its writes complete, and persisted at lifecycle boundaries,
+not per write: an acknowledged one is not guaranteed to survive a sandbox
+crash, forced stop or host failure. [Guest file and disk
+I/O](space/design/guest-io.md) describes the guest's disk, its per-sandbox
+limits, the upload and read paths, and what each lifecycle operation persists.
+
 The **E2B Compatibility Wrapper (ECW)** is SPACE's E2B-compatible API surface.
 It translates E2B-compatible requests and responses at the edge and is distinct
 from the SPACE API. The [ECW guide](ecw.md) defines its tested compatibility
@@ -111,8 +123,15 @@ to SPACE suspend, and its resume maps to SPACE restore.
 Service-port ingress has a separate connection lifetime. With ingress protection
 enabled and completion framing negotiated, automatic lifecycle transitions defer until the HTTP response body or
 WebSocket connection completes; explicit lifecycle operations retain their
-existing authority. Optional ingress wake authorizes access and respects the
-sandbox's access-wake policy before preparing a dormant backend. Transport idle
+existing authority. Ingress wake authorizes access and respects the
+sandbox's access-wake policy before preparing a dormant backend. Route resolution
+first prepares the current worker path. If activation or recovery is needed,
+the cluster API delegates through the authenticated `IngressActivationApi` to
+the API process's existing lifecycle controller. It re-resolves and reauthorizes
+after activation, within the original request deadline. The cluster API does
+not construct a Kubernetes substrate or retain the sandbox-pod reflector cache.
+Accepted activation remains owned by the API's tracked lifecycle tasks and
+existing execution leases; a caller timeout only ends its wait. Transport idle
 limits still apply, and SPACE does not generate WebSocket keepalives.
 During coordinated deployment, a temporary metadata opt-in falls back to ordinary
 stream termination for older callers or gateways. Drain existing attachments
@@ -129,11 +148,10 @@ current execution generation from the worker before applying a fenced mutation.
 This lookup remains necessary after rollout; missing API identity is not proof
 of a dormant execution. Ingress protection does not cover unrelated background
 operations.
-Accepted ingress activation survives request cancellation. Shutdown draining is
-best-effort within the deployment termination budget: the application allows up
-to 150 seconds after server shutdown, while the local internal-API chart allows
-10 seconds total. Existing activation leases provide recovery if the process
-exits before completion.
+Accepted ingress activation survives request cancellation. The API's HTTP and
+activation listeners share its shutdown signal and drain budget. Draining is
+best-effort within the deployment termination grace; existing activation leases
+provide recovery if the process exits before completion.
 
 ### Lifecycle policy at activation
 
@@ -173,8 +191,33 @@ is safe.
 | Controllers and adapters | Coordinate sandbox lifecycle changes with worker services. In Kind, the Kubernetes adapter, cluster controller, and runtime shim create and manage sandbox pods. |
 | Worker services | Manage VMs, networking, volumes, templates, and credentials. btrfs copy-on-write supports root filesystem creation. |
 | Data plane | Connect clients to guest processes and forward events using scoped tokens. |
-| Builders and object storage | Build templates separately from user sandboxes and store template and snapshot artifacts. The Kind deployment uses SeaweedFS. |
+| Builders and object storage | Build templates separately from user sandboxes and store template and snapshot artifacts. The Kind deployment uses Versity S3 Gateway (versitygw). |
 | Internal API and UI | Support node registration and template-release publication, and provide a browser interface. API clients do not require the UI. |
+
+Sandbox-manager waits for node-manager before advertising takeover readiness
+and again before acquiring the startup-recovery work gate. Temporary dependency
+failures keep the process waiting with bounded individual attempts and periodic
+warnings; there is no overall dependency-wait deadline. Its optional local health
+socket serves liveness while withholding readiness during these waits. Deployment
+probes must distinguish liveness from readiness; external startup deadlines still
+apply. Local execution-authority validation remains under recovery admission.
+These availability checks do not guarantee that node-manager will stay available
+through recovery, and do not extend any caller's request deadline.
+
+Existing namespace containment runs with at most four workers, preserving the
+order of checks within each namespace. All checks finish before admission;
+any failure prevents activation. Shutdown stops scheduling new namespaces and
+waits for in-flight host commands before releasing service ownership. The pool
+opens on tracked blocking work so its host commands do not stall local liveness.
+
+An opt-in Linux benchmark exercises production containment against synthetic
+network namespaces and nftables rules, comparing sequential and bounded parallel
+passes. Run only inside a disposable container with network namespace capabilities:
+
+```sh
+SPACE_RUN_CONTAINMENT_BENCHMARK=1 cargo test -p pplx-space-node-mgr --lib \
+  linux_containment_benchmark -- --ignored --nocapture
+```
 
 ## Security boundaries
 

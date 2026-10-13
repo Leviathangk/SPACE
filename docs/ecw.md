@@ -140,9 +140,23 @@ The following compatibility limits are important:
   Connect leaves the lifecycle policy unchanged when `timeout` is omitted. An
   explicit timeout replaces the current timeout, including with a shorter
   value; if no E2B policy exists, it creates an auto-delete policy.
-- Template `startCmd` is installed as a systemd unit and runs on cold boot;
-  SPACE does not yet publish the warm snapshot used by E2B for this behavior.
-- Template `readyCmd` is accepted for SDK compatibility but is not enforced.
+- Template `startCmd` and `readyCmd` become the native app named `app` in the
+  native declaration, compiled by the builder into systemd units. A TOML inspection
+  copy is retained in the guest. Native recipes can declare multiple apps; ECW retains
+  its single-command interface. Startup
+  uses template ENV only, as root in `/` through `/bin/sh -lc`. Sandbox environment
+  overrides apply to later commands, not the template application. Apps are optional:
+  `readyCmd` controls the app unit's startup status, not sandbox readiness. Base
+  snapshot preparation waits up to the app startup budget, returns early when ready,
+  and logs a host warning before capturing if the app fails or times out. ECW apps
+  use the default `best-effort` startup policy. Native recipes can opt into
+  `required`, which rejects the snapshot on failure while allowing cold boot.
+  Restore resumes captured state. Rootfs publication does not validate app readiness.
+  A non-empty `readyCmd` without `startCmd` is now rejected; previously it was
+  ignored. App failures do not fail sandbox start, resume, restore, or wake.
+  Clients may receive connection refused immediately after create and must wait
+  for their application separately.
+  See [native template startup](native-template-runtime.md) for limits and rollout.
   Per-step `force=true` is promoted to SPACE's build-wide cache switch, which
   may rebuild more layers but will not reuse the requested layer. Positive
   `minFreeDiskMb` and `teamID` are rejected explicitly.
@@ -150,6 +164,13 @@ The following compatibility limits are important:
   are not supported.
 - `code-interpreter-v1` is translated to SPACE's `code-runtime` template. That
   template must exist if callers rely on the alias.
+- Sandbox delete records a durable delete operation and waits briefly for it.
+  It returns `204` when the delete has finished and `202` when the delete is
+  queued but has not finished, for example while the sandbox's node is draining
+  or restarting. Both are SDK success responses; repeated deletes join the same
+  queued operation, so a `202` needs no retry. The sandbox can remain visible
+  until the queued delete finishes. If the delete cannot be recorded, the
+  response is a retryable `503` with `Retry-After`.
 
 ECW routes are not included in the SPACE OpenAPI document. Treat the pinned SDK
 tests and the behavior documented here as the compatibility baseline. When
@@ -173,6 +194,36 @@ return an explicit E2B-shaped `501`; unsupported methods on implemented envd
 routes return `405`. Service-port traffic is intercepted before envd routing,
 so these paths remain available to applications on user sandbox ports.
 
+`POST /files` accepts `multipart/form-data` and `application/octet-stream`
+uploads of up to 256 MiB per request, which the data plane streams to a spool
+file rather than holding in memory. For multipart, the 256 MiB includes part
+headers and ignored fields. A multipart request may carry at most 1000 parts
+and a boundary of at most 70 characters, and each part may carry at most 32
+headers. Part headers beyond roughly 60 KiB may be rejected, depending on how
+the body is framed and encoded. Only parts named `file` are written. Without a
+`path` query, each `file` part's filename names its destination and may be at
+most 4096 bytes. Such a filename may not contain `\\`: clients encode it as
+either one backslash or two, so the request is rejected instead of guessing.
+With a `path` query, the request may carry only one `file` part. JSON file writes (`{"path": …, "content": …}`,
+also used when the request has no `Content-Type`) are capped at 1 MiB of
+request body and return `413` above that; send larger files as multipart or
+octet-stream.
+
+### Retrying an ambiguous command start
+
+A client can lose a `Process.Start` after writing it, for example when the
+connection stops acknowledging data, and then cannot tell whether the command
+ran. Send an `Idempotency-Key` header of 1 to 256 visible ASCII bytes with the
+start, and retry the identical request with the same key. Within 60 seconds of
+the first attempt, a retry that finds the original start receives that
+process's stream from its first event instead of running the command again; a
+retry that finds no earlier start runs it once. Reusing a key with a different
+request starts that request as a new command. A later retry usually fails with
+`failed_precondition`, but deduplication state is bounded and does not survive
+a sandbox runtime restart, so treat it as retry protection rather than an
+exactly-once guarantee. Starts without the header keep their existing
+behavior.
+
 ## Choose the SPACE API for new integrations
 
 Use ECW when an existing application needs E2B SDK compatibility. New SPACE
@@ -195,6 +246,14 @@ A successful reconnect or timeout update for a running execution requires
 `x-space-access-idle-update: 1` acknowledgement metadata and an `Applied` or
 `AlreadyCurrent` outcome from the sandbox manager. Ordinary access touches are
 not sufficient acknowledgement of a deadline operation.
+
+If the worker connection fails before a deadline update is sent, for example
+while the node service restarts, the API retries it once on a fresh connection
+within the same operation deadline. If the connection breaks after the update
+may have reached the worker, the API does not resend it. A reconnect extension
+succeeds only if the worker's state then shows the extended deadline; otherwise,
+and always for a timeout reset, the request fails with a retryable `503` and
+`Retry-After`.
 
 When execution identity has not reached the API, it queries the current worker
 identity before sending the generation-fenced deadline update. This lookup is

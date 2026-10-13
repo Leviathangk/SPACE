@@ -76,6 +76,9 @@ const WORKER_ENV_ALLOWLIST: &[&str] = &[
     // chosen export cadence has to cross the re-exec with the endpoint it
     // applies to; the launcher's cadence does not reach the child.
     "OTEL_METRIC_EXPORT_INTERVAL",
+    // Its temporality likewise: unforwarded, the worker would fall back to
+    // delta under a launcher that selected cumulative.
+    "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
     "OTEL_EXPORTER_OTLP_HEADERS",
     "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
     "HOSTNAME",
@@ -91,6 +94,9 @@ const WORKER_ENV_ALLOWLIST: &[&str] = &[
 ];
 const MAX_IDENTITY_WORKERS: usize = 16;
 const IDENTITY_WORKER_IDLE_TTL: Duration = Duration::from_secs(10 * 60);
+/// How soon the reaper looks again at a worker whose idle TTL has passed
+/// while an operation still holds it.
+const IDENTITY_WORKER_BUSY_RECHECK: Duration = Duration::from_secs(60);
 const IDENTITY_WORKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const IDENTITY_WORKER_START_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const IDENTITY_WORKER_MAX_BLOCKING_THREADS: usize = 16;
@@ -117,6 +123,8 @@ pub(crate) struct WorkerClient {
     activity: Arc<()>,
     stop_token: CancellationToken,
     supervisor: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// The worker process, for duplicating descriptors it opened as its user.
+    pidfd: Option<Arc<std::os::fd::OwnedFd>>,
 }
 
 struct ResidentWorker {
@@ -150,7 +158,7 @@ enum WorkerEntry {
 }
 
 enum ClientAcquisition {
-    Ready(WorkerClient),
+    Ready(Box<WorkerClient>),
     Waiting(watch::Receiver<Option<Result<WorkerClient, Status>>>),
     Start {
         startup_id: uuid::Uuid,
@@ -164,6 +172,61 @@ pub(crate) struct WorkerPool {
     shutdown: CancellationToken,
     workers: Arc<Mutex<HashMap<GuestUserName, WorkerEntry>>>,
     process_slots: Arc<tokio::sync::Semaphore>,
+    /// Whether the idle reaper task is running. It runs only while a worker
+    /// that can expire is resident, so an unused daemon has no timer.
+    reaper_running: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Removes resident workers that are idle and past their TTL, for the caller
+/// to stop outside the pool lock.
+fn take_expired_workers(
+    workers: &mut HashMap<GuestUserName, WorkerEntry>,
+    now: Instant,
+) -> Vec<WorkerClient> {
+    let expired_users = workers
+        .iter()
+        .filter(|(_, entry)| {
+            matches!(
+                entry,
+                WorkerEntry::Resident(worker)
+                    if worker.is_idle()
+                        && now.saturating_duration_since(worker.last_access)
+                            > IDENTITY_WORKER_IDLE_TTL
+            )
+        })
+        .map(|(user, _)| user.clone())
+        .collect::<Vec<_>>();
+    expired_users
+        .into_iter()
+        .filter_map(|expired_user| match workers.remove(&expired_user) {
+            Some(WorkerEntry::Resident(worker)) => Some(worker.client),
+            _ => None,
+        })
+        .collect()
+}
+
+/// When the reaper must look next: the earliest TTL expiry among workers
+/// that can expire (a worker kept for the change ledger cannot), or a
+/// recheck for one whose TTL passed while an operation held it. `None` when
+/// no resident worker can expire.
+fn next_worker_expiry(
+    workers: &HashMap<GuestUserName, WorkerEntry>,
+    now: Instant,
+) -> Option<Instant> {
+    workers
+        .values()
+        .filter_map(|entry| match entry {
+            WorkerEntry::Resident(worker) if !worker.ledger_enabled => {
+                let expiry = worker.last_access + IDENTITY_WORKER_IDLE_TTL;
+                Some(if worker.is_idle() {
+                    expiry
+                } else {
+                    expiry.max(now + IDENTITY_WORKER_BUSY_RECHECK)
+                })
+            }
+            _ => None,
+        })
+        .min()
 }
 
 impl WorkerPool {
@@ -199,36 +262,61 @@ impl WorkerPool {
             shutdown,
             workers: Arc::new(Mutex::new(HashMap::new())),
             process_slots: Arc::new(tokio::sync::Semaphore::new(MAX_IDENTITY_WORKERS)),
+            reaper_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Stops idle workers once their TTL passes, without waiting for the next
+    /// acquisition: an unused daemon otherwise keeps every worker process
+    /// (and its memory) resident until filesystem traffic resumes. One task
+    /// at most; it sleeps until the next expiry and exits when no resident
+    /// worker can expire.
+    fn ensure_reaper(&self) {
+        use std::sync::atomic::Ordering;
+        if self.reaper_running.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let pool = self.clone();
+        drop(tokio::spawn(async move {
+            loop {
+                let next = {
+                    let mut workers = pool.workers.lock().await;
+                    let expired = take_expired_workers(&mut workers, Instant::now());
+                    let next = next_worker_expiry(&workers, Instant::now());
+                    drop(workers);
+                    Self::stop_workers(expired);
+                    next
+                };
+                let Some(deadline) = next else {
+                    pool.reaper_running.store(false, Ordering::Release);
+                    // A worker published after the look above may have seen
+                    // the reaper as running and not started one: look again.
+                    let expirable = next_worker_expiry(&*pool.workers.lock().await, Instant::now());
+                    if expirable.is_some() && !pool.reaper_running.swap(true, Ordering::AcqRel) {
+                        continue;
+                    }
+                    return;
+                };
+                tokio::select! {
+                    () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {}
+                    () = pool.shutdown.cancelled() => {
+                        pool.reaper_running.store(false, Ordering::Release);
+                        return;
+                    }
+                }
+            }
+        }));
     }
 
     pub(crate) async fn client_for(&self, user: GuestUserName) -> Result<WorkerClient, Status> {
         let (acquisition, mut workers_to_stop) = {
             let mut workers = self.workers.lock().await;
-            let expired_users = workers
-                .iter()
-                .filter(|(_, entry)| {
-                    matches!(
-                        entry,
-                        WorkerEntry::Resident(worker)
-                            if worker.is_idle()
-                                && worker.last_access.elapsed() > IDENTITY_WORKER_IDLE_TTL
-                    )
-                })
-                .map(|(user, _)| user.clone())
-                .collect::<Vec<_>>();
-            let mut workers_to_stop = expired_users
-                .into_iter()
-                .filter_map(|expired_user| match workers.remove(&expired_user) {
-                    Some(WorkerEntry::Resident(worker)) => Some(worker.client),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
+            let mut workers_to_stop = take_expired_workers(&mut workers, Instant::now());
 
             let acquisition = match workers.get_mut(&user) {
                 Some(WorkerEntry::Resident(worker)) => {
                     worker.last_access = Instant::now();
-                    ClientAcquisition::Ready(worker.client.clone())
+                    ClientAcquisition::Ready(Box::new(worker.client.clone()))
                 }
                 Some(WorkerEntry::Starting(worker)) => {
                     ClientAcquisition::Waiting(worker.result.clone())
@@ -248,9 +336,9 @@ impl WorkerPool {
                         let Some(evict) = evict else {
                             drop(workers);
                             Self::stop_workers(workers_to_stop);
-                            return Err(Status::resource_exhausted(
+                            return Err(crate::refused(Status::resource_exhausted(
                                 "too many active filesystem identity workers",
-                            ));
+                            )));
                         };
                         if let Some(WorkerEntry::Resident(worker)) = workers.remove(&evict) {
                             workers_to_stop.push(worker.client);
@@ -278,7 +366,7 @@ impl WorkerPool {
         match acquisition {
             ClientAcquisition::Ready(worker) => {
                 Self::stop_workers(workers_to_stop);
-                Ok(worker)
+                Ok(*worker)
             }
             ClientAcquisition::Waiting(result) => {
                 Self::stop_workers(workers_to_stop);
@@ -328,6 +416,11 @@ impl WorkerPool {
     pub(crate) async fn set_ledger_enabled(&self, worker: &WorkerClient, enabled: bool) -> bool {
         if let Some(mut resident) = self.resident_mut(worker).await {
             resident.ledger_enabled = enabled;
+            drop(resident);
+            if !enabled {
+                // It can expire again.
+                self.ensure_reaper();
+            }
             true
         } else {
             false
@@ -360,6 +453,27 @@ impl WorkerPool {
         enabled
     }
 
+    /// [`Self::insert_test_client`] for a worker whose descriptors live in
+    /// this process, so the router can duplicate them as it does a spawned
+    /// worker's.
+    #[cfg(test)]
+    pub(crate) async fn insert_test_client_in_this_process(
+        &self,
+        user: GuestUserName,
+        channel: Channel,
+    ) -> Result<(), Status> {
+        self.insert_test_client(user.clone(), channel).await?;
+        let pidfd = rustix::process::pidfd_open(
+            rustix::process::getpid(),
+            rustix::process::PidfdFlags::empty(),
+        )
+        .map_err(|error| Status::internal(format!("pidfd_open: {error}")))?;
+        if let Some(WorkerEntry::Resident(resident)) = self.workers.lock().await.get_mut(&user) {
+            resident.client.pidfd = Some(Arc::new(pidfd));
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) async fn insert_test_client(
         &self,
@@ -374,6 +488,7 @@ impl WorkerPool {
             ledger_update_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             stop_token: CancellationToken::new(),
             supervisor: Arc::new(Mutex::new(None)),
+            pidfd: None,
         };
         self.workers.lock().await.insert(
             user,
@@ -458,6 +573,7 @@ impl WorkerPool {
                             user.clone(),
                             WorkerEntry::Resident(Box::new(ResidentWorker::new(worker.clone()))),
                         );
+                        self.ensure_reaper();
                     }
                     Err(_) => {
                         workers.remove(user);
@@ -475,14 +591,16 @@ impl WorkerPool {
 
     async fn spawn_worker(&self, user: &GuestUserName) -> Result<WorkerClient, Status> {
         if self.shutdown.is_cancelled() {
-            return Err(Status::unavailable("guest shutting down"));
+            return Err(crate::refused(Status::unavailable("guest shutting down")));
         }
         let process_slot = self
             .process_slots
             .clone()
             .try_acquire_owned()
             .map_err(|_| {
-                Status::resource_exhausted("identity workers still running or terminating")
+                crate::refused(Status::resource_exhausted(
+                    "identity workers still running or terminating",
+                ))
             })?;
         let lookup_user = user.clone();
         let process_slot = tokio::task::spawn_blocking(move || {
@@ -511,6 +629,11 @@ impl WorkerPool {
         unsafe {
             command.pre_exec(move || clear_fd_cloexec(&worker_fd));
         }
+        // Workers run in the `filesystem/` leaf, apart from the supervisor's
+        // control traffic and from workloads.
+        if let Some(cgroups) = crate::cgroup::GuestCgroups::for_process() {
+            cgroups.place_filesystem_worker(&mut command);
+        }
         // Complete fallible socket adoption before a child exists. From spawn
         // to supervisor handoff there must be no error/cancellation gap.
         let router_stream = std::os::unix::net::UnixStream::from(router_fd);
@@ -519,12 +642,29 @@ impl WorkerPool {
             .map_err(worker_io_status)?;
         let router_stream =
             tokio::net::UnixStream::from_std(router_stream).map_err(worker_io_status)?;
-        let child = {
-            let _spawn_guard = crate::GUEST_CHILD_SPAWN_LOCK.lock().await;
-            command.spawn().map_err(worker_io_status)?
-        };
-        drop(command);
+        // The daemon creates its own descriptors CLOEXEC (std and tokio do,
+        // and process starts open PTYs CLOEXEC), so this spawn needs no lock
+        // against concurrent forks. `spawn` blocks until the worker execs, so
+        // it runs off the runtime threads. A caller cancelled meanwhile drops
+        // the spawned child, which `kill_on_drop` terminates.
+        let child = tokio::task::spawn_blocking(move || {
+            let child = command.spawn();
+            // Closes this process's copy of the worker's socket.
+            drop(command);
+            child
+        })
+        .await
+        .map_err(|error| Status::internal(format!("filesystem worker spawn task failed: {error}")))?
+        .map_err(worker_io_status)?;
 
+        // Taken while the child is ours and unreaped, so its pid is its own.
+        let pidfd = child
+            .id()
+            .and_then(|pid| rustix::process::Pid::from_raw(pid as i32))
+            .and_then(|pid| {
+                rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).ok()
+            })
+            .map(Arc::new);
         let stop_token = self.shutdown.child_token();
         let supervisor = Arc::new(Mutex::new(Some(supervise_worker(
             child,
@@ -590,6 +730,7 @@ impl WorkerPool {
             ledger_update_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             stop_token,
             supervisor,
+            pidfd,
         })
     }
 }
@@ -632,6 +773,23 @@ fn worker_command_from_environment(
 }
 
 impl WorkerClient {
+    /// A copy of `fd`, a descriptor open in this worker, or `None` where the
+    /// worker cannot be reached that way (no pidfd, or the kernel refuses).
+    pub(crate) fn duplicate_descriptor(&self, fd: i32) -> Option<std::os::fd::OwnedFd> {
+        let pidfd = self.pidfd.as_ref()?;
+        match rustix::process::pidfd_getfd(
+            pidfd.as_ref(),
+            fd,
+            rustix::process::PidfdGetfdFlags::empty(),
+        ) {
+            Ok(fd) => Some(fd),
+            Err(error) => {
+                tracing::debug!(%error, worker = %self.instance_id, "cannot duplicate a worker descriptor");
+                None
+            }
+        }
+    }
+
     pub(crate) async fn stop(&self) {
         self.stop_token.cancel();
         let mut supervisor = self.supervisor.lock().await;

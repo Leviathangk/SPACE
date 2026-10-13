@@ -25,6 +25,7 @@
 pub mod admin;
 pub mod auth;
 pub mod auto_lifecycle;
+pub mod balloon;
 pub mod cluster;
 pub mod compute;
 pub mod data;
@@ -57,6 +58,8 @@ pub mod snapshot;
 mod sqlite;
 pub mod subject;
 pub mod template;
+#[cfg(feature = "serde")]
+pub mod template_runtime;
 pub mod time;
 pub mod transport_vsock;
 pub mod version;
@@ -65,6 +68,7 @@ pub mod version;
 pub use admin::*;
 pub use auth::*;
 pub use auto_lifecycle::*;
+pub use balloon::*;
 pub use cluster::*;
 pub use compute::*;
 pub use data::*;
@@ -117,6 +121,8 @@ pub use template::{
     TemplateManifestSchemaError, TemplateMetadata, TemplateMetadataSchemaError, ZSTD_CODEC,
     ZSTD_FILENAME_SUFFIX,
 };
+#[cfg(feature = "serde")]
+pub use template_runtime::*;
 pub use time::*;
 pub use transport_vsock::*;
 pub use version::{SemVer, SemVerParseError};

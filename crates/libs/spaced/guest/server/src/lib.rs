@@ -18,7 +18,7 @@ mod tests;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
@@ -132,12 +132,6 @@ fn observe_connection_admission(
     );
 }
 
-// `openpty` cannot create both descriptors with CLOEXEC atomically. Every
-// production child spawn in this process takes this lock, so no concurrent
-// fork can inherit a PTY during the short openpty→fcntl window.
-static GUEST_CHILD_SPAWN_LOCK: LazyLock<tokio::sync::Mutex<()>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(()));
-
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectBridgeHostError {
     #[error(transparent)]
@@ -199,6 +193,8 @@ mod guest_path;
 mod idempotency;
 mod identity;
 mod local_admission;
+#[cfg(target_os = "linux")]
+mod memlock;
 mod meta;
 mod networking;
 mod port_forward;
@@ -233,7 +229,19 @@ use process::ProcessRegistry;
 const HOST_CONNECTION_PORT: u32 = pplx_space_spaced_common::BRIDGE_HOST_VSOCK_PORT;
 const GUEST_BRIDGE_PORT: u32 = pplx_space_spaced_common::BRIDGE_GUEST_VSOCK_PORT;
 
-fn native_vsock_available() -> bool {
+/// A request refused before any of its work started: an admission limit, or
+/// the guest shutting down. The status says so on the wire, with a retry hint,
+/// so hops return it to the caller instead of retrying it, and the caller knows
+/// this request did nothing.
+pub(crate) fn refused(status: Status) -> Status {
+    pplx_space_common_grpc::refused_before_start(status, REFUSAL_RETRY_AFTER)
+}
+
+// Admission slots free as in-flight requests finish; a second is a fair wait,
+// and long enough for a restarting guest to come back.
+const REFUSAL_RETRY_AFTER: Duration = Duration::from_secs(1);
+
+pub(crate) fn native_vsock_available() -> bool {
     cfg!(target_os = "linux") && std::path::Path::new("/dev/vsock").exists()
 }
 
@@ -327,6 +335,13 @@ impl std::fmt::Debug for SpacedGuestService {
 struct SpacedGuestServiceInner {
     shutdown: CancellationToken,
     process_tasks: tokio_util::task::TaskTracker,
+    /// Orders process-start admission with shutdown. A start checks
+    /// readiness, claims its process id, begins its idempotent operation and
+    /// registers its owner in `process_tasks` under this gate, and shutdown
+    /// closes `process_tasks` under it, so no admitted start escapes the
+    /// drain. It is never held across a spawn: a spawn that stalls must not
+    /// stall every other start.
+    start_gate: std::sync::Mutex<()>,
     process_payload_slots: Arc<Semaphore>,
     filesystem_flush_slots: Arc<Semaphore>,
     host_connector_type: HostConnectorType,
@@ -350,8 +365,8 @@ struct SpacedGuestServiceInner {
     /// host-side reconcilers can detect guest restarts (which drop the
     /// in-memory authorized port set) and re-apply port bridges.
     service_generation: String,
-    /// Guest cgroup split that places spawned workloads in a capped
-    /// `workloads/` leaf, away from the supervisor. `None` outside a real
+    /// Guest cgroup split that places spawned workloads in the workloads
+    /// unit's leaf, with the rest of user work and away from the supervisor. `None` outside a real
     /// Firecracker guest or when cgroup setup degraded to the shared layout.
     guest_cgroups: Option<Arc<cgroup::GuestCgroups>>,
 }
@@ -376,8 +391,15 @@ impl SpacedGuestService {
         // guest vsock transport device. Setup relocates this process and
         // rewrites cgroup limits, so it must never run against a host's
         // cgroups; with no `/dev/vsock` (any non-guest environment) it no-ops.
+        // `run()` has normally done it already, before any large allocation
+        // and before telemetry; its report is logged here, where telemetry is
+        // up.
         let guest_cgroups = if native_vsock_available() {
-            cgroup::GuestCgroups::initialize().map(Arc::new)
+            let cgroups = cgroup::GuestCgroups::initialize_for_process();
+            cgroup::GuestCgroups::report_process_setup();
+            #[cfg(target_os = "linux")]
+            memlock::report();
+            cgroups
         } else {
             None
         };
@@ -385,6 +407,7 @@ impl SpacedGuestService {
             inner: Arc::new(SpacedGuestServiceInner {
                 shutdown,
                 process_tasks: tokio_util::task::TaskTracker::new(),
+                start_gate: std::sync::Mutex::new(()),
                 filesystem_flush_slots: Arc::new(Semaphore::new(1)),
                 process_payload_slots: Arc::new(Semaphore::new(
                     pplx_space_spaced_common::process_limits::PAYLOAD_SLOTS,
@@ -401,7 +424,9 @@ impl SpacedGuestService {
                 ready,
                 ready_events,
                 process_env: RwLock::new(EnvMap::empty()),
-                processes: ProcessRegistry::default(),
+                processes: ProcessRegistry::new(process::ProcessOutputBudget::for_guest_memory(
+                    meta::guest_mem_total_bytes(),
+                )),
                 idempotency: IdempotencyStore::new("process"),
                 filesystem,
                 loopback_bridge,
@@ -446,7 +471,7 @@ impl SpacedGuestService {
 
     fn require_ready(&self) -> Result<(), Status> {
         if self.inner.shutdown.is_cancelled() {
-            return Err(Status::unavailable("guest shutting down"));
+            return Err(crate::refused(Status::unavailable("guest shutting down")));
         }
         if *self.inner.ready.borrow() {
             Ok(())
@@ -498,6 +523,18 @@ impl SpacedGuestService {
         .await
     }
 
+    /// Stop admitting process starts. Closure is serialized with start
+    /// admission, so every start admitted before it has its owner tracked in
+    /// `process_tasks` and the drain waits for it.
+    fn close_process_admission(&self) {
+        let _start_gate = self
+            .inner
+            .start_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.inner.process_tasks.close();
+    }
+
     pub async fn run(self) -> Result<(), RunGuestServerError> {
         tracing::info!(
             guest_socket_path = ?self.inner.local_socket_path,
@@ -532,11 +569,7 @@ impl SpacedGuestService {
         let mut local_error = None;
         let mut bridge_error = None;
         let drain = async {
-            // Serialize closure with process publication, not just OS spawn.
-            {
-                let _spawn_guard = GUEST_CHILD_SPAWN_LOCK.lock().await;
-                self.inner.process_tasks.close();
-            }
+            self.close_process_admission();
             tokio::join!(
                 self.inner.filesystem.drain(),
                 self.inner.process_tasks.wait(),
@@ -628,7 +661,11 @@ impl SpacedGuestService {
             .bridge_host_calls
             .clone()
             .try_acquire_owned()
-            .map_err(|_| Status::resource_exhausted("too many concurrent bridge-host calls"))?;
+            .map_err(|_| {
+                crate::refused(Status::resource_exhausted(
+                    "too many concurrent bridge-host calls",
+                ))
+            })?;
         let failed_generation = FailedGeneration::default();
         pplx_space_spaced_common::retry_status_with_context_and_retry_hook(
             "spaced bridge host",

@@ -138,9 +138,18 @@ impl SandboxManagerService {
             }
         };
         let options = start_process_options(operation)?;
-        let stream = match async { client.start_process_stream_with_options(options).await }.await {
-            Ok(stream) => stream,
-            Err(error) => {
+        let start = client.start_process_stream_with_options(options);
+        use super::restart_admission::GuestStartOutcome;
+        let stream = match super::restart_admission::abandon_start_if_caller_cancelled(start).await
+        {
+            GuestStartOutcome::Opened(stream) => stream,
+            // A caller that left is not a guest start failure.
+            GuestStartOutcome::CallerGone => {
+                return Err(Status::cancelled(
+                    "process start caller disconnected before the guest opened the process stream",
+                ));
+            }
+            GuestStartOutcome::Failed(error) => {
                 emit_sandbox_event(
                     &req.sandbox_id,
                     SandboxEventType::GuestProcessStartFailed,
@@ -630,20 +639,15 @@ impl SandboxManagerService {
         let route_auth =
             self.prepare_service_port_ingress(&metadata, &sandbox_id_str, "ServicePortIngress")?;
         route_auth.authorize_service_port(&self.lookup_sandbox(&sandbox_id_str)?, port)?;
-        if pplx_space_common_core::env::env_flag(
-            pplx_space_common_core::env::test_hook_var("SPACE_INGRESS_WAKE_ENABLED").as_deref(),
-            false,
-        ) {
-            self.ensure_active_for_read_only_guest_activity(
-                Some(route_auth.clone()),
-                &sandbox_id_str,
-                true,
-                Some(pplx_space_common_svc::ingress_admission::preparation_timeout()),
-                GuestActivityKind::Access,
-                "ServicePortIngress",
-            )
-            .await?;
-        }
+        self.ensure_active_for_read_only_guest_activity(
+            Some(route_auth.clone()),
+            &sandbox_id_str,
+            true,
+            Some(pplx_space_common_svc::ingress_admission::preparation_timeout()),
+            GuestActivityKind::Access,
+            "ServicePortIngress",
+        )
+        .await?;
         let ingress_protection::AdmittedIngress {
             sandbox,
             fence: identity_token,
@@ -847,7 +851,7 @@ impl SandboxManagerService {
         let mut snapshots = Vec::new();
         let mut response_budget = InventoryBudget::new(MAX_ITEMS, MAX_ENCODED_BYTES);
 
-        let mut node_client = connect_node()
+        let mut node_client = connect_node(&self.node_manager)
             .await
             .map_err(|e| Status::internal(format!("cannot connect to node-manager: {e}")))?;
 
@@ -1236,7 +1240,7 @@ impl SandboxManagerService {
                 .map(|artifact| artifact.local_path)
         });
 
-        let mut node_client = connect_node()
+        let mut node_client = connect_node(&self.node_manager)
             .await
             .map_err(|e| Status::internal(format!("cannot connect to node-manager: {e}")))?;
 
@@ -1482,7 +1486,7 @@ impl SandboxManagerService {
             })
             .await?;
 
-        let mut node_client = connect_node()
+        let mut node_client = connect_node(&self.node_manager)
             .await
             .map_err(|e| Status::internal(format!("cannot connect to node-manager: {e}")))?;
 

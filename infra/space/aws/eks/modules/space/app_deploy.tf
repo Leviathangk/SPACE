@@ -28,9 +28,9 @@ module "app_deploy" {
   external_secrets_role_name = "${local.name}-external-secrets"
   external_secret_store_name = "space-aws-secrets"
   chart_path                 = "${var.charts_dir}/space-secrets-bootstrap"
-  external_secrets = [
+  external_secrets = concat([
     {
-      # This and the three listener identities below come from
+      # This and the four listener identities below come from
       # internal_rpc_tls.tf. They change only on a Terraform renewal or
       # rotation, and processes load them at startup, so the chart-default 5m
       # refresh would re-fetch constants.
@@ -92,6 +92,23 @@ module "app_deploy" {
         {
           secret_key = "tls.key"
           remote_key = aws_secretsmanager_secret.node_api_tls.name
+          property   = "tls_key"
+        }
+      ]
+    },
+    {
+      name               = "space-ingress-activation-tls"
+      target_secret_name = "space-ingress-activation-tls"
+      refresh_interval   = "1h"
+      data = [
+        {
+          secret_key = "tls.crt"
+          remote_key = aws_secretsmanager_secret.ingress_activation_tls.name
+          property   = "tls_crt"
+        },
+        {
+          secret_key = "tls.key"
+          remote_key = aws_secretsmanager_secret.ingress_activation_tls.name
           property   = "tls_key"
         }
       ]
@@ -319,33 +336,6 @@ module "app_deploy" {
       ]
     },
     {
-      # Node honeytoken canaries: decoy IAM access key + zero-permission STS
-      # role ARN for an operator-supplied space-honeytoken node DaemonSet. The
-      # calling root names the secret; its value is populated out-of-band, not
-      # by Terraform. Off until it has been populated, for the same reason as
-      # the intermediate-key-broker token above.
-      name               = "space-honeytoken"
-      target_secret_name = "space-honeytoken"
-      enabled            = var.honeytoken_external_secret_enabled
-      data = [
-        {
-          secret_key = "AWS_ACCESS_KEY_ID"
-          remote_key = var.honeytoken_secret_name
-          property   = "AWS_ACCESS_KEY_ID"
-        },
-        {
-          secret_key = "AWS_SECRET_ACCESS_KEY"
-          remote_key = var.honeytoken_secret_name
-          property   = "AWS_SECRET_ACCESS_KEY"
-        },
-        {
-          secret_key = "STS_ROLE_ARN"
-          remote_key = var.honeytoken_secret_name
-          property   = "STS_ROLE_ARN"
-        }
-      ]
-    },
-    {
       # ECW API key the in-cluster smoke Job authenticates with.
       # In this cluster's own account, which is what lets a cluster join smoke
       # coverage without a key filed in another account for an agent looking in
@@ -426,5 +416,5 @@ module "app_deploy" {
         }
       ]
     }
-  ]
+  ], var.additional_external_secrets)
 }

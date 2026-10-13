@@ -7,6 +7,11 @@ fn only_an_absent_config_uses_defaults() {
     let defaults = load_from(&missing).unwrap();
     assert_eq!(defaults.max_memory_mib, None);
     assert!(!defaults.hugepages);
+    assert_eq!(defaults.balloon_hint_timeout_ms, None);
+    assert_eq!(
+        defaults.disk_io_burst_secs(),
+        pplx_space_common_core::types::DEFAULT_DISK_IO_BURST_SECS
+    );
     // A directory is an unreadable config even when this test runs as root.
     assert!(matches!(
         load_from(directory.path()),
@@ -23,6 +28,8 @@ fn present_invalid_config_is_never_replaced_with_defaults() {
         "max_memory_mib = 'large'",
         "max_memory_mib = -1",
         "hugepages = 'true'",
+        "disk_io_burst_secs = 0",
+        "balloon_hint_timeout_ms = 0",
     ] {
         std::fs::write(&path, content).unwrap();
         let error = load_from(&path).unwrap_err();
@@ -57,4 +64,27 @@ fn loaded_cold_start_config_preserves_restore_options_without_rejecting_startup(
             restore_supported
         );
     }
+}
+
+#[test]
+fn balloon_hint_timeout_is_bounded() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sandbox.toml");
+    std::fs::write(&path, "balloon_hint_timeout_ms = 2000").unwrap();
+    assert_eq!(
+        load_from(&path).unwrap().balloon_hint_timeout_ms,
+        NonZeroU32::new(2000)
+    );
+    std::fs::write(
+        &path,
+        format!(
+            "balloon_hint_timeout_ms = {}",
+            MAX_BALLOON_HINT_TIMEOUT_MS + 1
+        ),
+    )
+    .unwrap();
+    assert!(matches!(
+        load_from(&path),
+        Err(ConfigLoadError::InvalidBalloonHintTimeout { .. })
+    ));
 }

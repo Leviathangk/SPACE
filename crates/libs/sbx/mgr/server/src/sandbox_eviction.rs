@@ -5,8 +5,8 @@
 //! The snapshot reaper (`crate::snapshot_gc`) only deletes unpinned
 //! artifact residue; a suspended sandbox resident on the node pins its
 //! current suspend artifact and keeps its whole cache directory —
-//! `instance/` rootfs subvolume included — until the sandbox is deleted
-//! or restored elsewhere. On long-lived nodes that population dominates
+//! `instance/` rootfs subvolume included — even after a restore elsewhere.
+//! On long-lived nodes that population dominates
 //! disk usage. This loop removes the **entire local presence** of such a
 //! sandbox (cache dir + node-local DB rows) when it is safe:
 //!
@@ -39,7 +39,7 @@
 //!    `FinalizeArtifactBackup(READY)`, which requires every per-file
 //!    transfer to have completed) — or, when the marker is absent (e.g.
 //!    the bytes were restored *from* S3 and never re-uploaded), by a
-//!    `GetArtifactBackupLocation` lookup keyed on the exact artifact
+//!    `GetArtifactBackupLocation` readiness query keyed on the exact artifact
 //!    id. Job journals and timestamps are never consulted for pinned
 //!    rows — they are not evidence about these bytes.
 //!
@@ -47,7 +47,7 @@
 //!    Pre-artifact-tracking sandboxes have no pin, so the best identity
 //!    is the newest `snapshot_upload` job's `payload.snapshot_id`.
 //!    Evictable only when that **equals** the cluster's latest ready
-//!    snapshot (`GetSuspendSnapshotLocation`) AND the sandbox's last
+//!    snapshot (confirmed by a readiness query) AND the sandbox's last
 //!    state transition is not later than that job's creation (plus
 //!    slack) — proving no later suspend exists whose backup enqueue
 //!    silently failed. UUIDv7 *ordering* is never eviction evidence:
@@ -427,9 +427,6 @@ pub(crate) fn decide(
     evidence: &LocalEvidence,
     sandbox_updated_at_secs: u64,
 ) -> PreDecision {
-    let Some(cluster) = cluster_latest else {
-        return PreDecision::Skip(SkipReason::NoReadyBackup);
-    };
     match evidence {
         LocalEvidence::Pinned(pinned) if pinned.backup_marker => {
             PreDecision::Evict(EvictReason::LatestBackedIdle)
@@ -441,10 +438,11 @@ pub(crate) fn decide(
         }
         LocalEvidence::Unpinned {
             latest_job: Some(job),
-        } => match cluster.cmp(&job.snapshot_id) {
-            std::cmp::Ordering::Less => PreDecision::Skip(SkipReason::LocalNewerThanBackup),
-            std::cmp::Ordering::Greater => PreDecision::Skip(SkipReason::GenerationUnproven),
-            std::cmp::Ordering::Equal => {
+        } => match cluster_latest.map(|cluster| cluster.cmp(&job.snapshot_id)) {
+            None => PreDecision::Skip(SkipReason::NoReadyBackup),
+            Some(std::cmp::Ordering::Less) => PreDecision::Skip(SkipReason::LocalNewerThanBackup),
+            Some(std::cmp::Ordering::Greater) => PreDecision::Skip(SkipReason::GenerationUnproven),
+            Some(std::cmp::Ordering::Equal) => {
                 if sandbox_updated_at_secs
                     <= job
                         .created_at_secs
@@ -683,6 +681,15 @@ fn count_malformed_suspended_updated_at(conn: &Connection) -> rusqlite::Result<u
     })
 }
 
+/// Every local `sandboxes` row, whatever its state. node-ctl's full census
+/// publishes one entry per row, so this is the count that sizes it.
+fn count_resident_rows(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.query_row("SELECT COUNT(*) FROM sandboxes", [], |row| {
+        let count: i64 = row.get(0)?;
+        usize::try_from(count).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, count))
+    })
+}
+
 /// Gather the local half of the eviction evidence plus the sandbox's
 /// last-transition time (`updated_at`, epoch secs) for the recency
 /// witness. The pin and its artifact row are read in one query so the
@@ -818,6 +825,8 @@ impl LegacyRepairReport {
 struct TickReport {
     candidates: usize,
     malformed_updated_at: usize,
+    /// Local `sandboxes` rows at tick start.
+    resident_rows: usize,
     evicted: usize,
     young_evictions: usize,
     youngest_eviction_age_secs: Option<u64>,
@@ -954,9 +963,8 @@ pub(crate) fn emit_eviction_event(
     );
 }
 
-/// Ask the cluster for a ready backup of **exactly** the pinned
-/// artifact id (`GetArtifactBackupLocation`: "select a ready remote
-/// copy only for this exact immutable local artifact"). On success the
+/// Check the cluster for a ready backup of **exactly** the pinned
+/// artifact id without reading its storage location. On success the
 /// local `backup_completed_at` marker is stamped best-effort so the
 /// next tick proves locally — this is the path restored-from-S3 copies
 /// take, since restore never stamps the marker. Returns `Ok(true)` on
@@ -968,8 +976,10 @@ async fn prove_pinned_artifact(
     sandbox_id: &str,
     pinned: &PinnedArtifact,
 ) -> Result<bool, SkipReason> {
-    let req = pplx_space_node_api_client::proto::GetArtifactBackupLocationRequest {
-        sandbox_id: sandbox_id.to_string(),
+    use pplx_space_node_api_client::proto::{
+        LocalArtifactBackupIdentity, backup_readiness_query::Artifact,
+    };
+    let artifact = Artifact::LocalArtifact(LocalArtifactBackupIdentity {
         local_artifact_id: pinned.artifact_id.to_string(),
         artifact_kind: match pinned.artifact_kind {
             pplx_space_common_core::types::ArtifactKind::Disk => {
@@ -979,40 +989,99 @@ async fn prove_pinned_artifact(
                 pplx_space_sbx_mgr_client::proto::ArtifactKind::Full as i32
             }
         },
+    });
+    if !backup_ready(cluster, sandbox_id, artifact).await? {
+        return Ok(false);
+    }
+    let service = service.clone();
+    let artifact_id = pinned.artifact_id;
+    let stamp = tokio::task::spawn_blocking(move || {
+        let conn = service.db_conn().map_err(|error| error.to_string())?;
+        crate::db::mark_local_artifact_backup_completed(&conn, &artifact_id.to_string())
+            .map_err(|error| error.to_string())
+    })
+    .await;
+    let stamp_error = match stamp {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(error.to_string()),
+        Err(join_error) => Some(join_error.to_string()),
     };
-    match cluster.get_artifact_backup_location(req).await {
-        Ok(_) => {
-            let service = service.clone();
-            let artifact_id = pinned.artifact_id;
-            let stamp = tokio::task::spawn_blocking(move || {
-                let conn = service.db_conn().map_err(|error| error.to_string())?;
-                crate::db::mark_local_artifact_backup_completed(&conn, &artifact_id.to_string())
-                    .map_err(|error| error.to_string())
-            })
-            .await;
-            let stamp_error = match stamp {
-                Ok(Ok(())) => None,
-                Ok(Err(error)) => Some(error.to_string()),
-                Err(join_error) => Some(join_error.to_string()),
+    if let Some(error) = stamp_error {
+        warn!(
+            sandbox_id,
+            local_artifact_id = %pinned.artifact_id,
+            error,
+            "sandbox eviction: failed to stamp backup marker after exact-artifact proof; next tick re-proves via RPC",
+        );
+    }
+    Ok(true)
+}
+
+/// The newest local upload generation of an unpinned cache, when the cluster
+/// confirms it is still the latest ready suspend attempt. Pinned caches use
+/// their own marker or exact-artifact proof and skip this query.
+async fn ready_unpinned_suspend_generation(
+    cluster: &mut pplx_space_node_api_client::cluster::AuthenticatedClusterApiClient,
+    sandbox_id: &str,
+    evidence: &LocalEvidence,
+) -> Result<Option<SnapshotId>, SkipReason> {
+    use pplx_space_node_api_client::proto::backup_readiness_query::Artifact;
+    let LocalEvidence::Unpinned {
+        latest_job: Some(job),
+    } = evidence
+    else {
+        return Ok(None);
+    };
+    let artifact = Artifact::LatestReadySuspendSnapshotId(job.snapshot_id.to_string());
+    let ready = backup_ready(cluster, sandbox_id, artifact).await?;
+    Ok(ready.then_some(job.snapshot_id))
+}
+
+/// Ask the cluster whether an identity this node already holds is backed
+/// up, without reading any storage location. The identity rides only in the
+/// readiness query, so a server without readiness support rejects the empty
+/// top-level artifact id instead of answering with a location. Only a bare
+/// `ready` reply is evidence: an absent `ready` or any location payload is
+/// unusable, and like an RPC failure it retains the cache.
+async fn backup_ready(
+    cluster: &mut pplx_space_node_api_client::cluster::AuthenticatedClusterApiClient,
+    sandbox_id: &str,
+    artifact: pplx_space_node_api_client::proto::backup_readiness_query::Artifact,
+) -> Result<bool, SkipReason> {
+    use pplx_space_node_api_client::proto::{
+        BackupReadinessQuery, GetArtifactBackupLocationRequest, GetArtifactBackupLocationResponse,
+    };
+    let request = GetArtifactBackupLocationRequest {
+        sandbox_id: sandbox_id.to_string(),
+        readiness: Some(BackupReadinessQuery {
+            artifact: Some(artifact),
+        }),
+        ..Default::default()
+    };
+    match cluster.get_artifact_backup_location(request).await {
+        Ok(response) => {
+            let response = response.into_inner();
+            let bare = GetArtifactBackupLocationResponse {
+                ready: response.ready,
+                ..Default::default()
             };
-            if let Some(error) = stamp_error {
-                warn!(
-                    sandbox_id,
-                    local_artifact_id = %pinned.artifact_id,
-                    error,
-                    "sandbox eviction: failed to stamp backup marker after exact-artifact proof; next tick re-proves via RPC",
-                );
+            match response.ready {
+                Some(ready) if response == bare => Ok(ready),
+                _ => {
+                    warn!(
+                        sandbox_id,
+                        "sandbox eviction: backup readiness reply is not a bare acknowledgement",
+                    );
+                    Err(SkipReason::RpcError)
+                }
             }
-            Ok(true)
         }
-        Err(status) if status.code() == tonic::Code::NotFound => Ok(false),
         Err(status) => {
             warn!(
                 sandbox_id,
-                local_artifact_id = %pinned.artifact_id,
                 code = %status.code(),
                 message = %status.message(),
-                "sandbox eviction: GetArtifactBackupLocation failed",
+                "sandbox eviction: backup readiness query failed",
             );
             Err(classify_rpc_failure(&status))
         }
@@ -1176,20 +1245,26 @@ async fn repair_legacy_reupload_candidates(
 async fn evict_tick(
     service: &SandboxManagerService,
     cfg: EvictionConfig,
-    disk: crate::disk_usage::DiskUsage,
+    disk: Option<crate::disk_usage::DiskUsage>,
     scan_state: &mut CandidateScanState,
 ) -> Result<TickReport, String> {
-    let service_for_malformed = service.clone();
-    let malformed_updated_at = tokio::task::spawn_blocking(move || {
-        let conn = service_for_malformed
+    let service_for_counts = service.clone();
+    let (malformed_updated_at, resident_rows) = tokio::task::spawn_blocking(move || {
+        let conn = service_for_counts
             .db_conn()
-            .map_err(|error| error.to_string())?;
-        count_malformed_suspended_updated_at(&conn).map_err(|error| error.to_string())
+            .map_err(|error| format!("eviction row counts db_conn: {error}"))?;
+        let malformed = count_malformed_suspended_updated_at(&conn)
+            .map_err(|error| format!("count_malformed_suspended_updated_at: {error}"))?;
+        let resident =
+            count_resident_rows(&conn).map_err(|error| format!("count_resident_rows: {error}"))?;
+        Ok::<_, String>((malformed, resident))
     })
     .await
-    .map_err(|e| format!("count_malformed_suspended_updated_at spawn_blocking: {e}"))?
-    .map_err(|e| format!("count_malformed_suspended_updated_at: {e}"))?;
+    .map_err(|e| format!("eviction row counts spawn_blocking: {e}"))??;
     pplx_space_metrics::sandbox_eviction::malformed_updated_at(malformed_updated_at as u64);
+    // Counted before the disk check so a tick that can't read disk usage
+    // still reports the population.
+    pplx_space_metrics::sandbox_eviction::resident_rows(resident_rows as u64);
     if malformed_updated_at > 0 {
         warn!(
             malformed_updated_at,
@@ -1197,6 +1272,7 @@ async fn evict_tick(
         );
     }
 
+    let disk = disk.ok_or("statvfs on the cache filesystem failed; cannot evaluate disk gate")?;
     // Hysteresis state: open when usage reached the engage fraction at
     // tick start; closed again mid-tick once evictions bring usage
     // below the target fraction.
@@ -1204,6 +1280,7 @@ async fn evict_tick(
         scan_state.reset_cursor();
         return Ok(TickReport {
             malformed_updated_at,
+            resident_rows,
             ..Default::default()
         });
     }
@@ -1231,6 +1308,7 @@ async fn evict_tick(
     let mut report = TickReport {
         candidates: candidates.len(),
         malformed_updated_at,
+        resident_rows,
         legacy_repair,
         ..Default::default()
     };
@@ -1332,57 +1410,24 @@ async fn evict_tick(
             continue;
         }
 
-        let cluster_latest = match cluster
-            .get_suspend_snapshot_location(
-                pplx_space_node_api_client::proto::GetSuspendSnapshotLocationRequest {
-                    sandbox_id: sandbox_id.clone(),
-                },
-            )
-            .await
-        {
-            Ok(resp) => match resp.get_ref().snapshot_id.trim().parse::<SnapshotId>() {
-                Ok(id) => Some(id),
-                Err(error) => {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        snapshot_id = %resp.get_ref().snapshot_id,
-                        %error,
-                        "sandbox eviction: unparseable cluster snapshot id",
-                    );
-                    record_continuing_candidate_skip(
+        let cluster_latest =
+            match ready_unpinned_suspend_generation(&mut cluster, &sandbox_id, &evidence).await {
+                Ok(generation) => generation,
+                Err(reason) => {
+                    let flow = record_candidate_skip(
                         &mut report,
                         scan_state,
                         &sandbox_id,
                         cursor,
-                        SkipReason::RpcError,
+                        reason,
                         scan_started,
                     );
+                    if flow == CandidateFlow::Stop {
+                        break;
+                    }
                     continue;
                 }
-            },
-            Err(status) if status.code() == tonic::Code::NotFound => None,
-            Err(status) => {
-                warn!(
-                    sandbox_id = %sandbox_id,
-                    code = %status.code(),
-                    message = %status.message(),
-                    "sandbox eviction: GetSuspendSnapshotLocation failed",
-                );
-                let reason = classify_rpc_failure(&status);
-                let flow = record_candidate_skip(
-                    &mut report,
-                    scan_state,
-                    &sandbox_id,
-                    cursor,
-                    reason,
-                    scan_started,
-                );
-                if flow == CandidateFlow::Stop {
-                    break;
-                }
-                continue;
-            }
-        };
+            };
 
         let suspend_age = suspend_time_witness(&evidence);
         let reason = match decide(cluster_latest, &evidence, updated_at_secs) {
@@ -1571,7 +1616,8 @@ async fn evict_tick(
                     pplx_space_events::SandboxEventType::LocalEvictionFailed,
                     pplx_space_events::SandboxEventDetails::default()
                         .reason(reason.as_str())
-                        .error(status.message().to_string()),
+                        .error(status.message().to_string())
+                        .logged_by_caller(),
                 );
             }
         }
@@ -1608,18 +1654,14 @@ pub async fn run_loop(
     let mut scan_state = CandidateScanState::default();
     loop {
         let tick_started = Instant::now();
-        let tick_result = match crate::disk_usage::read_cache_disk_usage() {
-            Some(disk) => {
-                pplx_space_metrics::sandbox_eviction::disk_usage_fraction(disk.fraction());
-                tokio::select! {
-                    biased;
-                    _ = shutdown.cancelled() => return,
-                    result = evict_tick(&service, cfg, disk, &mut scan_state) => result,
-                }
-            }
-            None => {
-                Err("statvfs on the cache filesystem failed; cannot evaluate disk gate".to_string())
-            }
+        let disk = crate::disk_usage::read_cache_disk_usage();
+        if let Some(disk) = disk {
+            pplx_space_metrics::sandbox_eviction::disk_usage_fraction(disk.fraction());
+        }
+        let tick_result = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return,
+            result = evict_tick(&service, cfg, disk, &mut scan_state) => result,
         };
 
         match tick_result {
@@ -1643,6 +1685,7 @@ pub async fn run_loop(
                     legacy_repair_skipped = report.legacy_repair.skipped,
                     legacy_repair_failed = report.legacy_repair.failed,
                     malformed_updated_at = report.malformed_updated_at,
+                    resident_rows = report.resident_rows,
                     logical_bytes_freed = report.logical_bytes_freed,
                     "sandbox eviction tick complete",
                 );

@@ -138,6 +138,28 @@ pub mod ids {
 pub mod spaced {
     /// Maximum entries sent in one write batch.
     pub const MAX_WRITE_BATCH_ENTRIES: usize = 256;
+    /// Largest gRPC message the sandbox manager and the guest filesystem
+    /// decode; the node API's worker server enforces the same 4 MiB through
+    /// tonic's default. A write batch travels as one message, so it must fit;
+    /// streamed writes are split into smaller messages.
+    pub const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+
+    /// gRPC metadata key naming why a call failed where its code alone is
+    /// ambiguous. Hops relay a status unchanged, so the key reaches the API.
+    pub const ERROR_REASON_METADATA_KEY: &str = "space-error-reason";
+
+    /// [`ERROR_REASON_METADATA_KEY`] value of a RESOURCE_EXHAUSTED that is the
+    /// sandbox's disk or quota being full (ENOSPC, EDQUOT), as opposed to the
+    /// admission limits that share the code.
+    pub const GUEST_STORAGE_FULL: &str = "guest-storage-full";
+
+    /// [`ERROR_REASON_METADATA_KEY`] value of a request refused before any of
+    /// its work started: an admission limit, or a guest or registry shutting
+    /// down. This request did nothing, so the caller may retry it, after the
+    /// retry hint the status carries and with the same operation identity (an
+    /// earlier attempt may still have run); hops return it as-is rather than
+    /// retrying it for the caller.
+    pub const REQUEST_REFUSED: &str = "request-refused";
 }
 
 /// Stable status markers shared by the sandbox-manager wake producer and

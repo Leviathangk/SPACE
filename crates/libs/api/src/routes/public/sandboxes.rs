@@ -13,22 +13,20 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
     },
 };
-use pplx_space_common_core::types::{
-    AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
-    AutoLifecyclePolicy, AutoLifecycleStage, IdempotencyKey, SandboxLifecycle,
-};
+use pplx_space_common_core::types::{AutoLifecyclePolicy, IdempotencyKey, SandboxLifecycle};
 use pplx_space_common_svc::types::{
     FACET_SANDBOX_DESIRED_STATE, SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY,
     SANDBOX_FAILURE_EPISODE_KEY, SANDBOX_FAILURE_EXECUTION_GENERATION_KEY,
     SANDBOX_FAILURE_POD_UID_KEY,
 };
+use pplx_space_metrics::warm_pool::AdmissionClaimOutcome;
 use pplx_space_public_api::{
     ConditionStatus, CreateSandboxRequest, OperationId, OperationKind, OperationTargetType,
     PageCursor, PublicErrorCode, PublicPage, PublicSandbox, PublicSandboxId, PublicSandboxMetadata,
     PublicSandboxMetadataValue, RequestFingerprint, RollbackSandboxRequest, SandboxCondition,
-    SandboxConditionType, SandboxFailureCode, SandboxLifecycleAction, SandboxLifecycleState,
-    SandboxOperationResponse, SandboxResources, SandboxStatsResponse, UpdateSandboxRequest,
-    routes as native_routes,
+    SandboxConditionType, SandboxFailureCode, SandboxIdleAction, SandboxLifecycleAction,
+    SandboxLifecycleState, SandboxOperationResponse, SandboxResources, SandboxStatsResponse,
+    UpdateSandboxRequest, routes as native_routes,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -36,17 +34,21 @@ use sqlx::{FromRow, PgPool, types::Json as SqlJson};
 use time::OffsetDateTime;
 
 use crate::{
-    controllers::{ControllerError, sandbox::fetch_sandbox},
+    controllers::{
+        ControllerError,
+        sandbox::{AdmissionPoolPlan, SandboxController, fetch_sandbox},
+        substrate::AdmissionPoolClaim,
+    },
     middleware::auth::{AuthFederatedOwner, AuthOrg, AuthUser},
     models::{Sandbox, SandboxMetadata as ControllerSandboxMetadata, SandboxMetadataValue},
     public_operations::{
         ApiProduct, CreatePublicOperation, CreatePublicOperationIdempotency,
-        CreatePublicOperationResult, HttpOperationMethod, OperationPathTemplate,
-        PublicOperationStore,
+        CreatePublicOperationResult, HttpOperationMethod, ObservePublicOperationIdempotency,
+        OperationPathTemplate, PublicOperationStore,
     },
     public_sandbox_operations::{
         CreateSandboxOperationPayload, SandboxLifecycleOperationPayload,
-        UpdateSandboxOperationPayload,
+        UpdateSandboxOperationPayload, controller_create_request,
     },
     public_sandbox_projection::public_lifecycle_state as project_public_lifecycle_state,
     routes::{AppState, metrics::RouteTemplateName},
@@ -64,6 +66,11 @@ const DEFAULT_SANDBOX_LIST_LIMIT: u16 = 100;
 const MAX_SANDBOX_LIST_LIMIT: u16 = 1000;
 const SANDBOX_METRICS_STREAM_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_NATIVE_IDLE_TIMEOUT_SECS: u64 = 6 * 60 * 60;
+/// Env master for claiming a warm-pool slot at native-create admission.
+const NATIVE_CREATE_POOL_CLAIM_ENV: &str = "SPACE_NATIVE_CREATE_POOL_CLAIM_ENABLED";
+const DEFAULT_NATIVE_CREATE_POOL_CLAIM_ENABLED: bool = false;
+/// The constant cluster subject the admission-claim flag is evaluated on.
+const NATIVE_CREATE_POOL_CLAIM_FLAG_SUBJECT: &str = "space-cluster";
 
 pub async fn create_sandbox(
     State(state): State<AppState>,
@@ -82,6 +89,8 @@ pub async fn create_sandbox(
     let federated_create = owner.zip(grant.as_ref()).map(|(owner, grant)| {
         crate::fork_operations::ForkFederatedCreateContext::from_request(owner, grant)
     });
+    let pool_claims =
+        native_create_pool_claim_enabled(&state.feature_flags).then_some(&state.sandbox_controller);
     let response = create_native_sandbox_operation(
         &state.pool,
         org.id,
@@ -89,6 +98,7 @@ pub async fn create_sandbox(
         &idempotency_key,
         request,
         federated_create,
+        pool_claims,
     )
     .await?;
 
@@ -99,50 +109,219 @@ pub async fn create_sandbox(
     ))
 }
 
-async fn create_native_sandbox_operation(
+/// Whether native creates claim a warm-pool slot at admission: the
+/// `SPACE_NATIVE_CREATE_POOL_CLAIM_ENABLED` env master (off by default) under
+/// the `space-native-create-pool-claim` flag (falls back off), by the
+/// env-master-first gate policy.
+fn native_create_pool_claim_enabled(
+    feature_flags: &pplx_space_feature_flags::FeatureFlagClient,
+) -> bool {
+    native_create_pool_claim_gate(
+        pplx_space_common_core::env::env_flag_var(
+            NATIVE_CREATE_POOL_CLAIM_ENV,
+            DEFAULT_NATIVE_CREATE_POOL_CLAIM_ENABLED,
+        ),
+        feature_flags,
+    )
+}
+
+fn native_create_pool_claim_gate(
+    env_enabled: bool,
+    feature_flags: &pplx_space_feature_flags::FeatureFlagClient,
+) -> bool {
+    feature_flags.gate_enabled(
+        env_enabled,
+        pplx_space_feature_flags::SPACE_NATIVE_CREATE_POOL_CLAIM_FLAG,
+        NATIVE_CREATE_POOL_CLAIM_FLAG_SUBJECT,
+    )
+}
+
+/// Record a native create.
+///
+/// `pool_claims` is `None` when admission-time pool claiming is off, which
+/// is exactly the path that predates it: a fresh sandbox ID and no pool
+/// calls. With a controller, an eligible new create claims a ready warm-pool
+/// slot in the transaction that records it and takes the slot's reserved ID
+/// as its public ID; the claim travels in the payload for the executor to
+/// adopt. Anything else (ineligible, a pool or template miss, a claim
+/// error) records the create with a fresh ID and no claim, as the disabled
+/// path does.
+pub(crate) async fn create_native_sandbox_operation(
     pool: &PgPool,
     org_id: OrgId,
     actor_user_id: UserId,
     idempotency_key: &IdempotencyKey,
     request: CreateSandboxRequest,
     federated_create: Option<crate::fork_operations::ForkFederatedCreateContext>,
+    pool_claims: Option<&SandboxController>,
 ) -> Result<SandboxOperationResponse, PublicApiError> {
     let (request, fingerprint) = prepare_native_create_request(request)?;
-    let sandbox_id = PublicSandboxId::new();
-    let sandbox_id_string = sandbox_id.to_string();
-    let payload_json = CreateSandboxOperationPayload {
-        sandbox_id,
-        request,
-        // Placement is operator-only (admin surface); the public API never pins.
-        node_pool: None,
-        federated_create: federated_create.clone(),
-    }
-    .into_json();
+    let plan = match pool_claims {
+        None => NativeCreatePoolPlan::Unclaimed(AdmissionClaimOutcome::Disabled),
+        Some(controller) => {
+            let controller_request = controller_create_request(request.clone(), None);
+            match controller
+                .plan_admission_pool_claim(pool, org_id, &controller_request)
+                .await
+            {
+                AdmissionPoolPlan::Eligible {
+                    template_release_id,
+                } => NativeCreatePoolPlan::Claim {
+                    controller,
+                    template_release_id,
+                },
+                AdmissionPoolPlan::TemplateMiss => {
+                    NativeCreatePoolPlan::Unclaimed(AdmissionClaimOutcome::Miss)
+                }
+                AdmissionPoolPlan::Ineligible => {
+                    NativeCreatePoolPlan::Unclaimed(AdmissionClaimOutcome::Ineligible)
+                }
+            }
+        }
+    };
 
     let store = PublicOperationStore::new(pool.clone());
-    let result = store
-        .create_operation(CreatePublicOperation {
-            org_id,
-            actor_user_id: Some(actor_user_id),
-            api_product: ApiProduct::Native,
-            kind: OperationKind::CreateSandbox,
-            target_type: Some(OperationTargetType::Sandbox),
-            target_id: Some(&sandbox_id_string),
-            payload_json,
-            idempotency: Some(CreatePublicOperationIdempotency {
-                method: HttpOperationMethod::Post,
-                path_template: OperationPathTemplate::new(CREATE_SANDBOX_PATH_TEMPLATE),
-                key: idempotency_key,
-                request_fingerprint: &fingerprint,
-            }),
-        })
-        .await?;
+    let idempotency = CreatePublicOperationIdempotency {
+        method: HttpOperationMethod::Post,
+        path_template: OperationPathTemplate::new(CREATE_SANDBOX_PATH_TEMPLATE),
+        key: idempotency_key,
+        request_fingerprint: &fingerprint,
+    };
+    let fresh_sandbox_id = PublicSandboxId::new();
+    let create =
+        |sandbox_id: PublicSandboxId, sandbox_id_string, pool_claim: Option<AdmissionPoolClaim>| {
+            CreatePublicOperation {
+                org_id,
+                actor_user_id: Some(actor_user_id),
+                api_product: ApiProduct::Native,
+                kind: OperationKind::CreateSandbox,
+                target_type: Some(OperationTargetType::Sandbox),
+                target_id: Some(sandbox_id_string),
+                payload_json: CreateSandboxOperationPayload {
+                    sandbox_id,
+                    request: request.clone(),
+                    // Placement is operator-only (admin surface); the public API never pins.
+                    node_pool: None,
+                    federated_create: federated_create.clone(),
+                    pool_claim: pool_claim.map(|claim| claim.claim.into()),
+                }
+                .into_json(),
+                idempotency: Some(idempotency.clone()),
+            }
+        };
+
+    let (sandbox_id, outcome, result) = match plan {
+        NativeCreatePoolPlan::Unclaimed(outcome) => {
+            let sandbox_id_string = fresh_sandbox_id.to_string();
+            let result = store
+                .create_operation(create(fresh_sandbox_id, &sandbox_id_string, None))
+                .await?;
+            (fresh_sandbox_id, outcome, result)
+        }
+        NativeCreatePoolPlan::Claim {
+            controller,
+            template_release_id,
+        } => {
+            // Take the idempotency lock before touching the pool: a retry or
+            // a conflicting reuse of the key answers without claiming, and a
+            // concurrent same-key request waits here until this one commits.
+            let mut admission = store
+                .begin_operation_admission(org_id, ApiProduct::Native, &idempotency)
+                .await?;
+            // A retry or a conflict records no create, so its outcome is
+            // never counted.
+            match admission.observation().clone() {
+                ObservePublicOperationIdempotency::Existing(operation_id) => {
+                    admission.finish().await?;
+                    (
+                        fresh_sandbox_id,
+                        AdmissionClaimOutcome::Hit,
+                        CreatePublicOperationResult::Existing(operation_id),
+                    )
+                }
+                ObservePublicOperationIdempotency::Conflict {
+                    operation_id,
+                    expected_fingerprint,
+                } => {
+                    drop(admission);
+                    (
+                        fresh_sandbox_id,
+                        AdmissionClaimOutcome::Hit,
+                        CreatePublicOperationResult::IdempotencyConflict {
+                            operation_id,
+                            expected_fingerprint,
+                        },
+                    )
+                }
+                ObservePublicOperationIdempotency::Missing => {
+                    match controller
+                        .claim_admission_pool_slot(admission.transaction(), template_release_id)
+                        .await
+                    {
+                        // The create's public ID is the slot's reserved ID:
+                        // the pod the slot booted already runs under it. Only
+                        // a newly recorded create keeps the claim; any other
+                        // result rolls it back with the transaction.
+                        Ok(Some(claim)) => {
+                            let sandbox_id = PublicSandboxId::from(claim.sandbox_id);
+                            let sandbox_id_string = sandbox_id.to_string();
+                            let result = admission
+                                .create_or_roll_back(create(
+                                    sandbox_id,
+                                    &sandbox_id_string,
+                                    Some(claim),
+                                ))
+                                .await?;
+                            (sandbox_id, AdmissionClaimOutcome::Hit, result)
+                        }
+                        Ok(None) => {
+                            let sandbox_id_string = fresh_sandbox_id.to_string();
+                            let result = admission
+                                .create_or_roll_back(create(
+                                    fresh_sandbox_id,
+                                    &sandbox_id_string,
+                                    None,
+                                ))
+                                .await?;
+                            (fresh_sandbox_id, AdmissionClaimOutcome::Miss, result)
+                        }
+                        Err(error) => {
+                            // A failed statement aborts the transaction, so
+                            // give it up and record the create cold.
+                            tracing::warn!(
+                                %error,
+                                "warm-pool claim at admission failed; admitting the create cold"
+                            );
+                            drop(admission);
+                            let sandbox_id_string = fresh_sandbox_id.to_string();
+                            let result = store
+                                .create_operation(create(
+                                    fresh_sandbox_id,
+                                    &sandbox_id_string,
+                                    None,
+                                ))
+                                .await?;
+                            (fresh_sandbox_id, AdmissionClaimOutcome::Miss, result)
+                        }
+                    }
+                }
+            }
+        }
+    };
 
     let response = match result {
-        CreatePublicOperationResult::Created(operation_id) => SandboxOperationResponse {
-            operation_id,
-            sandbox_id,
-        },
+        CreatePublicOperationResult::Created(operation_id) => {
+            pplx_space_metrics::warm_pool::admission_claim(outcome);
+            // The path names no sandbox yet; the request span learns it here.
+            pplx_space_common_svc::record_sandbox_id(
+                &tracing::Span::current(),
+                &sandbox_id.to_string(),
+            );
+            SandboxOperationResponse {
+                operation_id,
+                sandbox_id,
+            }
+        }
         CreatePublicOperationResult::Existing(operation_id) => {
             if let Some(context) = &federated_create {
                 store
@@ -162,9 +341,31 @@ async fn create_native_sandbox_operation(
     Ok(response)
 }
 
+/// What admission does about a warm-pool slot for one native create.
+enum NativeCreatePoolPlan<'a> {
+    /// Record it with a fresh ID and no slot, for this reason.
+    Unclaimed(AdmissionClaimOutcome),
+    /// Claim a ready slot of this release if the create is new.
+    Claim {
+        controller: &'a SandboxController,
+        template_release_id: uuid::Uuid,
+    },
+}
+
 fn prepare_native_create_request(
-    request: CreateSandboxRequest,
+    mut request: CreateSandboxRequest,
 ) -> Result<(CreateSandboxRequest, RequestFingerprint), PublicApiError> {
+    let idle_timeout_secs = request
+        .idle_timeout_secs()
+        .map_err(|error| PublicApiError::bad_request(error.to_string()))?;
+    if let Some(vcpu) = request
+        .resources
+        .as_ref()
+        .and_then(|resources| resources.vcpu)
+    {
+        pplx_space_common_core::types::VcpuCount::try_from_u32(vcpu)
+            .map_err(|error| PublicApiError::bad_request(format!("vcpu: {error}")))?;
+    }
     if let Some(size_mib) = request
         .resources
         .as_ref()
@@ -177,28 +378,23 @@ fn prepare_native_create_request(
     // idempotent retries stable across rolling deploys where older API replicas
     // still hash the omitted policy as null.
     let fingerprint = request_fingerprint(&request)?;
+    if let Some(timeout_secs) = idle_timeout_secs {
+        let auto_pause = request.idle_action != Some(SandboxIdleAction::Delete);
+        request.auto_lifecycle = Some(crate::e2b::access_idle_policy(
+            timeout_secs,
+            auto_pause,
+            auto_pause,
+        ));
+        request.idle_timeout = None;
+        request.idle_action = None;
+    }
     Ok((with_native_create_defaults(request), fingerprint))
 }
 
 fn with_native_create_defaults(mut request: CreateSandboxRequest) -> CreateSandboxRequest {
-    request
-        .auto_lifecycle
-        .get_or_insert_with(|| AutoLifecyclePolicy {
-            wake: Default::default(),
-            // Command activity advances both the command and access clocks in
-            // sbx-mgr. One access-idle condition therefore means "no access or
-            // command activity"; separate conditions would fire when either
-            // individual clock expired.
-            condition_sets: std::collections::BTreeMap::from([(
-                AutoLifecycleConditionSetId::AccessIdle,
-                AutoLifecycleConditionSet::access_idle(),
-            )]),
-            stages: vec![AutoLifecycleStage {
-                condition_set: AutoLifecycleConditionSetId::AccessIdle,
-                at: DEFAULT_NATIVE_IDLE_TIMEOUT_SECS,
-                action: AutoLifecycleIdleAction::Suspend,
-            }],
-        });
+    request.auto_lifecycle.get_or_insert_with(|| {
+        crate::e2b::access_idle_policy(DEFAULT_NATIVE_IDLE_TIMEOUT_SECS, true, false)
+    });
     request
 }
 
@@ -228,11 +424,20 @@ pub async fn get_sandbox(
     Path(sandbox_id): Path<String>,
 ) -> Result<Json<PublicSandbox>, PublicApiError> {
     let sandbox_id = parse_public_sandbox_id(&sandbox_id)?;
-    let Some(sandbox) = fetch_public_sandbox(&state.pool, org.id, sandbox_id).await? else {
+    Ok(Json(
+        read_public_sandbox(&state.pool, org.id, sandbox_id).await?,
+    ))
+}
+
+pub(crate) async fn read_public_sandbox(
+    pool: &PgPool,
+    org_id: OrgId,
+    sandbox_id: PublicSandboxId,
+) -> Result<PublicSandbox, PublicApiError> {
+    let Some(sandbox) = fetch_public_sandbox(pool, org_id, sandbox_id).await? else {
         return Err(PublicApiError::not_found("sandbox not found"));
     };
-
-    Ok(Json(public_sandbox_from_row(sandbox)?))
+    public_sandbox_from_row(sandbox)
 }
 
 pub async fn get_sandbox_stats(
@@ -252,7 +457,7 @@ pub async fn get_sandbox_stats(
         .stats(&state.pool, &sandbox, sandbox_id.into())
         .await
         .map_err(controller_error)?;
-    Ok(Json(public_stats_response(sandbox_id, stats)?))
+    Ok(Json(public_stats_response(sandbox_id, stats)))
 }
 
 pub async fn stream_sandbox_metrics(
@@ -314,7 +519,7 @@ fn sandbox_metrics_stream(
                 )
                 .await
                 .map_err(controller_error)
-                .and_then(|stats| public_stats_response(stream.sandbox_id, stats))
+                .map(|stats| public_stats_response(stream.sandbox_id, stats))
             {
                 Ok(stats) => Event::default()
                     .event("metrics")
@@ -425,7 +630,12 @@ pub async fn apply_custom_sandbox_action(
     headers: HeaderMap,
     Path(sandbox_id_and_action): Path<String>,
     body: Bytes,
-) -> Result<(StatusCode, Json<SandboxOperationResponse>), PublicApiError> {
+) -> Result<Response, PublicApiError> {
+    if let Some(sandbox_id) = sandbox_id_and_action.strip_suffix(":set_timeout") {
+        return super::timeout::set_timeout(&state, org.id, sandbox_id, &headers, &body)
+            .await
+            .map(IntoResponse::into_response);
+    }
     let (sandbox_id, action) = parse_action_segment(&sandbox_id_and_action)?;
     let rollback = rollback_request(action, &body)?;
     enqueue_lifecycle_operation(
@@ -438,6 +648,7 @@ pub async fn apply_custom_sandbox_action(
         rollback,
     )
     .await
+    .map(IntoResponse::into_response)
 }
 
 pub async fn delete_sandbox(
@@ -483,6 +694,41 @@ impl ListSandboxesQuery {
     }
 }
 
+pub(super) async fn delete_replay_in_owner_scope(
+    pool: &PgPool,
+    org_id: OrgId,
+    subject_id: Option<UserId>,
+    headers: &HeaderMap,
+    sandbox_id: PublicSandboxId,
+) -> Result<bool, PublicApiError> {
+    if !headers.contains_key("idempotency-key") {
+        return Ok(false);
+    }
+    let key = idempotency_key(headers)?;
+    let action = SandboxLifecycleAction::Delete;
+    let fingerprint = lifecycle_request_fingerprint(sandbox_id, action, None)?;
+    let store = PublicOperationStore::new(pool.clone());
+    let observation = store
+        .observe_operation_idempotency(
+            org_id,
+            ApiProduct::Native,
+            &CreatePublicOperationIdempotency {
+                method: lifecycle_method(action),
+                path_template: lifecycle_path_template(action),
+                key: &key,
+                request_fingerprint: &fingerprint,
+            },
+        )
+        .await?;
+    match observation {
+        ObservePublicOperationIdempotency::Existing(operation_id) => Ok(store
+            .operation_in_owner_scope(org_id, subject_id, operation_id)
+            .await?),
+        ObservePublicOperationIdempotency::Missing
+        | ObservePublicOperationIdempotency::Conflict { .. } => Ok(false),
+    }
+}
+
 async fn enqueue_lifecycle_operation(
     pool: &PgPool,
     org_id: OrgId,
@@ -494,8 +740,39 @@ async fn enqueue_lifecycle_operation(
 ) -> Result<(StatusCode, Json<SandboxOperationResponse>), PublicApiError> {
     let idempotency_key = idempotency_key(&headers)?;
     let sandbox_id = parse_public_sandbox_id(sandbox_id)?;
-    ensure_sandbox_owner(pool, org_id, sandbox_id).await?;
     let fingerprint = lifecycle_request_fingerprint(sandbox_id, action, rollback.as_ref())?;
+    let store = PublicOperationStore::new(pool.clone());
+    let idempotency = CreatePublicOperationIdempotency {
+        method: lifecycle_method(action),
+        path_template: lifecycle_path_template(action),
+        key: &idempotency_key,
+        request_fingerprint: &fingerprint,
+    };
+    let mut admission = store
+        .begin_operation_admission(org_id, ApiProduct::Native, &idempotency)
+        .await?;
+    // A completed DELETE outlives its sandbox. The tenant-scoped operation and
+    // request fingerprint authorize replay; only new intent needs a live target.
+    match admission.observation() {
+        ObservePublicOperationIdempotency::Existing(operation_id) => {
+            let operation_id = *operation_id;
+            admission.finish().await?;
+            let response = sandbox_operation_response(&store, org_id, operation_id).await?;
+            return Ok((StatusCode::ACCEPTED, Json(response)));
+        }
+        ObservePublicOperationIdempotency::Conflict { .. } => {
+            return Err(PublicApiError::idempotency_conflict(
+                "idempotency key was already used with a different request",
+            ));
+        }
+        ObservePublicOperationIdempotency::Missing => {}
+    }
+    if !admission
+        .sandbox_belongs_to_org(SandboxId::from_uuid(sandbox_id.as_uuid()), org_id)
+        .await?
+    {
+        return Err(PublicApiError::not_found("sandbox not found"));
+    }
     let sandbox_id_string = sandbox_id.to_string();
     let payload_json = SandboxLifecycleOperationPayload {
         sandbox_id,
@@ -503,9 +780,8 @@ async fn enqueue_lifecycle_operation(
         rollback,
     }
     .into_json();
-    let store = PublicOperationStore::new(pool.clone());
-    let result = store
-        .create_operation(CreatePublicOperation {
+    let result = admission
+        .create(CreatePublicOperation {
             org_id,
             actor_user_id: Some(actor_user_id),
             api_product: ApiProduct::Native,
@@ -513,12 +789,7 @@ async fn enqueue_lifecycle_operation(
             target_type: Some(OperationTargetType::Sandbox),
             target_id: Some(&sandbox_id_string),
             payload_json,
-            idempotency: Some(CreatePublicOperationIdempotency {
-                method: lifecycle_method(action),
-                path_template: lifecycle_path_template(action),
-                key: &idempotency_key,
-                request_fingerprint: &fingerprint,
-            }),
+            idempotency: Some(idempotency),
         })
         .await?;
 
@@ -617,6 +888,8 @@ struct PublicSandboxRow {
     memory_mib: Option<i32>,
     disk_mib: Option<i32>,
     metadata: SqlJson<ControllerSandboxMetadata>,
+    next_auto_event_at: Option<i64>,
+    auto_lifecycle: SqlJson<AutoLifecyclePolicy>,
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
 }
@@ -667,6 +940,8 @@ const PUBLIC_SANDBOX_SELECT: &str = "SELECT s.id,
             s.memory_mib,
             s.disk_mib,
             s.metadata,
+            s.next_auto_event_at,
+            s.auto_lifecycle_json AS auto_lifecycle,
             s.created_at,
             s.updated_at
      FROM sandboxes s
@@ -774,7 +1049,7 @@ async fn sandbox_operation_response(
     })
 }
 
-fn idempotency_key(headers: &HeaderMap) -> Result<IdempotencyKey, PublicApiError> {
+pub(super) fn idempotency_key(headers: &HeaderMap) -> Result<IdempotencyKey, PublicApiError> {
     let Some(value) = headers
         .get(IDEMPOTENCY_KEY_HEADER)
         .and_then(|value| value.to_str().ok())
@@ -880,7 +1155,7 @@ fn lifecycle_path_template(action: SandboxLifecycleAction) -> OperationPathTempl
     })
 }
 
-fn parse_public_sandbox_id(value: &str) -> Result<PublicSandboxId, PublicApiError> {
+pub(super) fn parse_public_sandbox_id(value: &str) -> Result<PublicSandboxId, PublicApiError> {
     PublicSandboxId::from_str(value).map_err(|_| PublicApiError::bad_request("invalid sandbox id"))
 }
 
@@ -919,6 +1194,28 @@ fn public_sandbox_from_row(sandbox: PublicSandboxRow) -> Result<PublicSandbox, P
     let failure_code = sandbox
         .has_current_failure
         .then_some(SandboxFailureCode::RuntimeFailure);
+    let expires_at = sandbox
+        .next_auto_event_at
+        .map(OffsetDateTime::from_unix_timestamp)
+        .transpose()
+        .map_err(|error| {
+            tracing::error!(%error, "invalid stored sandbox idle deadline");
+            PublicApiError::internal()
+        })?;
+    let (idle_timeout, idle_action) = match sandbox.auto_lifecycle.0.stages.as_slice() {
+        [stage] => match crate::e2b::lifecycle_config_from_policy(&sandbox.auto_lifecycle.0) {
+            Some(config) => (
+                Some(format!("{}s", stage.at)),
+                Some(if config.auto_pause {
+                    SandboxIdleAction::Suspend
+                } else {
+                    SandboxIdleAction::Delete
+                }),
+            ),
+            None => (None, None),
+        },
+        _ => (None, None),
+    };
     Ok(PublicSandbox {
         id: PublicSandboxId::from(sandbox.id),
         name: sandbox.name,
@@ -935,54 +1232,54 @@ fn public_sandbox_from_row(sandbox: PublicSandboxRow) -> Result<PublicSandbox, P
             disk_mib: sandbox.disk_mib.and_then(|value| u32::try_from(value).ok()),
         },
         metadata: public_metadata(sandbox.metadata.0),
+        expires_at,
+        idle_timeout,
+        idle_action,
         created_at: sandbox.created_at,
         updated_at: sandbox.updated_at,
     })
 }
 
+/// The public stats shape. Every sandbox-manager field is named, so a field
+/// added to the proto must be placed here before this compiles.
 fn public_stats_response(
     sandbox_id: PublicSandboxId,
-    stats: serde_json::Value,
-) -> Result<SandboxStatsResponse, PublicApiError> {
-    Ok(SandboxStatsResponse {
+    stats: pplx_space_sbx_mgr_client::proto::StatsResponse,
+) -> SandboxStatsResponse {
+    let pplx_space_sbx_mgr_client::proto::StatsResponse {
+        sandbox_id: _,
+        cpu_max,
+        memory_max,
+        memory_current,
+        pids_max,
+        pids_current,
+        cpu_usage_usec,
+        network_tx_bytes,
+        network_rx_bytes,
+        net_gateway_reachable,
+        tcp_active_connections,
+        tcp_total_connections,
+        udp_active_mappings,
+        bytes_forwarded,
+        tcp_denied_connections,
+    } = stats;
+    SandboxStatsResponse {
         sandbox_id,
-        cpu_max: json_string(&stats, "cpu_max")?,
-        memory_max: json_u64(&stats, "memory_max")?,
-        memory_current: json_u64(&stats, "memory_current")?,
-        pids_max: json_u64(&stats, "pids_max")?,
-        pids_current: json_u64(&stats, "pids_current")?,
-        cpu_usage_usec: json_u64(&stats, "cpu_usage_usec")?,
-        network_tx_bytes: json_u64(&stats, "network_tx_bytes")?,
-        network_rx_bytes: json_u64(&stats, "network_rx_bytes")?,
-        net_gateway_reachable: json_bool(&stats, "net_gateway_reachable")?,
-        tcp_active_connections: json_u64(&stats, "tcp_active_connections")?,
-        tcp_total_connections: json_u64(&stats, "tcp_total_connections")?,
-        tcp_denied_connections: json_u64(&stats, "tcp_denied_connections")?,
-        udp_active_mappings: json_u64(&stats, "udp_active_mappings")?,
-        bytes_forwarded: json_u64(&stats, "bytes_forwarded")?,
-    })
-}
-
-fn json_string(stats: &serde_json::Value, key: &'static str) -> Result<String, PublicApiError> {
-    stats
-        .get(key)
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned)
-        .ok_or_else(PublicApiError::internal)
-}
-
-fn json_u64(stats: &serde_json::Value, key: &'static str) -> Result<u64, PublicApiError> {
-    stats
-        .get(key)
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(PublicApiError::internal)
-}
-
-fn json_bool(stats: &serde_json::Value, key: &'static str) -> Result<bool, PublicApiError> {
-    stats
-        .get(key)
-        .and_then(serde_json::Value::as_bool)
-        .ok_or_else(PublicApiError::internal)
+        cpu_max,
+        memory_max,
+        memory_current,
+        pids_max,
+        pids_current,
+        cpu_usage_usec,
+        network_tx_bytes,
+        network_rx_bytes,
+        net_gateway_reachable,
+        tcp_active_connections,
+        tcp_total_connections,
+        tcp_denied_connections,
+        udp_active_mappings,
+        bytes_forwarded,
+    }
 }
 
 fn public_lifecycle_state(lifecycle: &str) -> Result<SandboxLifecycleState, PublicApiError> {
@@ -1061,5 +1358,7 @@ fn parse_sandbox_cursor(value: &str) -> Result<(OffsetDateTime, SandboxId), Publ
     Ok((created_at, id))
 }
 
+#[cfg(all(test, feature = "kubernetes"))]
+pub(crate) mod admission_test_fixture;
 #[cfg(test)]
 mod tests;

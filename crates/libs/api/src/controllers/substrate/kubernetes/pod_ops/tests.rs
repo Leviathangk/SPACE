@@ -1,3 +1,10 @@
+use std::ffi::OsStr;
+
+use pplx_space_common_grpc::internal_transport::{CA_ENV, INSECURE_DEV_ENV};
+use tokio_stream::wrappers::TcpListenerStream;
+use tokio_util::sync::CancellationToken;
+use tonic::transport::{Identity, Server, ServerTlsConfig};
+
 use pplx_space_common_core::types::{NodeId, SandboxId};
 
 use std::sync::{
@@ -5,7 +12,11 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+use k8s_openapi::api::core::v1::PodStatus;
 use kube::error::Status;
+use pplx_space_common_core::kubernetes::{
+    SANDBOX_EXECUTION_GENERATION_ANNOTATION, SANDBOX_ID_ANNOTATION,
+};
 
 use super::*;
 
@@ -47,14 +58,14 @@ fn lingering_sandbox_pod_names_selects_only_strictly_older_generations() {
                 generation.to_string(),
             );
         }
-        Pod {
+        SandboxPodView::from(Pod {
             metadata: kube::api::ObjectMeta {
                 name: Some(name.to_string()),
                 annotations: Some(annotations),
                 ..Default::default()
             },
             ..Default::default()
-        }
+        })
     };
 
     let ours_current = annotated("space-sbx-x-g3", sandbox_id, Some("3"));
@@ -143,7 +154,7 @@ fn classify_precondition_reread_covers_all_post_conflict_shapes() {
     // Bound on the source -> retain, same-node.
     assert_eq!(
         classify_precondition_reread(
-            Some(&pod(Some("source-node"), true, false)),
+            Some(&SandboxPodView::from(pod(Some("source-node"), true, false))),
             Some("source-node")
         ),
         PreconditionReread::Retain { cross_node: false }
@@ -151,20 +162,26 @@ fn classify_precondition_reread_covers_all_post_conflict_shapes() {
     // Bound on a shortlist fallback -> retain, cross-node.
     assert_eq!(
         classify_precondition_reread(
-            Some(&pod(Some("other-node"), true, false)),
+            Some(&SandboxPodView::from(pod(Some("other-node"), true, false))),
             Some("source-node")
         ),
         PreconditionReread::Retain { cross_node: true }
     );
     // Unpinned, unbound -> concurrent cross-node successor, retain.
     assert_eq!(
-        classify_precondition_reread(Some(&pod(None, false, false)), Some("source-node")),
+        classify_precondition_reread(
+            Some(&SandboxPodView::from(pod(None, false, false))),
+            Some("source-node")
+        ),
         PreconditionReread::Retain { cross_node: true }
     );
     // Still required-pinned + Unschedulable -> retry with fresh identity,
     // never retained (regression guard for the status-only RV bump).
     assert_eq!(
-        classify_precondition_reread(Some(&pod(None, true, true)), Some("source-node")),
+        classify_precondition_reread(
+            Some(&SandboxPodView::from(pod(None, true, true))),
+            Some("source-node")
+        ),
         PreconditionReread::RetryDelete {
             uid: "uid-2".to_string(),
             resource_version: "rv-2".to_string(),
@@ -172,7 +189,10 @@ fn classify_precondition_reread_covers_all_post_conflict_shapes() {
     );
     // Still required-pinned but undecided -> also retry, never retained.
     assert_eq!(
-        classify_precondition_reread(Some(&pod(None, true, false)), Some("source-node")),
+        classify_precondition_reread(
+            Some(&SandboxPodView::from(pod(None, true, false))),
+            Some("source-node")
+        ),
         PreconditionReread::RetryDelete {
             uid: "uid-2".to_string(),
             resource_version: "rv-2".to_string(),
@@ -196,7 +216,10 @@ fn classify_precondition_reread_covers_all_post_conflict_shapes() {
     };
     assert_eq!(
         classify_precondition_reread(
-            Some(&pinned_without_identity(Some("uid-2"), None)),
+            Some(&SandboxPodView::from(pinned_without_identity(
+                Some("uid-2"),
+                None
+            ))),
             Some("source-node")
         ),
         PreconditionReread::Indeterminate,
@@ -204,7 +227,10 @@ fn classify_precondition_reread_covers_all_post_conflict_shapes() {
     );
     assert_eq!(
         classify_precondition_reread(
-            Some(&pinned_without_identity(None, Some("rv-2"))),
+            Some(&SandboxPodView::from(pinned_without_identity(
+                None,
+                Some("rv-2")
+            ))),
             Some("source-node")
         ),
         PreconditionReread::Indeterminate,
@@ -315,8 +341,12 @@ fn routable_pod(sandbox_id: SandboxId, generation: i64) -> Pod {
 #[test]
 fn restored_pod_routability_accepts_matching_running_pod() {
     let sandbox_id = SandboxId::new();
-    let identity = restored_pod_routability(&routable_pod(sandbox_id, 2), sandbox_id, 2)
-        .expect("matching Running pod with IP is routable");
+    let identity = restored_pod_routability(
+        &SandboxPodView::from(routable_pod(sandbox_id, 2)),
+        sandbox_id,
+        2,
+    )
+    .expect("matching Running pod with IP is routable");
     assert_eq!(identity.pod_ip, "10.90.0.9");
     assert_eq!(identity.pod_uid.as_deref(), Some("pod-uid-1"));
 }
@@ -328,31 +358,51 @@ fn restored_pod_routability_rejects_every_mismatch() {
     let sandbox_id = SandboxId::new();
 
     // Wrong sandbox id (a name collision must never vouch).
-    assert!(restored_pod_routability(&routable_pod(SandboxId::new(), 2), sandbox_id, 2).is_none());
+    assert!(
+        restored_pod_routability(
+            &SandboxPodView::from(routable_pod(SandboxId::new(), 2)),
+            sandbox_id,
+            2
+        )
+        .is_none()
+    );
 
     // Stale prior-generation pod.
-    assert!(restored_pod_routability(&routable_pod(sandbox_id, 1), sandbox_id, 2).is_none());
+    assert!(
+        restored_pod_routability(
+            &SandboxPodView::from(routable_pod(sandbox_id, 1)),
+            sandbox_id,
+            2
+        )
+        .is_none()
+    );
 
     // Not Running.
     let mut pending = routable_pod(sandbox_id, 2);
     pending.status.as_mut().unwrap().phase = Some("Pending".to_string());
-    assert!(restored_pod_routability(&pending, sandbox_id, 2).is_none());
+    assert!(
+        restored_pod_routability(&SandboxPodView::from(pending.clone()), sandbox_id, 2).is_none()
+    );
 
     // Being deleted.
     let mut deleting = routable_pod(sandbox_id, 2);
     deleting.metadata.deletion_timestamp =
         Some(serde_json::from_str("\"2026-07-14T00:00:00Z\"").unwrap());
-    assert!(restored_pod_routability(&deleting, sandbox_id, 2).is_none());
+    assert!(
+        restored_pod_routability(&SandboxPodView::from(deleting.clone()), sandbox_id, 2).is_none()
+    );
 
     // No IP yet.
     let mut no_ip = routable_pod(sandbox_id, 2);
     no_ip.status.as_mut().unwrap().pod_ip = None;
-    assert!(restored_pod_routability(&no_ip, sandbox_id, 2).is_none());
+    assert!(
+        restored_pod_routability(&SandboxPodView::from(no_ip.clone()), sandbox_id, 2).is_none()
+    );
 
     // No annotations at all.
     let mut bare = routable_pod(sandbox_id, 2);
     bare.metadata.annotations = None;
-    assert!(restored_pod_routability(&bare, sandbox_id, 2).is_none());
+    assert!(restored_pod_routability(&SandboxPodView::from(bare.clone()), sandbox_id, 2).is_none());
 
     // Unparseable generation annotation.
     let mut garbled = routable_pod(sandbox_id, 2);
@@ -360,7 +410,9 @@ fn restored_pod_routability_rejects_every_mismatch() {
         SANDBOX_EXECUTION_GENERATION_ANNOTATION.to_string(),
         "x".to_string(),
     );
-    assert!(restored_pod_routability(&garbled, sandbox_id, 2).is_none());
+    assert!(
+        restored_pod_routability(&SandboxPodView::from(garbled.clone()), sandbox_id, 2).is_none()
+    );
 }
 
 #[test]
@@ -466,12 +518,18 @@ fn terminal_cleanup_requires_uncached_terminal_or_missing_pod() {
     let failed = pod_with_phase("Failed");
 
     assert_eq!(
-        terminal_cleanup_phase_after_uncached_check(TerminalPodPhase::Succeeded, Some(&running),),
+        terminal_cleanup_phase_after_uncached_check(
+            TerminalPodPhase::Succeeded,
+            Some(&SandboxPodView::from(running.clone())),
+        ),
         None,
         "a stale cached terminal phase must not clear tracking for an authoritative running pod"
     );
     assert_eq!(
-        terminal_cleanup_phase_after_uncached_check(TerminalPodPhase::Succeeded, Some(&failed)),
+        terminal_cleanup_phase_after_uncached_check(
+            TerminalPodPhase::Succeeded,
+            Some(&SandboxPodView::from(failed.clone()))
+        ),
         Some(TerminalPodPhase::Failed),
         "authoritative terminal truth should drive cleanup/logging"
     );
@@ -514,11 +572,11 @@ fn successful_terminal_publication_grace_is_bounded() {
         .expect("test time must parse");
 
     assert_eq!(
-        succeeded_pod_publication_grace_remaining(&pod, within_grace),
+        succeeded_pod_publication_grace_remaining(&SandboxPodView::from(pod.clone()), within_grace),
         Some(Duration::from_secs(60))
     );
     assert_eq!(
-        succeeded_pod_publication_grace_remaining(&pod, after_grace),
+        succeeded_pod_publication_grace_remaining(&SandboxPodView::from(pod.clone()), after_grace),
         None,
         "an old successful pod must fall through to genuine missing-source recovery"
     );
@@ -854,4 +912,91 @@ mod stopped_restore_plan_tests {
 
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn pod_worker_channel_verifies_tls_for_raw_pod_ips() {
+    let temp = tempfile::tempdir().unwrap();
+    let ca_path = temp.path().join("ca.pem");
+    if !pplx_space_test_env::enter_test_process(&[
+        (CA_ENV, Some(ca_path.as_os_str())),
+        (INSECURE_DEV_ENV, None),
+        (
+            "SPACE_NODE_API_TLS_SERVER_NAME",
+            Some(OsStr::new("node.example")),
+        ),
+    ]) {
+        return;
+    }
+    pplx_space_common_svc::install_default_rustls_crypto_provider();
+    let ca_path = std::path::PathBuf::from(std::env::var_os(CA_ENV).unwrap());
+    // The certificate has no IP SAN: dialing a Pod IP must use the configured
+    // NodeApi identity as well as the mounted CA.
+    let certificate = rcgen::generate_simple_self_signed(vec!["node.example".into()]).unwrap();
+    let untrusted = rcgen::generate_simple_self_signed(vec!["node.example".into()]).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (reporter, health) = tonic_health::server::health_reporter();
+    reporter
+        .set_service_status("", tonic_health::ServingStatus::Serving)
+        .await;
+    let shutdown = CancellationToken::new();
+    let server = tokio::spawn(
+        Server::builder()
+            .tls_config(ServerTlsConfig::new().identity(Identity::from_pem(
+                certificate.cert.pem(),
+                certificate.signing_key.serialize_pem(),
+            )))
+            .unwrap()
+            .add_service(health)
+            .serve_with_incoming_shutdown(
+                TcpListenerStream::new(listener),
+                shutdown.clone().cancelled_owned(),
+            ),
+    );
+    for (trust, accepted) in [
+        (Some(certificate.cert.pem()), true),
+        (Some(untrusted.cert.pem()), false),
+        (None, false),
+    ] {
+        if let Some(pem) = trust {
+            tokio::fs::write(&ca_path, pem).await.unwrap();
+        } else {
+            tokio::fs::remove_file(&ca_path).await.unwrap();
+        }
+        let channel = tokio::time::timeout(
+            Duration::from_secs(3),
+            KubernetesSubstrate::pod_worker_channel(
+                PodIp(address.ip()),
+                address.port(),
+                Duration::from_secs(2),
+            ),
+        )
+        .await
+        .expect("connection establishment must remain bounded");
+        assert_eq!(channel.is_some(), accepted);
+        if let Some(channel) = channel {
+            let response = tokio::time::timeout(
+                Duration::from_secs(3),
+                tonic_health::pb::health_client::HealthClient::new(channel).check(
+                    tonic_health::pb::HealthCheckRequest {
+                        service: String::new(),
+                    },
+                ),
+            )
+            .await
+            .expect("health RPC must remain bounded")
+            .unwrap();
+            assert_eq!(
+                response.into_inner().status,
+                tonic_health::ServingStatus::Serving as i32,
+            );
+        }
+    }
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .expect("listener shutdown must remain bounded")
+        .unwrap()
+        .unwrap();
 }

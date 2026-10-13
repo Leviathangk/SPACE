@@ -1,5 +1,6 @@
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     handler::Handler,
     middleware,
     routing::{MethodFilter, MethodRouter, on},
@@ -7,13 +8,16 @@ use axum::{
 use pplx_space_public_api::routes::{self as native, NativeHttpMethod, NativeOperation};
 use std::collections::BTreeSet;
 
-use super::{AppState, credentials};
+use super::AppState;
 use crate::middleware::auth::require_native_auth;
 
 mod credential_references;
 mod cursors;
 pub(crate) mod error;
 mod files;
+pub(crate) use files::{
+    MAX_FILE_WRITE_BATCH_BYTES, WRITE_FILE_BATCH_BODY_LIMIT_BYTES, WRITE_FILE_BODY_LIMIT_BYTES,
+};
 pub(crate) mod network_policy;
 mod operations;
 mod owner_scope;
@@ -24,6 +28,7 @@ pub(crate) mod sandboxes;
 pub(crate) mod sessions;
 mod snapshots;
 mod templates;
+mod timeout;
 
 fn method_filter(method: NativeHttpMethod) -> MethodFilter {
     match method {
@@ -47,6 +52,21 @@ where
     (operation, on(method_filter(operation.method()), handler))
 }
 
+/// [`mount`] with a request body limit other than the framework's 2 MiB
+/// default, for an operation whose documented payload is larger.
+fn mount_with_body_limit<H, T>(
+    operation: NativeOperation,
+    handler: H,
+    limit_bytes: usize,
+) -> (NativeOperation, MethodRouter<AppState>)
+where
+    H: Handler<T, AppState>,
+    T: 'static,
+{
+    let (operation, router) = mount(operation, handler);
+    (operation, router.layer(DefaultBodyLimit::max(limit_bytes)))
+}
+
 /// Every native control-plane operation and the handler that serves it.
 ///
 /// [`v1_router`] mounts exactly this table, so `every_control_plane_operation_is_mounted`
@@ -67,19 +87,6 @@ fn mounted_operations() -> Vec<(NativeOperation, MethodRouter<AppState>)> {
         ),
         mount(native::LIST_TEMPLATES, templates::list_templates),
         mount(native::GET_TEMPLATE, templates::get_template),
-        mount(native::LIST_CREDENTIALS, credentials::list_user_credentials),
-        mount(
-            native::CREATE_CREDENTIAL,
-            credentials::create_user_credential,
-        ),
-        mount(
-            native::UPDATE_CREDENTIAL,
-            credentials::update_user_credential,
-        ),
-        mount(
-            native::DELETE_CREDENTIAL,
-            credentials::delete_user_credential,
-        ),
         mount(native::CREATE_SANDBOX, sandboxes::create_sandbox),
         mount(native::LIST_SANDBOXES, sandboxes::list_sandboxes),
         mount(native::GET_SANDBOX, sandboxes::get_sandbox),
@@ -107,6 +114,10 @@ fn mounted_operations() -> Vec<(NativeOperation, MethodRouter<AppState>)> {
             sandboxes::apply_custom_sandbox_action,
         ),
         mount(native::WAKE_SANDBOX, sandboxes::apply_custom_sandbox_action),
+        mount(
+            native::SET_SANDBOX_TIMEOUT,
+            sandboxes::apply_custom_sandbox_action,
+        ),
         mount(native::KILL_SANDBOX, sandboxes::apply_custom_sandbox_action),
         mount(
             native::CHECKPOINT_SANDBOX,
@@ -163,8 +174,16 @@ fn mounted_operations() -> Vec<(NativeOperation, MethodRouter<AppState>)> {
         mount(native::STAT_FILE, files::stat_file),
         mount(native::LIST_FILES, files::list_files),
         mount(native::READ_FILE, files::read_file),
-        mount(native::WRITE_FILE, files::write_file),
-        mount(native::WRITE_FILE_BATCH, files::write_file_batch),
+        mount_with_body_limit(
+            native::WRITE_FILE,
+            files::write_file,
+            files::WRITE_FILE_BODY_LIMIT_BYTES,
+        ),
+        mount_with_body_limit(
+            native::WRITE_FILE_BATCH,
+            files::write_file_batch,
+            files::WRITE_FILE_BATCH_BODY_LIMIT_BYTES,
+        ),
         mount(
             native::ENABLE_FILE_CHANGES,
             files::enable_file_change_tracking,

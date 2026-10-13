@@ -2,8 +2,6 @@
 
 use pplx_space_common_core::types::UserId;
 
-use std::fmt;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -55,6 +53,7 @@ const SPACE_TMPLMGR_ACCOUNT: &str = user_names::SPACE_TMPLMGR;
 const ALLOW_EXCHANGE_TOKEN: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Service(SPACE_SBXMGR_ACCOUNT),
     UdsPeerPrincipal::Service(SPACE_TMPLMGR_ACCOUNT),
+    UdsPeerPrincipal::Service(user_names::SPACE_VOLMGR),
 ];
 /// Same callers as `ExchangeToken` for now: sandbox-manager and
 /// template-manager are the two on-node services that own data they
@@ -63,11 +62,13 @@ const ALLOW_ISSUE_DEK: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Service(SPACE_SBXMGR_ACCOUNT),
     UdsPeerPrincipal::Service(SPACE_TMPLMGR_ACCOUNT),
+    UdsPeerPrincipal::Service(user_names::SPACE_VOLMGR),
 ];
 const ALLOW_UNWRAP_DEK: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Service(SPACE_SBXMGR_ACCOUNT),
     UdsPeerPrincipal::Service(SPACE_TMPLMGR_ACCOUNT),
+    UdsPeerPrincipal::Service(user_names::SPACE_VOLMGR),
 ];
 
 /// TCP service identities mirroring the UDS allow-lists above. On the
@@ -131,92 +132,9 @@ const MAX_DECRYPT_CIPHERTEXT_LEN: usize = MAX_ENCRYPT_PLAINTEXT_LEN + 1 + 12 + 1
 /// string — the dep direction would invert the usual server→client one.
 const AWS_CREDENTIALS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:aws-credentials";
 
-/// Authority-side rollout behavior for storage credential exchange.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum ExchangeTokenMode {
-    /// Preserve the pre-scoping request contract while vending only the
-    /// dedicated storage role. This is the fast rollback mode.
-    #[default]
-    Legacy,
-    /// Scope requests carrying the new protocol marker and preserve legacy
-    /// behavior for requests sent or re-encoded by an older service.
-    Mixed,
-    /// Require every request to satisfy the scoped exchange contract.
-    Enforce,
-    /// Refuse every otherwise-authenticated exchange request.
-    Disabled,
-}
-
-impl ExchangeTokenMode {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Legacy => "legacy",
-            Self::Mixed => "mixed",
-            Self::Enforce => "enforce",
-            Self::Disabled => "disabled",
-        }
-    }
-
-    fn route(
-        self,
-        request: &ExchangeTokenRequest,
-        scoped_authority_available: bool,
-    ) -> ExchangeTokenRoute {
-        match self {
-            Self::Legacy => ExchangeTokenRoute::Legacy,
-            // Field 10 is the rollout marker. Older generated protobuf proxies
-            // drop it when decoding and re-encoding a request. Presence, not a
-            // valid value, selects the scoped parser so a malformed modern
-            // request cannot fall back after validation.
-            Self::Mixed if request.requested_expires_in.is_some() && scoped_authority_available => {
-                ExchangeTokenRoute::Scoped
-            }
-            Self::Mixed => ExchangeTokenRoute::Legacy,
-            Self::Enforce => ExchangeTokenRoute::Scoped,
-            Self::Disabled => ExchangeTokenRoute::Disabled,
-        }
-    }
-}
-
-impl fmt::Display for ExchangeTokenMode {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl FromStr for ExchangeTokenMode {
-    type Err = ParseExchangeTokenModeError;
-
-    fn from_str(raw: &str) -> Result<Self, Self::Err> {
-        match raw {
-            "legacy" => Ok(Self::Legacy),
-            "mixed" => Ok(Self::Mixed),
-            "enforce" => Ok(Self::Enforce),
-            "disabled" => Ok(Self::Disabled),
-            _ => Err(ParseExchangeTokenModeError {
-                value: raw.to_string(),
-            }),
-        }
-    }
-}
-
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-#[error("expected one of legacy, mixed, enforce, or disabled; got {value:?}")]
-pub struct ParseExchangeTokenModeError {
-    value: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ExchangeTokenRoute {
-    Legacy,
-    Scoped,
-    Disabled,
-}
-
 #[derive(Clone)]
 pub struct CredentialManagerService {
     caller_resolver: CallerResolver,
-    exchange_token_mode: ExchangeTokenMode,
     /// Validated once at authority startup. Keeping this out of the request
     /// path prevents a Ready authority from discovering a malformed role only
     /// after callers depend on it.
@@ -230,6 +148,8 @@ pub struct CredentialManagerService {
     /// instances with database access (the control-plane deployment);
     /// node-local instances refuse those RPCs with FAILED_PRECONDITION.
     kek_store: Option<Arc<dyn KekStore>>,
+    /// Shared authority pool used for TCP caller node-registration checks.
+    pub(crate) database_pool: Option<sqlx::PgPool>,
     /// Sandbox-owner reads for volume encryption.
     /// Present only on instances with database access.
     credential_store: Option<Arc<dyn CredentialStore>>,
@@ -295,13 +215,11 @@ impl CredentialManagerService {
                 UdsPeerAuthorizer::new(
                     "space-credential-manager",
                     [
-                        // The uid-keyed allowlist: volume-manager runs as
-                        // this same uid by design (its chart's runAsUser)
-                        // and calls credmgr for token exchange and DEK
-                        // issue/unwrap, so its binary is admitted alongside
-                        // sandbox-manager's.
                         UdsPeerAccount::with_linux_user(users::SPACE_SBXMGR)
                             .require_binary(paths::SPACE_SBXMGR_UID_BINARIES)
+                            .forbid_capabilities(capability::CAP_SYS_PTRACE),
+                        UdsPeerAccount::with_linux_user(users::SPACE_VOLMGR)
+                            .require_binary(paths::SPACE_VOLMGR_SVC_BINARIES)
                             .forbid_capabilities(capability::CAP_SYS_PTRACE),
                         UdsPeerAccount::with_linux_user(users::SPACE_TMPLMGR)
                             .require_binary(paths::SPACE_TMPLMGR_SVC_BINARIES)
@@ -310,10 +228,10 @@ impl CredentialManagerService {
                 )
                 .with_process_check_mode(peer_process_check_mode),
             ),
-            exchange_token_mode: ExchangeTokenMode::default(),
             storage_vend_role: None,
             key_wrapper,
             kek_store: None,
+            database_pool: None,
             credential_store: None,
             storage_vend_store: None,
             volume_wrap_store: None,
@@ -321,12 +239,6 @@ impl CredentialManagerService {
             intermediate_ca_issuer: None,
             credential_injection_rpc: None,
         }
-    }
-
-    /// Configure the ExchangeToken rollout mode resolved at startup.
-    pub fn with_exchange_token_mode(mut self, mode: ExchangeTokenMode) -> Self {
-        self.exchange_token_mode = mode;
-        self
     }
 
     /// Configure the startup-validated platform storage vending role.
@@ -488,28 +400,6 @@ impl CredentialManager for CredentialManagerService {
             return Err(status);
         }
         let request = request.into_inner();
-        let scoped_authority_available =
-            !matches!(caller, ResolvedCaller::Plaintext) && self.storage_vend_store.is_some();
-        match self
-            .exchange_token_mode
-            .route(&request, scoped_authority_available)
-        {
-            ExchangeTokenRoute::Disabled => {
-                audit_exchange_disabled(&caller);
-                return Err(Status::failed_precondition(
-                    "storage credential exchange is disabled",
-                ));
-            }
-            ExchangeTokenRoute::Legacy => {
-                let role = self.storage_vend_role.as_ref().ok_or_else(|| {
-                    Status::failed_precondition("storage credential vending is not configured")
-                })?;
-                return exchange_legacy_credentials(&caller, self.exchange_token_mode, role)
-                    .await
-                    .map(Response::new);
-            }
-            ExchangeTokenRoute::Scoped => {}
-        }
         let authorized =
             match authorize_exchange(self.storage_vend_store()?.as_ref(), &caller, request).await {
                 Ok(authorized) => authorized,
@@ -533,9 +423,7 @@ impl CredentialManager for CredentialManagerService {
             }
         };
         let aws_credentials =
-            match assume_s3_vend_role(role.as_str(), Some(&policy), Some(authorized.ttl_seconds))
-                .await
-            {
+            match assume_s3_vend_role(role.as_str(), &policy, authorized.ttl_seconds).await {
                 Ok(credentials) => credentials,
                 Err(status) => {
                     audit_exchange_failure(&authorized, status.code());
@@ -575,10 +463,7 @@ impl CredentialManager for CredentialManagerService {
         )?;
         let req = request.into_inner();
 
-        let org: OrgId = req
-            .organization_id
-            .parse()
-            .map_err(|e| Status::invalid_argument(format!("organization_id: {e}")))?;
+        let org = parse_organization_id(&req.organization_id)?;
         let provider: KekProvider = req
             .provider
             .parse()
@@ -616,10 +501,7 @@ impl CredentialManager for CredentialManagerService {
         )?;
         let req = request.into_inner();
 
-        let org: OrgId = req
-            .organization_id
-            .parse()
-            .map_err(|e| Status::invalid_argument(format!("organization_id: {e}")))?;
+        let org = parse_organization_id(&req.organization_id)?;
         let provider: KekProvider = req
             .provider
             .parse()
@@ -905,10 +787,8 @@ impl CredentialManager for CredentialManagerService {
 
     /// Certify a node's intermediate CA public key under the SPACE root.
     ///
-    /// Authorizes callers to hold a node CA key, at ServiceAccount granularity:
-    /// every node's credential manager presents the
-    /// same ServiceAccount, so this authorizes *a* node and not *which one*. A
-    /// stolen agent token mints intermediates fleet-wide until that narrows.
+    /// The TCP layer verifies the caller pod, node registration, and connection
+    /// peer before this handler's service-level authorization runs.
     async fn issue_intermediate_certificate(
         &self,
         request: Request<IssueIntermediateCertificateRequest>,
@@ -1041,8 +921,8 @@ impl CredentialManagerService {
     fn storage_vend_store(&self) -> Result<&Arc<dyn StorageVendStore>, Status> {
         self.storage_vend_store.as_ref().ok_or_else(|| {
             Status::failed_precondition(
-                "ExchangeToken requires authority database access; this credmgr instance \
-                 has no storage authorization store configured",
+                "storage credential exchange is not configured; it requires a storage vend \
+                 role and authority database access",
             )
         })
     }
@@ -1078,13 +958,16 @@ impl CredentialManagerService {
     }
 }
 
+pub(crate) fn parse_organization_id(raw: &str) -> Result<OrgId, Status> {
+    raw.parse()
+        .map_err(|error| Status::invalid_argument(format!("organization_id: {error}")))
+}
+
 fn parse_org_and_user(
     organization_id: &str,
     user_id: Option<&str>,
 ) -> Result<(OrgId, Option<UserId>), Status> {
-    let org: OrgId = organization_id
-        .parse()
-        .map_err(|e| Status::invalid_argument(format!("organization_id: {e}")))?;
+    let org = parse_organization_id(organization_id)?;
     let user_id = user_id
         .map(|raw| {
             raw.parse::<UserId>()
@@ -1248,6 +1131,21 @@ fn org_kek_access_revoked_status() -> Status {
     )
 }
 
+/// `PERMISSION_DENIED` carrying the machine-readable already-published reason,
+/// so a builder whose publication check raced another publisher, or could not
+/// see the release, converges on tags-only registration instead of failing.
+/// Decode with [`pplx_space_credmgr_client::status_is_release_already_published`].
+fn release_already_published_status(message: String) -> Status {
+    let mut metadata = tonic::metadata::MetadataMap::new();
+    metadata.insert(
+        pplx_space_credmgr_client::CREDMGR_ERROR_REASON_METADATA_KEY,
+        pplx_space_credmgr_client::CREDMGR_ERROR_REASON_RELEASE_ALREADY_PUBLISHED
+            .parse()
+            .expect("static ASCII metadata value"),
+    );
+    Status::with_metadata(tonic::Code::PermissionDenied, message, metadata)
+}
+
 fn invalid_key_reference_status(message: String) -> Status {
     let mut metadata = tonic::metadata::MetadataMap::new();
     metadata.insert(
@@ -1339,70 +1237,22 @@ fn unwrap_error_to_status(e: UnwrapError) -> Status {
     }
 }
 
-/// Preserve availability for request shapes produced by older callers and
-/// proxies while limiting the rollback path to the dedicated storage role.
-/// It intentionally preserves STS's one-hour default and has no inline policy;
-/// operators select this path while broad role permissions and long-held
-/// credentials are needed for cross-version compatibility.
-async fn exchange_legacy_credentials(
-    caller: &ResolvedCaller,
-    mode: ExchangeTokenMode,
-    role: &VendRoleArn,
-) -> Result<ExchangeTokenResponse, Status> {
-    // Preserve the pre-scoping behavior exactly: omitting DurationSeconds lets
-    // STS apply its one-hour default. Volume/build managers hold one lease for
-    // the whole transfer, so both rollout paths retain the same usable window.
-    let aws_credentials = match assume_s3_vend_role(role.as_str(), None, None).await {
-        Ok(credentials) => credentials,
-        Err(status) => {
-            audit_legacy_exchange_failure(caller, mode, status.code());
-            return Err(status);
-        }
-    };
-    let expires_in = match credential_expires_in(&aws_credentials) {
-        Ok(expires_in) => expires_in,
-        Err(status) => {
-            audit_legacy_exchange_failure(caller, mode, status.code());
-            return Err(status);
-        }
-    };
-    audit_legacy_exchange_issuance(caller, mode, expires_in);
-
-    Ok(ExchangeTokenResponse {
-        issued_token_type: AWS_CREDENTIALS_TOKEN_TYPE.to_string(),
-        token_type: "N_A".to_string(),
-        expires_in: Some(expires_in),
-        scope: None,
-        refresh_token: None,
-        payload: Some(exchange_token_response::Payload::AwsCredentials(
-            aws_credentials,
-        )),
-    })
-}
-
-/// Vend a storage-role session. A scoped exchange supplies an exact-resource
-/// inline policy and an explicit one-hour TTL; the legacy rollout path omits
-/// both so STS applies its historical one-hour default. Ambient and static
-/// credentials are inputs to STS only, never response values.
+/// Vend a storage-role session limited by the exact-resource inline policy and
+/// TTL. Ambient and static credentials are inputs to STS only, never response
+/// values.
 async fn assume_s3_vend_role(
     role_arn: &str,
-    session_policy: Option<&str>,
-    ttl_seconds: Option<u32>,
+    session_policy: &str,
+    ttl_seconds: u32,
 ) -> Result<AwsCredentials, Status> {
     let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let provider = aws_config::sts::AssumeRoleProvider::builder(role_arn)
-        .session_name("space-storage-exchange");
-    let provider = if let Some(ttl_seconds) = ttl_seconds {
-        provider.session_length(Duration::from_secs(u64::from(ttl_seconds)))
-    } else {
-        provider
-    };
-    let provider = if let Some(session_policy) = session_policy {
-        provider.policy(session_policy)
-    } else {
-        provider
-    };
-    let provider = provider.configure(&config).build().await;
+        .session_name("space-storage-exchange")
+        .session_length(Duration::from_secs(u64::from(ttl_seconds)))
+        .policy(session_policy)
+        .configure(&config)
+        .build()
+        .await;
     let creds = provider.provide_credentials().await.map_err(|e| {
         tracing::warn!(error = %e, "storage role assumption failed");
         Status::failed_precondition("failed to assume the configured storage role")
@@ -1453,6 +1303,9 @@ fn storage_exchange_error_to_status(error: StorageExchangeError) -> Status {
         | StorageExchangeError::UnauthorizedResource
         | StorageExchangeError::UnknownSubject
         | StorageExchangeError::WrongNode => Status::permission_denied(error.to_string()),
+        StorageExchangeError::ReleaseAlreadyPublished => {
+            release_already_published_status(error.to_string())
+        }
         StorageExchangeError::MissingVendRole
         | StorageExchangeError::InvalidVendRole
         | StorageExchangeError::InvalidStorageConfiguration
@@ -1482,54 +1335,6 @@ fn audit_exchange_caller_denial(caller: Option<&ResolvedCaller>, code: tonic::Co
         decision = "deny",
         outcome = "rejected",
         error_class = ?code,
-        "credential security audit event"
-    );
-}
-
-fn audit_exchange_disabled(caller: &ResolvedCaller) {
-    tracing::warn!(
-        target: "credential_security_audit",
-        operation = "ExchangeToken",
-        actor = %caller_audit_label(caller),
-        decision = "deny",
-        outcome = "disabled",
-        error_class = "rollout_gate_disabled",
-        "credential security audit event"
-    );
-}
-
-fn audit_legacy_exchange_failure(
-    caller: &ResolvedCaller,
-    mode: ExchangeTokenMode,
-    code: tonic::Code,
-) {
-    tracing::warn!(
-        target: "credential_security_audit",
-        operation = "ExchangeToken",
-        actor = %caller_audit_label(caller),
-        rollout_mode = %mode,
-        credential_scope = "storage_role",
-        decision = "allow",
-        outcome = "failed",
-        error_class = ?code,
-        "credential security audit event"
-    );
-}
-
-fn audit_legacy_exchange_issuance(
-    caller: &ResolvedCaller,
-    mode: ExchangeTokenMode,
-    expires_in: u32,
-) {
-    tracing::warn!(
-        target: "credential_security_audit",
-        operation = "ExchangeToken",
-        actor = %caller_audit_label(caller),
-        rollout_mode = %mode,
-        credential_scope = "storage_role",
-        expires_in,
-        decision = "allow",
-        outcome = "issued_legacy",
         "credential security audit event"
     );
 }

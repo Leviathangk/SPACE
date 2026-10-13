@@ -1359,6 +1359,7 @@ impl SandboxController {
                 SandboxEventDetails::default()
                     .action("delete")
                     .reason("in_flight_suspend_upload")
+                    .routine()
                     .trigger(SandboxEventTrigger::User),
             );
             tracing::info!(
@@ -1420,6 +1421,7 @@ impl SandboxController {
                         SandboxEventDetails::default()
                             .action("delete")
                             .reason("in_flight_suspend_upload_locked")
+                            .routine()
                             .trigger(SandboxEventTrigger::User),
                     );
                     tracing::info!(
@@ -1441,6 +1443,7 @@ impl SandboxController {
                             .action("delete")
                             .reason("db_delete_failed")
                             .error(err.to_string())
+                            .logged_by_caller()
                             .trigger(SandboxEventTrigger::User),
                     );
                     tracing::error!(
@@ -1634,6 +1637,9 @@ impl SandboxController {
                         return Ok(body);
                     }
                     maybe_update_sandbox_state(pool, id, "started", "on_node").await;
+                    self.substrate
+                        .complete_activation_lease(typed_id, execution.lease_completion)
+                        .await;
                     Ok((Some(SandboxLifecycleStatus::Started), body))
                 }
                 SandboxAction::Wake | SandboxAction::ImplicitWake(_) => {
@@ -2325,7 +2331,7 @@ impl SandboxController {
         pool: &PgPool,
         sandbox: &Sandbox,
         id: SandboxId,
-    ) -> Result<serde_json::Value, ControllerError> {
+    ) -> Result<pplx_space_sbx_mgr_client::proto::StatsResponse, ControllerError> {
         // `runtime_client` on the k8s substrate recovers a missing pod for
         // recoverable-live lifecycles, which would re-pin the pod to
         // `target_node_id` on a draining node. Gate before the call so a
@@ -2342,22 +2348,7 @@ impl SandboxController {
 
         let _ = sandbox;
 
-        Ok(serde_json::json!({
-            "sandbox_id": stats.sandbox_id,
-            "cpu_max": stats.cpu_max,
-            "memory_max": stats.memory_max,
-            "memory_current": stats.memory_current,
-            "pids_max": stats.pids_max,
-            "pids_current": stats.pids_current,
-            "network_tx_bytes": stats.network_tx_bytes,
-            "network_rx_bytes": stats.network_rx_bytes,
-            "net_gateway_reachable": stats.net_gateway_reachable,
-            "tcp_active_connections": stats.tcp_active_connections,
-            "tcp_total_connections": stats.tcp_total_connections,
-            "tcp_denied_connections": stats.tcp_denied_connections,
-            "udp_active_mappings": stats.udp_active_mappings,
-            "bytes_forwarded": stats.bytes_forwarded,
-        }))
+        Ok(stats)
     }
 }
 
@@ -2377,6 +2368,9 @@ mod drain_guard_postgres_tests;
 
 #[cfg(test)]
 mod wake_completion_postgres_tests;
+
+#[cfg(test)]
+mod characterization_tests;
 
 // Coverage-gap acknowledgment: `SandboxController::control_runtime_client`'s
 // ordering invariant (drain check must run before any substrate call that can

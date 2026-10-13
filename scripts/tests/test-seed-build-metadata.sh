@@ -56,14 +56,35 @@ case "${1:-}" in
       exit 97
     }
     env_file=""
+    container_id=""
+    prev=""
     while [[ $# -gt 0 ]]; do
       if [[ "$1" == type=bind,src=*,dst=/workspace/inputs,* ]]; then
         src="${1#type=bind,src=}"
         src="${src%%,dst=*}"
         env_file="${src}/rootfs-builder.env"
       fi
+      # ctr run <options> <image-ref> <container-id> <cmd...>
+      if [[ -z "$container_id" && "$prev" == docker.io/*@sha256:* ]]; then
+        container_id="$1"
+      fi
+      prev="$1"
       shift
     done
+    # Mirror containerd's identifier validation (identifiers.Validate).
+    [[ -n "$container_id" ]] || {
+      echo "ctr run: no container ID after the image ref" >&2
+      exit 1
+    }
+    if (( ${#container_id} > 76 )); then
+      echo "ctr: create container failed validation: container.ID: identifier \"${container_id}\" greater than maximum length (76 characters): invalid argument" >&2
+      exit 1
+    fi
+    [[ "$container_id" =~ ^[A-Za-z0-9]+([._-][A-Za-z0-9]+)*$ ]] || {
+      echo "ctr: container.ID: identifier \"${container_id}\" must match ^[A-Za-z0-9]+(?:[._-](?:[A-Za-z0-9]+))*\$: invalid argument" >&2
+      exit 1
+    }
+    printf '%s\n' "$container_id" >"${CAPTURED_CONTAINER_ID:?CAPTURED_CONTAINER_ID is required}"
     [[ -n "$env_file" && -f "$env_file" ]] || {
       echo "rootfs-builder env file was not staged" >&2
       exit 1
@@ -120,6 +141,7 @@ make_case_dirs() {
   guest_bin_dir="${case_root}/guest-bin"
   rootfs_builder="${case_root}/rootfs-builder.sh"
   captured_env="${case_root}/rootfs-builder.env"
+  captured_container_id="${case_root}/container-id"
   pubkey="${case_root}/sandbox_ed25519.pub"
   cargo_toml="${case_root}/Cargo.toml"
 
@@ -138,6 +160,7 @@ run_success() {
     PATH="${fake_bin}:${PATH}" \
     ALLOW_CTR_RUN=1 \
     CAPTURED_ENV="$captured_env" \
+    CAPTURED_CONTAINER_ID="$captured_container_id" \
     SPACE_SEED_OUTPUT_DIR="$out_dir" \
     SPACE_SEED_CACHE_DIR="$cache_dir" \
     SPACE_SEED_STAGE_ROOT="$stage_root" \
@@ -187,12 +210,20 @@ run_failure() {
   }
 }
 
+# Compare what the build container's `source` assigns, not the file's spelling.
 assert_export() {
   local file="$1"
   local name="$2"
   local value="$3"
-  grep -F "export ${name}=\"${value}\"" "$file" >/dev/null || {
-    echo "expected ${name}=${value} in ${file}" >&2
+  local actual
+  # shellcheck disable=SC2016 # the inner shell expands its own arguments
+  actual="$(env -i bash --noprofile --norc -c \
+    'set -euo pipefail; source "$1"; printf "%s." "${!2}"' _ "$file" "$name")" || {
+    echo "sourcing ${file} failed" >&2
+    exit 1
+  }
+  [[ "${actual%.}" == "$value" ]] || {
+    echo "expected ${name}=${value@Q} in ${file}, got ${actual%.}" >&2
     echo "actual exports:" >&2
     sed 's/^/  /' "$file" >&2
     exit 1
@@ -237,6 +268,65 @@ run_failure guest-kernel-version-only "$kernel_pair_error" \
   SPACE_SEED_KERNEL_VERSION="$kernel_version"
 run_failure guest-kernel-digest-only "$kernel_pair_error" \
   SPACE_SEED_KERNEL_DIGEST="$kernel_digest"
+
+# The privileged build container sources the env file as root, so every
+# staged value must stay data however the caller spelled it.
+marker="${tmp_dir}/shell-metacharacters/sourced-command-ran"
+declare -A hostile=(
+  [SPACE_SEED_UBUNTU_RELEASE]="resolute\"; touch '${marker}'; echo \""
+  [SPACE_SEED_UBUNTU_VERSION]="\$(touch '${marker}')"
+  [SPACE_SEED_UBUNTU_DATE]="\`touch '${marker}'\`"
+  [SPACE_SEED_RUNTIME]=$'firecracker\ntouch '"'${marker}'"
+  [SPACE_SEED_RUNTIME_VERSION]="1.16.0'; touch '${marker}'; '"
+  [SPACE_SEED_STATE_FORMAT_VERSION]="10.1.0\\\"; touch '${marker}' #"
+  [SPACE_SEED_KERNEL_VERSION]="\${PATH:+\$(touch '${marker}')}"
+  [SPACE_SEED_KERNEL_DIGEST]=$'sha256:0\r\n$(touch '"'${marker}'"')'
+  [SPACE_SEED_SPACED_VERSION]="0.1.2\$IFS\$(touch '${marker}')"
+)
+hostile_env=()
+for name in "${!hostile[@]}"; do
+  hostile_env+=("${name}=${hostile[$name]}")
+done
+run_success shell-metacharacters "${hostile_env[@]}"
+# shellcheck disable=SC2016 # the inner shell expands its own argument
+env -i bash --noprofile --norc -c 'source "$1"' _ "$captured_env" >/dev/null 2>&1 || true
+[[ ! -e "$marker" ]] || {
+  echo "shell-metacharacters: sourcing the staged env file ran a command" >&2
+  sed 's/^/  /' "$captured_env" >&2
+  exit 1
+}
+for name in "${!hostile[@]}"; do
+  assert_export "$captured_env" "$name" "${hostile[$name]}"
+done
+
+# The ctr container ID is bounded by containerd's 76-character identifier
+# limit. It must fit for any template ID and for any PID the kernel can hand
+# out (pid_max is at most 2^22, i.e. 7 digits), so a long-lived builder whose
+# PID counter passed 1,000,000 cannot push a long template ID over the limit.
+assert_container_id_fits() {
+  local case_name="$1"
+  local container_id pid_suffix base
+  container_id="$(cat "$captured_container_id")"
+  pid_suffix="${container_id##*-}"
+  base="${container_id%-*}"
+  [[ "$pid_suffix" =~ ^[0-9]+$ ]] || {
+    echo "${case_name}: expected a PID suffix in container ID ${container_id}" >&2
+    exit 1
+  }
+  (( ${#base} + 1 + 7 <= 76 )) || {
+    echo "${case_name}: container ID ${container_id} exceeds 76 characters with a 7-digit PID" >&2
+    exit 1
+  }
+}
+
+# Shape used by the template recipe build smoke: seed-bk-smoke-<job uuid>.
+smoke_shaped_id="seed-bk-smoke-00000000-0000-4000-8000-000000000000"
+run_success "$smoke_shaped_id"
+assert_container_id_fits smoke-shaped-id
+
+long_id="seed-$(printf 'x%.0s' {1..120})"
+run_success "$long_id"
+assert_container_id_fits long-id
 
 rootfs_stderr="${tmp_dir}/rootfs-kernel-pair.stderr"
 set +e

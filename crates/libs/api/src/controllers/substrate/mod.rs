@@ -1,6 +1,10 @@
 pub mod direct;
 #[cfg(feature = "kubernetes")]
 pub mod kubernetes;
+mod runtime_rpc;
+mod worker_channels;
+
+pub(crate) use runtime_rpc::RuntimeRpcError;
 
 #[cfg(feature = "kubernetes")]
 pub use kubernetes::ReflectorReady;
@@ -323,10 +327,19 @@ impl ActivationCompletion {
     }
 }
 
+/// Exact operation lease to release after the controller publishes its lifecycle.
+/// A later owner or execution must never be released by this completion.
+#[derive(Debug, Clone, Copy)]
+pub struct ActivationLeaseCompletion {
+    pub generation: i64,
+    pub attempt_id: SandboxActivationAttemptId,
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecutionActivation {
     pub binding: ExecutionBinding,
     pub completion: ActivationCompletion,
+    pub lease_completion: Option<ActivationLeaseCompletion>,
 }
 
 impl ExecutionActivation {
@@ -334,6 +347,7 @@ impl ExecutionActivation {
         Self {
             binding,
             completion: ActivationCompletion::Owned,
+            lease_completion: None,
         }
     }
 
@@ -341,6 +355,7 @@ impl ExecutionActivation {
         Self {
             binding,
             completion: ActivationCompletion::Joined,
+            lease_completion: None,
         }
     }
 }
@@ -1227,6 +1242,7 @@ impl TeardownProgress {
 }
 
 pub struct CreateExecutionOutcome {
+    pub lease_completion: Option<ActivationLeaseCompletion>,
     pub sandbox_id: SandboxId,
     pub binding: Option<ExecutionBinding>,
     pub initial_lifecycle: &'static str,
@@ -1318,6 +1334,46 @@ pub struct PooledExecutionClaim {
     /// Authoritative route identity returned while claiming the execution.
     /// Substrates without route identity leave it unset.
     pub route_identity: Option<SandboxRouteIdentity>,
+}
+
+/// A warm-pool slot claimed for a create when the create was admitted, before
+/// it was queued. The create's public sandbox ID is that slot's reserved ID,
+/// so the executor must adopt exactly this slot (or build cold under the same
+/// ID) and never claim a different one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmittedPoolClaim {
+    pub claim_id: Uuid,
+    pub pool_slot_id: Uuid,
+}
+
+/// A ready warm-pool slot claimed while a create is being admitted, in the
+/// transaction that records the create. `sandbox_id` is the slot's reserved
+/// ID, which becomes the create's public ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmissionPoolClaim {
+    pub claim: AdmittedPoolClaim,
+    pub sandbox_id: SandboxId,
+}
+
+/// What the substrate found for an [`AdmittedPoolClaim`].
+pub enum AdmittedPoolClaimLookup {
+    /// The admitted slot still carries this claim and passed the same pod
+    /// and placement checks an ordinary claim makes. The caller must persist
+    /// it with `persist_pooled_execution_claim` or compensate it with
+    /// `rollback_pooled_execution_claim`.
+    Adoptable {
+        claim: Box<PooledExecutionClaim>,
+        pool_shape: PooledExecutionPoolShape,
+    },
+    /// No unbound slot owns a pod under this sandbox ID any more (the slot
+    /// was collected, or was bound and retired). A cold create under the same
+    /// ID is safe once it skips the generation the slot's pod used.
+    Released,
+    /// A slot still owns a pod under this sandbox ID that this create will
+    /// not adopt. It has been taken out of the claimable inventory, and the
+    /// pool's own cleanup collects it; until then a cold create under this ID
+    /// would leave that pod with nothing to collect it, so the caller waits.
+    ReleasePending,
 }
 
 pub struct PooledExecutionClaimAttempt {
@@ -2099,6 +2155,14 @@ pub trait SubstrateAdapter: Send + Sync {
         request: CreateExecutionRequest<'a>,
     ) -> Result<CreateExecutionOutcome, SubstrateError>;
 
+    /// Finish an owned operation only after its target lifecycle is published.
+    async fn complete_activation_lease(
+        &self,
+        _sandbox_id: SandboxId,
+        _completion: Option<ActivationLeaseCompletion>,
+    ) {
+    }
+
     /// Delete the active execution object for a sandbox.
     ///
     /// This removes substrate-owned runtime state and any substrate-owned
@@ -2422,6 +2486,54 @@ pub trait SubstrateAdapter: Send + Sync {
         _request: &PooledExecutionClaimRequest<'_>,
     ) -> Result<PooledExecutionClaimAttempt, ControllerError> {
         Ok(PooledExecutionClaimAttempt::missed(None))
+    }
+
+    /// Look up the slot a create was admitted against. Substrates without
+    /// admission-time pool claims own no slot under the ID, so the default
+    /// answers [`AdmittedPoolClaimLookup::Released`] and the create builds
+    /// cold.
+    async fn lookup_admitted_pooled_execution(
+        &self,
+        _request: &PooledExecutionClaimRequest<'_>,
+        _admitted: AdmittedPoolClaim,
+        _sandbox_id: SandboxId,
+    ) -> Result<AdmittedPoolClaimLookup, ControllerError> {
+        Ok(AdmittedPoolClaimLookup::Released)
+    }
+
+    /// Before a cold create under an ID whose admitted slot was not adopted,
+    /// record that the slot's pod used this ID's first execution generation,
+    /// so the cold execution is allocated the next one and cannot share a
+    /// name with a pod that may still be shutting down. Default: nothing to
+    /// skip.
+    async fn skip_admitted_pool_generation(
+        &self,
+        _sandbox_id: SandboxId,
+    ) -> Result<(), ControllerError> {
+        Ok(())
+    }
+
+    /// Whether a failed adoption under this ID still owes a pool cleanup that
+    /// will tear the sandbox down. A create that finds its row in that state
+    /// has not succeeded yet. Default: no such cleanup exists.
+    async fn admitted_pool_cleanup_pending(
+        &self,
+        _sandbox_id: SandboxId,
+    ) -> Result<bool, ControllerError> {
+        Ok(false)
+    }
+
+    /// Claim a ready, plaintext, default-shape warm-pool slot of
+    /// `template_release_id` inside `tx`, the transaction that records the
+    /// create being admitted. The claim commits or rolls back with that
+    /// transaction. `None` is a miss. Default: substrates without a warm pool
+    /// always miss.
+    async fn claim_admission_pool_slot(
+        &self,
+        _tx: &mut Transaction<'_, Postgres>,
+        _template_release_id: Uuid,
+    ) -> Result<Option<AdmissionPoolClaim>, ControllerError> {
+        Ok(None)
     }
 
     /// Persist substrate metadata for a previously claimed pool execution.
@@ -3142,6 +3254,26 @@ impl SubstrateAdapter for Substrate {
         }
     }
 
+    async fn complete_activation_lease(
+        &self,
+        sandbox_id: SandboxId,
+        completion: Option<ActivationLeaseCompletion>,
+    ) {
+        match self {
+            Self::Direct(substrate) => {
+                substrate
+                    .complete_activation_lease(sandbox_id, completion)
+                    .await
+            }
+            #[cfg(feature = "kubernetes")]
+            Self::Kubernetes(substrate) => {
+                substrate
+                    .complete_activation_lease(sandbox_id, completion)
+                    .await
+            }
+        }
+    }
+
     async fn delete_execution(&self, sandbox_id: SandboxId) -> Result<(), SubstrateError> {
         match self {
             Self::Direct(substrate) => substrate.delete_execution(sandbox_id).await,
@@ -3498,6 +3630,73 @@ impl SubstrateAdapter for Substrate {
         }
     }
 
+    async fn lookup_admitted_pooled_execution(
+        &self,
+        request: &PooledExecutionClaimRequest<'_>,
+        admitted: AdmittedPoolClaim,
+        sandbox_id: SandboxId,
+    ) -> Result<AdmittedPoolClaimLookup, ControllerError> {
+        match self {
+            Self::Direct(substrate) => {
+                substrate
+                    .lookup_admitted_pooled_execution(request, admitted, sandbox_id)
+                    .await
+            }
+            #[cfg(feature = "kubernetes")]
+            Self::Kubernetes(substrate) => {
+                substrate
+                    .lookup_admitted_pooled_execution(request, admitted, sandbox_id)
+                    .await
+            }
+        }
+    }
+
+    async fn skip_admitted_pool_generation(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<(), ControllerError> {
+        match self {
+            Self::Direct(substrate) => substrate.skip_admitted_pool_generation(sandbox_id).await,
+            #[cfg(feature = "kubernetes")]
+            Self::Kubernetes(substrate) => {
+                substrate.skip_admitted_pool_generation(sandbox_id).await
+            }
+        }
+    }
+
+    async fn admitted_pool_cleanup_pending(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<bool, ControllerError> {
+        match self {
+            Self::Direct(substrate) => substrate.admitted_pool_cleanup_pending(sandbox_id).await,
+            #[cfg(feature = "kubernetes")]
+            Self::Kubernetes(substrate) => {
+                substrate.admitted_pool_cleanup_pending(sandbox_id).await
+            }
+        }
+    }
+
+    async fn claim_admission_pool_slot(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        template_release_id: Uuid,
+    ) -> Result<Option<AdmissionPoolClaim>, ControllerError> {
+        match self {
+            Self::Direct(substrate) => {
+                substrate
+                    .claim_admission_pool_slot(tx, template_release_id)
+                    .await
+            }
+            #[cfg(feature = "kubernetes")]
+            Self::Kubernetes(substrate) => {
+                substrate
+                    .claim_admission_pool_slot(tx, template_release_id)
+                    .await
+            }
+        }
+    }
+
     async fn persist_pooled_execution_claim(
         &self,
         tx: &mut Transaction<'_, Postgres>,
@@ -3676,6 +3875,19 @@ pub fn node_api_channel(
     ))
 }
 
+/// [`node_api_transport`] for the TCP connect helpers, carrying the TLS
+/// handshake bound the transport applies.
+async fn node_api_connect_endpoint(
+    endpoint: Endpoint,
+) -> Result<pplx_space_common_grpc::internal_transport::ConnectEndpoint, ControllerError> {
+    pplx_space_common_grpc::internal_transport::client_connect_endpoint(
+        pplx_space_common_grpc::internal_transport::Service::NodeApi,
+        endpoint,
+    )
+    .await
+    .map_err(ControllerError::node_api_transport)
+}
+
 async fn node_api_transport(endpoint: Endpoint) -> Result<Endpoint, ControllerError> {
     pplx_space_common_grpc::internal_transport::client_endpoint(
         pplx_space_common_grpc::internal_transport::Service::NodeApi,
@@ -3714,34 +3926,34 @@ pub(super) async fn require_activation_policy_support(
 }
 
 pub async fn connect_worker(endpoint: Endpoint) -> Result<RuntimeClient, ControllerError> {
-    let endpoint = node_api_transport(endpoint).await?;
-    let channel = pplx_space_common_grpc::connect_tcp_channel_with_retry(
-        "worker-node-api",
-        "worker-node-api",
-        endpoint,
-        pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
-    )
-    .await
-    .map_err(|err| {
-        ControllerError::service_unavailable(format!("node-api not reachable: {err}"))
-    })?;
+    let channel = node_api_connect_endpoint(endpoint)
+        .await?
+        .connect_with_retry(
+            "worker-node-api",
+            "worker-node-api",
+            pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
+        )
+        .await
+        .map_err(|err| {
+            ControllerError::service_unavailable(format!("node-api not reachable: {err}"))
+        })?;
     Ok(RuntimeClient::new(channel))
 }
 
 pub async fn connect_worker_internal(
     endpoint: Endpoint,
 ) -> Result<RuntimeInternalClient, ControllerError> {
-    let endpoint = node_api_transport(endpoint).await?;
-    let channel = pplx_space_common_grpc::connect_tcp_channel_with_retry(
-        "worker-node-api-internal",
-        "worker-node-api-internal",
-        endpoint,
-        pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
-    )
-    .await
-    .map_err(|err| {
-        ControllerError::service_unavailable(format!("node-api not reachable: {err}"))
-    })?;
+    let channel = node_api_connect_endpoint(endpoint)
+        .await?
+        .connect_with_retry(
+            "worker-node-api-internal",
+            "worker-node-api-internal",
+            pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
+        )
+        .await
+        .map_err(|err| {
+            ControllerError::service_unavailable(format!("node-api not reachable: {err}"))
+        })?;
     Ok(WorkerApiInternalClient::new(wrap_grpc_client_channel(
         InterceptedService::new(
             channel,
@@ -3751,17 +3963,17 @@ pub async fn connect_worker_internal(
 }
 
 pub async fn connect_builder(endpoint: Endpoint) -> Result<BuilderClient, ControllerError> {
-    let endpoint = node_api_transport(endpoint).await?;
-    let channel = pplx_space_common_grpc::connect_tcp_channel_with_retry(
-        "builder-node-api",
-        "builder-node-api",
-        endpoint,
-        pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
-    )
-    .await
-    .map_err(|err| {
-        ControllerError::service_unavailable(format!("node-api not reachable: {err}"))
-    })?;
+    let channel = node_api_connect_endpoint(endpoint)
+        .await?
+        .connect_with_retry(
+            "builder-node-api",
+            "builder-node-api",
+            pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
+        )
+        .await
+        .map_err(|err| {
+            ControllerError::service_unavailable(format!("node-api not reachable: {err}"))
+        })?;
     Ok(BuilderApiClient::new(wrap_grpc_client_channel(
         InterceptedService::new(
             channel,

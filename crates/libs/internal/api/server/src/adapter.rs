@@ -69,8 +69,74 @@ fn project_sandbox_network_policy_states(
     states
 }
 
+impl ClusterApiService {
+    /// Derive the template-catalog scope from the authenticated caller.
+    ///
+    /// `caller_org_id` on the lookup requests is caller-asserted and the node
+    /// pull path omits it, so it cannot authorize anything. A node-scoped
+    /// caller (every TokenReview identity, and the static token once
+    /// TokenReview is configured) is instead bound to the nodes registered at
+    /// its remote address, the same binding `validate_origin_remote_addr`
+    /// applies to node-bound RPCs; a caller with no registered node resolves
+    /// generic templates only. A request that reached the handler without the
+    /// auth layer (tests, local simulators) is unscoped, matching how the
+    /// other narrow authorities treat a missing extension.
+    async fn template_read_scope<T>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<super::template_releases_store::TemplateReadScope, Status> {
+        use super::template_releases_store::TemplateReadScope;
+        use pplx_space_common_svc::auth::{
+            NodeApiAuthenticatedCaller, TemplateReleaseReadAuthority,
+        };
+
+        let node_scoped = request
+            .extensions()
+            .get::<NodeApiAuthenticatedCaller>()
+            .is_some_and(|caller| {
+                caller.template_release_read_authority() == TemplateReleaseReadAuthority::NodeScoped
+            });
+        if !node_scoped {
+            return Ok(TemplateReadScope::Unscoped);
+        }
+        let Some(remote_addr) = request.remote_addr() else {
+            return Ok(TemplateReadScope::NodeScoped {
+                node_ids: Vec::new(),
+            });
+        };
+        self.template_releases_store
+            .node_scope_for_address(normalize_ip(remote_addr.ip()))
+            .await
+            .map_err(|err| Status::internal(format!("resolve caller nodes: {err}")))
+    }
+}
+
 #[tonic::async_trait]
 impl ClusterApi for ClusterApiService {
+    async fn create_system_template_publication_grant(
+        &self,
+        request: Request<CreateSystemTemplatePublicationGrantRequest>,
+    ) -> Result<Response<CreateSystemTemplatePublicationGrantResponse>, Status> {
+        pplx_space_common_svc::auth::build::authorize_system_publication_grant(&request)?;
+        let template = template_publication::parse_template_name(&request.get_ref().template_name)?;
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            Status::internal(format!("begin system publication grant: {error}"))
+        })?;
+        let grant = template_system_publication_grants::issue(&mut tx, &template)
+            .await
+            .map_err(|error| {
+                Status::internal(format!("issue system publication grant: {error}"))
+            })?;
+        tx.commit().await.map_err(|error| {
+            Status::internal(format!("commit system publication grant: {error}"))
+        })?;
+        Ok(Response::new(
+            CreateSystemTemplatePublicationGrantResponse {
+                grant_id: grant.to_string(),
+            },
+        ))
+    }
+
     async fn list_nodes(
         &self,
         request: Request<ListNodesRequest>,
@@ -99,10 +165,17 @@ impl ClusterApi for ClusterApiService {
             &request,
             request.get_ref().org_id.as_deref(),
         )?;
+        let requires_grant =
+            pplx_space_common_svc::auth::build::system_publication_requires_grant(&request);
         let request = request.into_inner();
         let name = template_publication::parse_template_name(&request.name)?;
         let description = optional_trimmed(request.description.as_deref());
         let template_org = TemplateOrg::parse(request.org_id.as_deref())?;
+        let system_grant = template_publication::system_publication_grant(
+            request.system_publication_grant_id.as_deref(),
+            template_org,
+            requires_grant,
+        )?;
         self.reserved_template_names
             .authorize(&name, template_org)?;
 
@@ -111,6 +184,15 @@ impl ClusterApi for ClusterApiService {
             .begin()
             .await
             .map_err(|err| Status::internal(format!("begin template registration: {err}")))?;
+
+        // Registration leaves the grant for the release that follows it.
+        if let Some(grant) = system_grant
+            && !template_system_publication_grants::covers(&mut *tx, &name, grant)
+                .await
+                .map_err(|err| Status::internal(format!("check system publication: {err}")))?
+        {
+            return Err(template_publication::missing_system_publication_grant());
+        }
 
         let inserted = template_registration_store::insert(
             &mut *tx,
@@ -152,6 +234,8 @@ impl ClusterApi for ClusterApiService {
             &request,
             request.get_ref().org_id.as_deref(),
         )?;
+        let requires_grant =
+            pplx_space_common_svc::auth::build::system_publication_requires_grant(&request);
         let request = request.into_inner();
         let template_name = template_publication::parse_template_name(&request.template_name)?;
         let runtime = validated_template_runtime(&request.runtime)?;
@@ -162,6 +246,11 @@ impl ClusterApi for ClusterApiService {
             &self.trusted_template_storage,
         )?;
         let template_org = TemplateOrg::parse(request.org_id.as_deref())?;
+        let system_grant = template_publication::system_publication_grant(
+            request.system_publication_grant_id.as_deref(),
+            template_org,
+            requires_grant,
+        )?;
         self.reserved_template_names
             .authorize(&template_name, template_org)?;
         let execution_metadata = validated_execution_metadata(request.execution.as_ref())?;
@@ -172,6 +261,15 @@ impl ClusterApi for ClusterApiService {
             .await
             .map_err(|err| Status::internal(format!("begin tx: {err}")))?;
 
+        // Consumed with the release it authorizes: a rolled-back publication
+        // keeps its grant, and a committed one cannot be repeated.
+        if let Some(grant) = system_grant
+            && !template_system_publication_grants::consume(&mut *tx, &template_name, grant)
+                .await
+                .map_err(|err| Status::internal(format!("consume system publication: {err}")))?
+        {
+            return Err(template_publication::missing_system_publication_grant());
+        }
         let release_org_id = self
             .lock_template_for_publication(&mut tx, &template_name, template_org)
             .await?;
@@ -223,6 +321,7 @@ impl ClusterApi for ClusterApiService {
         &self,
         request: Request<FindTemplateReleaseRequest>,
     ) -> Result<Response<FindTemplateReleaseResponse>, Status> {
+        let scope = self.template_read_scope(&request).await?;
         let request = request.into_inner();
         let template_name = trimmed_required(&request.template_name, "template_name")?;
         let runtime = validated_template_runtime(&request.runtime)?;
@@ -238,10 +337,18 @@ impl ClusterApi for ClusterApiService {
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let rows = self
             .template_releases_store
-            .find_by_tag(&template_name, runtime, &tag, caller_org)
+            .find_by_tag(
+                &template_name,
+                runtime,
+                &tag,
+                caller_org,
+                &scope,
+                request.generic_only,
+            )
             .await
             .map_err(|error| Status::internal(format!("query release: {error}")))?;
 
+        let generic_authorized = rows.first().is_some_and(|row| row.generic_authorized);
         let release = match rows.first() {
             Some(first) => TemplateRelease {
                 id: first.release_id.to_string(),
@@ -276,6 +383,7 @@ impl ClusterApi for ClusterApiService {
         )
         .await;
         Ok(Response::new(FindTemplateReleaseResponse {
+            generic_authorized,
             authorized_org_id: caller_org.map(|org| org.to_string()),
             release: Some(release),
             storage_locations,
@@ -287,6 +395,7 @@ impl ClusterApi for ClusterApiService {
         &self,
         request: Request<FindTemplateReleaseByHashRequest>,
     ) -> Result<Response<FindTemplateReleaseResponse>, Status> {
+        let scope = self.template_read_scope(&request).await?;
         let request = request.into_inner();
         let template_name = trimmed_required(&request.template_name, "template_name")?;
         // Canonical `sha256:`-prefixed form.
@@ -312,10 +421,18 @@ impl ClusterApi for ClusterApiService {
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let rows = self
             .template_releases_store
-            .find_by_hash(&template_name, &hash, &bare_hash, caller_org)
+            .find_by_hash(
+                &template_name,
+                &hash,
+                &bare_hash,
+                caller_org,
+                &scope,
+                request.generic_only,
+            )
             .await
             .map_err(|error| Status::internal(format!("query release: {error}")))?;
 
+        let generic_authorized = rows.first().is_some_and(|row| row.generic_authorized);
         let release = match rows.first() {
             Some(first) => TemplateRelease {
                 id: first.release_id.to_string(),
@@ -350,6 +467,7 @@ impl ClusterApi for ClusterApiService {
         )
         .await;
         Ok(Response::new(FindTemplateReleaseResponse {
+            generic_authorized,
             authorized_org_id: caller_org.map(|org| org.to_string()),
             release: Some(release),
             storage_locations,
@@ -361,6 +479,7 @@ impl ClusterApi for ClusterApiService {
         &self,
         request: Request<ListLatestTemplateReleasesRequest>,
     ) -> Result<Response<ListLatestTemplateReleasesResponse>, Status> {
+        let scope = self.template_read_scope(&request).await?;
         let request = request.into_inner();
         let template_name = trimmed_required(&request.template_name, "template_name")?;
         let runtime = validated_template_runtime(&request.runtime)?;
@@ -368,7 +487,7 @@ impl ClusterApi for ClusterApiService {
 
         let releases = self
             .template_releases_store
-            .list_latest(&template_name, runtime, i64::from(limit))
+            .list_latest(&template_name, runtime, i64::from(limit), &scope)
             .await?;
 
         let visibility = template_visibility(
@@ -449,7 +568,7 @@ impl ClusterApi for ClusterApiService {
         request: Request<GetNodeNetworkPolicyStateRequest>,
     ) -> Result<Response<GetNodeNetworkPolicyStateResponse>, Status> {
         let role_hint = optional_db_role_from_proto(request.get_ref().role)?;
-        let _ = self
+        let origin = self
             .authenticated_origin_node_id(&request, &request.get_ref().node_id, role_hint)
             .await?;
         let request = request.into_inner();
@@ -468,15 +587,35 @@ impl ClusterApi for ClusterApiService {
                         COALESCE(t.network_policy_generation, 0) AS network_policy_generation
                  FROM requested r
                  LEFT JOIN templates t ON t.name = r.template
-                 WHERE t.name IS NOT NULL
+                 WHERE (t.visibility = 'generic' AND t.desired_state = 'present')
                     OR EXISTS (
                         SELECT 1
-                        FROM node_template_inventory nti
-                        WHERE nti.template_name = r.template
-                    )"
+                        FROM sandboxes sb
+                        WHERE sb.template_id = t.name
+                          AND (sb.active_node_id = $3 OR sb.target_node_id = $3)
+                    )
+                    OR ($4 = 'worker' AND EXISTS (
+                        SELECT 1
+                        FROM kubernetes_pool_configs pc
+                        JOIN template_releases pr ON pr.id = pc.template_release_id
+                        WHERE pc.enabled
+                          AND pr.template_name = t.name
+                    ))
+                    OR ($4 = 'builder' AND EXISTS (
+                        SELECT 1
+                        FROM template_build_base_grants g
+                        WHERE g.base_template_name = t.name
+                          AND g.org_id = t.org_id
+                          AND ((g.builder_node_id IS NULL
+                                AND g.granted_at > NOW() - INTERVAL '1 hour')
+                               OR (g.builder_node_id = $3
+                                   AND g.granted_at > NOW() - INTERVAL '7 days'))
+                    ))"
             ))
             .bind(&templates)
             .bind(Json(NetworkPolicyV1::deny_all()))
+            .bind(origin.id)
+            .bind(origin.role.as_str())
             .fetch_all(&self.pool)
             .await
             .map_err(|err| Status::internal(format!("query template policies: {err}")))?
@@ -510,20 +649,16 @@ impl ClusterApi for ClusterApiService {
         let sandbox_states = if sandbox_ids.is_empty() {
             Vec::new()
         } else {
-            let rows = sqlx::query_as::<_, SandboxPolicyRow>(sql!(
-                "SELECT s.id AS sandbox_id,
-                        s.template_id,
-                        s.network_policy_override_json AS network_policy_json,
-                        s.network_policy_generation,
-                        t.network_policy_json AS template_network_policy_json
-                 FROM sandboxes s
-                 LEFT JOIN templates t ON t.name = s.template_id
-                 WHERE s.id = ANY($1)"
-            ))
-            .bind(&sandbox_ids)
-            .fetch_all(&self.pool)
+            let rows = pplx_space_sandbox_store::network_policy_inputs_placed_on(
+                &self.pool,
+                origin.id,
+                &sandbox_ids,
+            )
             .await
-            .map_err(|err| Status::internal(format!("query sandbox policies: {err}")))?;
+            .map_err(|err| Status::internal(format!("query sandbox policies: {err}")))?
+            .into_iter()
+            .map(SandboxPolicyRow::try_from)
+            .collect::<Result<Vec<_>, Status>>()?;
 
             project_sandbox_network_policy_states(rows)
         };
@@ -576,19 +711,35 @@ impl ClusterApi for ClusterApiService {
              FROM requested r
              LEFT JOIN template_base_snapshot_policies p ON p.template = r.template
              LEFT JOIN local_inventory li ON li.template_name = r.template
-             WHERE EXISTS (
-                     SELECT 1
-                     FROM templates t
-                     WHERE t.name = r.template
-                 )
+             LEFT JOIN templates t ON t.name = r.template
+             WHERE (t.visibility = 'generic' AND t.desired_state = 'present')
                 OR EXISTS (
-                     SELECT 1
-                     FROM node_template_inventory nti
-                     WHERE nti.template_name = r.template
-                 )"
+                    SELECT 1
+                    FROM sandboxes sb
+                    WHERE sb.template_id = t.name
+                      AND (sb.active_node_id = $2 OR sb.target_node_id = $2)
+                )
+                OR ($3 = 'worker' AND EXISTS (
+                    SELECT 1
+                    FROM kubernetes_pool_configs pc
+                    JOIN template_releases pr ON pr.id = pc.template_release_id
+                    WHERE pc.enabled
+                      AND pr.template_name = t.name
+                ))
+                OR ($3 = 'builder' AND EXISTS (
+                    SELECT 1
+                    FROM template_build_base_grants g
+                    WHERE g.base_template_name = t.name
+                      AND g.org_id = t.org_id
+                      AND ((g.builder_node_id IS NULL
+                            AND g.granted_at > NOW() - INTERVAL '1 hour')
+                           OR (g.builder_node_id = $2
+                               AND g.granted_at > NOW() - INTERVAL '7 days'))
+                ))"
         ))
         .bind(&templates)
         .bind(origin.id)
+        .bind(origin.role.as_str())
         .fetch_all(&self.pool)
         .await
         .map_err(|err| Status::internal(format!("query template base-snapshot policies: {err}")))?;
@@ -645,6 +796,10 @@ impl ClusterApi for ClusterApiService {
             }));
         }
 
+        // Visibility follows the node's placement, as the release lookups do.
+        // The one addition is a template the node still holds while it is
+        // being retired: the node must hear `present = false` to delete it.
+        // Inventory is node-reported, so it never admits a present template.
         let rows = sqlx::query_as::<_, TemplateDesiredStateRow>(
             sql!("WITH requested AS (
                  SELECT DISTINCT UNNEST($1::TEXT[]) AS template
@@ -694,7 +849,37 @@ impl ClusterApi for ClusterApiService {
              LEFT JOIN template_base_snapshot_policies bsp
                     ON bsp.template = r.template
              LEFT JOIN local_inventory li
-                    ON li.template_name = r.template"),
+                    ON li.template_name = r.template
+             WHERE (t.visibility = 'generic' AND t.desired_state = 'present')
+                OR EXISTS (
+                    SELECT 1
+                    FROM sandboxes sb
+                    WHERE sb.template_id = t.name
+                      AND (sb.active_node_id = $3 OR sb.target_node_id = $3)
+                )
+                OR ($2 = 'worker' AND EXISTS (
+                    SELECT 1
+                    FROM kubernetes_pool_configs pc
+                    JOIN template_releases pr ON pr.id = pc.template_release_id
+                    WHERE pc.enabled
+                      AND pr.template_name = t.name
+                ))
+                OR ($2 = 'builder' AND EXISTS (
+                    SELECT 1
+                    FROM template_build_base_grants g
+                    WHERE g.base_template_name = t.name
+                      AND g.org_id = t.org_id
+                      AND ((g.builder_node_id IS NULL
+                            AND g.granted_at > NOW() - INTERVAL '1 hour')
+                           OR (g.builder_node_id = $3
+                               AND g.granted_at > NOW() - INTERVAL '7 days'))
+                ))
+                OR (t.desired_state <> 'present' AND EXISTS (
+                    SELECT 1
+                    FROM node_template_inventory nti
+                    WHERE nti.template_name = r.template
+                      AND nti.node_id = $3
+                ))"),
         )
         .bind(&templates)
         .bind(origin.role.as_str())
@@ -1004,6 +1189,7 @@ impl ClusterApi for ClusterApiService {
         let response = tokio::time::timeout(
             budget,
             data_plane_sessions::resolve_session_route(
+                budget,
                 self.ingress_activation.as_deref(),
                 &self.pool,
                 self.route_ed25519_authority.as_deref(),
@@ -1058,6 +1244,7 @@ impl ClusterApi for ClusterApiService {
         let response = tokio::time::timeout(
             budget,
             data_plane_sessions::unstable_resolve_sandbox_service_route(
+                budget,
                 self.ingress_activation.as_deref(),
                 &self.pool,
                 self.route_ed25519_authority.as_deref(),

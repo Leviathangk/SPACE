@@ -1,5 +1,6 @@
 use pplx_space_common_core::types::{JobId, LocalArtifactId};
 
+use super::cleanup_executor::CleanupWait;
 use super::cleanup_support::{
     ActivationCleanupSpec, CLEANUP_HANDOFF_RETRY, CleanupCompletion, CleanupFenceAuthorization,
     CleanupLock, CleanupLockGuard, CleanupLockMap, CleanupLockTryResult, NetGatewayStatsSnapshot,
@@ -10,7 +11,6 @@ use super::start_support::{ActivationAdmissionPermit, ActivationCleanupGuard};
 use super::tail_support::*;
 use super::*;
 use crate::db::cleanup_jobs::CleanupOutcome;
-use pplx_space_common_core::types::{ExecutionReleaseDetachReason, ExecutionReleaseIntent};
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
     emit_sandbox_event,
@@ -51,6 +51,7 @@ pub(super) struct AsyncCleanupRequest {
     pub(super) context: &'static str,
     pub(super) completion: CleanupCompletion,
     pub(super) immediate_kill: bool,
+    pub(super) guest_flush: crate::db::cleanup_jobs::GuestFlush,
     pub(super) persist_intent: bool,
     pub(super) cleanup_id: Option<SandboxCleanupEpisodeId>,
 }
@@ -63,6 +64,7 @@ pub(super) struct SynchronousCleanupRequest<'a> {
     pub(super) completion: CleanupCompletion,
     pub(super) published_artifact: Option<(LocalArtifactId, String)>,
     pub(super) immediate_kill: bool,
+    pub(super) guest_flush: crate::db::cleanup_jobs::GuestFlush,
 }
 
 pub(super) enum CleanupAdmission {
@@ -155,31 +157,6 @@ impl CleanupAdmissionError {
                 ))
             }
             Self::Status(status) => status,
-        }
-    }
-}
-
-pub(super) enum CleanupAdmissionDecision {
-    Admitted(CleanupAdmission),
-    ExecutionReleaseAdmitted {
-        admission: CleanupAdmission,
-        runtime_label: SandboxRuntimeLabel,
-    },
-    ExecutionReleaseDetached {
-        reason: ExecutionReleaseDetachReason,
-    },
-}
-
-impl CleanupAdmissionDecision {
-    fn require_admitted(self) -> Result<CleanupAdmission, CleanupAdmissionError> {
-        match self {
-            Self::Admitted(admission) => Ok(admission),
-            Self::ExecutionReleaseAdmitted { .. } | Self::ExecutionReleaseDetached { .. } => {
-                Err(Status::internal(
-                    "non-release cleanup unexpectedly produced an execution-release decision",
-                )
-                .into())
-            }
         }
     }
 }
@@ -438,61 +415,6 @@ pub(super) struct ObservedCleanupClaim {
         Option<Option<pplx_space_common_core::types::ExecutionGeneration>>,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(super) struct ExecutionReleaseCleanup {
-    pub(super) target_state: SandboxState,
-    pub(super) keep_filesystem: bool,
-    pub(super) completion: CleanupCompletion,
-    pub(super) context: &'static str,
-}
-
-impl ExecutionReleaseCleanup {
-    pub(super) const fn for_intent(intent: ExecutionReleaseIntent) -> Self {
-        match intent {
-            ExecutionReleaseIntent::Stop => Self {
-                target_state: SandboxState::Stopping,
-                keep_filesystem: true,
-                completion: CleanupCompletion::MarkStopped,
-                context: "cleanup after execution release stop",
-            },
-            ExecutionReleaseIntent::Delete => Self {
-                target_state: SandboxState::Deleting,
-                keep_filesystem: false,
-                completion: CleanupCompletion::DeleteRow,
-                context: "cleanup after execution release delete",
-            },
-        }
-    }
-}
-
-pub(super) struct ReleaseExecutionClaim {
-    execution_generation: pplx_space_common_core::types::ExecutionGeneration,
-    cleanup: ExecutionReleaseCleanup,
-}
-
-impl ReleaseExecutionClaim {
-    pub(super) const fn new(
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
-        cleanup: ExecutionReleaseCleanup,
-    ) -> Self {
-        Self {
-            execution_generation,
-            cleanup,
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) const fn from_intent(
-        intent: ExecutionReleaseIntent,
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
-    ) -> Self {
-        Self::new(
-            execution_generation,
-            ExecutionReleaseCleanup::for_intent(intent),
-        )
-    }
-}
-
 struct CleanupAdmissionSpec {
     mode: CleanupAdmissionMode,
     template_filter: Option<pplx_space_common_core::types::TemplateName>,
@@ -502,6 +424,7 @@ struct CleanupAdmissionSpec {
     completion: CleanupCompletion,
     persist_intent: bool,
     immediate_kill: bool,
+    guest_flush: crate::db::cleanup_jobs::GuestFlush,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -514,9 +437,6 @@ enum CleanupAdmissionMode {
     ObservedExecution {
         execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
     },
-    ExecutionRelease {
-        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
-    },
     AutoLifecycleDelete {
         expectation: crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteExpectation,
     },
@@ -526,10 +446,9 @@ impl CleanupAdmissionMode {
     const fn observed_state(self) -> Option<SandboxState> {
         match self {
             Self::ObservedState { state, .. } => Some(state),
-            Self::Unfenced
-            | Self::ObservedExecution { .. }
-            | Self::ExecutionRelease { .. }
-            | Self::AutoLifecycleDelete { .. } => None,
+            Self::Unfenced | Self::ObservedExecution { .. } | Self::AutoLifecycleDelete { .. } => {
+                None
+            }
         }
     }
 
@@ -544,23 +463,7 @@ impl CleanupAdmissionMode {
             Self::ObservedExecution {
                 execution_generation,
             } => Some(execution_generation),
-            Self::Unfenced | Self::ExecutionRelease { .. } | Self::AutoLifecycleDelete { .. } => {
-                None
-            }
-        }
-    }
-
-    const fn release_execution_generation(
-        self,
-    ) -> Option<pplx_space_common_core::types::ExecutionGeneration> {
-        match self {
-            Self::ExecutionRelease {
-                execution_generation,
-            } => Some(execution_generation),
-            Self::Unfenced
-            | Self::ObservedState { .. }
-            | Self::ObservedExecution { .. }
-            | Self::AutoLifecycleDelete { .. } => None,
+            Self::Unfenced | Self::AutoLifecycleDelete { .. } => None,
         }
     }
 
@@ -571,14 +474,8 @@ impl CleanupAdmissionMode {
                 execution_generation,
                 ..
             } => execution_generation.is_some(),
-            Self::ObservedExecution { .. }
-            | Self::ExecutionRelease { .. }
-            | Self::AutoLifecycleDelete { .. } => true,
+            Self::ObservedExecution { .. } | Self::AutoLifecycleDelete { .. } => true,
         }
-    }
-
-    const fn is_execution_release(self) -> bool {
-        matches!(self, Self::ExecutionRelease { .. })
     }
 
     const fn auto_lifecycle_delete_expectation(
@@ -586,18 +483,12 @@ impl CleanupAdmissionMode {
     ) -> Option<crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteExpectation> {
         match self {
             Self::AutoLifecycleDelete { expectation } => Some(expectation),
-            Self::Unfenced
-            | Self::ObservedState { .. }
-            | Self::ObservedExecution { .. }
-            | Self::ExecutionRelease { .. } => None,
+            Self::Unfenced | Self::ObservedState { .. } | Self::ObservedExecution { .. } => None,
         }
     }
 
     const fn requires_atomic_admission(self) -> bool {
-        matches!(
-            self,
-            Self::ExecutionRelease { .. } | Self::AutoLifecycleDelete { .. }
-        )
+        matches!(self, Self::AutoLifecycleDelete { .. })
     }
 
     const fn requires_immediate_transaction(self) -> bool {
@@ -672,6 +563,7 @@ impl SandboxManagerService {
             pplx_space_node_mgr_client::execution_fence::InstanceTarget::RestoreScope(
                 transfer_scope_id,
             ),
+            &self.node_manager,
         )
         .await
         .map_err(|error| {
@@ -876,11 +768,11 @@ impl SandboxManagerService {
                 keep_filesystem: claim.keep_filesystem,
                 completion: claim.completion,
                 immediate_kill: Self::cleanup_immediate_kill(claim.completion),
+                guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                 persist_intent: claim.persist_intent,
             },
         )
-        .await?
-        .require_admitted()
+        .await
     }
 
     pub(super) async fn admit_lifecycle_cleanup_for_observed_execution(
@@ -910,32 +802,8 @@ impl SandboxManagerService {
                 keep_filesystem,
                 completion,
                 immediate_kill: Self::cleanup_immediate_kill(completion),
+                guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                 persist_intent,
-            },
-        )
-        .await?
-        .require_admitted()
-    }
-
-    pub(super) async fn admit_execution_release(
-        &self,
-        sandbox_id: SandboxId,
-        claim: ReleaseExecutionClaim,
-    ) -> Result<CleanupAdmissionDecision, CleanupAdmissionError> {
-        let cleanup = claim.cleanup;
-        self.admit_lifecycle_cleanup_inner(
-            sandbox_id,
-            CleanupAdmissionSpec {
-                mode: CleanupAdmissionMode::ExecutionRelease {
-                    execution_generation: claim.execution_generation,
-                },
-                template_filter: None,
-                require_template_owner: false,
-                target_state: cleanup.target_state,
-                keep_filesystem: cleanup.keep_filesystem,
-                completion: cleanup.completion,
-                immediate_kill: Self::cleanup_immediate_kill(cleanup.completion),
-                persist_intent: true,
             },
         )
         .await
@@ -956,11 +824,11 @@ impl SandboxManagerService {
                 keep_filesystem: false,
                 completion: CleanupCompletion::DeleteRow,
                 immediate_kill: false,
+                guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                 persist_intent: true,
             },
         )
-        .await?
-        .require_admitted()
+        .await
     }
 
     pub(super) fn check_cleanup_selection(
@@ -1012,6 +880,13 @@ impl SandboxManagerService {
             CleanupCompletion::DeleteRow => false,
             _ => return Err(Status::internal("invalid selected cleanup completion").into()),
         };
+        let guest_flush = if !stop {
+            crate::db::cleanup_jobs::GuestFlush::Unrequested
+        } else if immediate_kill {
+            crate::db::cleanup_jobs::GuestFlush::Forbidden
+        } else {
+            crate::db::cleanup_jobs::GuestFlush::BeforeTermination
+        };
         self.admit_lifecycle_cleanup_inner(
             sandbox_id,
             CleanupAdmissionSpec {
@@ -1027,17 +902,17 @@ impl SandboxManagerService {
                 completion,
                 persist_intent,
                 immediate_kill,
+                guest_flush,
             },
         )
-        .await?
-        .require_admitted()
+        .await
     }
 
     async fn admit_lifecycle_cleanup_inner(
         &self,
         sandbox_id: SandboxId,
         spec: CleanupAdmissionSpec,
-    ) -> Result<CleanupAdmissionDecision, CleanupAdmissionError> {
+    ) -> Result<CleanupAdmission, CleanupAdmissionError> {
         let id = sandbox_id.to_string();
         let fence = CleanupLockGuard::new(
             Arc::clone(&self.cleanup_locks),
@@ -1082,7 +957,7 @@ impl SandboxManagerService {
         sandbox_id: SandboxId,
         spec: CleanupAdmissionSpec,
         fence: OwnedCleanupFenceGuard,
-    ) -> Result<CleanupAdmissionDecision, CleanupAdmissionError> {
+    ) -> Result<CleanupAdmission, CleanupAdmissionError> {
         let CleanupAdmissionSpec {
             mode,
             template_filter,
@@ -1092,11 +967,12 @@ impl SandboxManagerService {
             completion,
             persist_intent,
             immediate_kill,
+            guest_flush,
         } = spec;
-        // Fenced callers depend on readable generation lineage. Execution
-        // release and auto-lifecycle deletion require the lifecycle claim and
-        // intent write to be atomic; observed-generation cleanup retains its
-        // best-effort local cleanup fallback when those writes fail.
+        // Fenced callers depend on readable generation lineage. Auto-lifecycle
+        // deletion requires the lifecycle claim and intent write to be atomic;
+        // observed-generation cleanup retains its best-effort local cleanup
+        // fallback when those writes fail.
         let require_selection_check = template_filter.is_some() || require_template_owner;
         let require_generation_inspection =
             mode.requires_generation_inspection() || require_selection_check;
@@ -1126,13 +1002,11 @@ impl SandboxManagerService {
                     ))
                     .into());
                 }
-                return Ok(CleanupAdmissionDecision::Admitted(
-                    CleanupAdmission::unpersisted(
-                        sandbox_id,
-                        None,
-                        Some(format!("begin cleanup admission failed: {error}")),
-                        fence,
-                    ),
+                return Ok(CleanupAdmission::unpersisted(
+                    sandbox_id,
+                    None,
+                    Some(format!("begin cleanup admission failed: {error}")),
+                    fence,
                 ));
             }
         };
@@ -1154,72 +1028,6 @@ impl SandboxManagerService {
                 Status::failed_precondition("prepared clone disposal owns this sandbox").into(),
             );
         }
-        let (
-            release_state,
-            release_failure_reason,
-            release_runtime_label,
-            allow_untracked_execution_release,
-        ) = if mode.is_execution_release() {
-            let release = match crate::db::execution_release_state(&transaction, &sandbox_id_string)
-            {
-                Ok(state) => state,
-                Err(error) => {
-                    return Err(Status::internal(format!(
-                        "inspect execution-release ownership during cleanup admission failed: {error}"
-                    ))
-                    .into());
-                }
-            };
-            match release {
-                Some(release) => {
-                    let Ok(current_state) = release.state_label.parse::<SandboxState>() else {
-                        return Ok(CleanupAdmissionDecision::ExecutionReleaseDetached {
-                            reason: ExecutionReleaseDetachReason::UnknownLifecycle,
-                        });
-                    };
-                    if !current_state.accepts_execution_release_to(target_state) {
-                        return Ok(CleanupAdmissionDecision::ExecutionReleaseDetached {
-                            reason: ExecutionReleaseDetachReason::LifecycleNotReleasable,
-                        });
-                    }
-                    (
-                        Some(current_state),
-                        release.failure_reason,
-                        Some(release.runtime_label),
-                        false,
-                    )
-                }
-                None => (
-                    None,
-                    None,
-                    Some(SandboxRuntimeLabel::from_sandbox_id(sandbox_id)),
-                    true,
-                ),
-            }
-        } else {
-            (None, None, None, false)
-        };
-        let admitted = |admission| match release_runtime_label.clone() {
-            Some(runtime_label) => CleanupAdmissionDecision::ExecutionReleaseAdmitted {
-                admission,
-                runtime_label,
-            },
-            None => CleanupAdmissionDecision::Admitted(admission),
-        };
-        if mode.is_execution_release()
-            && release_state.is_some()
-            && crate::db::cleanup_episode(&transaction, &sandbox_id_string)
-                .map_err(|error| {
-                    Status::internal(format!(
-                        "inspect manager cleanup ownership during execution release failed: {error}"
-                    ))
-                })?
-                .is_some()
-        {
-            return Ok(CleanupAdmissionDecision::ExecutionReleaseDetached {
-                reason: ExecutionReleaseDetachReason::ManagerCleanupInProgress,
-            });
-        }
         if let Some(observed_state) = mode.observed_state() {
             let current_state = crate::db::get_sandbox(&transaction, &sandbox_id_string)
                 .map_err(|error| {
@@ -1236,37 +1044,22 @@ impl SandboxManagerService {
             }
         }
         if target_state == SandboxState::Deleting && completion.deletes_row() {
-            let erase_safety = match release_state {
-                Some(state) => {
-                    // The execution-release matrix already rejects suspend-owned
-                    // states. Use the minimal release projection so unrelated
-                    // malformed row metadata cannot block release admission.
-                    Some((
-                        state,
-                        crate::db::sandbox_erase_safety(
-                            state,
-                            None,
-                            release_failure_reason.as_deref(),
-                        ),
+            let erase_safety = crate::db::get_sandbox(&transaction, &sandbox_id_string)
+                .map_err(|error| {
+                    Status::internal(format!(
+                        "inspect suspend publication during delete admission failed: {error}"
                     ))
-                }
-                None => crate::db::get_sandbox(&transaction, &sandbox_id_string)
-                    .map_err(|error| {
-                        Status::internal(format!(
-                            "inspect suspend publication during delete admission failed: {error}"
-                        ))
-                    })?
-                    .map(|row| {
-                        (
+                })?
+                .map(|row| {
+                    (
+                        row.state,
+                        crate::db::sandbox_erase_safety(
                             row.state,
-                            crate::db::sandbox_erase_safety(
-                                row.state,
-                                row.cleanup_completion,
-                                row.failure_reason.as_deref(),
-                            ),
-                        )
-                    }),
-            };
+                            row.cleanup_completion,
+                            row.failure_reason.as_deref(),
+                        ),
+                    )
+                });
             match erase_safety {
                 Some((state, crate::db::SandboxEraseSafety::SuspendPublicationPending)) => {
                     tracing::info!(
@@ -1299,35 +1092,16 @@ impl SandboxManagerService {
                     .into());
                 }
                 Err(error) => {
-                    return Ok(admitted(CleanupAdmission::unpersisted(
+                    return Ok(CleanupAdmission::unpersisted(
                         sandbox_id,
                         None,
                         Some(format!(
                             "inspect runtime generation during cleanup admission failed: {error}"
                         )),
                         fence,
-                    )));
+                    ));
                 }
             };
-        if let Some(expected_execution_generation) = mode.release_execution_generation()
-            && release_state.is_some()
-        {
-            match current_execution_generation {
-                Some(current_execution_generation)
-                    if current_execution_generation == expected_execution_generation => {}
-                Some(_) => {
-                    return Ok(CleanupAdmissionDecision::ExecutionReleaseDetached {
-                        reason: ExecutionReleaseDetachReason::ExecutionGenerationMismatch,
-                    });
-                }
-                None => {
-                    return Err(Status::failed_precondition(
-                        "tracked sandbox has no runtime execution generation",
-                    )
-                    .into());
-                }
-            }
-        }
         if let Some(observed_execution_generation) = mode.observed_execution_generation()
             && current_execution_generation != observed_execution_generation
         {
@@ -1447,92 +1221,57 @@ impl SandboxManagerService {
         } else {
             None
         };
-        if matches!(
+        let guest_flush = guest_flush.for_superseded_state(
+            crate::db::current_state_label(&transaction, &sandbox_id_string)
+                .ok()
+                .flatten()
+                .and_then(|state| state.parse().ok()),
+        );
+        match crate::db::update_state_superseding_activation_in_transaction(
+            &transaction,
+            &sandbox_id_string,
             target_state,
-            SandboxState::Stopping | SandboxState::Deleting
         ) {
-            match crate::db::update_state_superseding_activation_in_transaction(
-                &transaction,
-                &sandbox_id_string,
-                target_state,
-            ) {
-                Ok(()) => {}
-                Err(crate::db::SupersedeActivationError::QuarantineRecoveryInProgress) => {
-                    return Err(CleanupAdmissionError::QuarantineRecoveryInProgress { sandbox_id });
-                }
-                Err(crate::db::SupersedeActivationError::StateWriteNotApplied(error))
-                    if error.outcome == crate::db::SandboxStateWriteOutcome::Missing =>
-                {
-                    if mode.auto_lifecycle_delete_expectation().is_some() {
-                        return Err(Status::unavailable(
-                            "sandbox disappeared during auto-lifecycle delete admission",
-                        )
-                        .into());
-                    }
-                    if mode.is_execution_release() && !allow_untracked_execution_release {
-                        // The raw state read and this write share one SQLite
-                        // transaction on the mutex-guarded connection, so this
-                        // is defense-in-depth for future storage changes.
-                        return Ok(CleanupAdmissionDecision::ExecutionReleaseDetached {
-                            reason: ExecutionReleaseDetachReason::SandboxRowMissing,
-                        });
-                    }
-                    return Ok(admitted(CleanupAdmission::unpersisted(
-                        sandbox_id,
-                        current_execution_generation,
-                        None,
-                        fence,
-                    )));
-                }
-                Err(crate::db::SupersedeActivationError::StateWriteNotApplied(error)) => {
-                    return Err(Status::unavailable(format!(
-                        "cleanup lifecycle claim was superseded: {error}"
-                    ))
-                    .into());
-                }
-                Err(error) => {
-                    if require_atomic_admission {
-                        return Err(Status::unavailable(format!(
-                            "claim atomic cleanup admission failed: {error}"
-                        ))
-                        .into());
-                    }
-                    return Ok(admitted(CleanupAdmission::unpersisted(
-                        sandbox_id,
-                        current_execution_generation,
-                        Some(format!("claim cleanup lifecycle failed: {error}")),
-                        fence,
-                    )));
-                }
+            Ok(()) => {}
+            Err(crate::db::SupersedeActivationError::QuarantineRecoveryInProgress) => {
+                return Err(CleanupAdmissionError::QuarantineRecoveryInProgress { sandbox_id });
             }
-        } else {
-            let outcome = crate::db::update_state(&transaction, &sandbox_id_string, target_state)
-                .map_err(|error| {
-                Status::internal(format!("claim cleanup lifecycle failed: {error}"))
-            })?;
-            if outcome == crate::db::SandboxStateWriteOutcome::Missing {
+            Err(crate::db::SupersedeActivationError::StateWriteNotApplied(error))
+                if error.outcome == crate::db::SandboxStateWriteOutcome::Missing =>
+            {
                 if mode.auto_lifecycle_delete_expectation().is_some() {
                     return Err(Status::unavailable(
                         "sandbox disappeared during auto-lifecycle delete admission",
                     )
                     .into());
                 }
-                if mode.is_execution_release() && !allow_untracked_execution_release {
-                    // See the equivalent superseding-activation arm above.
-                    return Ok(CleanupAdmissionDecision::ExecutionReleaseDetached {
-                        reason: ExecutionReleaseDetachReason::SandboxRowMissing,
-                    });
-                }
-                return Ok(admitted(CleanupAdmission::unpersisted(
+                return Ok(CleanupAdmission::unpersisted(
                     sandbox_id,
                     current_execution_generation,
                     None,
                     fence,
-                )));
+                ));
             }
-            outcome.require_applied().map_err(|error| {
-                Status::unavailable(format!("cleanup lifecycle claim was superseded: {error}"))
-            })?;
+            Err(crate::db::SupersedeActivationError::StateWriteNotApplied(error)) => {
+                return Err(Status::unavailable(format!(
+                    "cleanup lifecycle claim was superseded: {error}"
+                ))
+                .into());
+            }
+            Err(error) => {
+                if require_atomic_admission {
+                    return Err(Status::unavailable(format!(
+                        "claim atomic cleanup admission failed: {error}"
+                    ))
+                    .into());
+                }
+                return Ok(CleanupAdmission::unpersisted(
+                    sandbox_id,
+                    current_execution_generation,
+                    Some(format!("claim cleanup lifecycle failed: {error}")),
+                    fence,
+                ));
+            }
         }
         if mode.auto_lifecycle_delete_expectation().is_some()
             && crate::db::cleanup_episode(&transaction, &sandbox_id_string)
@@ -1562,12 +1301,12 @@ impl SandboxManagerService {
                 ))
                 .into());
             }
-            return Ok(admitted(CleanupAdmission::unpersisted(
+            return Ok(CleanupAdmission::unpersisted(
                 sandbox_id,
                 current_execution_generation,
                 Some(format!("persist cleanup intent failed: {error}")),
                 fence,
-            )));
+            ));
         }
         let (auto_lifecycle_delete_receipt, admission_metric) =
             match auto_lifecycle_delete_admission {
@@ -1662,6 +1401,7 @@ impl SandboxManagerService {
                     completion,
                     keep_filesystem,
                     immediate_kill,
+                    guest_flush,
                     published_artifact: None,
                 },
             )
@@ -1671,12 +1411,12 @@ impl SandboxManagerService {
                     Status::unavailable(format!("persist cleanup scheduling: {error}")).into(),
                 );
             }
-            return Ok(admitted(CleanupAdmission::unpersisted(
+            return Ok(CleanupAdmission::unpersisted(
                 sandbox_id,
                 current_execution_generation,
                 Some(format!("persist cleanup scheduling: {error}")),
                 fence,
-            )));
+            ));
         }
         if let Err(error) = transaction.commit() {
             if require_atomic_admission {
@@ -1685,12 +1425,12 @@ impl SandboxManagerService {
                 ))
                 .into());
             }
-            return Ok(admitted(CleanupAdmission::unpersisted(
+            return Ok(CleanupAdmission::unpersisted(
                 sandbox_id,
                 current_execution_generation,
                 Some(format!("commit cleanup admission failed: {error}")),
                 fence,
-            )));
+            ));
         }
         if let Some((disposition, reason)) = admission_metric {
             pplx_space_metrics::sandbox::worker::auto_lifecycle_delete_admission(
@@ -1698,12 +1438,12 @@ impl SandboxManagerService {
                 reason,
             );
         }
-        Ok(admitted(CleanupAdmission::persisted(
+        Ok(CleanupAdmission::persisted(
             sandbox_id,
             current_execution_generation,
             auto_lifecycle_delete_receipt,
             fence,
-        )))
+        ))
     }
 
     pub(super) async fn dispatch_cleanup_if_generation_current<F, Fut>(
@@ -1788,6 +1528,7 @@ impl SandboxManagerService {
                         context,
                         completion,
                         immediate_kill: SandboxManagerService::cleanup_immediate_kill(completion),
+                        guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
                         persist_intent: false,
                         cleanup_id: Some(cleanup_id),
                     },
@@ -1973,6 +1714,7 @@ impl SandboxManagerService {
         db: &Arc<Mutex<rusqlite::Connection>>,
         sandbox_id: &str,
         cleanup_id: SandboxCleanupEpisodeId,
+        verdicts: &crate::retained_source::RetainedSourceVerdicts,
     ) -> Result<(), QuarantineRecoveryArtifactError> {
         let expected_artifact_id = {
             let db = db
@@ -1995,6 +1737,7 @@ impl SandboxManagerService {
             super::suspend_snapshot_publication::validate_canonical_suspend_snapshot_for_recovery(
                 Path::new(CACHE_DIR),
                 sandbox_id_typed,
+                verdicts,
             )?;
         if artifact.local_artifact_id == expected_artifact_id {
             Ok(())
@@ -2018,12 +1761,20 @@ impl SandboxManagerService {
             .lock_owned()
             .await;
         let owned_sandbox_id = sandbox_id.to_owned();
+        // Inspected under the artifact lock, which the completion below keeps.
+        let verdicts = self
+            .inspect_retained_sources_in(
+                vec![Path::new(CACHE_DIR).join(sandbox_id)],
+                &mut Default::default(),
+            )
+            .await;
         let recovery_validation = match self
             .blocking_io(move |service| {
                 Ok(Self::validate_quarantine_recovery_artifact(
                     &service.db,
                     &owned_sandbox_id,
                     cleanup_id,
+                    &verdicts,
                 ))
             })
             .await
@@ -2291,6 +2042,7 @@ impl SandboxManagerService {
             context: "retry blocking cleanup failure",
             completion,
             immediate_kill: Self::cleanup_immediate_kill(completion),
+            guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
             persist_intent: false,
             cleanup_id: None,
         });
@@ -2338,7 +2090,7 @@ impl SandboxManagerService {
         &self,
         request: SynchronousCleanupRequest<'_>,
     ) -> Result<(), Status> {
-        self.run_cleanup_to_completion_using_admission(request, None, None)
+        self.run_cleanup_to_completion_using_admission(request, None, None, CleanupWait::Attempt)
             .await
     }
 
@@ -2347,8 +2099,13 @@ impl SandboxManagerService {
         request: SynchronousCleanupRequest<'_>,
         cleanup_id: SandboxCleanupEpisodeId,
     ) -> Result<(), Status> {
-        self.run_cleanup_to_completion_using_admission(request, None, Some(cleanup_id))
-            .await
+        self.run_cleanup_to_completion_using_admission(
+            request,
+            None,
+            Some(cleanup_id),
+            CleanupWait::Attempt,
+        )
+        .await
     }
 
     pub(super) async fn run_admitted_cleanup_to_completion(
@@ -2356,8 +2113,27 @@ impl SandboxManagerService {
         request: SynchronousCleanupRequest<'_>,
         admission: CleanupAdmission,
     ) -> Result<(), Status> {
-        self.run_cleanup_to_completion_using_admission(request, Some(admission), None)
-            .await
+        self.run_cleanup_to_completion_using_admission(
+            request,
+            Some(admission),
+            None,
+            CleanupWait::Attempt,
+        )
+        .await
+    }
+
+    pub(super) async fn run_admitted_stop_to_completion(
+        &self,
+        request: SynchronousCleanupRequest<'_>,
+        admission: CleanupAdmission,
+    ) -> Result<(), Status> {
+        self.run_cleanup_to_completion_using_admission(
+            request,
+            Some(admission),
+            None,
+            CleanupWait::Stop,
+        )
+        .await
     }
 
     pub(super) async fn execute_cleanup_attempt(
@@ -2388,6 +2164,7 @@ impl SandboxManagerService {
         let context = request.context;
         let completion = request.completion;
         let immediate_kill = request.immediate_kill;
+        let guest_flush = request.guest_flush;
         let return_after_slot_release =
             Self::cleanup_return_after_slot_release(keep_filesystem, completion);
         let job_id = match admission.as_ref() {
@@ -2401,13 +2178,17 @@ impl SandboxManagerService {
             admission,
             cleanup_id,
             || async move {
-                connect_node().await.map_err(|error| {
+                connect_node(&self.node_manager).await.map_err(|error| {
                     Status::internal(format!(
                         "{context}: cannot connect to node-manager: {error}"
                     ))
                 })
             },
             |mut node_client| async move {
+                // Before every termination attempt: writes can land between
+                // a flush and a retried termination.
+                self.flush_guest_before_termination(sandbox_id, guest_flush)
+                    .await;
                 service_cleanup_via_node_with_options(
                     &self.db,
                     &mut node_client,
@@ -2454,6 +2235,7 @@ impl SandboxManagerService {
             completion,
             published_artifact,
             immediate_kill: _,
+            guest_flush: _,
         } = request;
         // Cheap currentness pre-check *before* allocating the per-sandbox lock
         // entry: an already-stale or gone cleanup has no node-mgr work, so
@@ -2710,12 +2492,15 @@ impl SandboxManagerService {
         let dispatch_keep_filesystem = request.keep_filesystem;
         let dispatch_completion = request.completion;
         let dispatch_immediate_kill = request.immediate_kill;
+        let dispatch_guest_flush = request.guest_flush;
         let dispatch_context = request.context;
         self.run_cleanup_after_persistence_failure_with_node_dispatch(
             request,
             &admission,
             || async move {
-                let mut node_client = connect_node().await.map_err(|error| {
+                self.flush_guest_before_termination(dispatch_sandbox_id, dispatch_guest_flush)
+                    .await;
+                let mut node_client = connect_node(&self.node_manager).await.map_err(|error| {
                     Status::internal(format!(
                         "{dispatch_context}: cannot connect to node-manager: {error}"
                     ))
@@ -2768,7 +2553,7 @@ impl SandboxManagerService {
         }
         // Recheck immediately before the persistence-failure escape hatch. A
         // failed/unknown ownership read must never become permission to delete.
-        {
+        let row_missing = {
             let db = self
                 .db
                 .lock()
@@ -2777,11 +2562,40 @@ impl SandboxManagerService {
             crate::db::cleanup_episode(&db, sandbox_id).map_err(|_| {
                 Status::unavailable("cleanup ownership cannot be decoded; retain resources")
             })?;
-        }
+            request.completion == CleanupCompletion::DeleteRow
+                && crate::db::current_state_label(&db, sandbox_id)
+                    .map_err(|error| {
+                        Status::unavailable(format!(
+                            "inspect sandbox after unpersisted delete: {error}"
+                        ))
+                    })?
+                    .is_none()
+        };
         self.cancel_route_streams_for_generation(
             parsed_sandbox_id,
             admission.expected_execution_generation(parsed_sandbox_id)?,
         )?;
+        if row_missing {
+            // A late legacy Delete can arrive after durable deletion removed
+            // the row. Durable DeleteRow completes only after node-manager
+            // verified the canonical cache directory absent, so a missing row
+            // with no cache directory is completed deletion: not authority to
+            // send an unfenced node cleanup or acknowledge it. A rowless
+            // sandbox whose cache directory remains was selected from disk and
+            // is not deleted; keep it retryable rather than reporting success.
+            let cache_dir = self.sandbox_cache_root().join(sandbox_id);
+            return match std::fs::symlink_metadata(&cache_dir) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Ok(_) => Err(Status::unavailable(format!(
+                    "sandbox {sandbox_id} has no row but {} remains; retain resources",
+                    cache_dir.display()
+                ))),
+                Err(error) => Err(Status::unavailable(format!(
+                    "inspect rowless sandbox cache {}: {error}; retain resources",
+                    cache_dir.display()
+                ))),
+            };
+        }
         node_dispatch().await
     }
 
@@ -2917,6 +2731,147 @@ impl SandboxManagerService {
                     }
                 });
             }
+        }
+    }
+}
+
+impl SandboxManagerService {
+    /// Attempt the guest flush an ordinary stop asked for, immediately before
+    /// terminating its VM. A failed flush is recorded, and the stop proceeds.
+    async fn flush_guest_before_termination(
+        &self,
+        sandbox_id: &str,
+        guest_flush: crate::db::cleanup_jobs::GuestFlush,
+    ) {
+        if guest_flush != crate::db::cleanup_jobs::GuestFlush::BeforeTermination {
+            return;
+        }
+        let flushed = within_stop_flush_budget(
+            crate::guest_filesystem_flush::GUEST_FILESYSTEM_FLUSH_TIMEOUT,
+            self.resume_paused_vm_before_flush(sandbox_id),
+            || crate::guest_filesystem_flush::flush_guest_root_filesystem_before_stop(sandbox_id),
+        )
+        .await;
+        match flushed {
+            Ok(()) => pplx_space_metrics::sandbox::worker::stop_guest_flush("flushed"),
+            Err(error) => {
+                pplx_space_metrics::sandbox::worker::stop_guest_flush("failed");
+                tracing::warn!(
+                    %sandbox_id,
+                    %error,
+                    "guest filesystem flush before stop failed; stopping anyway, so writes the guest has not committed can be lost"
+                );
+                emit_sandbox_event(
+                    sandbox_id,
+                    SandboxEventType::StopGuestFlushFailed,
+                    SandboxEventSource::SbxManager,
+                    SandboxEventDetails::default()
+                        .error(error.to_string().as_str())
+                        .logged_by_caller(),
+                );
+            }
+        }
+    }
+
+    /// Resume a paused VM so the stop's flush can reach its guest; see
+    /// [`BeforeStopFlush`].
+    async fn resume_paused_vm_before_flush(&self, sandbox_id: &str) -> Result<(), StopFlushError> {
+        let id = SandboxId::from_str(sandbox_id).map_err(StopFlushError::SandboxId)?;
+        let state =
+            crate::firecracker_via_nodemgr::get_firecracker_vm_state(id, &self.node_manager).await;
+        if let Err(error) = &state {
+            tracing::debug!(%sandbox_id, %error, "VM state unreadable before the stop flush");
+        }
+        match BeforeStopFlush::for_vm_state(state.ok()) {
+            BeforeStopFlush::Flush => Ok(()),
+            BeforeStopFlush::NotRunning => Err(StopFlushError::VmNotRunning),
+            BeforeStopFlush::ResumeThenFlush => {
+                let execution_fence = {
+                    let db = self.db_conn().map_err(StopFlushError::Database)?;
+                    crate::db::node_execution_fence(&db, sandbox_id)
+                        .map_err(StopFlushError::Fence)?
+                        .map(Into::into)
+                };
+                let mut node_client = connect_node(&self.node_manager)
+                    .await
+                    .map_err(StopFlushError::NodeManager)?;
+                node_client
+                    .resume_sandbox(ResumeSandboxRequest {
+                        execution_fence,
+                        sandbox_id: sandbox_id.to_owned(),
+                    })
+                    .await
+                    .map(drop)
+                    .map_err(StopFlushError::Resume)
+            }
+        }
+    }
+}
+
+/// Why a stop's guest flush did not complete. The stop proceeds either way.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum StopFlushError {
+    #[error("invalid sandbox id: {0}")]
+    SandboxId(#[source] pplx_space_common_core::types::SandboxIdParseError),
+    #[error("the VM is not running")]
+    VmNotRunning,
+    #[error("cannot read the execution fence: {0}")]
+    Database(#[source] Status),
+    #[error("cannot read the execution fence: {0}")]
+    Fence(#[source] rusqlite::Error),
+    #[error("cannot connect to node-manager: {0}")]
+    NodeManager(#[source] NodeManagerConnectError),
+    #[error("cannot resume the paused VM to flush it: {0}")]
+    Resume(#[source] Status),
+    #[error(transparent)]
+    Flush(#[from] crate::guest_filesystem_flush::GuestFlushError),
+    #[error("guest flush before stop timed out after {0:?}")]
+    TimedOut(std::time::Duration),
+}
+
+/// Prepare the guest and flush it within one `budget`. Every step can stall
+/// (a resume that never answers, a guest that never acknowledges), and the
+/// stop holds its cleanup fence meanwhile, which a forced stop also waits on;
+/// so the whole attempt, not each step, is bounded.
+pub(super) async fn within_stop_flush_budget<Flush, FlushError>(
+    budget: std::time::Duration,
+    prepare: impl std::future::Future<Output = Result<(), StopFlushError>>,
+    flush: impl FnOnce() -> Flush,
+) -> Result<(), StopFlushError>
+where
+    Flush: std::future::Future<Output = Result<(), FlushError>>,
+    FlushError: Into<StopFlushError>,
+{
+    tokio::time::timeout(budget, async {
+        prepare.await?;
+        flush().await.map_err(Into::into)
+    })
+    .await
+    .unwrap_or(Err(StopFlushError::TimedOut(budget)))
+}
+
+/// What a stop's flush needs first, from the VM's state. A paused VM cannot
+/// answer a flush, so it is resumed: pause flushes the guest before it
+/// freezes the VM, but a write still in progress then can complete after that
+/// flush, and stopping the paused VM would discard it. A running VM, or one
+/// whose state cannot be read, goes straight to the flush, which has its own
+/// budget.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum BeforeStopFlush {
+    Flush,
+    ResumeThenFlush,
+    NotRunning,
+}
+
+impl BeforeStopFlush {
+    pub(super) fn for_vm_state(
+        state: Option<pplx_space_node_runtime_core::fc_api::FirecrackerVmState>,
+    ) -> Self {
+        use pplx_space_node_runtime_core::fc_api::FirecrackerVmState;
+        match state {
+            Some(FirecrackerVmState::Running) | None => Self::Flush,
+            Some(FirecrackerVmState::Paused) => Self::ResumeThenFlush,
+            Some(FirecrackerVmState::NotStarted) => Self::NotRunning,
         }
     }
 }

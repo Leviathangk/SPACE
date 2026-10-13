@@ -87,7 +87,50 @@ fn rusqlite_profile_emits_statement_without_bind_values() {
 }
 
 #[tokio::test]
-async fn migrate_with_recreate_policy_replaces_untracked_schema() {
+async fn node_manager_migration_chain_preserves_leases_on_history_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("node-manager.db");
+    let migrator =
+        Migrator::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../db/node-manager"))
+            .await
+            .unwrap();
+
+    migrate("node-manager", &db_path, &migrator).await.unwrap();
+    let conn = open_rusqlite(&db_path, RusqliteOpenOptions::default()).unwrap();
+    conn.execute_batch(
+        "INSERT INTO network_slots
+        (slot_id, slot_label, generation, schema_version, state, health, sandbox_id, sandbox_uid,
+         memory_reservation_mib, created_at, updated_at, lease_kind)
+        VALUES (0, 'slot-0', 7, 1, 'leased', 'healthy', 'sandbox-a', 10000, 8320, 1, 1, 'pooled');",
+    )
+    .unwrap();
+    drop(conn);
+    // A compatible reopen must preserve the real migrated lease schema.
+    migrate("node-manager", &db_path, &migrator).await.unwrap();
+    let conn = open_rusqlite(&db_path, RusqliteOpenOptions::default()).unwrap();
+    conn.execute(
+        "UPDATE _sqlx_migrations SET checksum = X'00' WHERE version = ?1",
+        [migrator
+            .iter()
+            .filter(|migration| migration.migration_type.is_up_migration())
+            .map(|migration| migration.version)
+            .max()
+            .unwrap()],
+    )
+    .unwrap();
+    drop(conn);
+    migrate("node-manager", &db_path, &migrator)
+        .await
+        .unwrap_err();
+    let conn = open_rusqlite(&db_path, RusqliteOpenOptions::default()).unwrap();
+    let lease = conn.query_row("SELECT sandbox_id, generation, memory_reservation_mib FROM network_slots WHERE slot_id = 0", [], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+    }).unwrap();
+    assert_eq!(lease, ("sandbox-a".into(), 7, 8320));
+}
+
+#[tokio::test]
+async fn migrate_preserves_untracked_schema() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("test.db");
     let migrations_dir = temp.path().join("migrations");
@@ -104,22 +147,15 @@ async fn migrate_with_recreate_policy_replaces_untracked_schema() {
     .unwrap();
 
     let conn = Connection::open(&db_path).unwrap();
-    conn.execute_batch("CREATE TABLE stale_schema (id INTEGER PRIMARY KEY);")
-        .unwrap();
+    conn.execute_batch(
+        "CREATE TABLE stale_schema (id INTEGER PRIMARY KEY); INSERT INTO stale_schema VALUES (42);",
+    )
+    .unwrap();
     drop(conn);
-    std::fs::write(format!("{}-wal", db_path.display()), "").unwrap();
-    std::fs::write(format!("{}-shm", db_path.display()), "").unwrap();
 
     let migrator = Migrator::new(migrations_dir).await.unwrap();
-    migrate(
-        "test",
-        &db_path,
-        &migrator,
-        Some(1),
-        MigrationFailurePolicy::Recreate,
-    )
-    .await
-    .unwrap();
+    let error = migrate("test", &db_path, &migrator).await.unwrap_err();
+    assert!(error.to_string().contains("failed to migrate test SQLite"));
 
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
@@ -130,226 +166,19 @@ async fn migrate_with_recreate_policy_replaces_untracked_schema() {
         )
         .await
         .unwrap();
-    assert!(table_exists(&pool, "current_schema").await.unwrap());
-    assert!(!table_exists(&pool, "stale_schema").await.unwrap());
-}
-
-#[tokio::test]
-async fn node_manager_migration_chain_preserves_leases_on_history_failure() {
-    let temp = tempfile::tempdir().unwrap();
-    let db_path = temp.path().join("node-manager.db");
-    let migrator =
-        Migrator::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../db/node-manager"))
-            .await
-            .unwrap();
-    let store = crate::sql::baselines::NODE_MANAGER;
-    migrate(
-        "node-manager",
-        &db_path,
-        &migrator,
-        Some(store.baseline_version),
-        store.migration_failure_policy,
-    )
-    .await
-    .unwrap();
-    let conn = open_rusqlite(&db_path, RusqliteOpenOptions::default()).unwrap();
-    conn.execute_batch(
-        "INSERT INTO network_slots
-        (slot_id, slot_label, generation, schema_version, state, health, sandbox_id, sandbox_uid,
-         memory_reservation_mib, created_at, updated_at, lease_kind)
-        VALUES (0, 'slot-0', 7, 1, 'leased', 'healthy', 'sandbox-a', 10000, 8320, 1, 1, 'pooled');",
-    )
-    .unwrap();
-    drop(conn);
-    // A compatible reopen must preserve the real migrated lease schema.
-    migrate(
-        "node-manager",
-        &db_path,
-        &migrator,
-        Some(store.baseline_version),
-        store.migration_failure_policy,
-    )
-    .await
-    .unwrap();
-    let conn = open_rusqlite(&db_path, RusqliteOpenOptions::default()).unwrap();
-    conn.execute(
-        "UPDATE _sqlx_migrations SET checksum = X'00' WHERE version = ?1",
-        [migrator
-            .iter()
-            .filter(|migration| migration.migration_type.is_up_migration())
-            .map(|migration| migration.version)
-            .max()
-            .unwrap()],
-    )
-    .unwrap();
-    drop(conn);
-    migrate(
-        "node-manager",
-        &db_path,
-        &migrator,
-        Some(store.baseline_version),
-        store.migration_failure_policy,
-    )
-    .await
-    .unwrap_err();
-    let conn = open_rusqlite(&db_path, RusqliteOpenOptions::default()).unwrap();
-    let lease = conn.query_row("SELECT sandbox_id, generation, memory_reservation_mib FROM network_slots WHERE slot_id = 0", [], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
-    }).unwrap();
-    assert_eq!(lease, ("sandbox-a".into(), 7, 8320));
-}
-
-#[tokio::test]
-async fn migrate_with_fail_policy_preserves_untracked_schema() {
-    for policy in [
-        MigrationFailurePolicy::Fail,
-        crate::sql::baselines::NODE_MANAGER.migration_failure_policy,
-    ] {
-        let temp = tempfile::tempdir().unwrap();
-        let db_path = temp.path().join("test.db");
-        let migrations_dir = temp.path().join("migrations");
-        std::fs::create_dir(&migrations_dir).unwrap();
-        std::fs::write(
-            migrations_dir.join("001_initial.up.sql"),
-            "CREATE TABLE current_schema (id INTEGER PRIMARY KEY);\n",
-        )
-        .unwrap();
-        std::fs::write(
-            migrations_dir.join("001_initial.down.sql"),
-            "DROP TABLE current_schema;\n",
-        )
-        .unwrap();
-
-        let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch("CREATE TABLE stale_schema (id INTEGER PRIMARY KEY); INSERT INTO stale_schema VALUES (42);")
-        .unwrap();
-        drop(conn);
-
-        let migrator = Migrator::new(migrations_dir).await.unwrap();
-        let error = migrate("test", &db_path, &migrator, Some(1), policy)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("failed to migrate test SQLite"));
-
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(
-                SqliteConnectOptions::new()
-                    .filename(&db_path)
-                    .create_if_missing(false),
-            )
-            .await
-            .unwrap();
-        assert!(table_exists(&pool, "stale_schema").await.unwrap());
-        assert!(!table_exists(&pool, "current_schema").await.unwrap());
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>(sql!("SELECT id FROM stale_schema"))
-                .fetch_one(&pool)
-                .await
-                .unwrap(),
-            42
-        );
-    }
-}
-
-#[tokio::test]
-async fn embedded_recreate_policy_retries_common_schema_migrations() {
-    let temp = tempfile::tempdir().unwrap();
-    let db_path = temp.path().join("test.db");
-    let service_migrations_dir = temp.path().join("service-migrations");
-    let common_migrations_dir = temp.path().join("common-migrations");
-    std::fs::create_dir(&service_migrations_dir).unwrap();
-    std::fs::create_dir(&common_migrations_dir).unwrap();
-    write_table_migration(&service_migrations_dir, 1, "service");
-    write_table_migration(&common_migrations_dir, 1, "common");
-
-    let conn = Connection::open(&db_path).unwrap();
-    conn.execute_batch(
-        r#"
-        CREATE TABLE stale_schema (id INTEGER PRIMARY KEY);
-        CREATE TABLE _space_common_schema_migrations (
-            version BIGINT PRIMARY KEY,
-            description TEXT NOT NULL,
-            installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            success BOOLEAN NOT NULL,
-            checksum BLOB NOT NULL,
-            execution_time BIGINT NOT NULL
-        );
-        INSERT INTO _space_common_schema_migrations
-            (version, description, success, checksum, execution_time)
-        VALUES (1, 'common', TRUE, x'00', 0);
-        "#,
-    )
-    .unwrap();
-    drop(conn);
-
-    let service_migrator = Box::leak(Box::new(
-        Migrator::new(service_migrations_dir).await.unwrap(),
-    ));
-    let common_migrator = Box::leak(Box::new(
-        Migrator::new(common_migrations_dir).await.unwrap(),
-    ));
-    migrate_embedded(
-        "test",
-        &db_path,
-        EmbeddedMigrators {
-            service: service_migrator,
-            common: Some(common_migrator),
-        },
-        None,
-        MigrationFailurePolicy::Recreate,
-        None,
-    )
-    .await
-    .unwrap();
-
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(
-            SqliteConnectOptions::new()
-                .filename(&db_path)
-                .create_if_missing(false),
-        )
-        .await
-        .unwrap();
-    assert!(table_exists(&pool, "service_schema").await.unwrap());
-    assert!(table_exists(&pool, "common_schema").await.unwrap());
-    assert!(!table_exists(&pool, "stale_schema").await.unwrap());
-}
-
-#[tokio::test]
-async fn rollback_compatible_migrator_preserves_configuration() {
-    let temp = tempfile::tempdir().unwrap();
-    let migrations_dir = temp.path().join("migrations");
-    std::fs::create_dir(&migrations_dir).unwrap();
-    write_table_migration(&migrations_dir, 1, "initial");
-    let mut migrator = Migrator::new(migrations_dir).await.unwrap();
-    migrator.dangerous_set_table_name("_custom_migrations");
-    migrator.set_locking(false);
-    migrator.no_tx = true;
-    migrator.create_schema("custom_schema");
-
-    let rollback_compatible = rollback_compatible_migrator(&migrator);
-
-    assert!(rollback_compatible.ignore_missing);
-    assert_eq!(rollback_compatible.locking, migrator.locking);
-    assert_eq!(rollback_compatible.no_tx, migrator.no_tx);
-    assert_eq!(rollback_compatible.table_name, migrator.table_name);
-    assert_eq!(rollback_compatible.create_schemas, migrator.create_schemas);
+    assert!(table_exists(&pool, "stale_schema").await.unwrap());
+    assert!(!table_exists(&pool, "current_schema").await.unwrap());
     assert_eq!(
-        rollback_compatible
-            .iter()
-            .map(|migration| migration.version)
-            .collect::<Vec<_>>(),
-        migrator
-            .iter()
-            .map(|migration| migration.version)
-            .collect::<Vec<_>>()
+        sqlx::query_scalar::<_, i64>(sql!("SELECT id FROM stale_schema"))
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        42
     );
 }
 
 #[tokio::test]
-async fn migrate_without_baseline_rejects_unknown_bundled_range_version() {
+async fn migrate_rejects_unknown_migration_version() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("test.db");
     let migrations_dir = temp.path().join("migrations");
@@ -376,24 +205,13 @@ async fn migrate_without_baseline_rejects_unknown_bundled_range_version() {
     drop(conn);
     let migrator = Migrator::new(migrations_dir).await.unwrap();
 
-    let error = migrate(
-        "test",
-        &db_path,
-        &migrator,
-        None,
-        MigrationFailurePolicy::Fail,
-    )
-    .await
-    .unwrap_err();
+    let error = migrate("test", &db_path, &migrator).await.unwrap_err();
 
-    assert!(
-        format!("{error:#}").contains("applied migration 2, but it is not bundled"),
-        "{error:#}"
-    );
+    assert!(format!("{error:#}").contains("migration 2"), "{error:#}");
 }
 
 #[tokio::test]
-async fn migrate_restamps_baseline_history() {
+async fn migrate_rejects_legacy_history_without_restamping() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("test.db");
     let migrations_dir = temp.path().join("migrations");
@@ -442,22 +260,7 @@ async fn migrate_restamps_baseline_history() {
     drop(conn);
 
     let migrator = Migrator::new(migrations_dir).await.unwrap();
-    let baseline_checksum = migrator
-        .iter()
-        .find(|migration| migration.version == 2 && migration.migration_type.is_up_migration())
-        .unwrap()
-        .checksum
-        .as_ref()
-        .to_vec();
-    migrate(
-        "test",
-        &db_path,
-        &migrator,
-        Some(2),
-        MigrationFailurePolicy::Recreate,
-    )
-    .await
-    .unwrap();
+    migrate("test", &db_path, &migrator).await.unwrap_err();
 
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
@@ -469,7 +272,7 @@ async fn migrate_restamps_baseline_history() {
         .await
         .unwrap();
     assert!(table_exists(&pool, "baseline_schema").await.unwrap());
-    assert!(table_exists(&pool, "next_schema").await.unwrap());
+    assert!(!table_exists(&pool, "next_schema").await.unwrap());
 
     let versions: Vec<i64> = sqlx::query_scalar(sql!(
         "SELECT version FROM _sqlx_migrations ORDER BY version"
@@ -477,18 +280,18 @@ async fn migrate_restamps_baseline_history() {
     .fetch_all(&pool)
     .await
     .unwrap();
-    assert_eq!(versions, vec![2, 3]);
-    let restamped_checksum: Vec<u8> = sqlx::query_scalar(sql!(
+    assert_eq!(versions, vec![1, 2]);
+    let preserved_checksum: Vec<u8> = sqlx::query_scalar(sql!(
         "SELECT checksum FROM _sqlx_migrations WHERE version = 2"
     ))
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(restamped_checksum, baseline_checksum);
+    assert_eq!(preserved_checksum, vec![0]);
 }
 
 #[tokio::test]
-async fn migrate_imports_goose_only_baseline_history() {
+async fn migrate_rejects_goose_history_without_importing() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("test.db");
     let migrations_dir = temp.path().join("migrations");
@@ -534,15 +337,7 @@ async fn migrate_imports_goose_only_baseline_history() {
     drop(conn);
 
     let migrator = Migrator::new(migrations_dir).await.unwrap();
-    migrate(
-        "test",
-        &db_path,
-        &migrator,
-        Some(2),
-        MigrationFailurePolicy::Recreate,
-    )
-    .await
-    .unwrap();
+    migrate("test", &db_path, &migrator).await.unwrap_err();
 
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
@@ -554,15 +349,16 @@ async fn migrate_imports_goose_only_baseline_history() {
         .await
         .unwrap();
     assert!(table_exists(&pool, "baseline_schema").await.unwrap());
-    assert!(table_exists(&pool, "next_schema").await.unwrap());
+    assert!(!table_exists(&pool, "next_schema").await.unwrap());
 
+    assert!(!table_exists(&pool, "_sqlx_migrations").await.unwrap());
     let versions: Vec<i64> = sqlx::query_scalar(sql!(
-        "SELECT version FROM _sqlx_migrations ORDER BY version"
+        "SELECT version_id FROM goose_db_version WHERE is_applied = 1 ORDER BY version_id"
     ))
     .fetch_all(&pool)
     .await
     .unwrap();
-    assert_eq!(versions, vec![2, 3]);
+    assert_eq!(versions, vec![1, 2]);
 }
 
 fn write_table_migration(migrations_dir: &Path, version: i64, name: &str) {
@@ -579,63 +375,16 @@ fn write_table_migration(migrations_dir: &Path, version: i64, name: &str) {
     .unwrap();
 }
 
-#[test]
-fn common_schema_accepts_registered_revisions_and_preserves_history() {
-    use sqlx::SqlSafeStr as _;
-    use sqlx::migrate::{Migration, MigrationType};
-    use std::borrow::Cow;
-
-    let revisions: Vec<_> = ["original", "intermediate", "current", "unknown"]
-        .iter()
-        .map(|comment| {
-            Migration::new(
-                101,
-                Cow::Borrowed("checksum probe"),
-                MigrationType::Simple,
-                sqlx::AssertSqlSafe(format!(
-                    "-- {comment}\nCREATE TABLE checksum_probe (id INTEGER);"
-                ))
-                .into_sql_str(),
-                false,
-            )
-        })
-        .collect();
-    let digests: Vec<_> = revisions[..3]
-        .iter()
-        .map(|m| hex::encode(&m.checksum))
-        .collect();
-    let registry = AcceptedChecksums::from_toml(&format!(
-        "[[migrations]]\nstore = 'common'\nversion = 101\naccepted_checksums = {digests:?}"
-    ))
-    .unwrap();
-    let current = Migrator::with_migrations(vec![revisions[2].clone()]);
-
-    for previous in [None, Some(0), Some(1), Some(2), Some(3)] {
-        let mut conn = Connection::open_in_memory().unwrap();
-        if let Some(previous) = previous {
-            let old = Migrator::with_migrations(vec![revisions[previous].clone()]);
-            migrate_common_schema_up(&mut conn, &old).unwrap();
-        }
-
-        let result = migrate_common_schema_with_checksums(&mut conn, &current, &registry);
-
-        assert_eq!(result.is_ok(), previous != Some(3));
-        let applied = applied_common_schema_migrations(&conn).unwrap();
-        assert_eq!(
-            applied[&101],
-            revisions[previous.unwrap_or(2)].checksum.as_ref()
-        );
-    }
-}
-
 #[tokio::test]
-async fn public_baseline_preserves_rejected_history_even_with_recreate_policy() {
+async fn public_baseline_preserves_rejected_history() {
     let version = super::super::baselines::PUBLIC_SQLITE_BASELINE;
     for damage in [
         "UPDATE _sqlx_migrations SET checksum = x'00'",
         "UPDATE _sqlx_migrations SET success = FALSE",
         "UPDATE _sqlx_migrations SET version = 1",
         "UPDATE _sqlx_migrations SET version = version + 1",
+        "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+         SELECT version + 1, description, success, checksum, execution_time FROM _sqlx_migrations",
     ] {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("test.db");
@@ -646,54 +395,32 @@ async fn public_baseline_preserves_rejected_history_even_with_recreate_policy() 
             "CREATE TABLE evidence (value TEXT NOT NULL);",
         )
         .unwrap();
-        let migrator = Migrator::new(migrations_dir).await.unwrap();
-        migrate(
-            "test",
-            &db_path,
-            &migrator,
-            Some(version),
-            MigrationFailurePolicy::Fail,
-        )
-        .await
-        .unwrap();
-        migrate(
-            "test",
-            &db_path,
-            &migrator,
-            Some(version),
-            MigrationFailurePolicy::Fail,
-        )
-        .await
-        .unwrap();
+        let mut migrator = Migrator::new(migrations_dir).await.unwrap();
+        migrate("test", &db_path, &migrator).await.unwrap();
+        migrate("test", &db_path, &migrator).await.unwrap();
         let conn = Connection::open(&db_path).unwrap();
         conn.execute("INSERT INTO evidence VALUES ('retained')", [])
             .unwrap();
         conn.execute_batch(damage).unwrap();
         let history = |conn: &Connection| {
-            conn.query_row(
-                "SELECT version, success, checksum FROM _sqlx_migrations",
-                [],
-                |row| {
+            conn.prepare("SELECT version, success, checksum FROM _sqlx_migrations ORDER BY version")
+                .unwrap()
+                .query_map([], |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, bool>(1)?,
                         row.get::<_, Vec<u8>>(2)?,
                     ))
-                },
-            )
-            .unwrap()
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
         };
         let before = history(&conn);
         drop(conn);
 
-        let result = migrate(
-            "test",
-            &db_path,
-            &migrator,
-            Some(version),
-            MigrationFailurePolicy::Recreate,
-        )
-        .await;
+        migrator.set_ignore_missing(true);
+        let result = migrate("test", &db_path, &migrator).await;
 
         assert!(result.is_err(), "accepted {damage}");
         let conn = Connection::open(&db_path).unwrap();
@@ -733,26 +460,111 @@ fn public_test_migrators() -> (&'static Migrator, &'static Migrator) {
 }
 
 #[tokio::test]
-async fn public_embedded_migrations_reject_both_histories_before_hooks_or_writes() {
+async fn embedded_migrations_accept_registered_revisions_and_preserve_history() {
+    use sqlx::SqlSafeStr as _;
+    use sqlx::migrate::MigrationType;
+    use std::borrow::Cow;
+
+    let (service, common) = public_test_migrators();
+    for store in ["common", "test"] {
+        let baseline = &if store == "common" { common } else { service }.migrations[0];
+        let revisions: Vec<_> = ["original", "intermediate", "current", "unknown"]
+            .iter()
+            .map(|comment| {
+                Migration::new(
+                    baseline.version,
+                    Cow::Borrowed("baseline"),
+                    MigrationType::Simple,
+                    sqlx::AssertSqlSafe(format!("-- {comment}\n{}", baseline.sql.as_ref()))
+                        .into_sql_str(),
+                    false,
+                )
+            })
+            .collect();
+        let digests: Vec<_> = revisions[..3]
+            .iter()
+            .map(|migration| hex::encode(&migration.checksum))
+            .collect();
+        let checksums = AcceptedChecksums::from_toml(&format!(
+            "[[migrations]]\nstore = {store:?}\nversion = {}\naccepted_checksums = {digests:?}",
+            baseline.version,
+        ))
+        .unwrap();
+        let current = Migrator::with_migrations(vec![revisions[2].clone()]);
+        let migrators = EmbeddedMigrators {
+            service: if store == "test" { &current } else { service },
+            common: Some(if store == "common" { &current } else { common }),
+        };
+
+        for previous in [None, Some(0), Some(1), Some(2), Some(3)] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("database.sqlite");
+            let before = if let Some(previous) = previous {
+                let old = Migrator::with_migrations(vec![revisions[previous].clone()]);
+                migrate_embedded(
+                    "test",
+                    &path,
+                    EmbeddedMigrators {
+                        service: if store == "test" { &old } else { service },
+                        common: Some(if store == "common" { &old } else { common }),
+                    },
+                )
+                .await
+                .unwrap();
+                let conn = Connection::open(&path).unwrap();
+                conn.execute("INSERT INTO jobs (job_id) VALUES ('retained')", [])
+                    .unwrap();
+                Some(embedded_history(&conn))
+            } else {
+                None
+            };
+
+            for _ in 0..2 {
+                let result = migrate_once("test", &path, migrators, &checksums).await;
+
+                assert_eq!(result.is_ok(), previous != Some(3), "{store}: {result:?}");
+            }
+            let conn = Connection::open(&path).unwrap();
+            if let Some(before) = before {
+                assert_eq!(embedded_history(&conn), before);
+                assert_eq!(
+                    conn.query_row("SELECT job_id FROM jobs", [], |row| row.get::<_, String>(0))
+                        .unwrap(),
+                    "retained"
+                );
+            } else {
+                assert_eq!(embedded_history(&conn).len(), 2);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn public_embedded_migrations_reject_both_histories_before_writes() {
+    use sqlx::SqlSafeStr as _;
+    use sqlx::migrate::MigrationType;
+    use std::borrow::Cow;
+
     let (service, common) = public_test_migrators();
     let migrators = EmbeddedMigrators {
         service,
         common: Some(common),
     };
+    let pending_version = super::super::baselines::PUBLIC_SQLITE_BASELINE + 1;
+    let mut common_migrations = common.iter().cloned().collect::<Vec<_>>();
+    common_migrations.push(Migration::new(
+        pending_version,
+        Cow::Borrowed("pending shared work"),
+        MigrationType::Simple,
+        "CREATE TABLE pending_common_work (id INTEGER);".into_sql_str(),
+        false,
+    ));
+    let next_common = Migrator::with_migrations(common_migrations);
     for table in ["_sqlx_migrations", "_space_common_schema_migrations"] {
         for change in ["checksum", "failed", "legacy", "future", "missing"] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("database.sqlite");
-            migrate_embedded(
-                "test",
-                &path,
-                migrators,
-                Some(1),
-                MigrationFailurePolicy::Recreate,
-                None,
-            )
-            .await
-            .unwrap();
+            migrate_embedded("test", &path, migrators).await.unwrap();
             let conn = Connection::open(&path).unwrap();
             conn.execute(
                 "INSERT INTO jobs VALUES ('retained', 'running', 'owner', 'intent')",
@@ -763,7 +575,7 @@ async fn public_embedded_migrations_reject_both_histories_before_hooks_or_writes
                 "checksum" => format!("UPDATE {table} SET checksum = x'00'"),
                 "failed" => format!("UPDATE {table} SET success = 0"),
                 "legacy" => format!("UPDATE {table} SET version = 1"),
-                "future" => format!("UPDATE {table} SET version = version + 1"),
+                "future" => format!("UPDATE {table} SET version = version + 2"),
                 "missing" => format!("DELETE FROM {table}"),
                 _ => unreachable!(),
             };
@@ -777,16 +589,34 @@ async fn public_embedded_migrations_reject_both_histories_before_hooks_or_writes
             let result = migrate_embedded(
                 "test",
                 &path,
-                migrators,
-                Some(1),
-                MigrationFailurePolicy::Recreate,
-                Some(|_, _| panic!("compatibility hook ran before history admission")),
+                EmbeddedMigrators {
+                    service,
+                    common: Some(&next_common),
+                },
             )
             .await;
 
             assert!(result.is_err(), "{table} {change}");
             let conn = Connection::open(&path).unwrap();
             assert_eq!(embedded_history(&conn), before);
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'pending_common_work'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM _space_common_schema_migrations WHERE version = ?1",
+                    [pending_version],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
             assert_eq!(
                 conn.pragma_query_value(None, "schema_version", |row| row.get::<_, i64>(0))
                     .unwrap(),
@@ -842,9 +672,6 @@ async fn public_common_with_legacy_service_preserves_rejected_store() {
             service: &SERVICE,
             common: Some(&COMMON),
         },
-        Some(1),
-        MigrationFailurePolicy::Recreate,
-        None,
     )
     .await
     .unwrap();
@@ -867,9 +694,6 @@ async fn public_common_with_legacy_service_preserves_rejected_store() {
             service: &SERVICE,
             common: Some(public_test_migrators().1),
         },
-        Some(1),
-        MigrationFailurePolicy::Recreate,
-        None,
     )
     .await;
 
@@ -894,8 +718,24 @@ async fn public_embedded_migrations_resume_after_common_schema_initialization() 
     let (service, common) = public_test_migrators();
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("database.sqlite");
-    let mut conn = Connection::open(&path).unwrap();
-    migrate_common_schema_up(&mut conn, common).unwrap();
+    let conn = Connection::open(&path).unwrap();
+    let baseline = common
+        .iter()
+        .find(|migration| migration.migration_type.is_up_migration())
+        .unwrap();
+    conn.execute_batch(baseline.sql.as_ref()).unwrap();
+    // Model a database written by the former shared-schema runner, before
+    // service initialization. SQLx must adopt its table without restamping it.
+    conn.execute_batch(
+        "CREATE TABLE _space_common_schema_migrations (
+        version BIGINT PRIMARY KEY, description TEXT NOT NULL,
+        installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        success BOOLEAN NOT NULL, checksum BLOB NOT NULL, execution_time BIGINT NOT NULL
+    );",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO _space_common_schema_migrations VALUES (?1, 'baseline', '2026-01-01 00:00:00', TRUE, ?2, 42)",
+        rusqlite::params![baseline.version, baseline.checksum.as_ref()]).unwrap();
     conn.execute(
         "INSERT INTO jobs VALUES ('retained', 'running', 'owner', 'intent')",
         [],
@@ -911,9 +751,6 @@ async fn public_embedded_migrations_resume_after_common_schema_initialization() 
                 service,
                 common: Some(common),
             },
-            Some(1),
-            MigrationFailurePolicy::Recreate,
-            None,
         )
         .await
         .unwrap();
@@ -921,6 +758,17 @@ async fn public_embedded_migrations_resume_after_common_schema_initialization() 
 
     let conn = Connection::open(&path).unwrap();
     assert_eq!(embedded_history(&conn).len(), 2);
+    let recorded: (String, i64, Vec<u8>) = conn
+        .query_row(
+            "SELECT installed_on, execution_time, checksum FROM _space_common_schema_migrations",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        recorded,
+        ("2026-01-01 00:00:00".into(), 42, baseline.checksum.to_vec())
+    );
     assert_eq!(
         conn.query_row("SELECT payload FROM jobs", [], |row| row
             .get::<_, String>(0))

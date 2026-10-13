@@ -19,7 +19,9 @@ use super::http_host::{HostBinding, MeteredIo};
 use super::{TcpProxy, relay, tls_http};
 use crate::certificates::{CertificateError, CertificateLease};
 use crate::stats::ProxyStats;
-use crate::tls_interception::{TlsHandshakeLeg, TlsInterception, TlsInterceptionError};
+use crate::tls_interception::{
+    Admission, HandshakePermit, Refused, TlsHandshakeLeg, TlsInterception, TlsInterceptionError,
+};
 use crate::tls_sni::{ClientAlpnOffer, HttpAlpn};
 
 const HANDSHAKE_BUDGET: Duration = Duration::from_secs(10);
@@ -54,6 +56,21 @@ pub(crate) enum TlsTransportError {
     Upstream(#[source] io::Error),
     #[error("HTTP connection failed")]
     Http(#[from] hyper::Error),
+}
+
+// hyper-util's auto server erases the error type. Recover it at the boundary
+// to preserve HTTP diagnostics and socket error kinds.
+impl From<Box<dyn std::error::Error + Send + Sync>> for TlsTransportError {
+    fn from(error: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        let error = match error.downcast::<hyper::Error>() {
+            Ok(error) => return Self::Http(*error),
+            Err(error) => error,
+        };
+        Self::Downstream(match error.downcast::<io::Error>() {
+            Ok(error) => *error,
+            Err(error) => io::Error::other(error),
+        })
+    }
 }
 
 impl TlsTransportError {
@@ -333,6 +350,16 @@ impl HttpProtocol {
         }
     }
 
+    /// The protocol hyper actually parsed a request with. This, not the ALPN
+    /// result, decides how the request is forwarded.
+    pub(super) fn of(version: http::Version) -> Self {
+        if version == http::Version::HTTP_2 {
+            Self::Http2
+        } else {
+            Self::Http1
+        }
+    }
+
     pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::Http1 => "http1",
@@ -356,7 +383,8 @@ fn selected_alpn(alpn: Option<&[u8]>) -> Result<Option<HttpAlpn>, TlsTransportEr
 }
 
 impl TcpProxy {
-    /// Each TLS handshake has eight non-queued slots and a ten-second budget.
+    /// Each TLS handshake waits for a shared pool permit and then completes
+    /// within one ten-second budget that includes the wait.
     /// The complete HTTP/stream lifetime is fenced by the certificate lease;
     /// upstream setup happens only after a request passes authority and policy.
     pub(super) async fn terminate_tls(
@@ -370,8 +398,10 @@ impl TcpProxy {
             "tls.server",
             sandbox_id = self.sandbox_id,
             destination_port = admitted.destination().port(),
+            negotiated = tracing::field::Empty,
             protocol = tracing::field::Empty,
             policy_ref = tracing::field::Empty,
+            handshake_queue_ms = tracing::field::Empty,
             otel.status_code = "ERROR",
         );
         async {
@@ -385,8 +415,12 @@ impl TcpProxy {
             }
             let accounting = WireAccounting::new(self.stats.clone());
             let operation = async {
-                let (downstream, protocol) = accept(client, &lease, &self.tls_interception).await?;
-                tracing::Span::current().record("protocol", protocol.as_str());
+                // ALPN is telemetry here. `tls_http::serve` detects the
+                // version from the guest's first bytes and records `protocol`
+                // once the first request arrives.
+                let (downstream, negotiated) =
+                    accept(client, &lease, &self.tls_interception).await?;
+                tracing::Span::current().record("negotiated", negotiated.as_str());
                 let binding = HostBinding::new(
                     self.sandbox_id,
                     destination,
@@ -397,7 +431,7 @@ impl TcpProxy {
                 let upstream_lease = lease.clone();
                 let wire_read = accounting.read.clone();
                 let wire_written = accounting.written.clone();
-                let connect = move || async move {
+                let connect = move |guest_protocol| async move {
                     let origin = async {
                         Ok(MeteredIo {
                             inner: relay::connect(destination).await?,
@@ -405,9 +439,10 @@ impl TcpProxy {
                             written: wire_written,
                         })
                     };
-                    connect(origin, &upstream_lease, &interception, client_alpn).await
+                    let offer = upstream_alpn_offer(client_alpn, guest_protocol);
+                    connect(origin, &upstream_lease, &interception, offer).await
                 };
-                tls_http::serve(downstream, protocol, binding, lease.clone(), connect).await
+                tls_http::serve(downstream, binding, lease.clone(), connect).await
             };
             let result = tokio::select! {
                 biased;
@@ -431,6 +466,25 @@ impl TcpProxy {
     }
 }
 
+/// ALPN to offer the origin given what the guest turned out to speak.
+///
+/// The origin leg mirrors the guest's ClientHello offer, except that a guest
+/// which offered h2 and then spoke HTTP/1.1 (Go's `net/http` dialing an
+/// `https://` forward proxy) gets an HTTP/1.1-only upstream. The gateway can
+/// only tunnel CONNECT over an HTTP/1.1 origin leg, and offering h2 there
+/// would let an h2-preferring proxy turn the CONNECT into `invalid_connect`.
+/// Guests without ALPN and genuine h2 guests are unchanged.
+pub(super) fn upstream_alpn_offer(
+    client_alpn: ClientAlpnOffer,
+    guest_protocol: HttpProtocol,
+) -> ClientAlpnOffer {
+    if guest_protocol == HttpProtocol::Http1 && client_alpn.supports(HttpAlpn::Http2) {
+        ClientAlpnOffer::Http1
+    } else {
+        client_alpn
+    }
+}
+
 /// The presented leaf and actual SNI must name the same authorized target.
 pub(super) async fn accept<S>(
     stream: S,
@@ -440,16 +494,8 @@ pub(super) async fn accept<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let _permit = match interception.handshake_permit(TlsHandshakeLeg::ClientToNetgw) {
-        Ok(permit) => permit,
-        Err(_) => {
-            HandshakeAttempt::record_failure(
-                TlsHandshakeLeg::ClientToNetgw,
-                &TlsTransportError::Capacity,
-            );
-            return Err(TlsTransportError::Capacity);
-        }
-    };
+    let deadline = tokio::time::Instant::now() + HANDSHAKE_BUDGET;
+    let _permit = admit_handshake(interception, TlsHandshakeLeg::ClientToNetgw, deadline).await?;
     let mut attempt = HandshakeAttempt::new(TlsHandshakeLeg::ClientToNetgw);
     let result = async {
         let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
@@ -464,13 +510,11 @@ where
         config.send_tls13_tickets = 0;
         config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
         config.max_early_data_size = 0;
-        let downstream = tokio::time::timeout(
-            HANDSHAKE_BUDGET,
-            TlsAcceptor::from(Arc::new(config)).accept(stream),
-        )
-        .await
-        .map_err(|_| TlsTransportError::Timeout)?
-        .map_err(TlsTransportError::Downstream)?;
+        let downstream =
+            tokio::time::timeout_at(deadline, TlsAcceptor::from(Arc::new(config)).accept(stream))
+                .await
+                .map_err(|_| TlsTransportError::Timeout)?
+                .map_err(TlsTransportError::Downstream)?;
         let actual_name = downstream
             .get_ref()
             .1
@@ -491,7 +535,8 @@ where
 }
 
 /// Verify the origin leg independently from the guest-facing interception CA.
-/// The ten-second budget includes transport setup and the complete handshake.
+/// The ten-second budget includes the permit wait, transport setup and the
+/// complete handshake.
 pub(super) async fn connect<S>(
     transport: impl std::future::Future<Output = io::Result<S>>,
     lease: &CertificateLease,
@@ -501,18 +546,10 @@ pub(super) async fn connect<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let _permit = match interception.handshake_permit(TlsHandshakeLeg::NetgwToOrigin) {
-        Ok(permit) => permit,
-        Err(_) => {
-            HandshakeAttempt::record_failure(
-                TlsHandshakeLeg::NetgwToOrigin,
-                &TlsTransportError::Capacity,
-            );
-            return Err(TlsTransportError::Capacity);
-        }
-    };
     async {
         let deadline = tokio::time::Instant::now() + HANDSHAKE_BUDGET;
+        let _permit =
+            admit_handshake(interception, TlsHandshakeLeg::NetgwToOrigin, deadline).await?;
         // TCP setup is not a TLS attempt. Start TLS telemetry only after the
         // transport connects, while retaining the original shared deadline.
         let mut tcp_attempt = Attempt::origin_tcp();
@@ -582,11 +619,45 @@ where
     .await
 }
 
+/// Admit one handshake into the shared pool. A queued admission is recorded on
+/// the current span. A pool that stays full fails as `tls_capacity`, the same
+/// outcome that an immediate refusal reported before queueing existed. A pool
+/// closed by gateway shutdown fails as `tls_withdrawn`.
+async fn admit_handshake(
+    interception: &TlsInterception,
+    leg: TlsHandshakeLeg,
+    deadline: tokio::time::Instant,
+) -> Result<HandshakePermit, TlsTransportError> {
+    match interception.admit_handshake(leg, deadline).await {
+        Ok(permit) => {
+            match permit.admission() {
+                Admission::Immediate => {}
+                Admission::Queued { waited } => {
+                    tracing::Span::current().record(
+                        "handshake_queue_ms",
+                        u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+                    );
+                }
+            }
+            Ok(permit)
+        }
+        Err(refused) => {
+            let error = match refused {
+                Refused::Saturated { .. } => TlsTransportError::Capacity,
+                Refused::Closed => TlsTransportError::Withdrawn,
+            };
+            HandshakeAttempt::record_failure(leg, &error);
+            Err(error)
+        }
+    }
+}
+
 fn upstream_span(host: &pplx_space_net_common::DomainName, port: u16) -> tracing::Span {
     tracing::info_span!(
         "tls.client",
         otel.kind = "client",
         otel.status_code = "ERROR",
+        handshake_queue_ms = tracing::field::Empty,
         server.address_length = host.as_str().len(),
         server.port = port,
         network.transport = "tcp"

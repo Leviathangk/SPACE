@@ -11,6 +11,9 @@ use pplx_space_common_core::types::{
     SnapshotKindParseError, SnapshotName, SnapshotParseError, SnapshotState,
     SnapshotStateParseError, TemplateName, TemplateParseError,
 };
+use pplx_space_common_core::types::{
+    Digest, DigestParseError, SnapshotArtifact as SnapshotArtifactFile, SnapshotArtifactParseError,
+};
 use sqlx::FromRow;
 use sqlx::types::Json;
 use time::OffsetDateTime;
@@ -510,6 +513,303 @@ pub async fn delete_snapshot_catalog(
         .execute(&mut **tx)
         .await?;
     Ok(result.rows_affected() == 1)
+}
+
+/// Content digest of one artifact file in a snapshot attempt, as reported by
+/// the node that uploaded it. Restore compares the bytes it pulls against this
+/// instead of trusting the object store.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SnapshotArtifactDigest {
+    pub artifact: SnapshotArtifactFile,
+    pub digest: Digest,
+    pub size_bytes: u64,
+}
+
+/// Recording artifact digests failed.
+#[derive(Debug, thiserror::Error)]
+pub enum RecordArtifactDigestsError {
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+
+    #[error("snapshot {snapshot_id} already records a different digest for {artifact}")]
+    Conflict {
+        snapshot_id: SnapshotId,
+        artifact: SnapshotArtifactFile,
+    },
+
+    #[error("snapshot {snapshot_id} reports a size for {artifact} beyond the catalog range")]
+    SizeOutOfRange {
+        snapshot_id: SnapshotId,
+        artifact: SnapshotArtifactFile,
+    },
+}
+
+/// Reading artifact digests failed.
+#[derive(Debug, thiserror::Error)]
+pub enum GetArtifactDigestsError {
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+
+    #[error("snapshot {snapshot_id} records an unknown artifact")]
+    InvalidArtifact {
+        snapshot_id: SnapshotId,
+        #[source]
+        source: SnapshotArtifactParseError,
+    },
+
+    #[error("snapshot {snapshot_id} records an invalid digest for {artifact}")]
+    InvalidDigest {
+        snapshot_id: SnapshotId,
+        artifact: SnapshotArtifactFile,
+        #[source]
+        source: DigestParseError,
+    },
+
+    #[error("snapshot {snapshot_id} records a negative size for {artifact}")]
+    InvalidSize {
+        snapshot_id: SnapshotId,
+        artifact: SnapshotArtifactFile,
+    },
+}
+
+/// Record the digests the uploading node reported for `snapshot_id`.
+///
+/// Digests are write-once: a replay that repeats them is a no-op and one that
+/// disagrees is refused, so a later finalize cannot swap what restore verifies.
+pub async fn record_artifact_digests(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    snapshot_id: SnapshotId,
+    digests: &[SnapshotArtifactDigest],
+) -> Result<(), RecordArtifactDigestsError> {
+    for entry in digests {
+        let size_bytes = i64::try_from(entry.size_bytes).map_err(|_| {
+            RecordArtifactDigestsError::SizeOutOfRange {
+                snapshot_id,
+                artifact: entry.artifact,
+            }
+        })?;
+        // The no-op update keeps an identical replay at one affected row while
+        // a differing one touches nothing.
+        let result = sqlx::query(sql!(
+            "INSERT INTO snapshot_artifact_digests
+                 (snapshot_id, artifact, digest, size_bytes)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (snapshot_id, artifact) DO UPDATE
+                 SET digest = EXCLUDED.digest
+               WHERE snapshot_artifact_digests.digest = EXCLUDED.digest
+                 AND snapshot_artifact_digests.size_bytes = EXCLUDED.size_bytes"
+        ))
+        .bind(snapshot_id.as_uuid())
+        .bind(entry.artifact.file_name())
+        .bind(entry.digest.to_string())
+        .bind(size_bytes)
+        .execute(&mut **tx)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(RecordArtifactDigestsError::Conflict {
+                snapshot_id,
+                artifact: entry.artifact,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The digests recorded for `snapshot_id`, ordered by artifact file name.
+/// Empty for attempts finalized before digests were recorded.
+pub async fn artifact_digests(
+    executor: impl sqlx::PgExecutor<'_>,
+    snapshot_id: SnapshotId,
+) -> Result<Vec<SnapshotArtifactDigest>, GetArtifactDigestsError> {
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(sql!(
+        "SELECT artifact, digest, size_bytes
+         FROM snapshot_artifact_digests
+         WHERE snapshot_id = $1
+         ORDER BY artifact"
+    ))
+    .bind(snapshot_id.as_uuid())
+    .fetch_all(executor)
+    .await?;
+
+    rows.into_iter()
+        .map(|(artifact, digest, size_bytes)| {
+            let artifact = SnapshotArtifactFile::from_str(&artifact).map_err(|source| {
+                GetArtifactDigestsError::InvalidArtifact {
+                    snapshot_id,
+                    source,
+                }
+            })?;
+            let digest = Digest::from_str(&digest).map_err(|source| {
+                GetArtifactDigestsError::InvalidDigest {
+                    snapshot_id,
+                    artifact,
+                    source,
+                }
+            })?;
+            let size_bytes =
+                u64::try_from(size_bytes).map_err(|_| GetArtifactDigestsError::InvalidSize {
+                    snapshot_id,
+                    artifact,
+                })?;
+            Ok(SnapshotArtifactDigest {
+                artifact,
+                digest,
+                size_bytes,
+            })
+        })
+        .collect()
+}
+
+/// Reading a ready artifact's storage location failed. A malformed stored
+/// row surfaces as a `sqlx::Error` decode failure, like every other typed
+/// column.
+#[derive(Debug, thiserror::Error)]
+pub enum ReadyArtifactLocationError {
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+}
+
+/// Where a `ready` snapshot's bytes live, as a restoring node needs it: the
+/// catalog row, the storage connection string of its location, and the byte
+/// count the upload reported.
+#[derive(Clone, Debug, Eq, PartialEq, FromRow)]
+pub struct ReadyArtifactLocation {
+    pub snapshot_id: SnapshotId,
+    pub storage_connection_string: String,
+    pub size_bytes: Option<i64>,
+}
+
+/// The newest `ready` suspend snapshot of `sandbox_id`, when that sandbox is
+/// placed on one of `node_ids`: active there, or the target of a pending
+/// migration or restore. A sandbox placed elsewhere reads as absent, not as
+/// an error: the caller is a node asking about its own set.
+///
+/// `timestamp` is the row's immutable creation time, so the newest row is the
+/// suspend attempt that started most recently and reached `ready`. Rows in
+/// `creating`, `failed` or `deleting` are invisible, which keeps a mid-flight
+/// upload, or a row claimed for prune, out of restore.
+pub async fn latest_ready_suspend_location_placed_on(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+    node_ids: &[NodeId],
+) -> Result<Option<ReadyArtifactLocation>, ReadyArtifactLocationError> {
+    let row = sqlx::query_as::<_, ReadyArtifactLocation>(sql!(
+        "SELECT s.id AS snapshot_id,
+                ssl.storage_connection_string,
+                s.size_bytes
+         FROM snapshots s
+         JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = s.id
+         JOIN sandboxes sb ON sb.id = s.sandbox_id
+         WHERE s.sandbox_id = $1
+           AND (sb.active_node_id = ANY($2) OR sb.target_node_id = ANY($2))
+           AND s.type = 'full'
+           AND (s.artifact_origin IS NULL OR s.artifact_origin = 'suspend')
+           AND s.state = 'ready'
+         ORDER BY s.timestamp DESC
+         LIMIT 1"
+    ))
+    .bind(sandbox_id)
+    .bind(node_ids)
+    .fetch_optional(executor)
+    .await?;
+    Ok(row)
+}
+
+/// The newest `ready` backup of the exact local artifact
+/// (`sandbox_id`, `local_artifact_id`, `artifact_kind`), when that sandbox is
+/// placed on one of `node_ids`. Same placement and absence semantics as
+/// [`latest_ready_suspend_location_placed_on`].
+pub async fn ready_backup_location_placed_on(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+    local_artifact_id: LocalArtifactId,
+    artifact_kind: ArtifactKind,
+    node_ids: &[NodeId],
+) -> Result<Option<ReadyArtifactLocation>, ReadyArtifactLocationError> {
+    let row = sqlx::query_as::<_, ReadyArtifactLocation>(sql!(
+        "SELECT s.id AS snapshot_id,
+                ssl.storage_connection_string,
+                s.size_bytes
+         FROM snapshots s
+         JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = s.id
+         JOIN sandboxes sb ON sb.id = s.sandbox_id
+         WHERE s.sandbox_id = $1
+           AND (sb.active_node_id = ANY($4) OR sb.target_node_id = ANY($4))
+           AND s.local_artifact_id = $2
+           AND s.artifact_kind = $3
+           AND s.state = 'ready'
+         ORDER BY s.timestamp DESC
+         LIMIT 1"
+    ))
+    .bind(sandbox_id)
+    .bind(local_artifact_id.as_uuid())
+    .bind(artifact_kind.as_str())
+    .bind(node_ids)
+    .fetch_optional(executor)
+    .await?;
+    Ok(row)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CheckBackupError {
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+}
+
+/// Whether these exact immutable bytes have a usable ready backup. This is
+/// placement-independent so a former hosting node can release its local copy;
+/// it discloses neither the backup identity nor its storage credentials.
+pub async fn artifact_backup_ready(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+    local_artifact_id: LocalArtifactId,
+    artifact_kind: ArtifactKind,
+) -> Result<bool, CheckBackupError> {
+    Ok(sqlx::query_scalar(sql!(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM snapshots s
+             JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = s.id
+             WHERE s.sandbox_id = $1
+               AND s.local_artifact_id = $2
+               AND s.artifact_kind = $3
+               AND s.state = 'ready'
+               AND ssl.orphaned_at IS NULL
+         )"
+    ))
+    .bind(sandbox_id)
+    .bind(local_artifact_id.as_uuid())
+    .bind(artifact_kind.as_str())
+    .fetch_one(executor)
+    .await?)
+}
+
+/// Whether `snapshot_id` is still the latest ready suspend attempt of
+/// `sandbox_id`, with a live storage location. This is the proof an unpinned
+/// local cache needs: a ready backup of an older attempt cannot show which
+/// generation that cache contains.
+pub async fn is_latest_ready_suspend(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+    snapshot_id: SnapshotId,
+) -> Result<bool, CheckBackupError> {
+    Ok(sqlx::query_scalar(sql!(
+        "SELECT COALESCE((
+             SELECT s.id = $2 AND ssl.orphaned_at IS NULL
+             FROM snapshots s
+             JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = s.id
+             WHERE s.sandbox_id = $1
+               AND s.type = 'full'
+               AND (s.artifact_origin IS NULL OR s.artifact_origin = 'suspend')
+               AND s.state = 'ready'
+             ORDER BY s.timestamp DESC
+             LIMIT 1
+         ), FALSE)"
+    ))
+    .bind(sandbox_id)
+    .bind(snapshot_id)
+    .fetch_one(executor)
+    .await?)
 }
 
 /// Fetch one snapshot catalog row by id.

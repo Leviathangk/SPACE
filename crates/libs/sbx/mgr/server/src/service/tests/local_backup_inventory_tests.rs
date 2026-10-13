@@ -57,7 +57,7 @@ async fn list_pending(service: &SandboxManagerService) -> Vec<crate::proto::Pend
 /// that silently failed would produce it rather than an error. The queue
 /// this feeds constrains the column to exactly those two values
 /// (`CHECK (artifact_kind IN ('disk', 'full'))` in
-/// `db/postgres/20260920025850_node_local_backup_pending.up.sql`), so an
+/// `db/postgres/20261002070625_baseline.up.sql`), so an
 /// unspecified kind reaching it would be rejected by the database. No
 /// Rust reader exists yet — this pins the producer against the stored
 /// contract, not against a live consumer.
@@ -68,7 +68,7 @@ async fn pending_local_backups_carry_a_concrete_artifact_kind_for_both_origins()
     let stopped = SandboxId::new().to_string();
     insert_test_sandbox(&conn, &suspended, SandboxState::Suspended);
     insert_test_sandbox(&conn, &stopped, SandboxState::Stopped);
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
     let suspend_artifact = LocalArtifactId::new();
     let stop_artifact = LocalArtifactId::new();
     pin_artifact(
@@ -130,7 +130,7 @@ async fn a_degraded_sandbox_still_reports_its_pending_artifact() {
     let conn = crate::db::test_conn();
     let degraded = SandboxId::new().to_string();
     insert_test_sandbox(&conn, &degraded, SandboxState::Suspended);
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
     let degraded_artifact = LocalArtifactId::new();
     pin_artifact(
         &service,
@@ -188,7 +188,7 @@ async fn a_degraded_sandbox_still_reports_its_pending_artifact() {
 #[tokio::test]
 async fn pending_local_backups_are_not_readable_by_the_general_observer_set() {
     let conn = crate::db::test_conn();
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
     let mut request = Request::new(crate::proto::ListPendingLocalBackupsRequest {});
     request.extensions_mut().insert(PeerIdentity::new(
         users::SPACE_NODEAPI.uid,

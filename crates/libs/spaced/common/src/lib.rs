@@ -75,6 +75,11 @@ impl std::fmt::Debug for proto::operations::SendInputRequest {
     }
 }
 
+/// HTTP/2 frame size the spaced channels advertise, so a 64 KiB file chunk
+/// travels as one DATA frame instead of five.
+pub const BULK_HTTP2_MAX_FRAME_SIZE: u32 = 256 * 1024;
+
+pub mod admission_queue;
 mod compatibility;
 mod error;
 pub mod filesystem_limits;
@@ -99,9 +104,9 @@ pub use retry_policy::{
 };
 pub use server::{BindUdsError, bind_uds, bind_uds_with_mode};
 pub use uds::{
-    ExpectedUdsPeer, UdsConnectError, connect_uds_channel, connect_uds_channel_with_expected_peer,
-    connect_uds_channel_with_expected_peer_and_retry, connect_uds_channel_with_retry,
-    default_bridge_guest_uds_path, default_bridge_host_uds_path,
+    ExpectedUdsPeer, PinnedConnection, UdsConnectError, connect_uds_channel,
+    connect_uds_channel_with_expected_peer, connect_uds_channel_with_expected_peer_and_retry,
+    connect_uds_channel_with_retry, default_bridge_guest_uds_path, default_bridge_host_uds_path,
 };
 pub use validate::{
     validate_duration, validate_optional_duration, validate_optional_reason,
@@ -110,7 +115,8 @@ pub use validate::{
 pub use vsock::{
     BRIDGE_GUEST_VSOCK_PORT, BRIDGE_HOST_VSOCK_PORT, FirecrackerVsockConnectError,
     VsockConnectError, bind_vsock, connect_firecracker_vsock_channel_with_expected_peer,
-    connect_vsock_channel, connect_vsock_channel_with_retry, firecracker_vsock_port_path,
+    connect_vsock_channel, connect_vsock_channel_with_retry, firecracker_vsock_handshake,
+    firecracker_vsock_port_path,
 };
 pub use wire::{
     duration_to_proto, parse_env, parse_globs, proto_duration, proto_env, proto_globs,
@@ -174,11 +180,23 @@ macro_rules! spaced_client_config {
     };
 }
 
+/// Whether a hop should retry `status` itself: a transport-shaped failure,
+/// unless the server refused the request before starting it. Such a refusal
+/// (an admission limit, a guest shutting down) goes back to the caller, who
+/// decides whether and when to retry.
 pub fn status_is_retryable(status: &tonic::Status) -> bool {
     matches!(
         status.code(),
         tonic::Code::Unavailable | tonic::Code::Unknown | tonic::Code::DeadlineExceeded
-    )
+    ) && !status_is_refused_before_start(status)
+}
+
+fn status_is_refused_before_start(status: &tonic::Status) -> bool {
+    status
+        .metadata()
+        .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
+        .and_then(|value| value.to_str().ok())
+        == Some(pplx_space_common_core::spaced::REQUEST_REFUSED)
 }
 
 pub fn spaced_version() -> &'static str {

@@ -21,7 +21,10 @@ fn step_descriptions_do_not_disclose_recipe_inputs() {
         ),
         (
             Step::Env {
-                vars: [(secret.into(), secret.into())].into(),
+                vars: pplx_space_common_core::types::EnvMap::try_from(
+                    std::collections::BTreeMap::from([(secret.into(), secret.into())]),
+                )
+                .unwrap(),
             },
             "env (1 vars)",
         ),
@@ -52,7 +55,7 @@ fn step_descriptions_do_not_disclose_recipe_inputs() {
         assert_eq!(step.to_string(), expected);
         let named = super::NamedStep {
             display_name: Some(secret.into()),
-            env_refs: vec![secret.into()],
+            env_refs: vec![pplx_space_common_core::types::EnvKey::parse(secret).unwrap()],
             step,
         };
         assert_eq!(named.to_string(), expected);
@@ -326,6 +329,74 @@ fn pinned_scratch_guest_kernel_fails_closed_through_legacy_proxy() {
     assert!(matches!(error, RecipeProtoError::MissingOriginKind));
 }
 
+/// Scratch source selectors reach a URL and a privileged build container, so
+/// the shared conversion accepts only Ubuntu Minimal Cloud release names.
+#[rstest]
+#[case::current_seed("resolute", "26.04", "release-20260908", None)]
+#[case::moving_release("resolute", "26.04", "release", None)]
+#[case::older_lts_point_release("noble", "24.04.1", "release-20240423.1", None)]
+#[case::empty_release("", "26.04", "release", Some("release"))]
+#[case::uppercase_release("Resolute", "26.04", "release", Some("release"))]
+#[case::release_path("resolute/../x", "26.04", "release", Some("release"))]
+#[case::release_quote("resolute\"; id; echo \"", "26.04", "release", Some("release"))]
+#[case::release_newline("resolute\nid", "26.04", "release", Some("release"))]
+#[case::version_substitution("resolute", "$(id)", "release", Some("version"))]
+#[case::version_trailing_space("resolute", "26.04 ", "release", Some("version"))]
+#[case::version_one_part("resolute", "26", "release", Some("version"))]
+#[case::version_four_parts("resolute", "26.04.1.2", "release", Some("version"))]
+#[case::date_backticks("resolute", "26.04", "`id`", Some("date"))]
+#[case::date_short("resolute", "26.04", "release-2026090", Some("date"))]
+#[case::date_traversal("resolute", "26.04", "release/../../x", Some("date"))]
+#[case::date_empty_serial("resolute", "26.04", "release-20260908.", Some("date"))]
+#[case::date_unprefixed("resolute", "26.04", "20260908", Some("date"))]
+fn scratch_source_selectors_are_validated(
+    #[case] release: &str,
+    #[case] version: &str,
+    #[case] date: &str,
+    #[case] invalid_field: Option<&str>,
+) {
+    let mut recipe = scratch_proto_with_kernel(KERNEL_VERSION, KERNEL_DIGEST);
+    let Some(recipe::origin::Kind::PinnedFromScratch(recipe::origin::PinnedFromScratch {
+        source:
+            Some(recipe::Source {
+                kind: Some(recipe::source::Kind::UbuntuMinimalCloudSquashfs(source)),
+            }),
+        ..
+    })) = recipe
+        .origin
+        .as_mut()
+        .and_then(|origin| origin.kind.as_mut())
+    else {
+        panic!("pinned scratch source should be set");
+    };
+    *source = recipe::source::UbuntuMinimalCloudSquashfs {
+        release: release.to_string(),
+        version: version.to_string(),
+        date: date.to_string(),
+    };
+
+    let result = Recipe::try_from(recipe);
+
+    match invalid_field {
+        None => {
+            let recipe = result.expect("supported scratch source should convert");
+            assert!(matches!(
+                recipe.origin,
+                Origin::FromScratch { source, .. }
+                    if source.release == release && source.version == version && source.date == date
+            ));
+        }
+        Some(field) => {
+            let error = result.expect_err("malformed scratch source should be rejected");
+            assert!(
+                matches!(&error, RecipeProtoError::InvalidScratchSource { field: actual, .. }
+                    if actual.as_str() == field),
+                "unexpected error for {field}: {error:?}"
+            );
+        }
+    }
+}
+
 fn scratch_proto_with_kernel(version: &str, digest: &str) -> ProtoRecipe {
     ProtoRecipe {
         metadata: Some(recipe::Metadata { description: None }),
@@ -550,7 +621,9 @@ fn interpolating_fields(step: &TomlStep) -> Vec<&str> {
         | TomlStep::NpmInstallGlobal { .. }
         | TomlStep::Env { .. }
         | TomlStep::Copy { .. }
-        | TomlStep::PlaywrightInstall { .. } => Vec::new(),
+        | TomlStep::PlaywrightInstall { .. }
+        | TomlStep::SetRuntime { .. }
+        | TomlStep::ClearRuntime => Vec::new(),
     }
 }
 
@@ -590,6 +663,8 @@ const VARIANT_STEP_KEYS: &[(&str, &[&str])] = &[
     ("env", &["vars"]),
     ("copy", &["source", "dest"]),
     ("playwright-install", &["browsers"]),
+    ("set-runtime", &["declaration"]),
+    ("clear-runtime", &[]),
 ];
 
 /// Keys in `table` that `TomlNamedStep` would drop, judged against the step's own
@@ -968,7 +1043,10 @@ fn package_install_uses_single_structural_step() {
             extra_args
         } if packages == &["foo"] && extra_args == &["--extra-index-url"]
     ));
-    assert_eq!(recipe.steps[0].env_refs, vec!["TOKEN".to_string()]);
+    assert_eq!(
+        recipe.steps[0].env_refs,
+        vec![pplx_space_common_core::types::EnvKey::parse("TOKEN").unwrap()]
+    );
 }
 
 #[test]
@@ -981,4 +1059,241 @@ fn resolves_env_refs_for_toml_env_values() {
         });
 
     assert_eq!(resolved, "https://user:secret@example.test/path");
+}
+
+#[test]
+fn runtime_recipe_round_trip_and_fail_closed_policy() {
+    let input = r#"
+[metadata]
+name = "native-runtime-example"
+base = "seed"
+[[steps]]
+type = "set-runtime"
+[steps.declaration]
+schema_version = 1
+[[steps.declaration.apps]]
+name = "app"
+command = ["/bin/sleep", "infinity"]
+user = "root"
+working_directory = "/"
+startup_timeout_secs = 10
+[steps.declaration.apps.env]
+EXAMPLE_MODE = "template"
+[steps.declaration.apps.readiness]
+type = "launch"
+[[steps.declaration.apps]]
+name = "worker"
+command = ["/usr/local/bin/worker"]
+user = "root"
+working_directory = "/"
+startup_timeout_secs = 20
+[steps.declaration.apps.readiness]
+type = "launch"
+"#;
+    let recipe: TomlRecipe = toml::from_str(input).unwrap();
+    let wire = recipe
+        .into_proto("example.toml", None, |_, _| unreachable!())
+        .unwrap();
+    let native = Recipe::try_from(wire.clone()).unwrap();
+    let Step::SetRuntime(runtime) = &native.steps[0].step else {
+        panic!("runtime step missing")
+    };
+    assert_eq!(
+        runtime.apps()[0].command().argv(),
+        ["/bin/sleep", "infinity"]
+    );
+    assert_eq!(runtime.apps()[0].startup_timeout().as_secs(), 10);
+    assert_eq!(runtime.apps().len(), 2);
+    assert_eq!(runtime.apps()[1].name().as_str(), "worker");
+    assert_eq!(
+        runtime.apps()[1].command().argv(),
+        ["/usr/local/bin/worker"]
+    );
+    assert_eq!(runtime.apps()[1].startup_timeout().as_secs(), 20);
+    assert!(!format!("{:?}", wire.steps[0]).contains("EXAMPLE_MODE"));
+
+    for steps in [
+        vec![wire.steps[0].clone(), wire.steps[0].clone()],
+        vec![
+            wire.steps[0].clone(),
+            recipe::Step {
+                body: Some(recipe::step::Body::Run(recipe::Run {
+                    command: "true".into(),
+                    user: None,
+                })),
+                ..Default::default()
+            },
+        ],
+        vec![recipe::Step {
+            env_refs: vec!["EXAMPLE_MODE".into()],
+            ..wire.steps[0].clone()
+        }],
+    ] {
+        assert!(matches!(
+            Recipe::try_from(ProtoRecipe {
+                steps,
+                ..wire.clone()
+            }),
+            Err(RecipeProtoError::RuntimePlacement)
+        ));
+    }
+    // An older protobuf intermediary retains Step but drops the unknown body.
+    #[derive(Clone, PartialEq, Message)]
+    struct OldStep {
+        #[prost(string, optional, tag = "1")]
+        display_name: Option<String>,
+    }
+    for body in [
+        wire.steps[0].body.clone().unwrap(),
+        recipe::step::Body::ClearRuntime(recipe::ClearRuntime {}),
+    ] {
+        let step = recipe::Step {
+            body: Some(body),
+            ..Default::default()
+        };
+        let old = OldStep::decode(step.encode_to_vec().as_slice()).unwrap();
+        let dropped = recipe::Step::decode(old.encode_to_vec().as_slice()).unwrap();
+        assert!(matches!(
+            Recipe::try_from(ProtoRecipe {
+                steps: vec![dropped],
+                ..wire.clone()
+            }),
+            Err(RecipeProtoError::MissingStep { index: 1 })
+        ));
+    }
+    let Some(recipe::step::Body::SetRuntime(mut runtime)) = wire.steps[0].body.clone() else {
+        unreachable!()
+    };
+    runtime.apps[0].readiness = None;
+    pplx_space_build_mgr_client::runtime::decode(runtime).unwrap_err();
+}
+
+#[test]
+fn balloon_round_trips_from_toml_through_the_wire() {
+    use pplx_space_common_core::types::BalloonMode;
+
+    let parse = |balloon: &str| {
+        toml::from_str::<TomlRecipe>(&format!(
+            "[metadata]\nname = \"balloon\"\nbase = \"seed\"\nmemory_mib = 8192\n{balloon}"
+        ))
+    };
+    for (balloon, mode, amount_mib) in [
+        (
+            r#"balloon = { mode = "inflate", amount_mib = 1024, deflate_on_oom = true }"#,
+            BalloonMode::Inflate,
+            1024,
+        ),
+        (
+            r#"balloon = { mode = "report", stats_polling_interval_s = 1 }"#,
+            BalloonMode::FreePageReporting,
+            0,
+        ),
+        (
+            r#"balloon = { mode = "hint" }"#,
+            BalloonMode::FreePageHinting,
+            0,
+        ),
+    ] {
+        let toml = parse(balloon).expect(balloon);
+        let expected = toml.metadata.balloon.expect(balloon);
+        let proto = toml
+            .try_into_proto(None, &mut |_index, _source| unreachable!("no copy steps"))
+            .expect(balloon);
+        // Through protobuf bytes, as the build request travels.
+        let proto = ProtoRecipe::decode(proto.encode_to_vec().as_slice()).unwrap();
+        let recipe = Recipe::try_from(proto).expect(balloon);
+        assert_eq!(recipe.build_config.balloon, Some(expected), "{balloon}");
+        assert_eq!(expected.mode(), mode);
+        assert_eq!(expected.amount_mib(), amount_mib);
+    }
+
+    let without = parse("").unwrap();
+    assert_eq!(without.metadata.balloon, None);
+    let proto = without
+        .try_into_proto(None, &mut |_index, _source| unreachable!("no copy steps"))
+        .unwrap();
+    assert_eq!(proto.build_config.as_ref().unwrap().balloon, None);
+    assert_eq!(Recipe::try_from(proto).unwrap().build_config.balloon, None);
+
+    for invalid in [
+        r#"balloon = { mode = "deflate" }"#,
+        r#"balloon = { mode = "inflate", amount_mib = 1024 }"#,
+        r#"balloon = { mode = "hint", deflate_on_oom = true }"#,
+    ] {
+        parse(invalid).expect_err(invalid);
+    }
+
+    let mut proto = parse(r#"balloon = { mode = "hint" }"#)
+        .unwrap()
+        .try_into_proto(None, &mut |_index, _source| unreachable!("no copy steps"))
+        .unwrap();
+    let balloon = proto
+        .build_config
+        .as_mut()
+        .and_then(|config| config.balloon.as_mut())
+        .unwrap();
+    balloon.mode = None;
+    assert!(matches!(
+        Recipe::try_from(proto.clone()),
+        Err(RecipeProtoError::MissingBalloonMode)
+    ));
+    let balloon = proto
+        .build_config
+        .as_mut()
+        .and_then(|config| config.balloon.as_mut())
+        .unwrap();
+    balloon.mode = Some(recipe::balloon::Mode::Inflate(recipe::balloon::Inflate {
+        amount_mib: 0,
+        deflate_on_oom: true,
+    }));
+    assert!(matches!(
+        Recipe::try_from(proto.clone()),
+        Err(RecipeProtoError::ZeroBalloonAmount)
+    ));
+    let balloon = proto
+        .build_config
+        .as_mut()
+        .and_then(|config| config.balloon.as_mut())
+        .unwrap();
+    balloon.mode = Some(recipe::balloon::Mode::FreePageHinting(
+        recipe::balloon::FreePageHinting {},
+    ));
+    balloon.stats_polling_interval_s = 65_536;
+    assert!(matches!(
+        Recipe::try_from(proto),
+        Err(RecipeProtoError::BalloonStatsIntervalOutOfRange { value: 65_536 })
+    ));
+}
+
+#[test]
+fn proto_steps_validate_environment_names_before_execution() {
+    use super::ProtoStepExt;
+
+    for step in [
+        recipe::Step {
+            env_refs: vec!["TOKEN; echo injected".into()],
+            body: Some(recipe::step::Body::Run(recipe::Run {
+                command: "true".into(),
+                user: None,
+            })),
+            ..Default::default()
+        },
+        recipe::Step {
+            body: Some(recipe::step::Body::Env(recipe::Env {
+                vars: [("TOKEN'".into(), "secret-value".into())].into(),
+            })),
+            ..Default::default()
+        },
+    ] {
+        let result = step.try_into_named_step(1);
+
+        let error = result.unwrap_err();
+        assert!(matches!(
+            error,
+            RecipeProtoError::Environment { index: 1, .. }
+        ));
+        assert!(error.to_string().contains("recipe step 1 env"));
+        assert!(!format!("{error:?}").contains("secret-value"));
+        assert!(!format!("{error:?}").contains("TOKEN"));
+    }
 }

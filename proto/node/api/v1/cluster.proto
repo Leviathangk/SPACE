@@ -15,6 +15,10 @@ import "template/manager/v1/manager.proto";
 service ClusterApi {
   rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
 
+  // Delegate one system publication to a build. Only a system-only publisher
+  // may issue these grants; a dual-authority build-manager cannot authorize itself.
+  rpc CreateSystemTemplatePublicationGrant(CreateSystemTemplatePublicationGrantRequest) returns (CreateSystemTemplatePublicationGrantResponse);
+
   // Register a template. Fails with ALREADY_EXISTS if `name` is already taken.
   rpc RegisterTemplate(RegisterTemplateRequest) returns (RegisterTemplateResponse);
 
@@ -160,6 +164,10 @@ service ClusterApi {
   rpc BeginArtifactBackup(BeginArtifactBackupRequest) returns (BeginArtifactBackupResponse);
   rpc FinalizeArtifactBackup(FinalizeArtifactBackupRequest) returns (FinalizeArtifactBackupResponse);
   rpc TouchArtifactBackup(TouchArtifactBackupRequest) returns (TouchArtifactBackupResponse);
+  // Two request shapes. A location request reads where a ready backup lives,
+  // only for a node the sandbox is placed on. A readiness query lets any
+  // registered node, including a former host after relocation, ask whether
+  // an identity it already holds is backed up; the reply is only `ready`.
   rpc GetArtifactBackupLocation(GetArtifactBackupLocationRequest) returns (GetArtifactBackupLocationResponse);
 
   // Return a read-only, generation-fenced plan for automatic recovery of the
@@ -280,10 +288,20 @@ message TemplateReleaseStorageLocation {
   string created_at = 3;    // RFC3339
 }
 
+message CreateSystemTemplatePublicationGrantRequest {
+  string template_name = 1;
+}
+
+message CreateSystemTemplatePublicationGrantResponse {
+  string grant_id = 1;
+}
+
 message RegisterTemplateRequest {
   string name = 1;
   optional string description = 2;
   optional string org_id = 4;
+  // One build submission's system publication authorization.
+  optional string system_publication_grant_id = 5;
 }
 
 message RegisterTemplateResponse {
@@ -309,6 +327,8 @@ message RegisterTemplateReleaseRequest {
   // `(template_name, hash)`, so the first registration that carries this wins;
   // later registrations never overwrite stored execution metadata.
   optional space.execution.v1.ExecutionMetadata execution = 8;
+  // Consumed atomically with the release; never substitutes another build's grant.
+  optional string system_publication_grant_id = 9;
 }
 
 message RegisterTemplateReleaseResponse {
@@ -323,6 +343,8 @@ message FindTemplateReleaseRequest {
   string tag = 3;
   // Tenant authorization is checked atomically with release resolution.
   optional string caller_org_id = 4;
+  // Restrict release and storage resolution to generic templates in one SQL snapshot.
+  bool generic_only = 5;
 }
 
 message FindTemplateReleaseResponse {
@@ -334,6 +356,9 @@ message FindTemplateReleaseResponse {
   TemplateVisibility template_visibility = 3;
   // Scoped callers must reject responses without this acknowledgement.
   optional string authorized_org_id = 4;
+  // True only when generic-only resolution succeeded. Prefetch must require this
+  // acknowledgement so older servers cannot silently ignore the restriction.
+  bool generic_authorized = 5;
 }
 
 message FindTemplateReleaseByHashRequest {
@@ -345,6 +370,7 @@ message FindTemplateReleaseByHashRequest {
   // `(template_name, hash)` uniquely identifies a release.
   string hash = 2;
   optional string caller_org_id = 3;
+  bool generic_only = 4;
 }
 
 message ListLatestTemplateReleasesRequest {
@@ -1018,6 +1044,24 @@ message FinalizeArtifactBackupRequest {
   SuspendSnapshotTerminalState target_state = 2;
   int64 bytes_uploaded = 3;
   optional string failure_reason = 4;
+  // Digests of the artifacts this attempt uploaded. Recorded only for READY
+  // and write-once: a replay must repeat the same digests.
+  repeated SnapshotArtifactDigest artifact_digests = 5;
+}
+
+// Content digest of one artifact file in a backup attempt, reported by the
+// uploading node and handed back to restore so the bytes it pulls are
+// verified against the catalog rather than trusted from the object store.
+message SnapshotArtifactDigest {
+  // Canonical file name under the attempt prefix: `memfile`, `binfile`,
+  // `rootfs`, `rootfs.btrfs-send`, `snapshot.luks`, `cow.luks`, or
+  // `metadata.json`.
+  string artifact = 1;
+  // `sha256:<64 lowercase hex>` over the artifact bytes as they exist on the
+  // node, before any transfer compression or encryption.
+  string digest = 2;
+  // Size in bytes of the same bytes the digest covers.
+  uint64 size_bytes = 3;
 }
 
 message FinalizeArtifactBackupResponse {}
@@ -1033,6 +1077,27 @@ message GetArtifactBackupLocationRequest {
   string sandbox_id = 1;
   string local_artifact_id = 2;
   space.sandbox.manager.v1.ArtifactKind artifact_kind = 3;
+  // Set for a readiness query, which leaves `local_artifact_id` empty and
+  // `artifact_kind` unspecified. A server without readiness support ignores
+  // this field and rejects the empty artifact id instead of returning a
+  // location.
+  BackupReadinessQuery readiness = 4;
+}
+
+message BackupReadinessQuery {
+  oneof artifact {
+    // Ready when these exact immutable bytes have a ready, non-orphaned
+    // backup.
+    LocalArtifactBackupIdentity local_artifact = 1;
+    // An unpinned cache's suspend attempt. Ready only while it is still the
+    // latest ready full suspend, not merely an older attempt with a backup.
+    string latest_ready_suspend_snapshot_id = 2;
+  }
+}
+
+message LocalArtifactBackupIdentity {
+  string local_artifact_id = 1;
+  space.sandbox.manager.v1.ArtifactKind artifact_kind = 2;
 }
 
 message GetArtifactBackupLocationResponse {
@@ -1041,6 +1106,10 @@ message GetArtifactBackupLocationResponse {
   string backup_attempt_id = 3;
   string storage_uri = 4;
   int64 bytes_uploaded = 5;
+  // Empty for attempts finalized before digests were recorded.
+  repeated SnapshotArtifactDigest artifact_digests = 6;
+  // Set only in reply to a readiness query; every other field is then empty.
+  optional bool ready = 7;
 }
 
 message GetQuarantineRecoveryPlanRequest {
@@ -1101,4 +1170,6 @@ message GetSuspendSnapshotLocationResponse {
   string storage_uri = 2;
   // Total compressed bytes of all VM artifacts that were uploaded.
   int64 bytes_uploaded = 3;
+  // Empty for snapshots finalized before digests were recorded.
+  repeated SnapshotArtifactDigest artifact_digests = 4;
 }

@@ -1,7 +1,7 @@
 use super::idempotency;
 use pplx_space_common_core::types::{CredentialReferenceId, IdempotencyKey, OrgId};
 use pplx_space_credential_injection_core::validation::{
-    RulesetValidationError, ValidatedCredentialReference,
+    ReferenceValidationError, ValidatedCredentialReference,
 };
 use pplx_space_credential_injection_store::references::{self as store, ReferenceState};
 use pplx_space_public_api::credential_references as wire;
@@ -12,10 +12,8 @@ pub(crate) enum ReferenceError {
     NotFound,
     #[error("request_id was already used with a different request")]
     IdempotencyConflict,
-    #[error("credential reference is attached")]
-    Attached,
     #[error(transparent)]
-    Invalid(#[from] RulesetValidationError),
+    Invalid(#[from] ReferenceValidationError),
     #[error(transparent)]
     Database(#[from] sqlx::Error),
 }
@@ -76,10 +74,8 @@ pub(crate) async fn retire(
         .await?
         .pop()
         .ok_or(ReferenceError::NotFound)?;
-    if reference.state == ReferenceState::Active
-        && !store::retire(&mut *tx, organization, id).await?
-    {
-        return Err(ReferenceError::Attached);
+    if reference.state == ReferenceState::Active {
+        store::retire(&mut *tx, organization, id).await?;
     }
     tx.commit().await?;
     Ok(())

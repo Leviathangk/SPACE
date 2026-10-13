@@ -199,7 +199,7 @@ pub(crate) const PHASE_TERMINATING: &str = "terminating";
 // No `'deleted'` phase: per the corrected drain design, terminate
 // success DELETEs the `nodes` row outright (no tombstone state).
 // The CHECK on `drain_phase` only allows `draining`/`drained`/
-// `terminating`/`NULL` — see `db/postgres/055_node_drain_lifecycle.up.sql`.
+// `terminating`/`NULL` — see `db/postgres/20261002070625_baseline.up.sql`.
 
 /// Lifecycle values that count as "still resident on the node" for the
 /// purposes of declaring a drain complete.
@@ -2401,7 +2401,7 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
                 .await
             {
                 Ok(true) => {
-                    node_drain_metrics::transition(PHASE_DRAINING, PHASE_DRAINED);
+                    node_drain_metrics::drained(PHASE_DRAINING, PHASE_DRAINED, mode);
                     tracing::info!(node_id = %node_id, "node_drain: drained");
                     report.drained_transitions += 1;
                     return;
@@ -2971,7 +2971,11 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
                     // lifecycle-preserving evacuations from started
                     // evacuations on dashboards. Restore latency is tracked
                     // separately by the restore sweep.
-                    node_drain_metrics::sandbox_suspend_duration(started, pre_lifecycle_tag);
+                    node_drain_metrics::sandbox_suspend_duration(
+                        started,
+                        &node_id.to_string(),
+                        pre_lifecycle_tag,
+                    );
                 }
                 // Terminal divergence: the sandbox is `failed` on the node but
                 // `started`/`paused` in the DB, so suspend will never succeed.
@@ -3237,7 +3241,7 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
                 // Same-name kube Node replacement detected. The
                 // inventory reflector will reset `drain_phase` on its
                 // next tick (see `upsert_k8s_node_role` in
-                // `crates/libs/api/src/controllers/substrate/kubernetes/store.rs`).
+                // `crates/libs/api/src/controllers/substrate/kubernetes/store/node_inventory.rs`).
                 // Skip this tick silently — no `drain_last_error`
                 // write, because the row is about to lose its drain
                 // state anyway and a stale error would survive past

@@ -38,13 +38,6 @@ impl SandboxManager for SandboxManagerService {
         SandboxManagerService::delete(self, request).await
     }
 
-    async fn release_execution(
-        &self,
-        request: Request<ReleaseExecutionRequest>,
-    ) -> Result<Response<ReleaseExecutionResponse>, Status> {
-        SandboxManagerService::release_execution(self, request).await
-    }
-
     async fn list_auto_lifecycle_delete_receipts(
         &self,
         request: Request<ListAutoLifecycleDeleteReceiptsRequest>,
@@ -223,6 +216,13 @@ impl SandboxManager for SandboxManagerService {
         request: Request<crate::proto::CreateSnapshotRequest>,
     ) -> Result<Response<crate::proto::CreateSnapshotResponse>, Status> {
         SandboxManagerService::create_snapshot(self, request).await
+    }
+
+    async fn wait_template_apps(
+        &self,
+        request: Request<crate::proto::WaitTemplateAppsRequest>,
+    ) -> Result<Response<crate::proto::WaitTemplateAppsResponse>, Status> {
+        SandboxManagerService::wait_template_apps(self, request).await
     }
 
     async fn create_template_base_snapshot(

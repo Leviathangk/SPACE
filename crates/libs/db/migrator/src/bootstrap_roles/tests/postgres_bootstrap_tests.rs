@@ -23,13 +23,6 @@ const APP_LOCK_UNSET_TIMEOUTS: SessionTimeouts<'static> = SessionTimeouts {
     ..TEST_TIMEOUTS
 };
 
-/// `20260914145627_normalized_credential_rules`, the migration
-/// [`credential_rules_enforce_constraints_triggers_and_grants`]
-/// applies and reverts, and its immediate predecessor
-/// `20260914055116_credential_references`.
-const NORMALIZATION: i64 = 20260914145627;
-const NORMALIZATION_PREDECESSOR: i64 = 20260914055116;
-
 fn test_passwords() -> BootstrapPasswords {
     BootstrapPasswords {
         superadmin: Some("superadmin-pw".to_string()),
@@ -901,157 +894,50 @@ async fn assuming_the_migrator_role_installs_its_role_level_timeouts() -> TestRe
 }
 
 #[tokio::test]
-async fn credential_rules_enforce_constraints_triggers_and_grants() -> TestResult {
-    use pplx_space_common_svc::core::types::{CredentialReferenceId, SandboxId};
-    use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID};
+async fn credential_references_enforce_triggers_and_grants() -> TestResult {
+    use pplx_space_common_svc::core::types::CredentialReferenceId;
+    use pplx_space_db_test_fixtures::SEED_ORG_ID;
     let Some(fixture) = postgres_fixture().await? else {
         return Ok(());
     };
     run_bootstrap(&fixture).await?;
-    let before_normalization = sqlx::migrate::Migrator {
-        migrations: std::borrow::Cow::Owned(
-            crate::POSTGRES_MIGRATOR
-                .iter()
-                .filter(|migration| {
-                    crate::baselines::is_public(&crate::POSTGRES_MIGRATOR)
-                        || migration.version < NORMALIZATION
-                })
-                .cloned()
-                .collect(),
-        ),
-        ..sqlx::migrate::Migrator::DEFAULT
-    };
-    // `Migrator::undo` reverts every down migration newer than its target, so
-    // rolling back through the unfiltered set would replay every migration
-    // added after this one and grow with the tree. Dropping the other down
-    // migrations from the set pins the rollback to the one migration under
-    // test; the up migrations stay, because `undo` rejects an applied version
-    // the set does not contain.
-    let normalization_rollback = sqlx::migrate::Migrator {
-        migrations: std::borrow::Cow::Owned(
-            crate::POSTGRES_MIGRATOR
-                .iter()
-                .filter(|migration| {
-                    !migration.migration_type.is_down_migration()
-                        || migration.version == NORMALIZATION
-                })
-                .cloned()
-                .collect(),
-        ),
-        ..sqlx::migrate::Migrator::DEFAULT
-    };
     let mut conn = fixture.connect_as("postgres").await?;
     assume_migrator_role(&mut conn).await?;
-    before_normalization.run(&mut conn).await?;
-    let sandbox = SandboxId::new().as_uuid();
+    crate::POSTGRES_MIGRATOR.run(&mut conn).await?;
     let reference = CredentialReferenceId::new().as_uuid();
-    sqlx::query(sql!("INSERT INTO sandboxes (id, user_id, org_id, network_policy_generation) VALUES ($1, $2, $3, 1)"))
-        .bind(sandbox).bind(SEED_USER_ID).bind(SEED_ORG_ID).execute(&mut conn).await?;
     sqlx::query(sql!("INSERT INTO credential_references (id, org_id, upstream_provider, upstream_provider_config) VALUES ($1, $2, 'aws_secrets_manager', '{}'::jsonb)"))
         .bind(reference).bind(SEED_ORG_ID).execute(&mut conn).await?;
-    sqlx::query(sql!("INSERT INTO sandbox_credential_injection_rules (sandbox_id, version, rules) VALUES ($1, 7, '\\xff'::bytea)"))
-        .bind(sandbox).execute(&mut conn).await?;
-    if !crate::baselines::is_public(&crate::POSTGRES_MIGRATOR) {
-        for rollback in [false, true, false] {
-            if rollback {
-                normalization_rollback
-                    .undo(&mut conn, NORMALIZATION_PREDECESSOR)
-                    .await?;
-            } else {
-                crate::POSTGRES_MIGRATOR.run(&mut conn).await?;
-            }
-            let legacy: (i64, Vec<u8>) = sqlx::query_as(sql!(
-                "SELECT version, rules FROM sandbox_credential_injection_rules WHERE sandbox_id = $1"
-            ))
-            .bind(sandbox)
-            .fetch_one(&mut conn)
-            .await?;
-            assert_eq!(legacy, (7, vec![0xff]));
-        }
-    }
     drop(conn);
     run_bootstrap(&fixture).await?;
-    let normalized: (bool, i64, i64) = sqlx::query_as(sql!(
-        "SELECT to_regclass('sandbox_credential_references') IS NULL,
-                (SELECT count(*) FROM sandbox_network_credential_injection_ruleset_version),
-                (SELECT count(*) FROM sandbox_network_credential_injection_rules)"
+    assert!(
+        role_has_table_privilege(&fixture, "space_credmgr", "credential_references", "SELECT")
+            .await?
+    );
+    assert!(
+        !role_has_table_privilege(
+            &fixture,
+            "space_credmgr",
+            "credential_references",
+            "INSERT,UPDATE,DELETE"
+        )
+        .await?
+    );
+    assert!(
+        role_has_table_privilege(
+            &fixture,
+            USER_ROLE,
+            "credential_references",
+            "INSERT,UPDATE,DELETE"
+        )
+        .await?
+    );
+    let timestamps: Vec<bool> = sqlx::query_scalar(sql!(
+        "UPDATE credential_references SET state = state WHERE id = $1 RETURNING created_at < updated_at AND updated_at = NOW()"
     ))
-    .fetch_one(&fixture.pool)
+    .bind(reference)
+    .fetch_all(&fixture.pool)
     .await?;
-    assert_eq!(normalized, (true, 0, 0));
-    for table in [
-        "credential_references",
-        "sandbox_network_credential_injection_ruleset_version",
-        "sandbox_network_credential_injection_rules",
-        "sandbox_credential_injection_rules",
-    ] {
-        assert!(role_has_table_privilege(&fixture, "space_credmgr", table, "SELECT").await?);
-        assert!(
-            !role_has_table_privilege(&fixture, "space_credmgr", table, "INSERT,UPDATE,DELETE")
-                .await?
-        );
-        assert!(
-            role_has_table_privilege(&fixture, USER_ROLE, table, "INSERT,UPDATE,DELETE").await?
-        );
-    }
-    let invalid_version = sqlx::query(sql!(
-        "INSERT INTO sandbox_network_credential_injection_ruleset_version (sandbox_id, version) VALUES ($1, 0)"
-    ))
-    .bind(sandbox)
-    .execute(&fixture.pool)
-    .await
-    .unwrap_err();
-    assert_sqlstate(&invalid_version, "23514");
-    sqlx::query(sql!(
-        "INSERT INTO sandbox_network_credential_injection_ruleset_version (sandbox_id, version) VALUES ($1, 1)"
-    ))
-    .bind(sandbox)
-    .execute(&fixture.pool)
-    .await?;
-    sqlx::query(sql!("INSERT INTO sandbox_network_credential_injection_rules (sandbox_id, rule_id, credential_reference_id, transformation_rule) VALUES ($1, 'one', $2, '{}'), ($1, 'two', $2, '{}')"))
-        .bind(sandbox).bind(reference).execute(&fixture.pool).await?;
-    for (statement, id) in [
-        (
-            "UPDATE credential_references SET state = state WHERE id = $1 RETURNING created_at < updated_at AND updated_at = NOW()",
-            reference,
-        ),
-        (
-            "UPDATE sandbox_network_credential_injection_ruleset_version SET version = version WHERE sandbox_id = $1 RETURNING created_at < updated_at AND updated_at = NOW()",
-            sandbox,
-        ),
-        (
-            "UPDATE sandbox_network_credential_injection_rules SET rule_id = rule_id WHERE sandbox_id = $1 RETURNING created_at < updated_at AND updated_at = NOW()",
-            sandbox,
-        ),
-    ] {
-        let timestamps: Vec<bool> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(statement)))
-            .bind(id)
-            .fetch_all(&fixture.pool)
-            .await?;
-        assert!(!timestamps.is_empty());
-        assert!(timestamps.iter().all(|updated| *updated), "{statement}");
-    }
-    for (id, source, expected) in [
-        ("one", reference, "23505"),
-        ("missing", CredentialReferenceId::new().as_uuid(), "23503"),
-    ] {
-        let error = sqlx::query(sql!("INSERT INTO sandbox_network_credential_injection_rules (sandbox_id, rule_id, credential_reference_id, transformation_rule) VALUES ($1, $2, $3, '{}')"))
-            .bind(sandbox).bind(id).bind(source).execute(&fixture.pool).await.unwrap_err();
-        assert_sqlstate(&error, expected);
-    }
-    sqlx::query(sql!("DELETE FROM sandboxes WHERE id = $1"))
-        .bind(sandbox)
-        .execute(&fixture.pool)
-        .await?;
-    let remaining: (i64, i64, i64, i64) = sqlx::query_as(sql!(
-        "SELECT (SELECT count(*) FROM sandbox_network_credential_injection_ruleset_version),
-                (SELECT count(*) FROM sandbox_network_credential_injection_rules),
-                (SELECT count(*) FROM sandbox_credential_injection_rules),
-                (SELECT count(*) FROM credential_references)"
-    ))
-    .fetch_one(&fixture.pool)
-    .await?;
-    assert_eq!(remaining, (0, 0, 0, 1));
+    assert_eq!(timestamps, vec![true]);
     Ok(())
 }
 
@@ -1101,5 +987,35 @@ async fn ro_reads_api_keys_without_key_hash() -> TestResult {
     sqlx::query(sql!("UPDATE api_keys SET name = name"))
         .execute(&mut user)
         .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn ro_reads_publication_grant_metadata_without_authorization_id() -> TestResult {
+    let Some(fixture) = postgres_fixture().await? else {
+        return Ok(());
+    };
+    run_bootstrap(&fixture).await?;
+    let mut conn = fixture.connect_as("postgres").await?;
+    assume_migrator_role(&mut conn).await?;
+    crate::POSTGRES_MIGRATOR.run(&mut conn).await?;
+    drop(conn);
+    run_bootstrap(&fixture).await?;
+
+    // This ID carries publication authority even though its name does not match
+    // the hash/bearer suffix inventory. Keep public metadata readable.
+    for (column, expected) in [("id", false), ("template_name", true)] {
+        let has: bool = sqlx::query_scalar(sql!(
+            "SELECT has_column_privilege($1, 'public.template_system_publication_grants'::regclass, $2, 'SELECT')"
+        ))
+        .bind(RO_ROLE)
+        .bind(column)
+        .fetch_one(&fixture.pool)
+        .await?;
+        assert_eq!(
+            has, expected,
+            "space_ro SELECT on publication grant {column}"
+        );
+    }
     Ok(())
 }

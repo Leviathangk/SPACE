@@ -32,7 +32,8 @@ use tonic::Status;
 use tower::{Layer, Service};
 
 use crate::auth::K8sIdentity;
-use crate::k8s_identity::CredmgrTokenReviewer;
+use crate::k8s_identity::{CredmgrTokenReviewer, K8sAuthConfig, K8sAuthConfigError};
+use tokio_util::sync::CancellationToken;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -50,12 +51,16 @@ pub enum TcpCallerIdentity {
 
 /// Authenticates TCP callers and resolves their identity. Cloned per request.
 enum Authenticator {
-    ProjectedToken(CredmgrTokenReviewer),
+    ProjectedToken(Box<CredmgrTokenReviewer>),
     StaticToken(String),
 }
 
 impl Authenticator {
-    async fn authenticate(&self, auth_header: Option<&str>) -> Result<TcpCallerIdentity, Status> {
+    async fn authenticate(
+        &self,
+        auth_header: Option<&str>,
+        extensions: &http::Extensions,
+    ) -> Result<TcpCallerIdentity, Status> {
         let token = bearer_token(auth_header)?;
 
         match self {
@@ -72,10 +77,10 @@ impl Authenticator {
                     );
                     return Err(Status::unauthenticated("invalid token"));
                 }
-                reviewer
-                    .authenticate(token)
-                    .await
-                    .map(TcpCallerIdentity::K8sJwt)
+                let caller = reviewer
+                    .resolve_token_identity(token, peer_ip(extensions))
+                    .await?;
+                Ok(TcpCallerIdentity::K8sJwt(caller))
             }
             Self::StaticToken(expected) => {
                 if constant_time_eq(token, expected) {
@@ -102,16 +107,22 @@ pub struct CredmgrTcpAuthLayer {
 }
 
 impl CredmgrTcpAuthLayer {
-    /// Build a Kubernetes listener that accepts projected ServiceAccount
-    /// tokens validated by `reviewer`. No static credential is retained.
-    pub fn projected_token(reviewer: CredmgrTokenReviewer) -> Self {
+    /// Build the projected-token authentication path, sharing one Kubernetes
+    /// client between TokenReview and the caller pod reflector.
+    pub async fn projected_token(
+        config: K8sAuthConfig,
+        database_pool: sqlx::PgPool,
+        shutdown: CancellationToken,
+    ) -> Result<Self, K8sAuthConfigError> {
+        let client = pplx_space_common_svc::kube_client::traced_kube_client_from_env().await?;
+        let reviewer = CredmgrTokenReviewer::new(config, client, database_pool, shutdown);
         tracing::info!(
             mode = "k8s_token_review",
             "credmgr TCP auth initialized; static token is not accepted"
         );
-        Self {
-            authenticator: Arc::new(Authenticator::ProjectedToken(reviewer)),
-        }
+        Ok(Self {
+            authenticator: Arc::new(Authenticator::ProjectedToken(Box::new(reviewer))),
+        })
     }
 
     /// Build a non-Kubernetes listener whose sole credential is the static
@@ -173,8 +184,12 @@ where
         Box::pin(async move {
             if !is_auth_exempt(&path) {
                 let identity = match auth_header {
-                    Some(Ok(header)) => authenticator.authenticate(Some(&header)).await?,
-                    None => authenticator.authenticate(None).await?,
+                    Some(Ok(header)) => {
+                        authenticator
+                            .authenticate(Some(&header), req.extensions())
+                            .await?
+                    }
+                    None => authenticator.authenticate(None, req.extensions()).await?,
                     Some(Err(_)) => {
                         pplx_space_metrics::auth::decision(
                             "static",
@@ -195,6 +210,19 @@ where
             Ok(response.map(tonic::body::Body::new))
         })
     }
+}
+
+fn peer_ip(extensions: &http::Extensions) -> Option<std::net::IpAddr> {
+    use tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
+    extensions
+        .get::<TcpConnectInfo>()
+        .and_then(|info| info.remote_addr)
+        .or_else(|| {
+            extensions
+                .get::<TlsConnectInfo<TcpConnectInfo>>()
+                .and_then(|info| info.get_ref().remote_addr)
+        })
+        .map(|addr| addr.ip())
 }
 
 /// Health and reflection bypass auth so Kubernetes gRPC probes work without a

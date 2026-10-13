@@ -223,7 +223,7 @@ impl BucketLocation {
             key,
             region: &self.region,
             // Real S3 only: a custom endpoint and path-style addressing are the
-            // local SeaweedFS harness's business, and the kind stack has its own
+            // local kind object store's business, and the kind stack has its own
             // publish Job.
             endpoint: None,
             path_style: false,
@@ -406,6 +406,7 @@ async fn resolved_latest_hash(
     template: &TemplateName,
 ) -> Result<Option<String>, RunTemplatePublishError> {
     let request = FindTemplateReleaseRequest {
+        generic_only: false,
         caller_org_id: None,
         template_name: template.as_str().to_string(),
         runtime: RUNTIME_FIRECRACKER_ALIAS.to_string(),
@@ -657,6 +658,7 @@ async fn register(
 ) -> Result<(), RunTemplatePublishError> {
     match cluster_api
         .register_template(RegisterTemplateRequest {
+            system_publication_grant_id: None,
             name: pin.template.as_str().to_string(),
             description: None,
             org_id: None,
@@ -682,6 +684,7 @@ async fn register(
     );
     cluster_api
         .register_template_release(RegisterTemplateReleaseRequest {
+            system_publication_grant_id: None,
             template_name: pin.template.as_str().to_string(),
             runtime: RUNTIME_FIRECRACKER_ALIAS.to_string(),
             hash: pin.content_hash.to_string(),

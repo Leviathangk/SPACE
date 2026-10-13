@@ -10,13 +10,15 @@ bash scripts/netgtw/traffic/run.sh
 The command installs the pinned peer libraries with `uv`, builds the gateway and
 its control fixture, then requests `sudo` on a devbox. It needs Linux, Python
 3.11+, a preinstalled `uv`, OpenSSL, `iproute2`, `nftables`, `procps`, `mount`,
-and `util-linux`, plus the repository's Rust/protobuf build tools. The SPACE devbox
+`util-linux`, plus the repository's Rust/protobuf build tools. The SPACE devbox
 and Buildkite command image supply these dependencies. The CI image pins and verifies its `uv`
 binary. The launcher requires `uv` on `PATH` and fails if it is missing; tool
 installation belongs to the CI image or developer setup.
 No running SPACE services, database, AWS resources, or VM are needed. Reserved
-DNS cases require outbound TCP/853 to Cloudflare (`1.1.1.1`) and Google
-(`8.8.8.8`); the other cases use local peers. Cargo and uv may download dependencies.
+DNS and domain-attribution cases require outbound TCP/853 to Cloudflare
+(`1.1.1.1`) and Google (`8.8.8.8`). Domain-attribution cases also depend on
+`sslip.io` answering synthetic names with the isolated peer's benchmark address;
+application traffic stays local. Cargo and uv may download dependencies.
 Peer libraries are isolated in `target/gateway-traffic/venv`. `requirements.txt`
 pins the complete dependency set; regenerate it from `requirements.in` with the
 `uv pip compile` command recorded at the top of that file.
@@ -44,10 +46,10 @@ real control RPC. Use a preceding DNS probe when a domain permit needs evidence.
 name = "Only the named service is reachable"
 
 [[steps]]
-policy = { default = "deny", allow = ["198.18.53.53", "api.example.test"] }
+policy = { default = "deny", allow = ["1.1.1.1", "api.198-18-1-2.sslip.io"] }
 probes = [
-  { kind = "dns-udp", target = "198.18.53.53", host = "api.example.test", expect = "answer" },
-  { kind = "tls", host = "api.example.test", expect = "allow" },
+  { kind = "dns-udp", target = "1.1.1.1", host = "api.198-18-1-2.sslip.io", expect = "answer" },
+  { kind = "tls", host = "api.198-18-1-2.sslip.io", expect = "allow" },
   { kind = "tls", host = "other.example.test", expect = "deny" },
 ]
 ```
@@ -73,7 +75,7 @@ only which headers matched, so neither results nor logs contain the credential.
 | `http2` | `198.18.1.2:8443` | `allow` / `deny`, verified TLS with required `h2` ALPN |
 | `grpc`, `grpcs` | `198.18.1.2:50051`, `:50052` | `allow` / `deny`, plaintext / verified TLS gRPC unary and bidirectional streaming |
 | `ws`, `wss` | `198.18.1.2:8081`, `:8444` | `allow` / `deny`, plaintext / verified TLS WebSocket upgrade, messages, ping/pong and close |
-| `quic` | `198.18.1.2:443` (UDP) | `allow` / `deny`, verified QUIC handshake and concurrent bidirectional streams |
+| `quic` | `198.18.1.2:443/8443` (UDP) | `allow` / `deny`, verified QUIC handshake and concurrent bidirectional streams |
 | `connect` | `198.18.1.2:8445` | `allow` / `deny`, authenticated HTTPS CONNECT with verified inner HTTPS |
 | `tls-echo` | `198.18.1.2:9443` | `allow` / `deny`, TLS SNI `host` and byte echo |
 | `udp` | `198.18.1.2:9000` | `allow` / `deny`; also accepts `port = 443` and a `sizes` array for multiple datagrams on one socket |
@@ -83,10 +85,25 @@ only which headers matched, so neither results nor logs contain the credential.
 Egress `target` can be `198.18.1.2`, `198.18.2.2`, `198.18.53.53`, `1.1.1.1`,
 `8.8.8.8`, or `169.254.169.254`. All are assigned inside the disposable network;
 even the metadata address is a test peer. Ordinary DNS fixtures answer every A
-query with `198.18.1.2`. Use UDP DNS to `198.18.53.53` to populate the gateway's
-DNS attribution cache for local domain cases, and allow that resolver IP in
-the policy. It is separate from both traffic targets so it grants neither one
-independent address permission. Generic TCP DNS does not populate attribution.
+query with `198.18.1.2`. Generic UDP/TCP DNS replies are relayed but never populate
+the gateway's DNS attribution cache. Case `03` checks the production boundary:
+a successful generic reply must leave HTTP/TLS denied; a subsequent reserved
+DNS reply for the same name and address must permit them.
+
+Domain cases resolve `*.198-18-1-2.sslip.io` through the reserved resolvers and
+require the answer `198.18.1.2`. This preserves exact/wildcard domain admission,
+hostname mismatch and policy-refresh coverage without trusting a guest-selected
+fixture resolver or adding a test-only gateway trust configuration. Resolver
+and authoritative-DNS failures fail these cases; they are not marked flaky.
+Only resolver IPs are independently allowed, not the application peer address.
+
+Guests using custom resolvers must use reserved DNS for domain-only egress and
+hostname-based TLS interception exemptions. Resolver transport still needs
+ordinary IP admission. Independent IP/default egress permissions continue to
+work, but do not supply the hostname binding needed for an exemption. Without
+trusted attribution, normal interception applies and certificate-pinned clients
+may fail. IP exemptions are independent of DNS evidence. The gateway's existing
+TLS-exemption unit table covers bound/unbound hosts with IP and default access.
 
 Reserved DNS is resolved through the real public upstreams. Its positive probes
 query `one.one.one.one` and assert `addresses = ["1.0.0.1", "1.1.1.1"]`, ignoring
@@ -99,8 +116,8 @@ WebSocket, and QUIC probes require `host`.
 HTTP/2 opens three streams concurrently with binary bodies larger than the
 initial stream and connection flow-control windows, checking full replies and
 stream completion. The TLS client requires `h2` ALPN, with no HTTP/1 fallback.
-TLS probes may set `alpn` plus `downstream_alpn` and `upstream_alpn` to assert
-the independently negotiated protocols on an intercepted connection.
+TLS and CONNECT probes may set `alpn` plus `downstream_alpn` and `upstream_alpn`
+to assert the independently negotiated protocols on an intercepted connection.
 gRPC uses grpcio clients and a grpcio server with protobuf `BytesValue` messages,
 checking unary replies, streaming message order/content, and final OK trailers.
 WebSockets check text and fragmented binary messages, pong contents, and a clean
@@ -132,23 +149,48 @@ in a later probe. An existing-session check never silently reconnects. See
 
 ### Established connections
 
-The UDP/QUIC allow probes require payload delivery after the first reply;
-UDP/443 probes also check the packaged pre-TPROXY counter increments.
+The UDP/QUIC allow probes require payload delivery after the first reply. QUIC/8443
+remains allowed; UDP/443 and QUIC/443 exercise the packaged rejection. UDP/443
+probes accept `ECONNREFUSED` or a timeout when the ICMP reply is rate-limited.
+Every sent datagram must increment the guardrail counter and none may reach
+upstream. The reply-boundary regression separately requires an isolated attempt
+to receive an explicit refusal and checks a 20-attempt burst.
 The [established-connection bypass](../../../crates/libs/node/mgr/server/src/firewall.rs)
 is restricted to reply-direction traffic so later outbound datagrams still
 reach the gateway proxy.
 
 The worker image packages `docker/space/nftables/sandbox-pre-tproxy-guardrails.json` under `/etc/space/nftables`.
-Its IPv4 UDP/443 counter is observation-only and applies on slot setup/reset, not live gateway restart.
+Its IPv4 UDP/443 reject and namespace `net.ipv4.icmp_ratemask=6168` apply on slot
+setup/reset. The default mask retains ICMP rate limits, including for
+destination-unreachable replies. Bursts may suppress some refusals, but every
+matching UDP/443 packet remains blocked; the source guard restricts replies to
+the guest's own address. Unconnected UDP clients may still
+wait for their handshake timeout. Non-443 QUIC, routed IPv6, and established
+flows are unchanged.
+
+On upgrade, startup marks idle slots unknown/non-allocatable until firewall
+validation passes. Observe-only or missing UDP/443 rejects fail validation and
+use the existing idle-slot rebuild path. Live leases are only marked degraded;
+they are not disconnected. **Rollout gate:** wait for recovery to finish, check
+the slot health/degraded count, inspect
+`pre_tproxy_guardrails` in every live namespace, and drain/reset stale leases
+(including long-lived ones) through normal sandbox lifecycle operations. Confirm
+the reject and `icmp_ratemask=6168` in each reused namespace before declaring the
+rollout complete; a healthy binary or aggregate action gauge is not that proof.
+
+For rollback, use only the recorded #253 observation image digest and follow
+the [per-namespace rollback procedure](#udp443-policy-rollback) below.
+
 The existing 15-second network metrics loop emits `node_mgr.guest_udp443_packets`, a gauge summing current kernel counters across active slots per `action:observe|reject` (from the rule verdict), without sandbox tags.
 These count conntrack-new packets, including retries, rather than unique flows. Use Datadog `monotonic_diff()` or rate calculations for volume visibility; slot resets/removals lower the sum, so the difference misses that interval.
 
 ### UDP/443 policy rollback
 
 Startup validation fences idle slots whose UDP/443 rule differs from the image's
-packaged policy; the existing repair path rebuilds them before reuse. Slot setup
-and reset restore the default `net.ipv4.icmp_ratemask=6168`; readiness validation
-also repairs mask-only drift. Before enabling a rejecting policy, deploy and
+packaged policy; the existing repair path rebuilds them before reuse. After
+rolling back to the observation image, slot setup/reset restores the default
+`net.ipv4.icmp_ratemask=6168`; readiness validation also repairs mask-only drift.
+Before enabling a rejecting policy, deploy and
 record a #253-or-later observation image digest as its rollback target. Older
 observation images do not repair stale rejecting namespaces.
 
@@ -223,7 +265,8 @@ audit, and preserved ingress rules.
 It also runs the real slot-pool startup worker and SQLite migrations, rebuilding
 idle namespaces seeded with the opposite UDP/443 stage and with mask-only drift,
 while leaving a current slot unchanged. Expected verdict and mask come from the
-packaged stage: observation/6168 or reject/6160. Namespace inodes must stay the
+packaged stage; both observation and rejection retain `icmp_ratemask=6168`.
+Mask-only drift is seeded with `0`. Namespace inodes must stay the
 same, proving in-place repair:
 
 ```sh
@@ -242,8 +285,8 @@ proxy rule generator and real nft JSON round-tripping.
 
 Plaintext hostname-bound connections do not support protocol upgrades. The
 WebSocket probe in `03-domain-rules.toml` therefore expects HTTP 403 with no
-upstream connection or payload, even after DNS attributes `allowed.test` to the
-destination. A transport failure or HTTP 502 cannot satisfy this denial.
+upstream connection or payload, even after trusted DNS attributes the allowed
+name to the destination. A transport failure or HTTP 502 cannot satisfy this denial.
 The adjacent WSS probe continues to require a successful WebSocket exchange.
 
 ## Evidence and isolation
@@ -292,6 +335,11 @@ Results go to a unique `target/gateway-traffic/run.*` directory: `results.json`,
 `junit.xml`, gateway/fixture logs, and `events.jsonl`. `manifest.json` records the
 commit, binary hashes, and exact selected TOML files. Each probe prints its
 result and elapsed time. The manifest also hashes the pinned peer dependencies.
+Direct TCP health checks connect from the destination's own address in its
+namespace. Their receipts go to `health-events.jsonl`, including late protocol
+control frames, so they cannot be mistaken for traffic from a denied probe.
+Gateway connections arrive from a different namespace and retain every receipt
+in `events.jsonl`.
 These are correctness timings; use the adjacent [performance bench](../bench/README.md)
 for throughput/CPU comparisons.
 

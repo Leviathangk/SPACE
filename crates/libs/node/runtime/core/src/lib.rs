@@ -1,11 +1,15 @@
 #[cfg(feature = "host-runtime")]
 pub mod cgroup;
+pub mod cgroup_paths;
 pub mod fc_api;
 #[cfg(feature = "host-runtime")]
 pub mod gateway_launch;
 #[cfg(feature = "host-runtime")]
 pub mod launch;
 
+#[cfg(feature = "artifact-store")]
+pub mod artifact_store;
+pub mod catalog;
 pub mod file_delta;
 
 pub mod runtime_inventory;

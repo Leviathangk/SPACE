@@ -202,14 +202,12 @@ impl DnsAttributionCacheUpdateResult {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DnsAttributionCacheObservationSource {
     ReservedDns,
-    GenericUdp53,
 }
 
 impl DnsAttributionCacheObservationSource {
     const fn as_str(self) -> &'static str {
         match self {
             Self::ReservedDns => "reserved_dns",
-            Self::GenericUdp53 => "generic_udp_53",
         }
     }
 }
@@ -710,6 +708,48 @@ pub fn tls_handshake_in_flight(leg: &str, active: usize, capacity: usize) {
     distribution(
         "gateway.tls.handshake.in_flight",
         active as f64,
+        &[
+            tag("leg", leg),
+            tag("capacity", capacity),
+            tag("git_sha", pplx_space_observability::git_sha()),
+        ],
+    );
+}
+
+/// One handshake admission decision. `result` is `immediate`, `queued`,
+/// `saturated` (the pool stayed full for the complete wait), or `closed`
+/// (the gateway is shutting down).
+pub fn tls_handshake_admission(leg: &str, result: &str) {
+    counter(
+        "gateway.tls.handshake.admission",
+        1,
+        &[
+            tag("leg", leg),
+            tag("result", result),
+            tag("git_sha", pplx_space_observability::git_sha()),
+        ],
+    );
+}
+
+/// Time one handshake waited for a pool permit. Immediate admissions emit no
+/// sample, so this measures only the waits that a full pool causes.
+pub fn tls_handshake_admission_wait_ms(leg: &str, result: &str, value_ms: f64) {
+    timing_ms(
+        "gateway.tls.handshake.admission.wait_ms",
+        value_ms,
+        &[
+            tag("leg", leg),
+            tag("result", result),
+            tag("git_sha", pplx_space_observability::git_sha()),
+        ],
+    );
+}
+
+/// Handshakes waiting for a permit on one leg of one gateway's shared pool.
+pub fn tls_handshake_queued(leg: &str, waiting: usize, capacity: usize) {
+    distribution(
+        "gateway.tls.handshake.queued",
+        waiting as f64,
         &[
             tag("leg", leg),
             tag("capacity", capacity),

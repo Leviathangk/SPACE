@@ -39,6 +39,7 @@ const (
 	SandboxManager_Resume_FullMethodName                                 = "/space.sandbox.manager.v1.SandboxManager/Resume"
 	SandboxManager_Wake_FullMethodName                                   = "/space.sandbox.manager.v1.SandboxManager/Wake"
 	SandboxManager_CreateSnapshot_FullMethodName                         = "/space.sandbox.manager.v1.SandboxManager/CreateSnapshot"
+	SandboxManager_WaitTemplateApps_FullMethodName                       = "/space.sandbox.manager.v1.SandboxManager/WaitTemplateApps"
 	SandboxManager_CreateTemplateBaseSnapshot_FullMethodName             = "/space.sandbox.manager.v1.SandboxManager/CreateTemplateBaseSnapshot"
 	SandboxManager_Suspend_FullMethodName                                = "/space.sandbox.manager.v1.SandboxManager/Suspend"
 	SandboxManager_PrepareTeardownSuspend_FullMethodName                 = "/space.sandbox.manager.v1.SandboxManager/PrepareTeardownSuspend"
@@ -98,7 +99,6 @@ const (
 	SandboxManager_ExportSandbox_FullMethodName                          = "/space.sandbox.manager.v1.SandboxManager/ExportSandbox"
 	SandboxManager_ImportSandbox_FullMethodName                          = "/space.sandbox.manager.v1.SandboxManager/ImportSandbox"
 	SandboxManager_ResolveSandboxMemory_FullMethodName                   = "/space.sandbox.manager.v1.SandboxManager/ResolveSandboxMemory"
-	SandboxManager_ReleaseExecution_FullMethodName                       = "/space.sandbox.manager.v1.SandboxManager/ReleaseExecution"
 )
 
 // SandboxManagerClient is the client API for SandboxManager service.
@@ -157,6 +157,9 @@ type SandboxManagerClient interface {
 	// For full: pause + FC snapshot + full memory file + resume.
 	// For disk: btrfs subvolume snapshot (instant CoW).
 	CreateSnapshot(ctx context.Context, in *CreateSnapshotRequest, opts ...grpc.CallOption) (*CreateSnapshotResponse, error)
+	// Internal: observe app startup before template-manager pauses a base-snapshot VM.
+	// Required app failures reject preparation; best-effort failures return warnings.
+	WaitTemplateApps(ctx context.Context, in *WaitTemplateAppsRequest, opts ...grpc.CallOption) (*WaitTemplateAppsResponse, error)
 	// Internal: create a template base snapshot for a template-owned sandbox.
 	// Produces template artifacts snapshot.base + vmstate.base.
 	CreateTemplateBaseSnapshot(ctx context.Context, in *CreateTemplateBaseSnapshotRequest, opts ...grpc.CallOption) (*CreateTemplateBaseSnapshotResponse, error)
@@ -280,12 +283,6 @@ type SandboxManagerClient interface {
 	ImportSandbox(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[ImportSandboxRequest, ImportSandboxResponse], error)
 	// Internal: resolve the effective sandbox memory policy for this node.
 	ResolveSandboxMemory(ctx context.Context, in *ResolveSandboxMemoryRequest, opts ...grpc.CallOption) (*ResolveSandboxMemoryResponse, error)
-	// Atomically release one runtime execution. An accepted response transfers
-	// teardown ownership to sandbox-manager: tracked rows are claimed durably
-	// and completed asynchronously, while a rowless local runtime is cleaned
-	// synchronously before the response. The caller detaches its task after
-	// either response disposition and performs no further sandbox teardown.
-	ReleaseExecution(ctx context.Context, in *ReleaseExecutionRequest, opts ...grpc.CallOption) (*ReleaseExecutionResponse, error)
 }
 
 type sandboxManagerClient struct {
@@ -479,6 +476,16 @@ func (c *sandboxManagerClient) CreateSnapshot(ctx context.Context, in *CreateSna
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CreateSnapshotResponse)
 	err := c.cc.Invoke(ctx, SandboxManager_CreateSnapshot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxManagerClient) WaitTemplateApps(ctx context.Context, in *WaitTemplateAppsRequest, opts ...grpc.CallOption) (*WaitTemplateAppsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(WaitTemplateAppsResponse)
+	err := c.cc.Invoke(ctx, SandboxManager_WaitTemplateApps_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1150,16 +1157,6 @@ func (c *sandboxManagerClient) ResolveSandboxMemory(ctx context.Context, in *Res
 	return out, nil
 }
 
-func (c *sandboxManagerClient) ReleaseExecution(ctx context.Context, in *ReleaseExecutionRequest, opts ...grpc.CallOption) (*ReleaseExecutionResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(ReleaseExecutionResponse)
-	err := c.cc.Invoke(ctx, SandboxManager_ReleaseExecution_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 // SandboxManagerServer is the server API for SandboxManager service.
 // All implementations must embed UnimplementedSandboxManagerServer
 // for forward compatibility.
@@ -1216,6 +1213,9 @@ type SandboxManagerServer interface {
 	// For full: pause + FC snapshot + full memory file + resume.
 	// For disk: btrfs subvolume snapshot (instant CoW).
 	CreateSnapshot(context.Context, *CreateSnapshotRequest) (*CreateSnapshotResponse, error)
+	// Internal: observe app startup before template-manager pauses a base-snapshot VM.
+	// Required app failures reject preparation; best-effort failures return warnings.
+	WaitTemplateApps(context.Context, *WaitTemplateAppsRequest) (*WaitTemplateAppsResponse, error)
 	// Internal: create a template base snapshot for a template-owned sandbox.
 	// Produces template artifacts snapshot.base + vmstate.base.
 	CreateTemplateBaseSnapshot(context.Context, *CreateTemplateBaseSnapshotRequest) (*CreateTemplateBaseSnapshotResponse, error)
@@ -1339,12 +1339,6 @@ type SandboxManagerServer interface {
 	ImportSandbox(grpc.ClientStreamingServer[ImportSandboxRequest, ImportSandboxResponse]) error
 	// Internal: resolve the effective sandbox memory policy for this node.
 	ResolveSandboxMemory(context.Context, *ResolveSandboxMemoryRequest) (*ResolveSandboxMemoryResponse, error)
-	// Atomically release one runtime execution. An accepted response transfers
-	// teardown ownership to sandbox-manager: tracked rows are claimed durably
-	// and completed asynchronously, while a rowless local runtime is cleaned
-	// synchronously before the response. The caller detaches its task after
-	// either response disposition and performs no further sandbox teardown.
-	ReleaseExecution(context.Context, *ReleaseExecutionRequest) (*ReleaseExecutionResponse, error)
 	mustEmbedUnimplementedSandboxManagerServer()
 }
 
@@ -1408,6 +1402,9 @@ func (UnimplementedSandboxManagerServer) Wake(context.Context, *WakeRequest) (*W
 }
 func (UnimplementedSandboxManagerServer) CreateSnapshot(context.Context, *CreateSnapshotRequest) (*CreateSnapshotResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateSnapshot not implemented")
+}
+func (UnimplementedSandboxManagerServer) WaitTemplateApps(context.Context, *WaitTemplateAppsRequest) (*WaitTemplateAppsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method WaitTemplateApps not implemented")
 }
 func (UnimplementedSandboxManagerServer) CreateTemplateBaseSnapshot(context.Context, *CreateTemplateBaseSnapshotRequest) (*CreateTemplateBaseSnapshotResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateTemplateBaseSnapshot not implemented")
@@ -1585,9 +1582,6 @@ func (UnimplementedSandboxManagerServer) ImportSandbox(grpc.ClientStreamingServe
 }
 func (UnimplementedSandboxManagerServer) ResolveSandboxMemory(context.Context, *ResolveSandboxMemoryRequest) (*ResolveSandboxMemoryResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ResolveSandboxMemory not implemented")
-}
-func (UnimplementedSandboxManagerServer) ReleaseExecution(context.Context, *ReleaseExecutionRequest) (*ReleaseExecutionResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method ReleaseExecution not implemented")
 }
 func (UnimplementedSandboxManagerServer) mustEmbedUnimplementedSandboxManagerServer() {}
 func (UnimplementedSandboxManagerServer) testEmbeddedByValue()                        {}
@@ -1923,6 +1917,24 @@ func _SandboxManager_CreateSnapshot_Handler(srv interface{}, ctx context.Context
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(SandboxManagerServer).CreateSnapshot(ctx, req.(*CreateSnapshotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxManager_WaitTemplateApps_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(WaitTemplateAppsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxManagerServer).WaitTemplateApps(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxManager_WaitTemplateApps_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxManagerServer).WaitTemplateApps(ctx, req.(*WaitTemplateAppsRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -2896,24 +2908,6 @@ func _SandboxManager_ResolveSandboxMemory_Handler(srv interface{}, ctx context.C
 	return interceptor(ctx, in, info, handler)
 }
 
-func _SandboxManager_ReleaseExecution_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ReleaseExecutionRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(SandboxManagerServer).ReleaseExecution(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: SandboxManager_ReleaseExecution_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(SandboxManagerServer).ReleaseExecution(ctx, req.(*ReleaseExecutionRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 // SandboxManager_ServiceDesc is the grpc.ServiceDesc for SandboxManager service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -2988,6 +2982,10 @@ var SandboxManager_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CreateSnapshot",
 			Handler:    _SandboxManager_CreateSnapshot_Handler,
+		},
+		{
+			MethodName: "WaitTemplateApps",
+			Handler:    _SandboxManager_WaitTemplateApps_Handler,
 		},
 		{
 			MethodName: "CreateTemplateBaseSnapshot",
@@ -3180,10 +3178,6 @@ var SandboxManager_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ResolveSandboxMemory",
 			Handler:    _SandboxManager_ResolveSandboxMemory_Handler,
-		},
-		{
-			MethodName: "ReleaseExecution",
-			Handler:    _SandboxManager_ReleaseExecution_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

@@ -45,17 +45,17 @@ const ALLOW_RESOLVE_NETWORK_CREDENTIALS: &[UdsPeerPrincipal] =
     &[UdsPeerPrincipal::Service(user_names::SPACE_SBXMGR)];
 
 /// Storage exchange is available only to the two local data-plane consumers.
-/// The shared Sandbox/Volume uid is mapped to Volume Manager for this RPC;
-/// Sandbox Manager has no legitimate storage-token call site.
+/// The old shared UID remains a Volume Manager actor during staged upgrades;
+/// remove that compatibility mapping only after its rollback path is retired.
 const ALLOW_EXCHANGE_TOKEN: &[UdsPeerPrincipal] = &[
+    UdsPeerPrincipal::Service(user_names::SPACE_VOLMGR),
     UdsPeerPrincipal::Service(user_names::SPACE_SBXMGR),
     UdsPeerPrincipal::Service(user_names::SPACE_TMPLMGR),
 ];
 
 /// Who may ask this node to sign a gateway CA: sandbox-manager, the only
-/// process holding both this socket's group and the control socket of every
-/// gateway it launched. A gateway cannot be named here — each runs under its own
-/// sandbox's uid, so peer credentials classify it as `Other`. Root is absent
+/// principal allowed to request gateway signing on this socket. A gateway cannot
+/// be named here — each runs under its own sandbox's uid, so peer credentials classify it as `Other`. Root is absent
 /// deliberately: naming the one service that mints is tighter than granting it to
 /// whatever else runs privileged on the node.
 const ALLOW_GATEWAY_CA_ISSUANCE: &[UdsPeerPrincipal] =
@@ -172,8 +172,8 @@ pub struct NodeCredentialManager {
 impl NodeCredentialManager {
     /// `peer_process_check_mode` is threaded from startup so an armed switch is
     /// consistently live on this resolver rather than silently dropped. It bears
-    /// on the one account this socket configures: sandbox-manager, the only
-    /// principal allowed to resolve injection rules or request certificate signing.
+    /// on the configured accounts. Sandbox-manager remains the only principal
+    /// allowed to resolve injection rules or request certificate signing.
     pub fn new(
         upstream: CredentialManagerGrpcClient,
         node_ca: Arc<NodeCa>,
@@ -190,6 +190,7 @@ impl NodeCredentialManager {
                     [
                         UdsPeerAccount::with_linux_user(users::SPACE_SBXMGR),
                         UdsPeerAccount::with_linux_user(users::SPACE_TMPLMGR),
+                        UdsPeerAccount::with_linux_user(users::SPACE_VOLMGR),
                     ],
                 )
                 .with_process_check_mode(peer_process_check_mode),
@@ -298,15 +299,16 @@ fn forwarded_exchange_request(
             "storage credential actor requires a UDS peer identity",
         ));
     };
-    let actor = if identity.uid() == users::SPACE_SBXMGR.uid {
-        ClientService::VolumeManager
-    } else if identity.uid() == users::SPACE_TMPLMGR.uid {
-        ClientService::TemplateManager
-    } else {
-        return Err(Status::permission_denied(
-            "local service is not authorized for storage credential exchange",
-        ));
-    };
+    let actor =
+        if identity.uid() == users::SPACE_VOLMGR.uid || identity.uid() == users::SPACE_SBXMGR.uid {
+            ClientService::VolumeManager
+        } else if identity.uid() == users::SPACE_TMPLMGR.uid {
+            ClientService::TemplateManager
+        } else {
+            return Err(Status::permission_denied(
+                "local service is not authorized for storage credential exchange",
+            ));
+        };
     request.actor_token = Some(actor.as_str().to_string());
     request.actor_token_type = Some(SERVICE_ACTOR_TOKEN_TYPE.to_string());
     Ok(request)
@@ -362,6 +364,9 @@ impl CredentialManager for NodeCredentialManager {
         &self,
         request: Request<IssueDekRequest>,
     ) -> Result<Response<IssueDekResponse>, Status> {
+        // Reject malformed scope locally before an upstream call; validation
+        // must remain available when the authority is unreachable.
+        crate::service::parse_organization_id(&request.get_ref().organization_id)?;
         let mut up = self.upstream.clone();
         self.forward("IssueDek", async move {
             up.issue_dek(request.into_inner()).await
@@ -373,6 +378,9 @@ impl CredentialManager for NodeCredentialManager {
         &self,
         request: Request<UnwrapDekRequest>,
     ) -> Result<Response<UnwrapDekResponse>, Status> {
+        // Reject malformed scope locally before an upstream call; validation
+        // must remain available when the authority is unreachable.
+        crate::service::parse_organization_id(&request.get_ref().organization_id)?;
         let mut up = self.upstream.clone();
         self.forward("UnwrapDek", async move {
             up.unwrap_dek(request.into_inner()).await

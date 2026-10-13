@@ -251,14 +251,7 @@ pub(super) async fn session_events(
                     let result = stream_bridge_error_label(&error);
                     pplx_space_metrics::data_plane::attach(session_id.kind().as_str(), result);
                     tracing::warn!(%error, "failed to start process event stream");
-                    return data_plane_http_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        DataPlaneHttpErrorCode::StreamUnavailable,
-                        "process event stream is not available",
-                        true,
-                        ResponseOrigin::Node,
-                        ResponseKind::BackendTransport,
-                    );
+                    return process_stream_start_http_error(&error);
                 }
             }
         }
@@ -271,6 +264,9 @@ pub(super) async fn session_events(
                     let result = stream_bridge_error_label(&error);
                     pplx_space_metrics::data_plane::attach(session_id.kind().as_str(), result);
                     tracing::warn!(%error, "failed to start file-watch event stream");
+                    if let Some(response) = backend_refusal_http_error(&error) {
+                        return response;
+                    }
                     return data_plane_http_error(
                         StatusCode::SERVICE_UNAVAILABLE,
                         DataPlaneHttpErrorCode::StreamUnavailable,
@@ -759,9 +755,21 @@ pub(super) fn revocation_state_is_active(revocation: &DataPlaneRevocationState) 
     revocation.status == DataPlaneRevocationStatus::Active as i32
 }
 
+/// Path parameters shared by the bare proxy route and its `{*path}` subpath
+/// mount.
+///
+/// The subpath mount captures two parameters, so a scalar `Path<String>`
+/// extractor rejects every subpath request with axum's 500
+/// `WrongNumberOfParameters` before the handler runs. Naming the field lets
+/// both routes deserialize; the proxied tail is read from the request URI.
+#[derive(Debug, Deserialize)]
+pub(super) struct ProxySessionPath {
+    pub(super) session_id: String,
+}
+
 pub(super) async fn proxy_session(
     State(state): State<DataPlaneState>,
-    Path(session_id): Path<String>,
+    Path(ProxySessionPath { session_id }): Path<ProxySessionPath>,
     mut request: Request<Body>,
 ) -> Result<Response, ProxyError> {
     reject_query_tokens(request.uri().query())?;
@@ -1209,6 +1217,97 @@ pub(super) async fn close_with_error(
     let _ = socket.close().await;
 }
 
+const MAX_CLIENT_FRAMES_DURING_OPEN: usize = 64;
+const MAX_CLIENT_BYTES_DURING_OPEN: usize = 1024 * 1024;
+/// How long a pong may wait for a client that stops reading before the client
+/// is treated as gone.
+const PONG_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+enum OpenWatch<T> {
+    Opened(T, VecDeque<Message>),
+    ClientClosed,
+    Overflow,
+}
+
+/// Drive the initial backend open while reading the client socket, so a client
+/// that disconnects mid-open drops the open. Pings are answered as the session
+/// loop does; other frames are kept, in order and within a bound, for that loop.
+///
+/// A pong is sent alongside the open and the client read, never instead of
+/// them, so a client that stops reading cannot stall either. Only the latest
+/// unanswered ping is kept, which bounds pings as the limits bound other frames.
+async fn open_while_watching_client<T, S, K>(
+    open: impl Future<Output = T>,
+    source: &mut S,
+    sink: &mut K,
+) -> OpenWatch<T>
+where
+    S: futures_util::Stream<Item = Result<Message, axum::Error>> + Unpin,
+    K: futures_util::Sink<Message> + Unpin,
+{
+    tokio::pin!(open);
+    let mut buffered = VecDeque::new();
+    let mut buffered_bytes = 0_usize;
+    // The payload of the ping to answer, and when its pong must be out by.
+    let mut pong: Option<(bytes::Bytes, tokio::time::Instant)> = None;
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut open => return OpenWatch::Opened(result, buffered),
+            // A send interrupted by another branch is retried; a repeated pong
+            // is harmless.
+            sent = send_pong(sink, pong.clone()), if pong.is_some() => match sent {
+                Ok(()) => pong = None,
+                Err(()) => return OpenWatch::ClientClosed,
+            },
+            message = source.next() => match message {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return OpenWatch::ClientClosed,
+                Some(Ok(Message::Ping(payload))) => {
+                    let deadline = pong.as_ref().map_or_else(
+                        || tokio::time::Instant::now() + PONG_SEND_TIMEOUT,
+                        |(_, deadline)| *deadline,
+                    );
+                    pong = Some((payload, deadline));
+                }
+                Some(Ok(message)) => {
+                    buffered_bytes = buffered_bytes.saturating_add(client_message_len(&message));
+                    buffered.push_back(message);
+                    if buffered.len() > MAX_CLIENT_FRAMES_DURING_OPEN
+                        || buffered_bytes > MAX_CLIENT_BYTES_DURING_OPEN
+                    {
+                        return OpenWatch::Overflow;
+                    }
+                }
+            },
+        }
+    }
+}
+
+/// Send a pending pong by its deadline; with none pending, never completes.
+async fn send_pong<K>(
+    sink: &mut K,
+    pong: Option<(bytes::Bytes, tokio::time::Instant)>,
+) -> Result<(), ()>
+where
+    K: futures_util::Sink<Message> + Unpin,
+{
+    let Some((payload, deadline)) = pong else {
+        return std::future::pending().await;
+    };
+    match tokio::time::timeout_at(deadline, sink.send(Message::Pong(payload))).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) | Err(_) => Err(()),
+    }
+}
+
+fn client_message_len(message: &Message) -> usize {
+    match message {
+        Message::Text(text) => text.as_str().len(),
+        Message::Binary(data) | Message::Ping(data) | Message::Pong(data) => data.len(),
+        Message::Close(_) => 0,
+    }
+}
+
 pub(super) async fn bridge_process_session(
     state: DataPlaneState,
     session_id: DataPlaneSessionId,
@@ -1216,7 +1315,30 @@ pub(super) async fn bridge_process_session(
     socket: WebSocket,
 ) -> Result<(), StreamBridgeError> {
     let (mut sink, mut source) = socket.split();
-    let initial = open_native_process_stream(&state, session_id, &mut attached, None).await;
+    let open = open_native_process_stream(&state, session_id, &mut attached, None);
+    let (initial, buffered) = match open_while_watching_client(open, &mut source, &mut sink).await {
+        OpenWatch::Opened(initial, buffered) => (initial, buffered),
+        // Dropping the open resets the backend stream, which cancels a start
+        // that is still queued downstream.
+        OpenWatch::ClientClosed => return Ok(()),
+        // The open may already have passed the guest's start, so a fresh
+        // session could run the command twice; only re-attaching this one is
+        // safe, which is not what `retryable` tells a client.
+        OpenWatch::Overflow => {
+            let _ = send_server_frame(
+                &mut sink,
+                &DataPlaneServerFrame::Error {
+                    code: DataPlaneErrorCode::SessionNotReady,
+                    message: "too many client frames before the session was ready".to_string(),
+                    retryable: false,
+                },
+            )
+            .await;
+            let _ = sink.close().await;
+            return Ok(());
+        }
+    };
+    let mut source = futures_util::stream::iter(buffered.into_iter().map(Ok)).chain(source);
     let mut stream = match initial {
         Ok((_client, initial)) => initial,
         Err(error) => {
@@ -1550,11 +1672,132 @@ async fn open_native_process_stream(
     .await
 }
 
+/// A backend refusal made before this request did anything (an admission
+/// limit, or the sandbox shutting down): retryable, with the backend's retry
+/// hint. It says nothing about an earlier attempt or an already running
+/// process, so the message claims only that this request was refused. The
+/// guest's own wording stays in the logs.
+fn backend_refusal_http_error(error: &StreamBridgeError) -> Option<Response> {
+    let StreamBridgeError::BackendStatus(status) = error else {
+        return None;
+    };
+    if !pplx_space_common_grpc::is_refused_before_start(status) {
+        return None;
+    }
+    let (http, code, message) = if status.code() == tonic::Code::ResourceExhausted {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            DataPlaneHttpErrorCode::RateLimited,
+            "sandbox is at capacity; this request was refused",
+        )
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            DataPlaneHttpErrorCode::ServiceUnavailable,
+            "sandbox is not accepting requests right now; this request was refused",
+        )
+    };
+    let mut response = data_plane_http_error(
+        http,
+        code,
+        message,
+        true,
+        ResponseOrigin::Node,
+        ResponseKind::Admission,
+    );
+    insert_retry_after(&mut response, pplx_space_common_grpc::retry_after(status));
+    Some(response)
+}
+
+fn guest_storage_full(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::ResourceExhausted
+        && status
+            .metadata()
+            .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
+            .and_then(|value| value.to_str().ok())
+            == Some(pplx_space_common_core::spaced::GUEST_STORAGE_FULL)
+}
+
+fn process_stream_start_http_error(error: &StreamBridgeError) -> Response {
+    if let Some(response) = backend_refusal_http_error(error) {
+        return response;
+    }
+    // The sandbox's disk or quota is full: not retryable until space is freed,
+    // and named as such rather than as a generic start failure.
+    if let StreamBridgeError::BackendStatus(status) = error
+        && guest_storage_full(status)
+    {
+        return data_plane_http_error(
+            StatusCode::BAD_REQUEST,
+            DataPlaneHttpErrorCode::InvalidRequest,
+            "sandbox storage is full",
+            false,
+            ResponseOrigin::Node,
+            ResponseKind::BackendStatus,
+        );
+    }
+    // Guest spawn failures are terminal for this command. Retrying a missing
+    // executable or working directory cannot repair it; route identity repair
+    // and transport failures must keep their existing retry contract.
+    let permanent = match error {
+        StreamBridgeError::BackendStatus(status)
+            if pplx_space_common_grpc::is_terminal_guest_process_error(status) =>
+        {
+            match status.code() {
+                tonic::Code::NotFound => {
+                    Some((StatusCode::NOT_FOUND, DataPlaneHttpErrorCode::NotFound))
+                }
+                tonic::Code::InvalidArgument
+                | tonic::Code::OutOfRange
+                | tonic::Code::FailedPrecondition
+                | tonic::Code::ResourceExhausted => Some((
+                    StatusCode::BAD_REQUEST,
+                    DataPlaneHttpErrorCode::InvalidRequest,
+                )),
+                tonic::Code::PermissionDenied => {
+                    Some((StatusCode::FORBIDDEN, DataPlaneHttpErrorCode::Forbidden))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    if let Some((status, code)) = permanent {
+        return data_plane_http_error(
+            status,
+            code,
+            "command could not be started",
+            false,
+            ResponseOrigin::Node,
+            ResponseKind::BackendTransport,
+        );
+    }
+    data_plane_http_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        DataPlaneHttpErrorCode::StreamUnavailable,
+        "process event stream is not available",
+        true,
+        ResponseOrigin::Node,
+        ResponseKind::BackendTransport,
+    )
+}
+
 fn stream_start_error_frame(error: &StreamBridgeError) -> DataPlaneServerFrame {
+    // A refusal made before anything started is retryable here as on SSE.
+    if let StreamBridgeError::BackendStatus(status) = error
+        && pplx_space_common_grpc::is_refused_before_start(status)
+    {
+        return DataPlaneServerFrame::Error {
+            code: DataPlaneErrorCode::BackendStreamError,
+            message: format!("this request was refused: {}", status.message()),
+            retryable: true,
+        };
+    }
     let retryable = matches!(
         error,
         StreamBridgeError::BackendStatus(status)
-            if backend_stream_status_retryable(status)
+            if !pplx_space_common_grpc::is_terminal_guest_process_error(status)
+                && backend_stream_status_retryable(status)
     );
     DataPlaneServerFrame::Error {
         code: DataPlaneErrorCode::BackendStreamError,
@@ -1676,10 +1919,18 @@ pub(super) async fn bridge_file_watch_session(
     socket: WebSocket,
 ) -> Result<(), StreamBridgeError> {
     let watch = file_watch_request(&attached)?;
-    let (_client, mut stream) =
-        open_native_watch_stream(&state, session_id, &mut attached, watch.clone()).await?;
-
     let (mut sink, mut source) = socket.split();
+    // As for a process: a failed opening, a refusal included, reaches the
+    // client as an error frame rather than a dropped socket.
+    let (_client, mut stream) =
+        match open_native_watch_stream(&state, session_id, &mut attached, watch.clone()).await {
+            Ok(opened) => opened,
+            Err(error) => {
+                let _ = send_server_frame(&mut sink, &stream_start_error_frame(&error)).await;
+                let _ = sink.close().await;
+                return Err(error);
+            }
+        };
     let mut event_seq = 0_u64;
     let mut revocation_tick = revocation_check_interval(&state);
 
@@ -2986,3 +3237,6 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

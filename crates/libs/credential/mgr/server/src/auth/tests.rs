@@ -213,6 +213,24 @@ fn uds_peer_process_checks_reject_when_enforcing() {
     assert_eq!(err.code(), tonic::Code::Unauthenticated, "{err:?}");
 }
 
+/// Root classifies ahead of any account match, so a root-owned test process
+/// can never reach a per-account check through the resolver. The
+/// allowlist-reaching half runs in common-svc against the snapshot's own uid,
+/// which root cannot divert. Classification reads only the presented uid, so
+/// this needs no root.
+#[test]
+fn uds_peer_root_classifies_before_the_binary_check() {
+    let resolver = resolver_with_armed_binary_check();
+    let mut request = Request::new(());
+    request
+        .extensions_mut()
+        .insert(PeerIdentity::new(0, 0, Some(std::process::id() as i32)));
+    let caller = resolver.resolve(&request).expect("root peer resolves");
+    resolver
+        .authorize_caller(&caller, "IssueDek", &[UdsPeerPrincipal::Root], &[])
+        .expect("root classifies before account matching; no account checks run");
+}
+
 #[test]
 fn uds_peer_binary_check_is_reached_when_uids_match() {
     // The uid-drift guard fires before the binary comparison whenever the
@@ -224,20 +242,10 @@ fn uds_peer_binary_check_is_reached_when_uids_match() {
     let pid = Some(std::process::id() as i32);
 
     if euid == 0 {
-        // Root classifies ahead of any account match, so a root-owned test
-        // process can never reach a per-account check through the resolver.
-        // Pin that short-circuit instead of silently skipping; the
-        // allowlist-reaching half runs in common-svc against the snapshot's
-        // own uid, which root cannot divert.
-        let resolver = resolver_with_armed_binary_check();
-        let mut request = Request::new(());
-        request
-            .extensions_mut()
-            .insert(PeerIdentity::new(0, 0, pid));
-        let caller = resolver.resolve(&request).expect("root peer resolves");
-        resolver
-            .authorize_caller(&caller, "IssueDek", &[UdsPeerPrincipal::Root], &[])
-            .expect("root classifies before account matching; no account checks run");
+        eprintln!(
+            "SKIPPED: root classifies before any account match; \
+             uds_peer_root_classifies_before_the_binary_check covers root"
+        );
         return;
     }
 
@@ -347,4 +355,97 @@ fn uds_peer_process_checks_do_not_run_before_the_allow_list() {
         .expect_err("principal is not in the allow-list");
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
     assert!(err.message().contains("is not authorized for"), "{err:?}");
+}
+
+const CREDENTIAL_RPC_PREFIX: &str = "/space.credential.manager.v1.CredentialManager/";
+
+#[tokio::test]
+async fn volume_listener_limits_both_peer_and_methods_before_dispatch() {
+    use tower::ServiceExt;
+
+    for (method, allowed) in [
+        ("ExchangeToken", true),
+        ("IssueDek", true),
+        ("UnwrapDek", true),
+        ("IssueIntermediateCertificate", false),
+        ("Encrypt", false),
+        ("Decrypt", false),
+        ("GetOrIssueSandboxVolumeDek", false),
+        ("SandboxVolumeEncryptionEnabled", false),
+        ("ResolveNetworkCredentials", false),
+        ("FutureMethod", false),
+    ] {
+        for uid in [users::SPACE_VOLMGR.uid, users::SPACE_SBXMGR.uid, 0, 65534] {
+            let dispatched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let observed = dispatched.clone();
+            let service = CredentialUdsAccess::Volume.layer(tower::service_fn(move |_| {
+                observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                async {
+                    Ok::<_, std::convert::Infallible>(http::Response::new(
+                        tonic::body::Body::empty(),
+                    ))
+                }
+            }));
+            let mut request = http::Request::builder()
+                .uri(format!("{CREDENTIAL_RPC_PREFIX}{method}"))
+                .body(())
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(PeerIdentity::new(uid, 951, Some(1)));
+            let result = service.oneshot(request).await;
+            let expected = allowed && uid == users::SPACE_VOLMGR.uid;
+            assert_eq!(
+                dispatched.load(std::sync::atomic::Ordering::SeqCst),
+                expected,
+                "{method}: {uid}"
+            );
+            let response = result.expect("authorization returns a gRPC response");
+            let status = Status::from_header_map(response.headers());
+            if expected {
+                assert!(
+                    status.is_none(),
+                    "the inner service answered {method}: {uid}"
+                );
+            } else {
+                assert_eq!(status.unwrap().code(), tonic::Code::PermissionDenied);
+            }
+        }
+    }
+}
+
+#[test]
+fn standard_listener_cannot_be_used_to_bypass_volume_policy() {
+    for uid in [
+        users::SPACE_VOLMGR.uid,
+        users::SPACE_SBXMGR.uid,
+        users::SPACE_TMPLMGR.uid,
+        0,
+    ] {
+        let mut request = Request::new(());
+        request
+            .extensions_mut()
+            .insert(PeerIdentity::new(uid, 951, Some(1)));
+        let result = CredentialUdsAccess::Standard.authorize(
+            &format!("{CREDENTIAL_RPC_PREFIX}IssueIntermediateCertificate"),
+            &request,
+            &volume_peer_authorizer(),
+        );
+        if uid == users::SPACE_VOLMGR.uid {
+            assert_eq!(result.unwrap_err().code(), tonic::Code::PermissionDenied);
+        } else {
+            result.unwrap(); // The existing handler still applies its own RPC policy.
+        }
+    }
+    assert_eq!(
+        CredentialUdsAccess::Volume
+            .authorize(
+                &format!("{CREDENTIAL_RPC_PREFIX}ExchangeToken"),
+                &Request::new(()),
+                &volume_peer_authorizer(),
+            )
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
 }

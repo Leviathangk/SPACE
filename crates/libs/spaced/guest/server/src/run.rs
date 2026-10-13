@@ -51,6 +51,11 @@ pub enum RunSpacedGuestError {
     Serve(#[from] RunGuestServerError),
 }
 
+// With the 10s drain these bound daemon exit; `TimeoutStopSec` in the seed's
+// spaced.service sits above their sum.
+const TELEMETRY_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const RUNTIME_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Runs `spaced-svc` end to end: this owns the whole process, which is why the
 /// binary's `main` is only a flag parser.
 ///
@@ -66,11 +71,17 @@ pub fn run(config: SpacedGuestRunConfig) -> Result<(), RunSpacedGuestError> {
         return Ok(());
     }
 
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(RunSpacedGuestError::Runtime)?
-        .block_on(async move {
+    // Move into the supervisor cgroup before the runtime, telemetry or anything
+    // else of size is allocated: memory stays charged to the cgroup it was
+    // allocated in, so it would otherwise sit outside the supervisor leaf.
+    if crate::native_vsock_available() {
+        drop(crate::cgroup::GuestCgroups::initialize_for_process());
+        #[cfg(target_os = "linux")]
+        crate::memlock::lock_text();
+    }
+
+    block_on_bounded(
+        async move {
             let telemetry =
                 pplx_space_common_svc::init_service(SERVICE_NAME).map_err(|source| {
                     RunSpacedGuestError::Telemetry {
@@ -80,9 +91,37 @@ pub fn run(config: SpacedGuestRunConfig) -> Result<(), RunSpacedGuestError> {
                 })?;
             let shutdown = pplx_space_common_svc::shutdown_token();
             let result = serve(config, shutdown).await;
-            pplx_space_common_svc::shutdown_telemetry(telemetry).await;
+            if tokio::time::timeout(
+                TELEMETRY_SHUTDOWN_TIMEOUT,
+                pplx_space_common_svc::shutdown_telemetry(telemetry),
+            )
+            .await
+            .is_err()
+            {
+                tracing::warn!("telemetry shutdown deadline exceeded");
+            }
             result
-        })
+        },
+        RUNTIME_SHUTDOWN_TIMEOUT,
+    )
+    .map_err(RunSpacedGuestError::Runtime)?
+}
+
+/// Runs `future` on a fresh multi-thread runtime, then shuts the runtime down
+/// within `shutdown_timeout`. Dropping a runtime waits for blocking threads
+/// without bound, and a thread can stay inside a child `spawn` past the drain
+/// deadline; such threads are left behind, and the unit's cgroup kill reaps any
+/// late child.
+fn block_on_bounded<F: std::future::Future>(
+    future: F,
+    shutdown_timeout: std::time::Duration,
+) -> std::io::Result<F::Output> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let output = runtime.block_on(future);
+    runtime.shutdown_timeout(shutdown_timeout);
+    Ok(output)
 }
 
 /// Serves the guest daemon on the caller's runtime until the service exits.

@@ -9,11 +9,11 @@ import space_smoke as smoke
 # received, nothing materialized, no template conjured from nowhere.
 #
 # Forcing, both kind-only and compensated: the fixture's own template is
-# removed from the other sandbox-pool worker (template-manager's
-# `delete-template`), and the cluster's `template_release_storage_locations`
-# rows for that template are withheld — saved first, the restore armed as a
-# critical compensation before the delete is dispatched, and put back inside
-# the scenario body. With the source cordoned the restore can only try the
+# withheld from the cluster's `template_release_storage_locations` first,
+# then removed from the other sandbox-pool worker (template-manager's
+# `delete-template`). The rows are saved first, their restoration armed as a
+# critical compensation before deletion, and put back inside the scenario
+# body. With the source cordoned the restore can only try the
 # cold worker. The rows go back only after the sandbox, its pods and its local
 # rows are gone: the kubelet keeps retrying the failed restore pod, and a retry
 # that can reach the parent again would bring the sandbox back up there.
@@ -34,12 +34,12 @@ def btrfs_send_restore_fails_closed_without_parent_source(test: smoke.KindEcw) -
 
     with test.phase("locate the source worker and the cold target"):
         source = restore.current_placement()
-        source_pod = codec.worker_pod(source.node_name)
-        target_node, target_pod = codec.other_sandbox_worker(source.node_name)
+        source_worker = source.node_name
+        target_node = codec.other_sandbox_worker(source.node_name)
         test.record("target_node", target_node)
 
     with test.phase("the worker resolves an omitted suspend format to the stream codec"):
-        codec.require_btrfs_send_default(source_pod)
+        codec.require_btrfs_send_default(source_worker)
 
     with test.phase("suspend without naming a format"):
         suspended_at = codec.mark_since()
@@ -52,9 +52,11 @@ def btrfs_send_restore_fails_closed_without_parent_source(test: smoke.KindEcw) -
         restore.wait_until_restore_portable()
 
     with restore.cordoned(source.node_name):
-        with test.phase("remove the parent from the target and withhold its cluster storage"):
-            codec.evict_template(target_pod, template)
+        with test.phase("withhold the parent's cluster storage, then evict it from the target"):
+            # Evicting first lets prefetch start a download that the restore
+            # can join even after its storage location has been withheld.
             codec.withhold_release_storage(template)
+            codec.evict_template(target_node, template)
             since = codec.mark_since()
 
         with test.phase("the restore fails at the client"):
@@ -71,8 +73,8 @@ def btrfs_send_restore_fails_closed_without_parent_source(test: smoke.KindEcw) -
             )
 
         with test.phase("nothing was materialized on the target"):
-            codec.expect_no_instance(target_pod)
-            codec.expect_template_absent(target_pod, template)
+            codec.expect_no_instance(target_node)
+            codec.expect_template_absent(target_node, template)
 
         with test.phase("delete the sandbox, then put the cluster's storage rows back"):
             codec.restore_release_storage()

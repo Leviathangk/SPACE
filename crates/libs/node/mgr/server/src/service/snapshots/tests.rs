@@ -1,6 +1,7 @@
 use super::{
-    ENC_SNAPSHOT_MEMORY_NAME, ENC_SNAPSHOT_VMSTATE_NAME, reown_encrypted_snapshot_inputs,
-    set_snapshot_export_modes, validate_cache_artifact_path,
+    ENC_SNAPSHOT_JAIL_SUBDIR, ENC_SNAPSHOT_MEMORY_NAME, ENC_SNAPSHOT_VMSTATE_NAME,
+    pin_encrypted_snapshot_bind, reown_encrypted_snapshot_inputs, set_snapshot_export_modes,
+    validate_cache_artifact_path,
 };
 use std::os::unix::fs::PermissionsExt;
 
@@ -173,6 +174,45 @@ fn encrypted_load_rejects_links_before_changing_ownership() {
     }
 }
 
+#[test]
+fn encrypted_bind_target_is_pinned_inside_the_jail() {
+    use std::os::unix::fs::{MetadataExt, symlink};
+
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let (volume, jail, outside) = (root.join("volume"), root.join("jail"), root.join("outside"));
+    for dir in [&volume, &jail, &outside] {
+        std::fs::create_dir(dir).unwrap();
+    }
+    let target = jail.join(ENC_SNAPSHOT_JAIL_SUBDIR);
+    symlink(&outside, &target).unwrap();
+
+    // Suspend and restore share this pin; neither may follow the planted link.
+    let mut reowned = false;
+    let error = pin_encrypted_snapshot_bind(&volume, &jail, |_, _| {
+        reowned = true;
+        Ok(())
+    })
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error}");
+    assert!(!reowned, "volume re-owned before its mountpoint was pinned");
+    assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+
+    std::fs::remove_file(&target).unwrap();
+    let (pinned_volume, pinned_target) =
+        pin_encrypted_snapshot_bind(&volume, &jail, |_, _| Ok(())).unwrap();
+    assert_eq!(
+        pinned_volume.metadata().unwrap().ino(),
+        std::fs::metadata(&volume).unwrap().ino()
+    );
+    let created = std::fs::symlink_metadata(&target).unwrap();
+    assert!(created.is_dir());
+    assert_eq!(pinned_target.metadata().unwrap().ino(), created.ino());
+    // A retry reuses the existing mountpoint.
+    let (_, retried) = pin_encrypted_snapshot_bind(&volume, &jail, |_, _| Ok(())).unwrap();
+    assert_eq!(retried.metadata().unwrap().ino(), created.ino());
+}
+
 fn cache_root() -> &'static str {
     pplx_space_common_core::host::linux::paths::SPACE_CACHE_DIR
 }
@@ -184,6 +224,8 @@ fn accepts_paths_strictly_inside_the_cache_root() {
     for suffix in [
         format!("{id}/snapshot"),
         format!("{id}/snapshots/name.gc-pending-x"),
+        // Sandbox-manager retires superseded snapshots here for the sweep.
+        format!("{id}/snapshots/.suspend-gc-pending-{id}"),
         format!(".fork-copies/{id}"),
     ] {
         validate_cache_artifact_path(&format!("{root}/{suffix}")).unwrap();
@@ -267,4 +309,425 @@ async fn detached_capture_finishes_its_cleanup_after_the_caller_cancels() {
         0,
         "a cancelled caller left a mount owned by no one"
     );
+}
+
+// A Firecracker API that accepts the connection and never answers fails the
+// pause or resume at its deadline instead of holding the VM gate forever.
+#[tokio::test]
+async fn a_firecracker_that_never_answers_fails_a_pause_state_change_at_its_deadline() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("firecracker.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let silent = tokio::spawn(async move {
+        let (connection, _) = listener.accept().await.unwrap();
+        // Hold the connection open without answering.
+        std::future::pending::<()>().await;
+        drop(connection);
+    });
+    let client = crate::fc_api::FcApiClient::new(&socket);
+    for paused in [false, true] {
+        let started = std::time::Instant::now();
+        let error =
+            super::set_firecracker_paused(&client, paused, std::time::Duration::from_millis(200))
+                .await
+                .expect_err("a silent Firecracker fails the change");
+        assert_eq!(error.code(), tonic::Code::DeadlineExceeded, "{paused}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+    silent.abort();
+}
+
+async fn service_with_stop(
+    code: tonic::Code,
+    failures: usize,
+) -> (
+    crate::service::NodeManagerService,
+    pplx_space_common_core::types::SandboxId,
+    tempfile::TempDir,
+    crate::runtime_supervisor_client::tests::StubSupervisorServer,
+) {
+    let (socket, client, server) =
+        crate::runtime_supervisor_client::tests::flaky_stop_client(code, failures).await;
+    let mut service = crate::service::tests::service_tests::service_for_unit_tests().await;
+    service.runtime_supervisor = client;
+    let id = pplx_space_common_core::types::SandboxId::new();
+    let fence = pplx_space_node_mgr_client::execution_fence::ExecutionFence::new(
+        pplx_space_common_core::types::SandboxActivationAttemptId::new(),
+        None,
+    );
+    service.pool.bind_execution(&id.to_string(), fence).unwrap();
+    (service, id, socket, server)
+}
+
+#[tokio::test]
+async fn encrypted_seal_stop_retries_while_the_runtime_is_still_exiting() {
+    for code in [tonic::Code::Internal, tonic::Code::Unavailable] {
+        let (service, id, _socket, server) = service_with_stop(code, 2).await;
+        super::stop_runtime_for_encrypted_seal(&service, &id.to_string())
+            .await
+            .expect("stop succeeds once the runtime finishes exiting");
+        crate::runtime_supervisor_client::tests::stop_supervisor_server(server).await;
+    }
+}
+
+#[tokio::test]
+async fn encrypted_seal_stop_gives_up_after_the_attempt_cap() {
+    let (service, id, _socket, server) =
+        service_with_stop(tonic::Code::Internal, super::ENC_CAPTURE_STOP_ATTEMPTS).await;
+
+    let error = super::stop_runtime_for_encrypted_seal(&service, &id.to_string())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Internal);
+
+    crate::runtime_supervisor_client::tests::stop_supervisor_server(server).await;
+}
+
+#[tokio::test]
+async fn encrypted_seal_stop_does_not_retry_other_failures() {
+    let (service, id, _socket, server) =
+        service_with_stop(tonic::Code::FailedPrecondition, 1).await;
+
+    let error = super::stop_runtime_for_encrypted_seal(&service, &id.to_string())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+
+    crate::runtime_supervisor_client::tests::stop_supervisor_server(server).await;
+}
+
+fn snapshot_volume(sandbox_id: &str) -> String {
+    format!("{}/{sandbox_id}/snapshot-vol", super::CACHE_DIR)
+}
+
+/// A service whose blocking host work is refused, with an allocated sandbox
+/// and a second sandbox whose execution is bound but which holds no lease.
+struct SnapshotFixture {
+    service: crate::service::NodeManagerService,
+    lease: crate::net::SlotInfo,
+    fence: crate::proto::ExecutionFence,
+    unallocated_id: String,
+    unallocated_fence: crate::proto::ExecutionFence,
+}
+
+impl SnapshotFixture {
+    async fn new() -> Self {
+        use crate::service::tests::service_tests::{
+            allocate_test_lease, bind_test_execution, refuse_host_work, service_for_unit_tests,
+        };
+
+        let mut service = service_for_unit_tests().await;
+        refuse_host_work(&mut service).await;
+        let id = super::SandboxId::new().to_string();
+        let fence = bind_test_execution(&service, &id);
+        let lease = allocate_test_lease(&service, &id);
+        let unallocated_id = super::SandboxId::new().to_string();
+        let unallocated_fence = bind_test_execution(&service, &unallocated_id);
+        Self {
+            service,
+            lease,
+            fence,
+            unallocated_id,
+            unallocated_fence,
+        }
+    }
+
+    fn lease_disturbed(&self, case: &str) -> Option<String> {
+        let current = self.service.pool.get(&self.lease.sandbox_id).unwrap();
+        (current
+            .as_ref()
+            .map(|lease| (lease.slot, lease.generation, lease.sandbox_uid, lease.pid))
+            != Some((
+                self.lease.slot,
+                self.lease.generation,
+                self.lease.sandbox_uid,
+                None,
+            )))
+        .then(|| format!("{case}: lease changed to {current:?}"))
+    }
+}
+
+// No case may pass validation for the allocated sandbox: the next step dials
+// the Firecracker API socket under the node's fixed jail directory. Rows whose
+// guard precedes the lease lookup use the unallocated sandbox, so dropping the
+// guard stops at the lease check instead. That includes the encrypted rows,
+// whose capture would otherwise bind into the jail.
+#[tokio::test]
+async fn create_snapshot_refuses_invalid_requests_before_dialing_firecracker() {
+    use crate::proto::CreateSnapshotRequest;
+    use crate::service::tests::service_tests::{refusal_mismatch, root_request, stale_test_fence};
+    use tonic::Code;
+
+    let fixture = SnapshotFixture::new().await;
+    let id = fixture.lease.sandbox_id.clone();
+    let valid = CreateSnapshotRequest {
+        sandbox_id: id.clone(),
+        snapshot_path: "/vmstate".into(),
+        mem_file_path: "/memory".into(),
+        execution_fence: Some(fixture.fence.clone()),
+        ..Default::default()
+    };
+    let unallocated = CreateSnapshotRequest {
+        sandbox_id: fixture.unallocated_id.clone(),
+        execution_fence: Some(fixture.unallocated_fence.clone()),
+        ..valid.clone()
+    };
+    let cases = [
+        (
+            "superseded execution",
+            CreateSnapshotRequest {
+                execution_fence: Some(stale_test_fence()),
+                ..unallocated.clone()
+            },
+            Code::FailedPrecondition,
+            "sandbox execution identity is missing or superseded",
+        ),
+        (
+            "vmstate path names another artifact",
+            CreateSnapshotRequest {
+                snapshot_path: "/memory".into(),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "snapshot_path must reference Firecracker artifact 'vmstate'",
+        ),
+        (
+            "memory path names another artifact",
+            CreateSnapshotRequest {
+                mem_file_path: "/vmstate".into(),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "mem_file_path must reference Firecracker artifact 'memory'",
+        ),
+        (
+            "destination outside the sandbox roots",
+            CreateSnapshotRequest {
+                dest_dir: Some(format!(
+                    "{}/{}/snapshot",
+                    super::CACHE_DIR,
+                    fixture.unallocated_id
+                )),
+                ..valid.clone()
+            },
+            Code::PermissionDenied,
+            "dest_dir is outside allowed runtime roots",
+        ),
+        (
+            "plaintext capture without a lease",
+            unallocated.clone(),
+            Code::Unavailable,
+            "snapshot lease is no longer active",
+        ),
+        (
+            "encrypted volume of another sandbox",
+            CreateSnapshotRequest {
+                snapshot_volume_mount_dir: Some(snapshot_volume(&id)),
+                ..unallocated.clone()
+            },
+            Code::InvalidArgument,
+            "path does not belong to this sandbox",
+        ),
+        (
+            "encrypted capture without a lease",
+            CreateSnapshotRequest {
+                snapshot_volume_mount_dir: Some(snapshot_volume(&fixture.unallocated_id)),
+                ..unallocated.clone()
+            },
+            Code::Unavailable,
+            "snapshot lease is no longer active",
+        ),
+    ];
+    let mut mismatches = Vec::new();
+    for (case, request, code, message) in cases {
+        let outcome = fixture.service.create_snapshot(root_request(request)).await;
+        mismatches.extend(refusal_mismatch(case, outcome, code, message));
+        mismatches.extend(fixture.lease_disturbed(case));
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+}
+
+// No invalid case may pass validation: the next step stages files or binds the
+// volume into the node's fixed jail directory, or waits for the Firecracker
+// socket. The valid encrypted loads show where validation ends: their volume
+// bind is the first blocking host step, which the fixture refuses. Rows whose
+// guard precedes the lease lookup and that stage nothing use the unallocated
+// sandbox, so dropping the guard stops at the lease check instead of polling
+// the jail's Firecracker socket. The encrypted rate-limit row shows the limit
+// is refused before the refused bind. The checkpoint row only shows it is
+// refused before the path checks: the source check first reads the sandbox's
+// checkpoint files under the fixed cache root, which do not exist, so no
+// plaintext row can reach the staging step, and a valid checkpoint load has no
+// row because that read's outcome depends on the host.
+#[tokio::test]
+async fn load_snapshot_refuses_invalid_requests_before_staging_the_jail() {
+    use crate::lifecycle_limiter::LifecycleMethod;
+    use crate::proto::{DriveRateLimit, LoadSnapshotRequest, TokenBucket};
+    use crate::service::tests::service_tests::{refusal_mismatch, root_request, stale_test_fence};
+    use tonic::Code;
+
+    let fixture = SnapshotFixture::new().await;
+    let id = fixture.lease.sandbox_id.clone();
+    let valid = LoadSnapshotRequest {
+        sandbox_id: id.clone(),
+        snapshot_path: "/vmstate".into(),
+        mem_file_path: "/memory".into(),
+        execution_fence: Some(fixture.fence.clone()),
+        ..Default::default()
+    };
+    let unallocated = LoadSnapshotRequest {
+        sandbox_id: fixture.unallocated_id.clone(),
+        execution_fence: Some(fixture.unallocated_fence.clone()),
+        ..valid.clone()
+    };
+    let bucket = Some(TokenBucket {
+        size: 1,
+        refill_time_ms: 1,
+    });
+    let cases = [
+        (
+            "superseded execution",
+            LoadSnapshotRequest {
+                execution_fence: Some(stale_test_fence()),
+                ..unallocated.clone()
+            },
+            Code::FailedPrecondition,
+            "sandbox execution identity is missing or superseded",
+        ),
+        (
+            "unallocated sandbox",
+            unallocated.clone(),
+            Code::Unavailable,
+            "snapshot lease is no longer active",
+        ),
+        (
+            "encrypted volume of another sandbox",
+            LoadSnapshotRequest {
+                snapshot_volume_mount_dir: Some(snapshot_volume(&fixture.unallocated_id)),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "path does not belong to this sandbox",
+        ),
+        (
+            "vmstate path names another artifact",
+            LoadSnapshotRequest {
+                snapshot_path: "/memory".into(),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "snapshot_path must reference Firecracker artifact 'vmstate'",
+        ),
+        (
+            "memory path names another artifact",
+            LoadSnapshotRequest {
+                mem_file_path: "/vmstate".into(),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "mem_file_path must reference Firecracker artifact 'memory'",
+        ),
+        (
+            "source other than the sandbox checkpoint",
+            LoadSnapshotRequest {
+                source_dir: Some(format!(
+                    "{}/{}/snapshot",
+                    super::CACHE_DIR,
+                    fixture.unallocated_id
+                )),
+                ..valid.clone()
+            },
+            Code::PermissionDenied,
+            "source_dir must be the sandbox checkpoint directory",
+        ),
+        (
+            "rate limit without bandwidth",
+            LoadSnapshotRequest {
+                rootfs_rate_limit: Some(DriveRateLimit {
+                    bandwidth: None,
+                    operations: bucket,
+                }),
+                ..unallocated.clone()
+            },
+            Code::InvalidArgument,
+            "rootfs_rate_limit.bandwidth is required",
+        ),
+        (
+            "rate limit without operations",
+            LoadSnapshotRequest {
+                rootfs_rate_limit: Some(DriveRateLimit {
+                    bandwidth: bucket,
+                    operations: None,
+                }),
+                ..unallocated.clone()
+            },
+            Code::InvalidArgument,
+            "rootfs_rate_limit.operations is required",
+        ),
+        (
+            "checkpoint load with a rate limit without bandwidth",
+            LoadSnapshotRequest {
+                source_dir: Some(format!("{}/{id}/snapshot", super::CACHE_DIR)),
+                rootfs_rate_limit: Some(DriveRateLimit {
+                    bandwidth: None,
+                    operations: bucket,
+                }),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "rootfs_rate_limit.bandwidth is required",
+        ),
+        (
+            "encrypted load with a rate limit without operations",
+            LoadSnapshotRequest {
+                snapshot_volume_mount_dir: Some(snapshot_volume(&id)),
+                rootfs_rate_limit: Some(DriveRateLimit {
+                    bandwidth: bucket,
+                    operations: None,
+                }),
+                ..valid.clone()
+            },
+            Code::InvalidArgument,
+            "rootfs_rate_limit.operations is required",
+        ),
+        (
+            "valid encrypted load",
+            LoadSnapshotRequest {
+                snapshot_volume_mount_dir: Some(snapshot_volume(&id)),
+                ..valid.clone()
+            },
+            Code::Cancelled,
+            "artifact work cancelled",
+        ),
+        (
+            "valid encrypted load with a rate limit",
+            LoadSnapshotRequest {
+                snapshot_volume_mount_dir: Some(snapshot_volume(&id)),
+                rootfs_rate_limit: Some(DriveRateLimit {
+                    bandwidth: bucket,
+                    operations: bucket,
+                }),
+                ..valid.clone()
+            },
+            Code::Cancelled,
+            "artifact work cancelled",
+        ),
+    ];
+    let mut mismatches = Vec::new();
+    for (case, request, code, message) in cases {
+        let outcome = fixture.service.load_snapshot(root_request(request)).await;
+        mismatches.extend(refusal_mismatch(case, outcome, code, message));
+        mismatches.extend(fixture.lease_disturbed(case));
+        if fixture
+            .service
+            .lifecycle_limiter
+            .snapshot(LifecycleMethod::LoadSnapshot)
+            != (0, 0)
+        {
+            mismatches.push(format!("{case}: refusal leaked its lifecycle permit"));
+            // A leaked permit would starve the remaining rows.
+            break;
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
 }

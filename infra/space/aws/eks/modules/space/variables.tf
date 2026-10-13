@@ -946,12 +946,6 @@ variable "cred_authority_instance_types" {
   default     = ["m7i.large"]
 }
 
-variable "honeytoken_external_secret_enabled" {
-  description = "Sync the space-honeytoken Secrets Manager value into the space namespace. Off until an operator has populated that value out-of-band (Terraform doesn't write it); an ExternalSecret pointed at an unpopulated secret reports SecretSyncError. The Secrets Manager read grant does not depend on this, so flipping it on is a single change."
-  type        = bool
-  default     = false
-}
-
 variable "mitm_root_ca_external_secret_enabled" {
   description = "Sync the space-mitm-root-ca Secrets Manager value (the public MITM root CA, sourced from the certificates stack in mitm_root_ca.tf) into the space namespace, where the space-build-manager chart mounts it into seed builds. On only where the certificates stack has a root; the Secrets Manager read grant does not depend on this."
   type        = bool
@@ -984,9 +978,20 @@ variable "cluster_smoke_ecw_api_key_external_secret_enabled" {
 }
 
 variable "network_credential_smoke_enabled" {
-  description = "Provision the fixed testing credential and grant Credential Authority direct Secrets Manager read access."
+  description = "Provision the fixed testing credential for the network-credential smoke. Requires network_credential_smoke_org_id."
   type        = bool
   default     = false
+}
+
+variable "network_credential_smoke_org_id" {
+  description = "Organization the network-credential smoke runs as. Tags the smoke fixture space-org-id=<org> so that organization's reader-role session can read it (credmgr_secrets_reader.tf). Required when network_credential_smoke_enabled is true."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.network_credential_smoke_org_id == null || can(regex("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", var.network_credential_smoke_org_id))
+    error_message = "network_credential_smoke_org_id must be a lowercase organization UUID."
+  }
 }
 
 variable "cluster_smoke_slack_webhook_external_secret_enabled" {

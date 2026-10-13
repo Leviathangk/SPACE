@@ -119,10 +119,12 @@ impl DirectRestoreCandidate {
 #[derive(Clone)]
 pub struct DirectSubstrate {
     pool: PgPool,
+    worker_channels: std::sync::Arc<super::worker_channels::WorkerChannels>,
 }
 
 const DIRECT_NODE_CREATE_FAILURE_TTL_SECS: i64 = 10;
 const DIRECT_NODE_RPC_TIMEOUT: Duration = crate::controllers::substrate::NODE_RPC_TIMEOUT;
+const DIRECT_NODE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const DIRECT_PULL_ON_CREATE_RPC_TIMEOUT: Duration = Duration::from_secs(600);
 const DIRECT_REMOTE_RESTORE_CANDIDATE_LIMIT: i64 = 7;
 
@@ -393,6 +395,7 @@ fn direct_restore_start_request(
 
 fn direct_wake_request(
     sandbox_id: SandboxId,
+    vcpu: Option<u32>,
     route_identity: Option<pplx_space_sbx_mgr_client::proto::SpaceApiRouteIdentity>,
     wake_activity: Option<ExecutionActivityKind>,
 ) -> pplx_space_sbx_mgr_client::proto::WakeRequest {
@@ -400,14 +403,31 @@ fn direct_wake_request(
         implicit_wake_source: wake_activity.map_or(0, ExecutionActivityKind::wake_source),
         sandbox_id: sandbox_id.to_string(),
         blocking: true,
-        start_context: route_identity.map(|route_identity| {
+        start_context: (route_identity.is_some() || vcpu.is_some()).then(|| {
             pplx_space_sbx_mgr_client::proto::WakeStartContext {
-                route_identity: Some(route_identity),
+                route_identity,
+                vcpu,
                 ..Default::default()
             }
         }),
         target_state: 0,
     }
+}
+
+/// Whether waking `resident` restores or starts it, which sandbox-manager
+/// admits only with a reserved route identity.
+fn resident_is_dormant(resident: &pplx_space_sbx_mgr_client::proto::SandboxInfo) -> bool {
+    use pplx_space_sbx_mgr_client::proto::SandboxLifecycleState;
+    matches!(
+        resident
+            .lifecycle
+            .and_then(|state| SandboxLifecycleState::try_from(state).ok()),
+        Some(
+            SandboxLifecycleState::Suspended
+                | SandboxLifecycleState::Stopped
+                | SandboxLifecycleState::Created
+        )
+    )
 }
 
 fn wake_requires_restore(status: &tonic::Status) -> bool {
@@ -648,7 +668,8 @@ impl DirectSubstrate {
         activity: Option<ExecutionActivityKind>,
     ) -> Result<pplx_space_sbx_mgr_client::proto::WakeRequest, SubstrateError> {
         let sandbox_id = sandbox.id;
-        let mut request = direct_wake_request(sandbox_id, route_identity, activity);
+        let vcpu = sandbox.vcpu.and_then(|value| u32::try_from(value).ok());
+        let mut request = direct_wake_request(sandbox_id, vcpu, route_identity, activity);
         let context = request.start_context.get_or_insert_default();
         context.activation_auto_lifecycle = Some(self.activation_auto_lifecycle(sandbox_id).await?);
         context.expected_execution_generation = expected_execution_generation;
@@ -656,7 +677,13 @@ impl DirectSubstrate {
     }
 
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            worker_channels: std::sync::Arc::new(super::worker_channels::WorkerChannels::new(
+                DIRECT_NODE_CONNECT_TIMEOUT,
+                DIRECT_NODE_RPC_TIMEOUT,
+            )),
+        }
     }
 
     async fn persist_route_identity_receipt(
@@ -1430,7 +1457,7 @@ impl DirectSubstrate {
         addr: &str,
         request_timeout: Duration,
     ) -> Result<Endpoint, SubstrateError> {
-        node_api_endpoint(addr, Duration::from_secs(3), request_timeout)
+        node_api_endpoint(addr, DIRECT_NODE_CONNECT_TIMEOUT, request_timeout)
     }
 
     async fn random_ready_nodes(&self, role: &str) -> Result<Vec<DirectNode>, SubstrateError> {
@@ -1908,8 +1935,15 @@ impl DirectSubstrate {
         &self,
         node: &DirectNode,
     ) -> Result<(Endpoint, RuntimeClient), SubstrateError> {
-        self.worker_client_for_node_with_timeout(node, DIRECT_NODE_RPC_TIMEOUT)
+        let endpoint = Self::endpoint(&node.node_api_endpoint)?;
+        let client = self
+            .worker_channels
+            .client(&node.node_api_endpoint)
             .await
+            .map_err(|err| SubstrateError::Unavailable {
+                message: format!("worker node {} not reachable: {err}", node.id),
+            })?;
+        Ok((endpoint, client))
     }
 
     async fn direct_node_by_id(&self, node_id: NodeId) -> Result<DirectNode, SubstrateError> {
@@ -3495,6 +3529,7 @@ impl SubstrateAdapter for DirectSubstrate {
                 .await?;
             let execution_generation = receipt_execution_generation(route_identity.as_ref());
             return Ok(CreateExecutionOutcome {
+                lease_completion: None,
                 sandbox_id,
                 binding: Some(ExecutionBinding {
                     execution_object_id: sandbox_id.to_string(),
@@ -3553,6 +3588,7 @@ impl SubstrateAdapter for DirectSubstrate {
             let execution_generation = receipt_execution_generation(route_identity.as_ref());
 
             return Ok(CreateExecutionOutcome {
+                lease_completion: None,
                 sandbox_id,
                 binding: Some(ExecutionBinding {
                     execution_object_id: sandbox_id.to_string(),
@@ -3674,6 +3710,7 @@ impl SubstrateAdapter for DirectSubstrate {
         let execution_generation = receipt_execution_generation(route_identity.as_ref());
 
         Ok(CreateExecutionOutcome {
+            lease_completion: None,
             sandbox_id,
             binding: Some(ExecutionBinding {
                 execution_object_id: sandbox_id.to_string(),
@@ -3876,20 +3913,18 @@ impl SubstrateAdapter for DirectSubstrate {
         // Missing published identity does not prove the resident is absent.
         // Keep the generation through transitional states: a Pausing or
         // Checkpointing resident may settle to Paused before Wake admits it.
-        // This fences only resident resume; dormant activation still uses the
-        // normal identity-required handshake.
+        // This fences only resident resume.
         let observed = observer
             .sandbox_state(pplx_space_sbx_mgr_client::proto::StateRequest {
                 sandbox_ids: vec![sandbox_id.to_string()],
             })
             .await;
-        let expected_execution_generation = match observed {
+        let resident = match observed {
             Ok(response) => response
                 .into_inner()
                 .sandboxes
                 .into_iter()
-                .find(|row| row.sandbox_id == sandbox_id.to_string())
-                .and_then(|row| row.execution_generation),
+                .find(|row| row.sandbox_id == sandbox_id.to_string()),
             Err(error) if error.code() == Code::NotFound => None,
             Err(error) => {
                 return Err(SubstrateError::Unavailable {
@@ -3897,11 +3932,25 @@ impl SubstrateAdapter for DirectSubstrate {
                 });
             }
         };
+        let expected_execution_generation =
+            resident.as_ref().and_then(|row| row.execution_generation);
+        // A dormant resident wakes by restore or start, which needs a reserved
+        // identity, so reserve it before the first attempt rather than after a
+        // refusal. The answers below still cover a resident that changed state
+        // in between.
+        let initial_identity = if resident.as_ref().is_some_and(resident_is_dormant) {
+            Some(
+                self.reserve_direct_activation_route_identity(sandbox_id, node.id)
+                    .await?,
+            )
+        } else {
+            None
+        };
         let initial_wake = client
             .wake_sandbox(
                 self.wake_request_with_policy(
                     sandbox,
-                    None,
+                    initial_identity,
                     expected_execution_generation,
                     wake_activity,
                 )

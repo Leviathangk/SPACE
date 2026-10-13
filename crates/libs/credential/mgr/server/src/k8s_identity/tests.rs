@@ -3,12 +3,30 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use k8s_openapi::api::authentication::v1::UserInfo;
 use kube::client::{Body, ClientBuilder};
+use pplx_space_common_core::types::NodeId;
+use pplx_space_common_svc::sql;
+use pplx_space_db_test_fixtures::{TestDb, TestDbResult, insert_ready_worker_node, pg_test_db};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
-const TEST_POD_NAME: &str = "credmgr-agent-abc";
+const TEST_POD_NAME: &str = "caller-pod";
 const TEST_POD_UID: &str = "018f1f4f-7e70-7f10-bc3c-12b1605a18c5";
 const TEST_NODE_NAME: &str = "kind-worker";
 const TEST_NODE_UID: &str = "kind-worker-uid";
+
+pub(crate) async fn registered_node_db() -> TestDbResult<(TestDb, NodeId)> {
+    let db = pg_test_db().await?;
+    let id = NodeId::new();
+    insert_ready_worker_node(&db.pool, id).await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid) VALUES ($1, $2, $3)"
+    ))
+    .bind(id)
+    .bind(TEST_NODE_NAME)
+    .bind(TEST_NODE_UID)
+    .execute(&db.pool)
+    .await?;
+    Ok((db, id))
+}
 
 fn test_config() -> K8sAuthConfig {
     K8sAuthConfig {
@@ -35,6 +53,10 @@ fn test_config() -> K8sAuthConfig {
 fn test_reviewer(config: K8sAuthConfig, client: kube::Client) -> CredmgrTokenReviewer {
     let review_limiter = Arc::new(tokio::sync::Semaphore::new(config.max_inflight_reviews));
     let rate_limiter = Arc::new(ReviewRateLimiter::new(config.review_rate_per_sec));
+    let (pods, mut writer) = reflector::store();
+    writer.apply_watcher_event(&watcher::Event::Init);
+    writer.apply_watcher_event(&watcher::Event::InitApply(pod()));
+    writer.apply_watcher_event(&watcher::Event::InitDone);
     CredmgrTokenReviewer {
         reviews: kube::Api::all(client),
         config: Arc::new(config),
@@ -42,6 +64,10 @@ fn test_reviewer(config: K8sAuthConfig, client: kube::Client) -> CredmgrTokenRev
         in_flight: Arc::new(Mutex::new(HashMap::new())),
         review_limiter,
         rate_limiter,
+        pods,
+        database_pool: sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/unused")
+            .unwrap(),
     }
 }
 
@@ -140,13 +166,33 @@ fn reviewer_returning_error(config: K8sAuthConfig) -> (CredmgrTokenReviewer, Arc
     (test_reviewer(config, client), calls)
 }
 
+pub(crate) fn caller_reviewer(
+    service: ClientService,
+    database_pool: sqlx::PgPool,
+) -> (CredmgrTokenReviewer, Arc<AtomicUsize>) {
+    let mut config = test_config();
+    config.allowed = build_allowed_map("space", [service.to_string()]).unwrap();
+    let reviewed = bound_status(
+        &config.audience,
+        &format!("system:serviceaccount:space:{service}"),
+        TEST_NODE_NAME,
+        TEST_NODE_UID,
+    );
+    let (mut reviewer, calls) = reviewer_returning_status(config, reviewed);
+    reviewer.database_pool = database_pool;
+    (reviewer, calls)
+}
+
 async fn assert_status_rejected(status: TokenReviewStatus) {
     let (reviewer, _) = reviewer_returning_status(test_config(), status);
-    let error = reviewer.authenticate(&projected_token()).await.unwrap_err();
+    let error = reviewer
+        .resolve_token_identity(&projected_token(), Some("10.0.0.2".parse().unwrap()))
+        .await
+        .unwrap_err();
     assert_eq!(error.code(), tonic::Code::Unauthenticated);
 }
 
-fn test_identity(service: ClientService) -> K8sIdentity {
+pub(crate) fn test_identity(service: ClientService) -> K8sIdentity {
     K8sIdentity::from_token_review(
         service,
         TEST_POD_NAME,
@@ -167,30 +213,6 @@ fn projected_token() -> String {
 }
 
 #[tokio::test]
-async fn valid_token_resolves_to_full_kubernetes_identity() {
-    let (reviewer, calls) = reviewer_returning_status(
-        test_config(),
-        bound_status(
-            "space-credential-manager",
-            "system:serviceaccount:space:space-volume-manager",
-            TEST_NODE_NAME,
-            TEST_NODE_UID,
-        ),
-    );
-    let token = projected_token();
-
-    let identity = reviewer.authenticate(&token).await.unwrap();
-    assert_eq!(identity.service(), ClientService::VolumeManager);
-    assert_eq!(identity.pod().pod_name().as_str(), TEST_POD_NAME);
-    assert_eq!(identity.pod().pod_uid().as_str(), TEST_POD_UID);
-    assert_eq!(identity.node().node_name().as_str(), TEST_NODE_NAME);
-    assert_eq!(identity.node().node_uid().as_str(), TEST_NODE_UID);
-    // Second call is served from cache: no extra TokenReview.
-    assert_eq!(reviewer.authenticate(&token).await.unwrap(), identity);
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
 async fn ordinary_service_without_pod_or_node_binding_is_rejected() {
     let mut unbound = status(
         "space-credential-manager",
@@ -201,7 +223,10 @@ async fn ordinary_service_without_pod_or_node_binding_is_rejected() {
         vec![TEST_NODE_NAME.to_owned()],
     )]));
     let (reviewer, calls) = reviewer_returning_status(test_config(), unbound);
-    let error = reviewer.authenticate(&projected_token()).await.unwrap_err();
+    let error = reviewer
+        .resolve_token_identity(&projected_token(), Some("10.0.0.2".parse().unwrap()))
+        .await
+        .unwrap_err();
     assert_eq!(error.code(), tonic::Code::Unauthenticated);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
@@ -319,40 +344,6 @@ async fn ordinary_service_with_multiple_node_uids_is_rejected() {
 }
 
 #[tokio::test]
-async fn node_agent_uses_full_identity_from_bound_token_review_and_cache() {
-    let mut config = test_config();
-    config.allowed = build_allowed_map("space", ["space-credential-manager".to_owned()]).unwrap();
-    let (reviewer, calls) = reviewer_returning_status(
-        config,
-        bound_status(
-            "space-credential-manager",
-            "system:serviceaccount:space:space-credential-manager",
-            TEST_NODE_NAME,
-            TEST_NODE_UID,
-        ),
-    );
-    let token = projected_token();
-
-    let identity = reviewer.authenticate(&token).await.unwrap();
-
-    assert_eq!(identity.service(), ClientService::NodeCredentialAgent);
-    assert_eq!(identity.pod().pod_name().as_str(), TEST_POD_NAME);
-    assert_eq!(identity.pod().pod_uid().as_str(), TEST_POD_UID);
-    assert_eq!(identity.node().node_name().as_str(), TEST_NODE_NAME);
-    assert_eq!(identity.node().node_uid().as_str(), TEST_NODE_UID);
-
-    let cached = reviewer.authenticate(&token).await.unwrap();
-    assert_eq!(
-        (
-            cached.node().node_name().as_str(),
-            cached.node().node_uid().as_str()
-        ),
-        (TEST_NODE_NAME, TEST_NODE_UID)
-    );
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
 async fn unrecognized_service_account_is_permission_denied() {
     let (reviewer, _) = reviewer_returning_status(
         test_config(),
@@ -361,7 +352,10 @@ async fn unrecognized_service_account_is_permission_denied() {
             "system:serviceaccount:space:space-node-manager",
         ),
     );
-    let err = reviewer.authenticate(&projected_token()).await.unwrap_err();
+    let err = reviewer
+        .resolve_token_identity(&projected_token(), Some("10.0.0.2".parse().unwrap()))
+        .await
+        .unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
 }
 
@@ -374,7 +368,10 @@ async fn audience_mismatch_is_unauthenticated() {
             "system:serviceaccount:space:space-api",
         ),
     );
-    let err = reviewer.authenticate(&projected_token()).await.unwrap_err();
+    let err = reviewer
+        .resolve_token_identity(&projected_token(), Some("10.0.0.2".parse().unwrap()))
+        .await
+        .unwrap_err();
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
 }
 
@@ -383,8 +380,14 @@ async fn apiserver_outage_is_retryable_and_not_cached() {
     let (reviewer, calls) = reviewer_returning_error(test_config());
     let token = projected_token();
 
-    let first = reviewer.authenticate(&token).await.unwrap_err();
-    let second = reviewer.authenticate(&token).await.unwrap_err();
+    let first = reviewer
+        .resolve_token_identity(&token, Some("10.0.0.2".parse().unwrap()))
+        .await
+        .unwrap_err();
+    let second = reviewer
+        .resolve_token_identity(&token, Some("10.0.0.2".parse().unwrap()))
+        .await
+        .unwrap_err();
 
     // Transient infrastructure failure: retryable, and not negative-cached
     // (each attempt re-reviews so a recovered apiserver validates at once).
@@ -673,5 +676,124 @@ fn validate_status_returns_username_on_success() {
             node_name: None,
             node_uid: None,
         })
+    );
+}
+
+fn pod() -> Pod {
+    serde_json::from_value(serde_json::json!({
+        "metadata": {"name": TEST_POD_NAME, "namespace": "space", "uid": TEST_POD_UID},
+        "status": {"phase": "Running", "podIPs": [{"ip": "10.0.0.2"}, {"ip": "2001:db8::2"}]}
+    }))
+    .unwrap()
+}
+
+#[tokio::test]
+async fn cached_identity_tracks_pod_state() {
+    use tonic::Code::{PermissionDenied, Unavailable};
+    use watcher::Event::{Apply, Delete, Init, InitDone};
+    let (db, _) = registered_node_db().await.unwrap();
+    let (mut reviewer, reviews) = caller_reviewer(ClientService::VolumeManager, db.pool.clone());
+    let (pods, mut writer) = reflector::store();
+    reviewer.pods = pods;
+    writer.apply_watcher_event(&Init);
+    let mut replacement = pod();
+    replacement.metadata.uid = Some("replacement-pod-uid".into());
+    let mut pending = pod();
+    pending.status.as_mut().unwrap().phase = Some("Pending".into());
+    let token = projected_token();
+    for (event, failure) in [
+        (None, Some((Unavailable, "pod_cache_not_synced"))),
+        (Some(InitDone), Some((PermissionDenied, "pod_not_found"))),
+        (Some(Apply(pod())), None),
+        (
+            Some(Apply(replacement)),
+            Some((PermissionDenied, "pod_uid_mismatch")),
+        ),
+        (
+            Some(Apply(pending)),
+            Some((PermissionDenied, "pod_not_running")),
+        ),
+        (
+            Some(Delete(pod())),
+            Some((PermissionDenied, "pod_not_found")),
+        ),
+        (Some(Apply(pod())), None),
+    ] {
+        if let Some(event) = event {
+            writer.apply_watcher_event(&event);
+        }
+        let result = reviewer
+            .resolve_token_identity(&token, Some("10.0.0.2".parse().unwrap()))
+            .await;
+        assert_eq!(
+            result.as_ref().err().map(|e| (e.code(), e.message())),
+            failure
+        );
+    }
+    assert_eq!(
+        reviews.load(Ordering::SeqCst),
+        1,
+        "pod state is never part of the token cache"
+    );
+}
+
+#[tokio::test]
+async fn cached_identity_tracks_postgres_registration() {
+    use tonic::Code::{PermissionDenied, Unavailable};
+    let (db, node_id) = registered_node_db().await.unwrap();
+    let closed_pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://localhost/unused")
+        .unwrap();
+    closed_pool.close().await;
+    let (mut reviewer, reviews) = caller_reviewer(ClientService::VolumeManager, db.pool.clone());
+    let token = projected_token();
+    // The same authenticated token must follow current name/UID registration,
+    // including deletion and a row that has not acquired its UID yet.
+    for (name, uid, registered) in [
+        (Some(TEST_NODE_NAME), Some(TEST_NODE_UID), true),
+        (Some("replacement-node"), Some(TEST_NODE_UID), false),
+        (Some(TEST_NODE_NAME), Some("replacement-uid"), false),
+        (Some(TEST_NODE_NAME), None, false),
+        (None, None, false),
+    ] {
+        sqlx::query(sql!("DELETE FROM node_k8s WHERE node_id = $1"))
+            .bind(node_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        if let Some(name) = name {
+            sqlx::query(sql!(
+                "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid) VALUES ($1, $2, $3)"
+            ))
+            .bind(node_id)
+            .bind(name)
+            .bind(uid)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+        let result = reviewer
+            .resolve_token_identity(&token, Some("10.0.0.2".parse().unwrap()))
+            .await;
+        let expected = (!registered).then_some((PermissionDenied, "node_identity_mismatch"));
+        assert_eq!(
+            result.as_ref().err().map(|e| (e.code(), e.message())),
+            expected,
+            "{name:?}/{uid:?}"
+        );
+    }
+    reviewer.database_pool = closed_pool.clone();
+    let result = reviewer
+        .resolve_token_identity(&token, Some("10.0.0.2".parse().unwrap()))
+        .await;
+    let expected = Some((Unavailable, "node_store_unavailable"));
+    assert_eq!(
+        result.as_ref().err().map(|e| (e.code(), e.message())),
+        expected
+    );
+    assert_eq!(
+        reviews.load(Ordering::SeqCst),
+        1,
+        "node registration is never part of the token cache"
     );
 }

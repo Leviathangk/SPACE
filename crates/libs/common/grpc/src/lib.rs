@@ -26,6 +26,10 @@
 //!   [`connect_uds_channel_with_retry`] when the caller only wants to buffer
 //!   initial channel establishment and will not also retry the same RPC.
 
+/// HTTP/2 frame size SPACE peers advertise, so a 64 KiB file chunk travels as
+/// one DATA frame instead of five.
+pub const BULK_HTTP2_MAX_FRAME_SIZE: u32 = 256 * 1024;
+
 mod active_requests;
 mod client;
 mod connect;
@@ -38,6 +42,7 @@ mod preface;
 pub use preface::PrefaceDeadline;
 #[cfg(feature = "internal-tls")]
 pub mod internal_transport;
+mod queued_slots;
 mod request_admission;
 mod request_body;
 mod retry;
@@ -46,15 +51,17 @@ mod sandbox_trace;
 mod server;
 pub use sandbox_trace::{
     SandboxTraceContext, record_guest_service_outcome, record_guest_service_status,
+    record_sandbox_id,
 };
 mod status;
 mod trace;
 
 pub use client::GrpcClient;
 pub use connect::{
-    UdsConnectError, connect_tcp_channel_with_retry, connect_uds_channel, connect_uds_channel_lazy,
+    TcpConnectError, UdsConnectError, connect_tcp_channel_with_retry,
+    connect_tcp_channel_with_retrying_redials, connect_uds_channel, connect_uds_channel_lazy,
     connect_uds_channel_with_endpoint, connect_uds_channel_with_endpoint_with_retry,
-    connect_uds_channel_with_retry,
+    connect_uds_channel_with_retry, retrying_redial_bound,
 };
 pub use context::GrpcRetryContext;
 pub use idempotency::generated_idempotency_key;
@@ -62,6 +69,7 @@ pub use policy::{
     DEFAULT_GRPC_CONNECT_RETRY_POLICY, DEFAULT_LOCAL_GRPC_RETRY_POLICY,
     DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY, GrpcRetryPolicy,
 };
+pub use queued_slots::{QueuedSlotWait, QueuedSlots, SlotRequest};
 pub use request_admission::{RequestAdmission, RequestPermit};
 pub use request_body::PreserveInputErrors;
 pub use retry::{
@@ -74,9 +82,10 @@ pub use status::{
     DESIRED_STATE_APPLY_TERMINAL_METADATA, GuestCapability, GuestCapabilityUnsupported,
     GuestServiceUnavailable, RETRY_AFTER_MS_METADATA, RateLimited, SandboxServiceRouteNotReady,
     UdsPerSandboxLimitExceeded, guest_capability_unsupported_status, guest_service_connect_status,
-    is_desired_state_apply_terminal, mark_desired_state_apply_terminal, rate_limited_status,
-    retry_after, sandbox_service_route_not_ready_status, uds_per_sandbox_limit_exceeded_status,
-    with_retry_after,
+    is_desired_state_apply_terminal, is_refused_before_start, is_terminal_guest_process_error,
+    mark_desired_state_apply_terminal, mark_guest_process_error, rate_limited_status,
+    refused_before_start, retry_after, sandbox_service_route_not_ready_status,
+    uds_per_sandbox_limit_exceeded_status, with_retry_after,
 };
 pub use trace::{
     CLIENT_SERVICE_METADATA_KEY, GrpcClientTrace, current_service_name, set_current_service_name,

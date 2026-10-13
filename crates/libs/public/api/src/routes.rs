@@ -171,16 +171,12 @@ macro_rules! native_operations {
     };
 }
 
-use NativeHttpMethod::{Delete, Get, Patch, Post, Put};
+use NativeHttpMethod::{Delete, Get, Patch, Post};
 use NativeOperationStatus::{Incubating, M1Supported};
 
 native_operations! {
     REGISTER_CREDENTIAL_REFERENCE = NativeOperation::new("/v1/credential-references", Post, "unstableRegisterCredentialReference", Incubating);
     DELETE_CREDENTIAL_REFERENCE = NativeOperation::new("/v1/credential-references/{credential_reference_id}", Delete, "unstableDeleteCredentialReference", Incubating);
-    LIST_CREDENTIALS = NativeOperation::new("/v1/credentials", Get, "listCredentials", Incubating);
-    CREATE_CREDENTIAL = NativeOperation::new("/v1/credentials", Post, "createCredential", Incubating);
-    DELETE_CREDENTIAL = NativeOperation::new("/v1/credentials/{credential_id}", Delete, "deleteCredential", Incubating);
-    UPDATE_CREDENTIAL = NativeOperation::new("/v1/credentials/{credential_id}", Put, "updateCredential", Incubating);
     GET_OPERATION = NativeOperation::new("/v1/operations/{operation_id}", Get, "getOperation", M1Supported);
     LIST_OPERATION_EVENTS = NativeOperation::new("/v1/operations/{operation_id}/events", Get, "listOperationEvents", Incubating);
     LIST_SANDBOXES = NativeOperation::new("/v1/sandboxes", Get, "listSandboxes", M1Supported);
@@ -233,6 +229,7 @@ native_operations! {
     STOP_SANDBOX = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:stop", SANDBOX_ACTION_RUNTIME_PATH, Post, "stopSandbox", Incubating);
     SUSPEND_SANDBOX = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:suspend", SANDBOX_ACTION_RUNTIME_PATH, Post, "suspendSandbox", M1Supported);
     WAKE_SANDBOX = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:wake", SANDBOX_ACTION_RUNTIME_PATH, Post, "wakeSandbox", M1Supported);
+    SET_SANDBOX_TIMEOUT = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:set_timeout", SANDBOX_ACTION_RUNTIME_PATH, Post, "setSandboxTimeout", Incubating);
     ATTACH_SESSION = NativeOperation::data_plane("/v1/sessions/{session_id}/attach", Get, "attachSession", Incubating);
     STREAM_SESSION_EVENTS = NativeOperation::data_plane("/v1/sessions/{session_id}/events", Get, "streamSessionEvents", M1Supported);
     PROXY_SESSION = NativeOperation::data_plane("/v1/sessions/{session_id}/proxy", Get, "proxySession", Incubating);

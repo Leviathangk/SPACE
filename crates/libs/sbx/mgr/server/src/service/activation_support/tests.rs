@@ -3,37 +3,63 @@ use super::*;
 
 mod interception_recovery;
 
-#[test]
-fn manager_rechecks_guest_identity_from_legacy_host_status() {
+#[tokio::test]
+async fn manager_checks_readiness_identity_with_legacy_status_fallback() {
     use pplx_space_spaced_host_client::proto::{GetStatusResponse, VersionInfo};
-    // The shared policy owns version parsing/ranges. This adapter must not
-    // trust an older sidecar's ready=true without checking its guest identity.
-    for (ready, guest, expected) in [
-        (true, Some(("0.1.0", "0.1")), None),
+    // The shared policy owns version parsing/ranges. The manager must validate
+    // the reported identity without probing again when WaitReady supplies it.
+    for (legacy, ready, guest, expected) in [
+        (false, true, Some(("0.1.0", "0.1")), None),
         (
+            false,
             true,
             Some(("0.9.0", "0.9")),
             Some(tonic::Code::FailedPrecondition),
         ),
-        (true, None, Some(tonic::Code::FailedPrecondition)),
         (
+            false,
+            true,
+            Some(("", "")),
+            Some(tonic::Code::FailedPrecondition),
+        ),
+        (true, true, Some(("0.1.0", "0.1")), None),
+        (
+            true,
+            true,
+            Some(("0.9.0", "0.9")),
+            Some(tonic::Code::FailedPrecondition),
+        ),
+        (true, true, None, Some(tonic::Code::FailedPrecondition)),
+        (
+            true,
             false,
             Some(("0.1.0", "0.1")),
             Some(tonic::Code::Unavailable),
         ),
     ] {
-        let status = GetStatusResponse {
-            ready,
-            guest_version: guest.map(|(version, compatibility_family)| VersionInfo {
-                version: version.to_string(),
-                compatibility_family: compatibility_family.to_string(),
-            }),
-            ..Default::default()
+        let guest = guest.map(|(version, compatibility_family)| VersionInfo {
+            version: version.to_string(),
+            compatibility_family: compatibility_family.to_string(),
+        });
+        let legacy_status = || {
+            assert!(
+                legacy,
+                "readiness identity must not trigger another guest probe"
+            );
+            std::future::ready(Ok(GetStatusResponse {
+                ready,
+                guest_version: guest.clone(),
+                ..Default::default()
+            }))
         };
         assert_eq!(
-            validate_ready_guest_status(&status)
-                .err()
-                .map(|error| error.code()),
+            validate_ready_guest_identity(
+                if legacy { None } else { guest.as_ref() },
+                legacy_status
+            )
+            .await
+            .err()
+            .map(|error| error.code()),
             expected
         );
     }
@@ -564,7 +590,7 @@ async fn restore_finalizer_retains_cleanup_until_state_persistence_succeeds() {
                 SandboxCleanupEpisodeId::new(),
             )
         };
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let temp = tempfile::tempdir().unwrap();
         let snapshot_dir = temp.path().join("snapshot");
         std::fs::create_dir(&snapshot_dir).unwrap();
@@ -605,7 +631,7 @@ async fn restore_finalizer_retains_cleanup_until_state_persistence_succeeds() {
 
 #[tokio::test]
 async fn cold_finalizer_retains_cleanup_until_state_persistence_succeeds() {
-    let service = SandboxManagerService::new(crate::db::test_conn());
+    let service = SandboxManagerService::for_test(crate::db::test_conn());
     let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel();
     let cleanup_guard = ActivationCleanupGuard::with_interruption_reason(
         SandboxRuntimeLabel::parse("runtime1").unwrap(),
@@ -616,7 +642,7 @@ async fn cold_finalizer_retains_cleanup_until_state_persistence_succeeds() {
         },
     );
 
-    spawn_guarded_start_state_transition(&service, cleanup_guard, async {
+    spawn_guarded_start_state_transition(&service, "runtime1", cleanup_guard, async {
         Err(Status::internal("failed to persist final start state"))
     })
     .unwrap();
@@ -629,7 +655,7 @@ async fn cold_finalizer_retains_cleanup_until_state_persistence_succeeds() {
 
 #[tokio::test]
 async fn cold_finalizer_disarms_cleanup_after_state_persistence_succeeds() {
-    let service = SandboxManagerService::new(crate::db::test_conn());
+    let service = SandboxManagerService::for_test(crate::db::test_conn());
     let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel();
     let cleanup_guard = ActivationCleanupGuard::with_interruption_reason(
         SandboxRuntimeLabel::parse("runtime1").unwrap(),
@@ -640,7 +666,8 @@ async fn cold_finalizer_disarms_cleanup_after_state_persistence_succeeds() {
         },
     );
 
-    spawn_guarded_start_state_transition(&service, cleanup_guard, async { Ok(()) }).unwrap();
+    spawn_guarded_start_state_transition(&service, "runtime1", cleanup_guard, async { Ok(()) })
+        .unwrap();
 
     assert!(cleanup_rx.await.is_err());
 }

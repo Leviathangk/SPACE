@@ -580,6 +580,7 @@ pub async fn run(
 
     let tcp_stats = stats.clone();
     let tls_interception = TlsInterception::new(certificates.requester());
+    let shutdown_tls_interception = tls_interception.clone();
     let tcp_network_state = network_state.clone();
     let tcp_dns_allow_cache = dns_allow_cache.clone();
     let tcp_reserved_dns = reserved_dns.clone();
@@ -696,6 +697,9 @@ pub async fn run(
                         ),
                     )
                     .layer(pplx_space_common_svc::grpc_trace_layer())
+                    .layer(pplx_space_common_svc::SandboxSpanLayer::new(
+                        trusted_sandbox_id,
+                    ))
                     .add_service(NetGatewayControlServer::new(service))
                     .serve_with_incoming(incoming)
             })
@@ -733,6 +737,7 @@ pub async fn run(
         .set_draining(NetworkStateReason::Shutdown)
         .await;
     proxy_shutdown_token.cancel();
+    shutdown_tls_interception.close_handshakes();
     if !authority_finished {
         join_with_deadline("gateway_authority", authority_task).await;
     }

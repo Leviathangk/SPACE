@@ -112,7 +112,12 @@ echo "Architecture: ${ARCH} (containerd: ${CONTAINER_PLATFORM}, rust: ${RUST_TAR
 OUTDIR="${SPACE_SEED_OUTPUT_DIR:-${REPO_ROOT}/templates/firecracker/seed/output/${ID}}"
 CACHEDIR="${SPACE_SEED_CACHE_DIR:-${REPO_ROOT}/templates/firecracker/seed/.cache}"
 GUEST_BINS=(spaced-svc spaced)
-CONTAINER_NAME="space-seed-builder-${ID}-$$"
+# containerd rejects container IDs longer than 76 characters. Embedding the raw
+# template ID made the name depend on both the ID length and the PID digit count,
+# so long IDs failed once a builder's PID counter passed 1,000,000. A short
+# digest keeps the name unique per ID and bounded (19 + 16 + 1 + <=7 digits).
+CONTAINER_ID_DIGEST="$(printf '%s' "$ID" | sha256sum | cut -c1-16)"
+CONTAINER_NAME="space-seed-builder-${CONTAINER_ID_DIGEST}-$$"
 STAGE_ROOT="${SPACE_SEED_STAGE_ROOT:-$(dirname "${CACHEDIR}")/scratch-bundles}"
 BUNDLE_DIR=""
 INPUT_DIR=""
@@ -294,34 +299,33 @@ if [[ -f "$default_kernel" ]]; then
   SPACE_SEED_KERNEL_DIGEST="${SPACE_SEED_KERNEL_DIGEST:-${kernel_digest}}"
 fi
 
-cat > "${INPUT_DIR}/rootfs-builder.env" <<EOF
-export SPACE_SEED_SOURCE_TYPE="${SPACE_SEED_SOURCE_TYPE}"
-export SPACE_SEED_UBUNTU_RELEASE="${SPACE_SEED_UBUNTU_RELEASE}"
-export SPACE_SEED_UBUNTU_VERSION="${SPACE_SEED_UBUNTU_VERSION}"
-export SPACE_SEED_UBUNTU_DATE="${SPACE_SEED_UBUNTU_DATE}"
-EOF
+# The build container sources this file as root, so recipe and host values
+# must stay data: %q quotes each one for bash, whatever characters it holds.
+ROOTFS_BUILDER_ENV="${INPUT_DIR}/rootfs-builder.env"
+: >"$ROOTFS_BUILDER_ENV"
+stage_env() {
+  local name
+  for name in "$@"; do
+    if [[ -n "${!name:-}" ]]; then
+      printf 'export %s=%q\n' "$name" "${!name}" >>"$ROOTFS_BUILDER_ENV"
+    fi
+  done
+}
 
-if [[ -n "${SPACE_SEED_RUNTIME:-}" ]]; then
-  printf 'export SPACE_SEED_RUNTIME="%s"\n' "${SPACE_SEED_RUNTIME}" >> "${INPUT_DIR}/rootfs-builder.env"
-fi
-if [[ -n "${SPACE_SEED_RUNTIME_VERSION:-}" ]]; then
-  printf 'export SPACE_SEED_RUNTIME_VERSION="%s"\n' "${SPACE_SEED_RUNTIME_VERSION}" >> "${INPUT_DIR}/rootfs-builder.env"
-fi
-if [[ -n "${SPACE_SEED_STATE_FORMAT_VERSION:-}" ]]; then
-  printf 'export SPACE_SEED_STATE_FORMAT_VERSION="%s"\n' "${SPACE_SEED_STATE_FORMAT_VERSION}" >> "${INPUT_DIR}/rootfs-builder.env"
-fi
-if [[ -n "${SPACE_SEED_KERNEL_VERSION:-}" ]]; then
-  printf 'export SPACE_SEED_KERNEL_VERSION="%s"\n' "${SPACE_SEED_KERNEL_VERSION}" >> "${INPUT_DIR}/rootfs-builder.env"
-fi
-if [[ -n "${SPACE_SEED_KERNEL_DIGEST:-}" ]]; then
-  printf 'export SPACE_SEED_KERNEL_DIGEST="%s"\n' "${SPACE_SEED_KERNEL_DIGEST}" >> "${INPUT_DIR}/rootfs-builder.env"
-fi
+stage_env \
+  SPACE_SEED_SOURCE_TYPE \
+  SPACE_SEED_UBUNTU_RELEASE \
+  SPACE_SEED_UBUNTU_VERSION \
+  SPACE_SEED_UBUNTU_DATE \
+  SPACE_SEED_RUNTIME \
+  SPACE_SEED_RUNTIME_VERSION \
+  SPACE_SEED_STATE_FORMAT_VERSION \
+  SPACE_SEED_KERNEL_VERSION \
+  SPACE_SEED_KERNEL_DIGEST
 
 # Prefer an explicit version from the outer launcher when available. Otherwise
 # rootfs-builder.sh will fall back to the workspace Cargo.toml copied below.
-if [[ -n "${SPACE_SEED_SPACED_VERSION:-}" ]]; then
-  printf 'export SPACE_SEED_SPACED_VERSION="%s"\n' "${SPACE_SEED_SPACED_VERSION}" >> "${INPUT_DIR}/rootfs-builder.env"
-fi
+stage_env SPACE_SEED_SPACED_VERSION
 
 if [[ -n "$CARGO_TOML_SOURCE" ]]; then
   cp "$CARGO_TOML_SOURCE" "${INPUT_DIR}/Cargo.toml"

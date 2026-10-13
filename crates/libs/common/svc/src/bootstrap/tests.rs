@@ -3,6 +3,44 @@ use http::HeaderValue;
 use tower_http::classify::{ClassifiedResponse, ClassifyResponse};
 
 #[test]
+fn staging_socket_recognition_follows_the_binder_and_rejects_other_names() {
+    for socket in [
+        "s",
+        "handoff.sock",
+        "volume-manager.sock",
+        "a-very-long-service-name.sock",
+    ] {
+        let path = Path::new(socket);
+        for attempt in 0..64 {
+            let staged =
+                unix_socket_staging_path_for_attempt(path, Uuid::now_v7(), attempt).unwrap();
+            assert!(is_unix_socket_staging_name(
+                path,
+                staged.file_name().unwrap()
+            ));
+        }
+    }
+    let path = Path::new("volume-manager.sock");
+    for name in [
+        "volume-manager.sock",
+        ".handoff-",
+        ".handoff-012345678!",
+        ".handoff-0123456789A",
+        ".handoff-012345678",
+        "xhandoff-0123456789",
+    ] {
+        assert!(
+            !is_unix_socket_staging_name(path, std::ffi::OsStr::new(name)),
+            "{name}"
+        );
+    }
+    assert!(!is_unix_socket_staging_name(
+        Path::new("/"),
+        std::ffi::OsStr::new("s")
+    ));
+}
+
+#[test]
 fn unix_socket_staging_path_preserves_the_published_path_budget() {
     let socket_path = Path::new(
         "/tmp/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.sock",
@@ -220,6 +258,44 @@ fn request_id_falls_back_to_correlation_id() {
 fn request_id_ignores_blank_header() {
     let mut headers = HeaderMap::new();
     headers.insert("x-request-id", HeaderValue::from_static("   "));
+    assert_eq!(request_id_from_headers(&headers), None);
+}
+
+#[test]
+fn request_id_accepts_only_bounded_token_characters() {
+    let longest = "a".repeat(128);
+    let too_long = "a".repeat(129);
+    for (value, accepted) in [
+        ("req_01a13274-0bc3-7355-9c00-50a16b9ef75e", true),
+        ("trace.span:1-2_3", true),
+        (longest.as_str(), true),
+        (too_long.as_str(), false),
+        ("two words", false),
+        ("req/../path", false),
+        ("\"quoted\"", false),
+        ("{\"json\":1}", false),
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_str(value).unwrap());
+        assert_eq!(
+            request_id_from_headers(&headers).is_some(),
+            accepted,
+            "{value:?}"
+        );
+    }
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-request-id",
+        HeaderValue::from_bytes(b"caf\xc3\xa9").unwrap(),
+    );
+    assert_eq!(request_id_from_headers(&headers), None, "non-ASCII");
+}
+
+#[test]
+fn request_id_rejects_an_invalid_request_id_rather_than_falling_back() {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-request-id", HeaderValue::from_static("not valid"));
+    headers.insert("x-correlation-id", HeaderValue::from_static("corr-456"));
     assert_eq!(request_id_from_headers(&headers), None);
 }
 

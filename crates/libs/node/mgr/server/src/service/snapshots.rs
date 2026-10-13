@@ -111,6 +111,12 @@ pub(super) const ENC_SNAPSHOT_JAIL_SUBDIR: &str = "encsnap";
 /// guards against an unexpected unmount that never reports "not mounted".
 const MAX_ENC_SNAPSHOT_BIND_DRAIN: usize = 8;
 
+/// Retries of the post-capture runtime stop. Firecracker can still be in kernel
+/// exit (KVM teardown) when the supervisor's cgroup removal gives up; the stop
+/// is idempotent, so re-issuing it once the exit finishes completes the seal.
+const ENC_CAPTURE_STOP_ATTEMPTS: usize = 8;
+const ENC_CAPTURE_STOP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// File names Firecracker writes into (suspend) and reads from (restore) the
 /// encrypted snapshot volume. Shared by the FC API paths and the load-side
 /// re-own list so they cannot drift apart.
@@ -133,6 +139,26 @@ fn reown_encrypted_snapshot_inputs(volume: &std::fs::File, uid: u32) -> Result<(
     reown(&vmstate, uid)?;
     reown(&memory, uid)?;
     reown(volume, uid)
+}
+
+/// Pin both ends of the encrypted-snapshot bind before re-owning the volume.
+/// The jail root belongs to the sandbox uid, so its mountpoint is opened
+/// relative to the pinned jail rather than looked up again by pathname.
+fn pin_encrypted_snapshot_bind(
+    mount_dir: &Path,
+    jail_root: &Path,
+    reown: impl FnOnce(&std::fs::File, u32) -> Result<(), Status>,
+) -> Result<(std::fs::File, std::fs::File), Status> {
+    let volume = super::trusted_paths::open_directory(mount_dir)?;
+    let jail = super::trusted_paths::open_directory(jail_root)?;
+    let uid = jail
+        .metadata()
+        .map_err(|e| Status::internal(e.to_string()))?
+        .uid();
+    let target =
+        super::trusted_paths::open_bind_directory(&jail, ENC_SNAPSHOT_JAIL_SUBDIR.as_ref())?;
+    reown(&volume, uid)?;
+    Ok((volume, target))
 }
 
 fn stage_plaintext_snapshot_inputs(
@@ -202,8 +228,14 @@ impl NodeManagerService {
     ) -> Result<Response<PauseSandboxResponse>, Status> {
         self.authorize_peer(&request, "PauseSandbox", ALLOW_NODE_ADMIN_OR_SBXMGR)?;
         let req = request.into_inner();
-        self.set_vm_paused(req.sandbox_id, req.execution_fence, true)
-            .await?;
+        let balloon_hint_timeout = req.balloon_hint_timeout_ms.map(balloon_hint_timeout);
+        self.set_vm_paused(
+            req.sandbox_id,
+            req.execution_fence,
+            true,
+            balloon_hint_timeout,
+        )
+        .await?;
         Ok(Response::new(PauseSandboxResponse {}))
     }
 
@@ -213,7 +245,7 @@ impl NodeManagerService {
     ) -> Result<Response<ResumeSandboxResponse>, Status> {
         self.authorize_peer(&request, "ResumeSandbox", ALLOW_NODE_ADMIN_OR_SBXMGR)?;
         let req = request.into_inner();
-        self.set_vm_paused(req.sandbox_id, req.execution_fence, false)
+        self.set_vm_paused(req.sandbox_id, req.execution_fence, false, None)
             .await?;
         Ok(Response::new(ResumeSandboxResponse {}))
     }
@@ -223,6 +255,7 @@ impl NodeManagerService {
         sandbox_id: String,
         fence: Option<crate::proto::ExecutionFence>,
         paused: bool,
+        balloon_hint_timeout: Option<std::time::Duration>,
     ) -> Result<(), Status> {
         validate_sandbox_id(&sandbox_id)?;
         let owner = sandbox_id.clone();
@@ -232,12 +265,10 @@ impl NodeManagerService {
             service.check_execution(&sandbox_id, fence.as_ref(), false)?;
             let api_socket = format!("{JAIL_DIR}/firecracker/{sandbox_id}/root/firecracker.sock");
             let client = crate::fc_api::FcApiClient::new(api_socket);
-            if paused {
-                client.pause().await
-            } else {
-                client.resume().await
+            if let Some(hint_timeout) = balloon_hint_timeout {
+                prepare_balloon_for_snapshot(&client, &sandbox_id, hint_timeout).await;
             }
-            .map_err(|error| Status::internal(format!("set VM pause state: {error}")))
+            set_firecracker_paused(&client, paused, VM_PAUSE_STATE_TIMEOUT).await
         })
         .await
     }
@@ -433,20 +464,13 @@ impl NodeManagerService {
             async move {
                 let _guard = guard;
                 let bind = {
-                    let jail_bind = jail_bind.clone();
                     tokio::task::spawn_blocking(move || -> Result<(), Status> {
-                        let volume = super::trusted_paths::open_directory(Path::new(&mount_dir))?;
-                        let jail = super::trusted_paths::open_directory(Path::new(&jail_root))?;
-                        let uid = jail
-                            .metadata()
-                            .map_err(|e| Status::internal(e.to_string()))?
-                            .uid();
-                        super::trusted_paths::reown(&volume, uid)?;
-                        std::fs::create_dir_all(&jail_bind).map_err(|e| {
-                            Status::internal(format!("create encrypted-snapshot jail dir: {e}"))
-                        })?;
-                        super::trusted_paths::bind_pinned(&volume, Path::new(&jail_bind))?;
-                        Ok(())
+                        let (volume, target) = pin_encrypted_snapshot_bind(
+                            Path::new(&mount_dir),
+                            Path::new(&jail_root),
+                            super::trusted_paths::reown,
+                        )?;
+                        super::trusted_paths::bind_pinned_files(&volume, &target)
                     })
                     .await
                     .map_err(|e| {
@@ -494,7 +518,7 @@ impl NodeManagerService {
                 // Stop the runtime to drop the mmap, then drain any remaining
                 // encsnap bind, so the volume can be sealed. Both are no-ops for
                 // a fresh capture (no restore pin).
-                stop_sandbox_runtime_with_supervisor(&service, &sandbox_id, true, None).await?;
+                stop_runtime_for_encrypted_seal(&service, &sandbox_id).await?;
                 let _ = tokio::task::spawn_blocking(move || {
                     for _ in 0..MAX_ENC_SNAPSHOT_BIND_DRAIN {
                         match unmount_if_present(&jail_bind) {
@@ -558,8 +582,15 @@ impl NodeManagerService {
     ) -> Result<Response<LoadSnapshotResponse>, Status> {
         let req = request.get_ref();
         validate_sandbox_id(&req.sandbox_id)?;
+        // Validate before either path stages the jail or re-owns the snapshot
+        // files, and so before the load, which cannot be undone short of
+        // killing the VM.
+        let rootfs_limiter = req
+            .rootfs_rate_limit
+            .as_ref()
+            .map(drive_rate_limiter)
+            .transpose()?;
         let jail_root = format!("{JAIL_DIR}/firecracker/{}/root", req.sandbox_id);
-        let api_socket = format!("{jail_root}/firecracker.sock");
         let _lifecycle_permit = self
             .lifecycle_limiter
             .acquire(crate::lifecycle_limiter::LifecycleMethod::LoadSnapshot)
@@ -581,24 +612,16 @@ impl NodeManagerService {
             .filter(|p| !p.is_empty())
         {
             super::trusted_paths::validate_snapshot_volume(&req.sandbox_id, mount_dir)?;
-            let jail_bind = format!("{jail_root}/{ENC_SNAPSHOT_JAIL_SUBDIR}");
             {
-                let jail_bind = jail_bind.clone();
                 let jail_root = jail_root.clone();
                 let mount_dir = mount_dir.to_string();
                 self.off_runtime("bind encrypted snapshot volume", move || {
-                    let volume = super::trusted_paths::open_directory(Path::new(&mount_dir))?;
-                    let jail = super::trusted_paths::open_directory(Path::new(&jail_root))?;
-                    let uid = jail
-                        .metadata()
-                        .map_err(|e| Status::internal(e.to_string()))?
-                        .uid();
-                    reown_encrypted_snapshot_inputs(&volume, uid)?;
-                    std::fs::create_dir_all(&jail_bind).map_err(|e| {
-                        Status::internal(format!("create encrypted-snapshot jail dir: {e}"))
-                    })?;
-                    super::trusted_paths::bind_pinned(&volume, Path::new(&jail_bind))?;
-                    Ok(())
+                    let (volume, target) = pin_encrypted_snapshot_bind(
+                        Path::new(&mount_dir),
+                        Path::new(&jail_root),
+                        reown_encrypted_snapshot_inputs,
+                    )?;
+                    super::trusted_paths::bind_pinned_files(&volume, &target)
                 })
                 .await?;
             }
@@ -609,8 +632,8 @@ impl NodeManagerService {
             self.finish_load_snapshot(
                 &lease,
                 &req.sandbox_id,
+                rootfs_limiter.as_ref(),
                 &jail_root,
-                &api_socket,
                 &fc_snapshot_path,
                 &fc_mem_file_path,
             )
@@ -658,8 +681,8 @@ impl NodeManagerService {
         self.finish_load_snapshot(
             &lease,
             &req.sandbox_id,
+            rootfs_limiter.as_ref(),
             &jail_root,
-            &api_socket,
             &fc_snapshot_path,
             &fc_mem_file_path,
         )
@@ -669,20 +692,22 @@ impl NodeManagerService {
 
     /// Shared tail of the load-snapshot paths (plaintext source_dir and BYOK
     /// encrypted volume): wait for the FC API socket, load the snapshot with the
-    /// given memory file, then fix v.sock permissions.
+    /// given memory file, apply the sandbox's validated rootfs rate limit, then
+    /// fix v.sock permissions.
     async fn finish_load_snapshot(
         &self,
         lease: &SlotInfo,
         sandbox_id: &str,
+        rootfs_limiter: Option<&pplx_space_common_core::types::RateLimiter>,
         jail_root: &str,
-        api_socket: &str,
         fc_snapshot_path: &str,
         fc_mem_file_path: &str,
     ) -> Result<(), Status> {
+        let api_socket = format!("{jail_root}/firecracker.sock");
         // Wait for the API socket to appear (FC needs time to create it after launch)
         let api_socket_wait_started = Instant::now();
         loop {
-            if std::path::Path::new(api_socket).exists() {
+            if std::path::Path::new(&api_socket).exists() {
                 break;
             }
             if api_socket_wait_started.elapsed() >= FIRECRACKER_API_SOCKET_TIMEOUT {
@@ -699,11 +724,24 @@ impl NodeManagerService {
             "firecracker api socket observed"
         );
 
-        let client = crate::fc_api::FcApiClient::new(api_socket.to_string());
+        let client = crate::fc_api::FcApiClient::new(api_socket);
         client
             .load_snapshot(fc_snapshot_path, fc_mem_file_path)
             .await
             .map_err(|e| Status::internal(format!("load snapshot failed: {e}")))?;
+        // The loaded drive limiter is the one of the VM the snapshot was taken
+        // from. Replace it with the sandbox's own while the VM is still
+        // paused; a sandbox must not run under another VM's limits.
+        if let Some(limiter) = rootfs_limiter
+            && let Err(error) = client.update_drive_rate_limiter("rootfs", limiter).await
+        {
+            let status = Status::internal(format!(
+                "apply rootfs rate limit after snapshot load failed: {error}"
+            ));
+            self.rollback_loaded_snapshot(sandbox_id, "rootfs rate limit", &status)
+                .await;
+            return Err(status);
+        }
         self.adopt_validated_lease(sandbox_id, lease)?;
 
         // Fix v.sock permissions so sbx-manager can connect for health checks.
@@ -711,23 +749,13 @@ impl NodeManagerService {
         let vsock_path = format!("{jail_root}/v.sock");
         if std::path::Path::new(&vsock_path).exists() {
             if let Err(status) = chgrp_path(&vsock_path, gids::SPACE_SBXMGR) {
-                self.rollback_loaded_snapshot_after_permission_failure(
-                    sandbox_id,
-                    &vsock_path,
-                    "chgrp",
-                    &status,
-                )
-                .await;
+                self.rollback_loaded_snapshot(sandbox_id, "vsock chgrp", &status)
+                    .await;
                 return Err(status);
             }
             if let Err(status) = chmod_path(&vsock_path, 0o770) {
-                self.rollback_loaded_snapshot_after_permission_failure(
-                    sandbox_id,
-                    &vsock_path,
-                    "chmod",
-                    &status,
-                )
-                .await;
+                self.rollback_loaded_snapshot(sandbox_id, "vsock chmod", &status)
+                    .await;
                 return Err(status);
             }
         }
@@ -735,11 +763,12 @@ impl NodeManagerService {
         Ok(())
     }
 
-    async fn rollback_loaded_snapshot_after_permission_failure(
+    /// Kill the VM a snapshot was loaded into when a later step of the load
+    /// fails, so a retried load starts from a fresh VM.
+    async fn rollback_loaded_snapshot(
         &self,
         sandbox_id: &str,
-        vsock_path: &str,
-        command: &'static str,
+        failed_step: &'static str,
         status: &Status,
     ) {
         let stored_pid = match self.pool.get(sandbox_id) {
@@ -755,10 +784,9 @@ impl NodeManagerService {
         let Some(fc_pid) = fc_pid else {
             tracing::error!(
                 sandbox_id,
-                vsock_path,
-                command,
+                failed_step,
                 error = %status,
-                "unable to roll back loaded snapshot after vsock permission failure because firecracker pid was not found"
+                "unable to roll back loaded snapshot because firecracker pid was not found"
             );
             return;
         };
@@ -766,10 +794,9 @@ impl NodeManagerService {
         tracing::warn!(
             sandbox_id,
             pid = fc_pid,
-            vsock_path,
-            command,
+            failed_step,
             error = %status,
-            "rolling back loaded snapshot after vsock permission failure"
+            "rolling back loaded snapshot after a failed load step"
         );
         kill_launched_process_after_pid_persist_failure(self, sandbox_id, fc_pid).await;
     }
@@ -886,6 +913,17 @@ impl NodeManagerService {
             .and_then(|path| path.components().next())
             .and_then(|part| part.as_os_str().to_str())
             .filter(|id| id.parse::<SandboxId>().is_ok());
+        // Deletion capacity is bounded where the work runs, and taken before
+        // any sandbox ownership so a queued deletion never holds a healthy
+        // sandbox's artifact lock while it waits. A caller that stops waiting
+        // releases nothing here: the slot is held by the blocking closure
+        // until the filesystem work is done.
+        let permit = self
+            .cache_artifact_delete_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Status::unavailable("cache artifact deletion lane closed"))?;
         let guard = match sandbox_id {
             Some(id) => Some(self.lock_sandbox_artifacts(id).await?),
             None => None,
@@ -897,6 +935,7 @@ impl NodeManagerService {
             .transpose()?;
 
         self.off_runtime("delete cache artifact", move || {
+            let _permit = permit;
             let _guard = guard;
             let _claim = claim;
             if !std::path::Path::new(&local_path).exists() {
@@ -1182,6 +1221,200 @@ fn validate_cache_artifact_path(local_path: &str) -> Result<(), Status> {
         ));
     }
     Ok(())
+}
+
+fn drive_rate_limiter(
+    limit: &pplx_space_node_mgr_client::proto::DriveRateLimit,
+) -> Result<pplx_space_common_core::types::RateLimiter, Status> {
+    let bucket = |bucket: Option<&pplx_space_node_mgr_client::proto::TokenBucket>, name: &str| {
+        bucket
+            .map(|bucket| pplx_space_common_core::types::TokenBucket {
+                size: bucket.size,
+                refill_time_ms: bucket.refill_time_ms,
+            })
+            .ok_or_else(|| {
+                Status::invalid_argument(format!("rootfs_rate_limit.{name} is required"))
+            })
+    };
+    Ok(pplx_space_common_core::types::RateLimiter {
+        bandwidth: bucket(limit.bandwidth.as_ref(), "bandwidth")?,
+        operations: bucket(limit.operations.as_ref(), "operations")?,
+    })
+}
+
+/// How long a Firecracker pause or resume may take. Both normally finish in
+/// milliseconds; a VMM that does not answer must not keep the sandbox's VM
+/// gate, which termination also takes, held indefinitely.
+const VM_PAUSE_STATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Upper bound on a requested pre-snapshot free-page-hinting wait. The pause
+/// holds the sandbox's VM gate meanwhile, which termination also takes.
+const MAX_BALLOON_HINT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How often a hinting run's completion is polled. Firecracker reports runs of
+/// about 200 ms per GiB of guest memory.
+const BALLOON_HINT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Bound for each balloon read before a snapshot pause; Firecracker answers
+/// them from memory without involving the guest.
+const BALLOON_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn balloon_hint_timeout(timeout_ms: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(u64::from(timeout_ms)).min(MAX_BALLOON_HINT_TIMEOUT)
+}
+
+/// Before a snapshot pause, record the VM's balloon statistics and, when the
+/// device has free-page hinting, run one hinting pass so that free guest
+/// memory is released before the snapshot captures it. This fails open: a VM
+/// without a balloon is untouched beyond one read, and every balloon error or
+/// timeout is logged and counted while the pause and snapshot proceed.
+/// Latency is bounded by `hint_timeout` plus the fixed probe and stop bounds.
+async fn prepare_balloon_for_snapshot(
+    client: &crate::fc_api::FcApiClient,
+    sandbox_id: &str,
+    hint_timeout: std::time::Duration,
+) {
+    use pplx_space_metrics::node_manager::{
+        BalloonHintResult, BalloonSnapshotProbe, balloon_free_page_hint,
+        balloon_snapshot_probe_failed, balloon_snapshot_statistics,
+    };
+
+    let balloon = match tokio::time::timeout(BALLOON_PROBE_TIMEOUT, client.balloon()).await {
+        Ok(Ok(Some(balloon))) => balloon,
+        Ok(Ok(None)) => return,
+        Ok(Err(error)) => {
+            tracing::warn!(sandbox_id, %error, "balloon read before snapshot pause failed");
+            balloon_snapshot_probe_failed(BalloonSnapshotProbe::Device);
+            return;
+        }
+        Err(_) => {
+            tracing::warn!(sandbox_id, "balloon read before snapshot pause timed out");
+            balloon_snapshot_probe_failed(BalloonSnapshotProbe::Device);
+            return;
+        }
+    };
+    let mode = balloon.mode();
+    if balloon.stats_polling_interval_s > 0 {
+        match tokio::time::timeout(BALLOON_PROBE_TIMEOUT, client.balloon_statistics()).await {
+            Ok(Ok(stats)) => {
+                let mib = |bytes: Option<u64>| bytes.map(|bytes| bytes / (1024 * 1024));
+                tracing::info!(
+                    sandbox_id,
+                    balloon_mode = %mode,
+                    target_mib = stats.target_mib,
+                    actual_mib = stats.actual_mib,
+                    guest_free_mib = mib(stats.free_memory_bytes),
+                    guest_available_mib = mib(stats.available_memory_bytes),
+                    guest_total_mib = mib(stats.total_memory_bytes),
+                    guest_disk_caches_mib = mib(stats.disk_caches_bytes),
+                    "balloon statistics before snapshot pause"
+                );
+                balloon_snapshot_statistics(mode, stats.actual_mib, mib(stats.free_memory_bytes));
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(sandbox_id, %error, "balloon statistics read before snapshot pause failed");
+                balloon_snapshot_probe_failed(BalloonSnapshotProbe::Statistics);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    sandbox_id,
+                    "balloon statistics read before snapshot pause timed out"
+                );
+                balloon_snapshot_probe_failed(BalloonSnapshotProbe::Statistics);
+            }
+        }
+    }
+    if !balloon.free_page_hinting {
+        return;
+    }
+    let started = Instant::now();
+    let (result, elapsed) = match client
+        .hint_free_pages(hint_timeout, BALLOON_HINT_POLL_INTERVAL)
+        .await
+    {
+        Ok(crate::fc_api::FreePageHintOutcome::Completed { elapsed }) => {
+            tracing::info!(
+                sandbox_id,
+                elapsed_ms = elapsed.as_millis(),
+                "free-page hinting before snapshot pause completed"
+            );
+            (BalloonHintResult::Completed, elapsed)
+        }
+        Ok(crate::fc_api::FreePageHintOutcome::TimedOut { elapsed }) => {
+            tracing::warn!(
+                sandbox_id,
+                timeout_ms = hint_timeout.as_millis(),
+                elapsed_ms = elapsed.as_millis(),
+                "free-page hinting before snapshot pause timed out; snapshotting anyway"
+            );
+            (BalloonHintResult::TimedOut, elapsed)
+        }
+        Err(error) => {
+            tracing::warn!(
+                sandbox_id,
+                %error,
+                "free-page hinting before snapshot pause failed; snapshotting anyway"
+            );
+            (BalloonHintResult::Failed, started.elapsed())
+        }
+    };
+    balloon_free_page_hint(result, elapsed.as_secs_f64() * 1000.0);
+}
+
+/// Pause or resume the VM behind `client`, failing once `timeout` passes.
+pub(super) async fn set_firecracker_paused(
+    client: &crate::fc_api::FcApiClient,
+    paused: bool,
+    timeout: std::time::Duration,
+) -> Result<(), Status> {
+    let change = async {
+        if paused {
+            client.pause().await
+        } else {
+            client.resume().await
+        }
+    };
+    match tokio::time::timeout(timeout, change).await {
+        Ok(changed) => {
+            changed.map_err(|error| Status::internal(format!("set VM pause state: {error}")))
+        }
+        Err(_) => Err(Status::deadline_exceeded(format!(
+            "Firecracker did not {} the VM within {timeout:?}",
+            if paused { "pause" } else { "resume" }
+        ))),
+    }
+}
+
+/// Stops the runtime before the encrypted seal, re-issuing the idempotent stop
+/// while it fails server-side because the killed Firecracker is still exiting.
+/// New supervisors report drain timeouts as `Unavailable`. Keep `Internal`
+/// handling while older supervisors still report busy cgroups that way.
+async fn stop_runtime_for_encrypted_seal(
+    service: &NodeManagerService,
+    sandbox_id: &str,
+) -> Result<(), Status> {
+    let mut attempt = 1;
+    loop {
+        match stop_sandbox_runtime_with_supervisor(service, sandbox_id, true, None).await {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if matches!(
+                    error.code(),
+                    tonic::Code::Internal | tonic::Code::Unavailable
+                ) && attempt < ENC_CAPTURE_STOP_ATTEMPTS =>
+            {
+                tracing::warn!(
+                    sandbox_id,
+                    attempt,
+                    %error,
+                    "post-capture runtime stop incomplete; retrying before seal"
+                );
+                attempt += 1;
+                tokio::time::sleep(ENC_CAPTURE_STOP_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 #[cfg(test)]

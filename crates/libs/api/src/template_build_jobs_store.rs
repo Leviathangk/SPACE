@@ -2,7 +2,9 @@ use std::str::FromStr;
 
 use pplx_space_common_core::{
     sql,
-    types::{BuildRunId, BuildRunIdParseError, NodeId, OrgId, TemplateName},
+    types::{
+        BuildRunId, BuildRunIdParseError, NodeId, OrgId, SystemPublicationGrantId, TemplateName,
+    },
 };
 use sqlx::PgPool;
 
@@ -14,6 +16,17 @@ pub struct TemplateBuildJobsStore {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BuildJob {
     pub daemon_job_id: BuildRunId,
+}
+
+/// One build submission's pre-dispatch base grant
+/// (`template_build_base_grants.id`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BuildBaseGrantId(uuid::Uuid);
+
+impl BuildBaseGrantId {
+    pub(crate) const fn as_uuid(self) -> uuid::Uuid {
+        self.0
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -71,6 +84,7 @@ impl TemplateBuildJobsStore {
         client_build_id: Option<&str>,
         daemon_job_id: BuildRunId,
         builder_node_id: Option<NodeId>,
+        base_grant: Option<BuildBaseGrantId>,
     ) -> Result<(), TemplateBuildJobsStoreError> {
         if !template_build_owner_matches(&self.pool, template_name, org_id).await? {
             return Err(TemplateBuildJobsStoreError::OwnershipConflict);
@@ -103,6 +117,113 @@ impl TemplateBuildJobsStore {
         if result.rows_affected() == 0 {
             return Err(TemplateBuildJobsStoreError::OwnershipConflict);
         }
+        if let (Some(base_grant), Some(builder_node_id)) = (base_grant, builder_node_id) {
+            self.pin_base_grant(base_grant, builder_node_id).await?;
+        }
+        Ok(())
+    }
+
+    /// Record, before `StartBuild` is dispatched, that this submission of
+    /// `org_id`'s build of `template_name` is authorized to read `base`.
+    ///
+    /// ClusterApi scopes release lookups by caller node and lets a registered
+    /// builder resolve the base while this grant is fresh. The grant has to
+    /// exist before dispatch because the API learns which builder takes the
+    /// job only from the response; [`Self::pin_base_grant`] then binds it to
+    /// that builder. Every submission gets its own row, so accepting one build
+    /// never alters another build's authorization. Rows older than the longest
+    /// validity ClusterApi honours are swept here, since nothing else observes
+    /// a build's end.
+    pub(crate) async fn record_base_grant(
+        &self,
+        org_id: OrgId,
+        template_name: &TemplateName,
+        base: &TemplateName,
+    ) -> Result<BuildBaseGrantId, sqlx::Error> {
+        sqlx::query(sql!(
+            "DELETE FROM template_build_base_grants
+             WHERE granted_at < NOW() - INTERVAL '7 days'"
+        ))
+        .execute(&self.pool)
+        .await?;
+        let grant = BuildBaseGrantId(uuid::Uuid::now_v7());
+        sqlx::query(sql!(
+            "INSERT INTO template_build_base_grants (id, template_id, base_template_name, org_id)
+             VALUES ($1, $2, $3, $4)"
+        ))
+        .bind(grant.as_uuid())
+        .bind(template_name.as_str())
+        .bind(base.as_str())
+        .bind(org_id.as_uuid())
+        .execute(&self.pool)
+        .await?;
+        Ok(grant)
+    }
+
+    /// Record, before `StartBuild` is dispatched, that this submission may
+    /// publish `template_name` as a system template.
+    ///
+    /// Build-manager also publishes tenant builds, so ClusterApi accepts its
+    /// system publication only under such a grant, and the release
+    /// registration consumes it. The grant has to exist before dispatch
+    /// because the build may publish before the API records the response.
+    /// Rows older than the freshness ClusterApi honours are swept here, since
+    /// nothing else observes a build's end.
+    pub(crate) async fn record_system_publication_grant(
+        &self,
+        template_name: &TemplateName,
+    ) -> Result<SystemPublicationGrantId, TemplateBuildJobsStoreError> {
+        sqlx::query(sql!(
+            "DELETE FROM template_system_publication_grants
+             WHERE granted_at < NOW() - INTERVAL '7 days'"
+        ))
+        .execute(&self.pool)
+        .await?;
+        let grant = SystemPublicationGrantId::new();
+        sqlx::query(sql!(
+            "INSERT INTO template_system_publication_grants (id, template_name)
+             VALUES ($1, $2)"
+        ))
+        .bind(grant.as_uuid())
+        .bind(template_name.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(grant)
+    }
+
+    /// Withdraw the grant of a submission that was never dispatched. Other
+    /// submissions' grants are untouched.
+    pub(crate) async fn revoke_system_publication_grant(
+        &self,
+        grant: SystemPublicationGrantId,
+    ) -> Result<(), TemplateBuildJobsStoreError> {
+        sqlx::query(sql!(
+            "DELETE FROM template_system_publication_grants WHERE id = $1"
+        ))
+        .bind(grant.as_uuid())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Pin one submission's base grant to the builder that accepted it. From
+    /// here on only that builder may use the grant, for as long as its queued
+    /// job can still be running, so a build that waits behind long jobs keeps
+    /// its base authorization. Other submissions' grants are untouched.
+    async fn pin_base_grant(
+        &self,
+        base_grant: BuildBaseGrantId,
+        builder_node_id: NodeId,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(sql!(
+            "UPDATE template_build_base_grants
+             SET builder_node_id = $2
+             WHERE id = $1"
+        ))
+        .bind(base_grant.as_uuid())
+        .bind(builder_node_id.as_uuid())
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 

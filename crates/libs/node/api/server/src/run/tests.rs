@@ -483,11 +483,25 @@ async fn shutdown_releases_listener_while_accepted_connections_drain() {
     let shutdown_token = CancellationToken::new();
     let server_shutdown = shutdown_token.clone();
     let (_, health_service) = pplx_space_common_svc::grpc_health_service();
+    struct PlaintextDev;
+    impl pplx_space_common_core::env::Environment for PlaintextDev {
+        fn var_os(&self, name: &str) -> Option<std::ffi::OsString> {
+            (name == pplx_space_common_grpc::internal_transport::INSECURE_DEV_ENV)
+                .then(|| "true".into())
+        }
+    }
+    let mut builder =
+        pplx_space_common_grpc::internal_transport::server_builder_from_environment(&PlaintextDev)
+            .unwrap();
+    // Use the same incoming stream as `run` so shutdown releases the listener before draining.
     let server = tokio::spawn(async move {
-        tonic::transport::Server::builder()
+        builder
             .add_service(health_service)
             .serve_with_incoming_shutdown(
-                ShutdownTcpIncoming::new(listener, server_shutdown),
+                pplx_space_common_grpc::internal_transport::Incoming::new(
+                    TcpIncoming::from(listener).with_nodelay(Some(true)),
+                    server_shutdown,
+                ),
                 std::future::pending(),
             )
             .await

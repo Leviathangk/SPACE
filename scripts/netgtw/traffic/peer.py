@@ -15,6 +15,7 @@ import socket
 import ssl
 import struct
 import sys
+from functools import partial
 from pathlib import Path
 
 RESOLVERS = {"1.1.1.1": "cloudflare-dns.com", "8.8.8.8": "dns.google"}
@@ -126,17 +127,23 @@ async def serve(args):
     import protocols
 
     descriptor = os.open(args.events, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+    health_descriptor = os.open(
+        args.health_events, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600
+    )
     credential = (
         Path(args.credential_file).read_text() if args.credential_file else None
     )
 
-    def record(kind, address, port, **fields):
+    def record(kind, address, port, *, health=False, **fields):
         event = dict(zone=args.zone, kind=kind, target=address, port=port, **fields)
-        os.write(descriptor, (json.dumps(event) + "\n").encode())
+        os.write(
+            health_descriptor if health else descriptor,
+            (json.dumps(event) + "\n").encode(),
+        )
 
-    def answer(wire, address, port):
+    def answer(wire, address, port, receipt=record):
         name, end = question(wire)
-        record("dns", address, port, host=name)
+        receipt("dns", address, port, host=name)
         header = wire[:2] + struct.pack("!5H", 0x8180, 1, 1, 0, 0)
         return (
             header
@@ -149,6 +156,7 @@ async def serve(args):
     contexts = {}
     for protocol, advertised in (
         ("h2", ["h2"]),
+        ("proxy", ["h2", "http/1.1"]),
         # Put an unsupported protocol first so fallback probes also prove that
         # interception does not advertise guest protocols it cannot bridge.
         ("http/1.1", ["space-unsupported", "http/1.1"]),
@@ -168,10 +176,15 @@ async def serve(args):
         address, port = writer.get_extra_info("sockname")[:2]
         remote = writer.get_extra_info("peername")
         connection = f"{remote[0]}:{remote[1]}"
-        record("connect", address, port, connection=connection)
+        # Direct health probes run in the destination's namespace and connect
+        # from its own address. Gateway traffic arrives from another namespace.
+        # Keep every receipt on a health connection separate, including control
+        # frames received after the client reports success.
+        record_connection = partial(record, health=remote[0] == address)
+        record_connection("connect", address, port, connection=connection)
 
         def received(data):
-            record(
+            record_connection(
                 "data",
                 address,
                 port,
@@ -192,7 +205,7 @@ async def serve(args):
                 for name in args.credential_header:
                     if name in headers:
                         headers[name] = "<redacted>"
-            record(
+            record_connection(
                 "request",
                 address,
                 port,
@@ -214,12 +227,16 @@ async def serve(args):
                     writer,
                     upstream_reader,
                     upstream_writer,
-                    lambda data: record("dot-data", address, port, bytes=len(data)),
+                    lambda data: record_connection(
+                        "dot-data", address, port, bytes=len(data)
+                    ),
                 )
                 return
             if port in protocols.TLS_PORTS:
                 context = contexts[
-                    "grpc"
+                    "proxy"
+                    if port == 8445
+                    else "grpc"
                     if port == 50052
                     else "h2"
                     if port == 8443
@@ -227,7 +244,7 @@ async def serve(args):
                 ]
                 await writer.start_tls(context, ssl_handshake_timeout=2)
                 ssl_object = writer.get_extra_info("ssl_object")
-                record(
+                record_connection(
                     "tls-handshake",
                     address,
                     port,
@@ -240,7 +257,7 @@ async def serve(args):
             if port == 8445:
 
                 def connect_received(host):
-                    record(
+                    record_connection(
                         "connect-request",
                         address,
                         port,
@@ -254,7 +271,7 @@ async def serve(args):
                     received,
                     request_received,
                     connect_received,
-                    context,
+                    contexts["http/1.1"],
                 )
                 return
             if port in (8080, 8443):
@@ -263,7 +280,7 @@ async def serve(args):
             if port in (8081, 8444):
 
                 def upgrade_received(host):
-                    record(
+                    record_connection(
                         "websocket-upgrade",
                         address,
                         port,
@@ -282,7 +299,9 @@ async def serve(args):
             while True:
                 if port == 53:
                     size = struct.unpack("!H", await reader.readexactly(2))[0]
-                    response = answer(await reader.readexactly(size), address, port)
+                    response = answer(
+                        await reader.readexactly(size), address, port, record_connection
+                    )
                     writer.write(struct.pack("!H", len(response)) + response)
                 else:
                     data = await reader.read(65536)
@@ -327,9 +346,12 @@ async def serve(args):
     transports = []
     if args.zone != "guest":
         for address in args.address:
-            transports.append(
-                await protocols.quic_server(address, args.certificate, args.key, record)
-            )
+            for port in (443, 8443):
+                transports.append(
+                    await protocols.quic_server(
+                        address, args.certificate, args.key, record, port
+                    )
+                )
             for port in (53, 9000):
                 (
                     transport,
@@ -349,6 +371,7 @@ async def serve(args):
         if grpc_service:
             await grpc_service.stop(0)
         os.close(descriptor)
+        os.close(health_descriptor)
 
 
 def receive_exact(stream, size):
@@ -422,12 +445,24 @@ def probe(spec, sessions):
         if kind == "udp":
             # A sizes array adds multiple datagrams on the same flow; existing
             # cases retain their single nonce echo.
+            blocked_udp443 = port == 443 and spec["expect"] == "deny"
+            if blocked_udp443:
+                stream.settimeout(0.1)
+            errors = []
             for index, size in enumerate(spec.get("sizes", [len(nonce)])):
                 data = (nonce + bytes(range(256)) * (size // 256 + 1))[:size]
                 stream.sendall(data)
                 try:
                     response = stream.recv(65536)
+                except ConnectionRefusedError:
+                    if blocked_udp443:
+                        errors.append("ConnectionRefusedError")
+                        continue
+                    raise
                 except TimeoutError:
+                    if blocked_udp443:
+                        errors.append("TimeoutError")
+                        continue
                     return {
                         "received": False,
                         "error": f"UDP datagram {index + 1} ({size} bytes) timed out",
@@ -435,8 +470,16 @@ def probe(spec, sessions):
                         "datagrams_received": index,
                         "timeout_datagram": index + 1,
                     }
+                if blocked_udp443:
+                    raise ValueError("denied UDP/443 received a reply")
                 if response != data:
                     raise ValueError("UDP datagram was corrupted or truncated")
+            if errors:
+                return {
+                    "received": False,
+                    "errors": errors,
+                    "datagrams_sent": len(spec.get("sizes", [len(nonce)])),
+                }
             return {"received": True, "protocol": "udp"}
         data = nonce
         stream.sendall(data)
@@ -459,6 +502,7 @@ def probe(spec, sessions):
             "received": False,
             "error": str(error),
             "error_type": type(error).__name__,
+            "errno": error.errno,
         }
     finally:
         if stream and not session:
@@ -484,7 +528,7 @@ if __name__ == "__main__":
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("probe-server")
     server = commands.add_parser("serve")
-    for name in ("zone", "events", "certificate", "key", "ready"):
+    for name in ("zone", "events", "health-events", "certificate", "key", "ready"):
         server.add_argument(f"--{name}", required=True)
     server.add_argument("--address", action="append", default=[])
     server.add_argument("--relay-socket", required=True)

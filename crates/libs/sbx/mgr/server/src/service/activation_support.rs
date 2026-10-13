@@ -2,12 +2,9 @@ use super::network_runtime::{network_policy_refresh_error_to_status, refresh_net
 use super::spaced_bridge::cleanup_restored_snapshot_dir_async;
 use super::start_support::ActivationCleanupGuard;
 use super::*;
-use pplx_space_common_core::guest::linux::network::{
-    GATEWAY_IPV4_ADDR as GUEST_GATEWAY, PRIMARY_INTERFACE as GUEST_NETWORK_INTERFACE,
-};
 use pplx_space_common_core::host::linux::identities::users;
 use pplx_space_common_core::types::{
-    ExecutionGeneration, GuestUserName, NodeId, NodeRole as SpaceNodeRole, PodUid, RouteGeneration,
+    ExecutionGeneration, NodeId, NodeRole as SpaceNodeRole, PodUid, RouteGeneration,
     SandboxActivationAttemptId, SandboxQuarantineReasonCode, SpaceApiRouteIdentity,
 };
 use pplx_space_common_core::wake_signals::MISSING_RUNTIME_CONTEXT_MARKER;
@@ -16,7 +13,6 @@ use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
 
-const RESTORE_GATEWAY_NEIGHBOR_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 const NODE_ID_PATH: &str = "/space/etc/node-id";
 
 #[derive(Clone, Copy, Debug)]
@@ -664,9 +660,14 @@ impl WakeNetworkContext {
                         | Ok(crate::proto::SandboxSubstrateKind::Direct)
                 )
         });
+        // An identity-free activation is a direct one: Kubernetes launches
+        // always carry their pod's route identity. It keeps the manager-owned
+        // namespace, and route-identity resolution, not a missing namespace,
+        // decides whether it may proceed.
+        let identity_free = start.route_identity.is_none();
         match start.netns_path.as_deref().filter(|path| !path.is_empty()) {
             Some(path) => Self::RuntimePath(path.to_string()),
-            None if direct_route_identity => Self::Unspecified,
+            None if direct_route_identity || identity_free => Self::Unspecified,
             None => Self::MissingRuntimePath,
         }
     }
@@ -825,9 +826,7 @@ pub(super) async fn wait_ready_via_spaced_host(
             .await
             .map_err(|error| Status::unavailable(error.to_string()))?;
         let ready = client.wait_ready(timeout).await?;
-        // A sidecar can outlive a manager upgrade. Older spaced-host versions
-        // report readiness without enforcing the manager's supported range.
-        validate_ready_guest_status(&client.get_status().await?)?;
+        validate_ready_guest_identity(ready.guest_version.as_ref(), || client.get_status()).await?;
         Ok(ready)
     })
     .await
@@ -844,15 +843,34 @@ pub(super) async fn wait_ready_via_spaced_host(
     result
 }
 
-fn validate_ready_guest_status(
-    status: &pplx_space_spaced_host_client::proto::GetStatusResponse,
-) -> Result<(), Status> {
-    if !status.ready {
-        return Err(Status::unavailable(
-            "guest readiness changed while checking compatibility",
-        ));
-    }
-    let guest = status.guest_version.as_ref();
+async fn validate_ready_guest_identity<F>(
+    guest: Option<&pplx_space_spaced_host_client::proto::VersionInfo>,
+    legacy_status: impl FnOnce() -> F,
+) -> Result<(), Status>
+where
+    F: std::future::Future<
+            Output = Result<pplx_space_spaced_host_client::proto::GetStatusResponse, Status>,
+        >,
+{
+    // Validate the successful readiness observation. A second, shorter status
+    // probe can reject a responsive guest merely because its response is slower.
+    // Sidecars can outlive manager upgrades; retain the identity check when an
+    // older sidecar omits it from WaitReady.
+    let status;
+    let guest = match guest {
+        Some(guest) => Some(guest),
+        None => {
+            // Keep the legacy RPC's large future out of the nested activation
+            // future. Current sidecars neither construct nor allocate it.
+            status = Box::pin(legacy_status()).await?;
+            if !status.ready {
+                return Err(Status::unavailable(
+                    "guest readiness changed while checking compatibility",
+                ));
+            }
+            status.guest_version.as_ref()
+        }
+    };
     pplx_space_spaced_common::validate_spaced_guest_compatibility(
         guest.map(|guest| guest.version.as_str()),
         guest.map(|guest| guest.compatibility_family.as_str()),
@@ -1193,9 +1211,9 @@ where
     // reconcile against the live gateway, so the gate need not — and must not,
     // to avoid a stale-ref mismatch failing the start — assert the latest ref
     // here.
-    let policy_task = readiness
-        .policy
-        .map(|policy| tokio_util::task::AbortOnDropHandle::new(tokio::spawn(policy)));
+    let policy_task = readiness.policy.map(|policy| {
+        tokio_util::task::AbortOnDropHandle::new(tokio::spawn(policy.in_current_span()))
+    });
 
     // Bound the start on the guest-readiness deadline. If the guest fails (a
     // fast error or the ready_timeout), return without waiting for the policy
@@ -1304,7 +1322,8 @@ where
                     .operation(phase)
                     .timeout_secs(ready_timeout_secs.to_string())
                     .elapsed_ms(ready_elapsed.as_millis().to_string())
-                    .error(error.to_string()),
+                    .error(error.to_string())
+                    .logged_by_caller(),
             );
             let reason = format!(
                 "guest did not become ready during {phase} within {ready_timeout_secs}s: {error}"
@@ -1418,13 +1437,13 @@ pub(super) async fn complete_restore_and_mark_final(
         ));
     }
 
-    // Guest compatibility does not establish gateway readiness. Clock sync is
-    // best-effort background work and must not add latency to start/restore.
-    // Only kick it off for the Started path: a Paused-final restore means
-    // the VM hasn't been resumed yet, so there's nothing to clock-sync
-    // until the user wakes it.
+    // Clock sync is best-effort background work and must not add latency to
+    // start/restore. Only kick it off for the Started path: a Paused-final
+    // restore means the VM hasn't been resumed yet, so there's nothing to
+    // clock-sync until the user wakes it. The restored guest's cached gateway
+    // MAC needs nothing here: node-manager's guest L2 ingress policy accepts
+    // frames for a stale gateway MAC.
     if final_state == SandboxState::Started {
-        flush_restore_gateway_neighbor_best_effort(sandbox_id).await;
         spawn_resume_clock_sync(
             sandbox_id.to_string(),
             pplx_space_spaced_host_client::proto::ResumeReason::SnapshotRestore,
@@ -1489,112 +1508,6 @@ async fn mark_restore_after_network_ready(
     Ok(())
 }
 
-// Snapshot restore preserves the guest neighbor table; after cross-node restore,
-// its cached gateway MAC can refer to the previous node's data-plane endpoint.
-// Flush it so restored guest traffic re-resolves the gateway on the current node.
-async fn flush_restore_gateway_neighbor_best_effort(sandbox_id: &str) {
-    match flush_restore_gateway_neighbor(sandbox_id).await {
-        Ok(()) => tracing::debug!(sandbox_id, "flushed restored guest gateway neighbor entry"),
-        Err(error) => tracing::warn!(
-            sandbox_id,
-            %error,
-            "failed to flush restored guest gateway neighbor entry"
-        ),
-    }
-}
-
-async fn flush_restore_gateway_neighbor(sandbox_id: &str) -> Result<(), String> {
-    let config = pplx_space_spaced_host_client::SpacedHostClientConfig::default()
-        .with_socket_path(spaced_host_socket_path(sandbox_id));
-    let client = pplx_space_spaced_host_client::SpacedHostClient::new_with_config(config)
-        .await
-        .map_err(|error| error.to_string())?;
-    let mut events = client
-        .start_process_stream_with_options(restore_gateway_neighbor_flush_options())
-        .await
-        .map_err(|error| error.to_string())?;
-    while let Some(event) = events.message().await.map_err(|error| error.to_string())? {
-        if matches!(
-            event.event,
-            Some(pplx_space_spaced_host_client::proto::process_event::Event::Exit(_))
-        ) {
-            return restore_gateway_neighbor_flush_succeeded(std::slice::from_ref(&event));
-        }
-    }
-    Err("ip neigh flush produced no exit event".to_string())
-}
-
-#[allow(
-    clippy::expect_used,
-    reason = "Root and neighbor flush argv are bounded nonempty NUL-free constants"
-)]
-fn restore_gateway_neighbor_flush_options() -> pplx_space_spaced_host_client::StartProcessOptions {
-    pplx_space_spaced_host_client::StartProcessOptions {
-        user: Some(GuestUserName::parse("root").expect("root guest user is valid")),
-        timeout: Some(RESTORE_GATEWAY_NEIGHBOR_FLUSH_TIMEOUT),
-        tag: Some("restore-gateway-neighbor-flush".to_string()),
-        ..pplx_space_spaced_host_client::StartProcessOptions::new(
-            pplx_space_common_core::types::ProcessCommand::new(
-                restore_gateway_neighbor_flush_command(),
-            )
-            .expect("neighbor flush command consists of valid constants"),
-        )
-    }
-}
-
-fn restore_gateway_neighbor_flush_command() -> Vec<String> {
-    [
-        "ip",
-        "neigh",
-        "flush",
-        GUEST_GATEWAY,
-        "dev",
-        GUEST_NETWORK_INTERFACE,
-    ]
-    .map(str::to_string)
-    .to_vec()
-}
-
-fn restore_gateway_neighbor_flush_succeeded(
-    events: &[pplx_space_spaced_host_client::proto::ProcessEvent],
-) -> Result<(), String> {
-    for event in events {
-        let Some(pplx_space_spaced_host_client::proto::process_event::Event::Exit(exit)) =
-            &event.event
-        else {
-            continue;
-        };
-        return match &exit.outcome {
-            Some(pplx_space_spaced_host_client::proto::process_exit::Outcome::Exited(exited))
-                if exited.exit_code == 0 =>
-            {
-                Ok(())
-            }
-            Some(pplx_space_spaced_host_client::proto::process_exit::Outcome::Exited(exited)) => {
-                Err(format!("ip neigh flush exited {}", exited.exit_code))
-            }
-            Some(pplx_space_spaced_host_client::proto::process_exit::Outcome::TimedOut(_)) => {
-                Err(format!(
-                    "ip neigh flush timed out after {}s",
-                    RESTORE_GATEWAY_NEIGHBOR_FLUSH_TIMEOUT.as_secs()
-                ))
-            }
-            Some(pplx_space_spaced_host_client::proto::process_exit::Outcome::Signaled(
-                signaled,
-            )) => Err(format!(
-                "ip neigh flush terminated by signal {}",
-                signaled
-                    .signal
-                    .map(|signal| signal.to_string())
-                    .unwrap_or_else(|| "unknown".to_string())
-            )),
-            Some(pplx_space_spaced_host_client::proto::process_exit::Outcome::Unknown(_))
-            | None => Err("ip neigh flush ended with unknown status".to_string()),
-        };
-    }
-    Err("ip neigh flush produced no exit event".to_string())
-}
-
 pub(super) async fn notify_resume_clock_sync_best_effort(
     sandbox_id: &str,
     reason: pplx_space_spaced_host_client::proto::ResumeReason,
@@ -1621,25 +1534,33 @@ pub(super) fn spawn_resume_clock_sync(
     // Intentionally outside lifecycle drain: this five-second best-effort
     // notification invalidates host readiness and updates the guest clock,
     // but never writes manager lifecycle persistence. Shutdown may abandon it.
-    tokio::spawn(async move {
-        match notify_resume_clock_sync_best_effort(&sandbox_id, reason).await {
-            Ok(()) => {
-                tracing::debug!(
-                    sandbox_id,
-                    operation,
-                    "guest clock sync notification completed after resume"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(
-                    sandbox_id,
-                    operation,
-                    %error,
-                    "guest clock sync notification failed after resume"
-                );
+    let span_sandbox_id = sandbox_id.clone();
+    tokio::spawn(
+        async move {
+            match notify_resume_clock_sync_best_effort(&sandbox_id, reason).await {
+                Ok(()) => {
+                    tracing::debug!(
+                        sandbox_id,
+                        operation,
+                        "guest clock sync notification completed after resume"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        sandbox_id,
+                        operation,
+                        %error,
+                        "guest clock sync notification failed after resume"
+                    );
+                    super::drain::record_detached_failure(&error.to_string());
+                }
             }
         }
-    });
+        .instrument(super::drain::detached_trace_span(
+            "ResumeClockSync",
+            &span_sandbox_id,
+        )),
+    );
 }
 
 pub(super) struct StartStateTransition {
@@ -1665,7 +1586,8 @@ pub(super) fn spawn_wait_ready_state_transition(
         apply_network_policy,
         cleanup_id,
     } = transition;
-    spawn_guarded_start_state_transition(service, cleanup_guard, async move {
+    let span_sandbox_id = sandbox_id.clone();
+    spawn_guarded_start_state_transition(service, &span_sandbox_id, cleanup_guard, async move {
         let result = wait_ready_and_mark_started(
             db.clone(),
             &sandbox_id,
@@ -1685,13 +1607,17 @@ pub(super) fn spawn_wait_ready_state_transition(
 
 fn spawn_guarded_start_state_transition(
     service: &SandboxManagerService,
+    sandbox_id: &str,
     mut cleanup_guard: ActivationCleanupGuard,
     transition: impl std::future::Future<Output = Result<(), Status>> + Send + 'static,
 ) -> Result<(), Status> {
-    service.spawn_state_writer("StartFinalizer", async move {
+    service.spawn_detached_state_writer("StartFinalizer", sandbox_id, async move {
         match transition.await {
             Ok(()) => cleanup_guard.complete_success(),
-            Err(error) => cleanup_guard.record_failure(&error),
+            Err(error) => {
+                super::drain::record_detached_failure(error.message());
+                cleanup_guard.record_failure(&error);
+            }
         }
     })?;
     Ok(())
@@ -1707,7 +1633,9 @@ pub(super) fn spawn_restore_state_transition(
     cleanup_id: SandboxCleanupEpisodeId,
 ) -> Result<(), Status> {
     let db = Arc::clone(&service.db);
-    service.spawn_state_writer("RestoreFinalizer", async move {
+    let node_manager = service.node_manager.clone();
+    let span_sandbox_id = sandbox_id.clone();
+    service.spawn_detached_state_writer("RestoreFinalizer", &span_sandbox_id, async move {
         match complete_restore_and_mark_final(
             db.clone(),
             &sandbox_id,
@@ -1719,12 +1647,13 @@ pub(super) fn spawn_restore_state_transition(
         {
             Ok(()) => {
                 if let Some(snapshot_dir) = snapshot_dir {
-                    cleanup_restored_snapshot_dir_async(&sandbox_id, &snapshot_dir);
+                    cleanup_restored_snapshot_dir_async(&sandbox_id, &snapshot_dir, &node_manager);
                 }
                 cleanup_guard.complete_success();
             }
             Err(error) => {
                 tracing::warn!(sandbox_id, state = %final_state, %error, "restore final-state transition failed");
+                super::drain::record_detached_failure(error.message());
                 cleanup_guard.record_failure(&error);
             }
         }

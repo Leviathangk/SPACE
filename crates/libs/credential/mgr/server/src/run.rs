@@ -24,6 +24,7 @@ use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::ServerTlsConfig;
 
+use crate::auth::CredentialUdsAccess;
 use crate::aws_secrets_manager::AwsSecretsManagerResolver;
 use crate::credential_injection_authority::CredentialInjectionAuthority;
 use crate::credential_injection_bundle::{
@@ -45,7 +46,7 @@ use crate::key_wrapper::CompositeKeyWrapper;
 use crate::node_ca::NodeCa;
 use crate::node_service::NodeCredentialManager;
 use crate::proto::credential_manager_server::{CredentialManager, CredentialManagerServer};
-use crate::service::{CredentialManagerService, ExchangeTokenMode, ParseExchangeTokenModeError};
+use crate::service::CredentialManagerService;
 use crate::storage_exchange::VendRoleArn;
 use crate::storage_vend_store::{PgStorageVendStore, StorageVendStore};
 use crate::volume_wrap_store::{PgVolumeWrapStore, VolumeWrapStore};
@@ -57,12 +58,16 @@ const SOCKET_GROUP: &str = group_names::SPACE_SBXCLIENTS;
 /// rate-limit surfaces with, and authorizes its Unix-socket peers under.
 pub const SERVICE_NAME: &str = "space-credential-manager";
 const IN_MEMORY_KEK_ENABLED_ENV: &str = "SPACE_CREDMGR_IN_MEMORY_KEK_ENABLED";
-const EXCHANGE_TOKEN_MODE_ENV: &str = "SPACE_CREDMGR_SCOPED_EXCHANGE_TOKEN_MODE";
 const STORAGE_VEND_ROLE_ENV: &str = "SPACE_CREDMGR_S3_VEND_ROLE_ARN";
+/// Retired rollout switch. Read only so a retained `disabled` emergency stop
+/// cannot be silently reversed by upgrading to a build without modes.
+const RETIRED_EXCHANGE_TOKEN_MODE_ENV: &str = "SPACE_CREDMGR_SCOPED_EXCHANGE_TOKEN_MODE";
 const PLATFORM_KEK_IDENTIFIER_ENV: &str = "SPACE_PLATFORM_KEK_IDENTIFIER";
 // Hard-coded so two instances on the same host cannot be configured to use
 // different mutex files and both acquire concurrently.
 const SERVICE_MUTEX_PATH: &str = "/space/run/credential-manager/service.mutex";
+
+mod volume_socket;
 
 /// Which side of the control-plane split this process runs as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -87,6 +92,8 @@ pub struct CredmgrRunConfig {
     pub role: CredmgrRole,
     /// Unix socket path for the gRPC service.
     pub socket_path: PathBuf,
+    /// Optional restricted listener for volume-manager, provisioned before enabling.
+    pub volume_socket_path: Option<PathBuf>,
     /// TCP listen address for the control-plane deployment. Without TLS
     /// material this requires `allow_plaintext`.
     pub tcp_listen: Option<SocketAddr>,
@@ -118,20 +125,22 @@ pub enum RunCredmgrError {
          be given DATABASE_URL."
     )]
     KeylessNodeAuthority,
+    #[error("--volume-socket requires UDS and a path distinct from --socket")]
+    InvalidVolumeSocket,
     #[error("invalid peer-process check mode: {0}")]
     PeerProcessCheck(#[source] pplx_space_common_svc::PeerProcessCheckModeEnvError),
-    #[error("invalid {EXCHANGE_TOKEN_MODE_ENV}: {0}")]
-    ExchangeTokenMode(#[source] ParseExchangeTokenModeError),
-    #[error("{EXCHANGE_TOKEN_MODE_ENV} must be valid UTF-8")]
-    ExchangeTokenModeNotUnicode,
-    #[error("{STORAGE_VEND_ROLE_ENV} is required unless storage exchange is disabled")]
-    MissingStorageVendRole,
     #[error("{STORAGE_VEND_ROLE_ENV} must be valid UTF-8")]
     StorageVendRoleNotUnicode,
     #[error("{STORAGE_VEND_ROLE_ENV} is not a valid IAM role ARN")]
     InvalidStorageVendRole,
-    #[error("{EXCHANGE_TOKEN_MODE_ENV}=enforce requires DATABASE_URL")]
-    ScopedExchangeMissingDatabase,
+    #[error("{STORAGE_VEND_ROLE_ENV} requires DATABASE_URL")]
+    StorageVendRoleMissingDatabase,
+    #[error(
+        "{RETIRED_EXCHANGE_TOKEN_MODE_ENV}=disabled is no longer supported and would not stop \
+         issuance; unset {STORAGE_VEND_ROLE_ENV} to keep storage credential exchange off, \
+         then remove {RETIRED_EXCHANGE_TOKEN_MODE_ENV}"
+    )]
+    RetiredExchangeDisabled,
     #[error("--tls-cert/--tls-key require --tcp-listen")]
     TlsWithoutTcpListen,
     #[error("--tls-cert and --tls-key must be set together")]
@@ -183,6 +192,8 @@ pub enum RunCredmgrError {
     ),
     #[error("invalid AWS Private CA configuration: {0}")]
     IntermediateCaConfig(#[source] crate::intermediate_ca::aws_private_ca::ConfigError),
+    #[error(transparent)]
+    SecretsManagerReaderRole(#[from] crate::aws_secrets_manager::ReaderRoleArnError),
     #[error(
         "SPACE_PLATFORM_KEK_PROVIDER=in-memory requires \
          SPACE_CREDMGR_IN_MEMORY_KEK_ENABLED=true"
@@ -210,6 +221,14 @@ pub enum RunCredmgrError {
     ServiceMutex(#[source] pplx_space_common_svc::service_mutex::AcquireError),
     #[error("failed to bind the credential-manager socket: {0}")]
     BindSocket(#[source] pplx_space_common_svc::bootstrap::BindUnixSocketError),
+    #[error("volume credential socket preflight failed for {path}: {source}")]
+    VolumeSocketPreflight {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("volume credential socket preflight task failed: {0}")]
+    VolumeSocketPreflightTask(#[source] tokio::task::JoinError),
     #[error(
         "the node credential agent serves the node-local Unix socket; \
          --no-uds is invalid in agent mode"
@@ -262,7 +281,9 @@ pub enum ServeError {
     InternalToken(#[source] tonic::Status),
     #[error("invalid credmgr projected-token (k8sAuth) configuration: {0}")]
     K8sAuthConfig(#[source] crate::k8s_identity::K8sAuthConfigError),
-    #[error("failed to initialize the TokenReview client: {0}")]
+    #[error("Kubernetes authentication requires DATABASE_URL")]
+    K8sAuthMissingDatabase,
+    #[error("failed to initialize the Kubernetes authentication client: {0}")]
     TokenReviewClient(#[source] crate::k8s_identity::K8sAuthConfigError),
     #[error("failed to read TLS PEM at {path}: {source}")]
     ReadTlsPem {
@@ -335,6 +356,13 @@ fn validate_startup_config(
 /// gets the same shapes rejected as a typed error, instead of a panic or a
 /// listener it did not ask for.
 fn validate_flag_shape(config: &CredmgrRunConfig) -> Result<(), RunCredmgrError> {
+    if config
+        .volume_socket_path
+        .as_ref()
+        .is_some_and(|path| config.no_uds || path == &config.socket_path)
+    {
+        return Err(RunCredmgrError::InvalidVolumeSocket);
+    }
     if config.no_uds && config.tcp_listen.is_none() {
         return Err(RunCredmgrError::NoUdsWithoutTcpListen);
     }
@@ -449,7 +477,7 @@ pub async fn run(
     else {
         return Ok(());
     };
-    let listener = bind_credential_manager_socket(&config.socket_path)?;
+    let listener = CredentialListeners::bind(&config)?;
 
     tracing::info!(
         socket_path = %config.socket_path.display(),
@@ -488,27 +516,11 @@ pub async fn run(
 async fn initialize_authority_service(
     peer_process_check_mode: PeerProcessCheckMode,
 ) -> Result<CredentialManagerService, RunCredmgrError> {
-    // Unset: `legacy` when a vend role is configured, otherwise `disabled`.
-    let exchange_token_mode = match std::env::var(EXCHANGE_TOKEN_MODE_ENV) {
-        Ok(raw) => raw.parse().map_err(RunCredmgrError::ExchangeTokenMode)?,
-        Err(std::env::VarError::NotPresent) => {
-            if std::env::var_os(STORAGE_VEND_ROLE_ENV).is_some() {
-                ExchangeTokenMode::Legacy
-            } else {
-                ExchangeTokenMode::Disabled
-            }
-        }
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err(RunCredmgrError::ExchangeTokenModeNotUnicode);
-        }
-    };
-    tracing::info!(
-        env = EXCHANGE_TOKEN_MODE_ENV,
-        mode = %exchange_token_mode,
-        "storage credential exchange rollout mode resolved"
-    );
-    let storage_vend_role =
-        resolve_storage_vend_role(exchange_token_mode, std::env::var(STORAGE_VEND_ROLE_ENV))?;
+    let storage_vend_role = resolve_storage_vend_role(std::env::var(STORAGE_VEND_ROLE_ENV))?;
+    check_retired_exchange_token_mode(
+        std::env::var(RETIRED_EXCHANGE_TOKEN_MODE_ENV),
+        storage_vend_role.is_some(),
+    )?;
     // Database access is what enables the Encrypt/Decrypt RPCs (cmk_id →
     // KEK row resolution) and, below, the intermediate-key-broker blob store.
     // The control-plane deployment sets DATABASE_URL; node-local deployments
@@ -525,25 +537,35 @@ async fn initialize_authority_service(
         }
         _ => None,
     };
-    if exchange_token_mode == ExchangeTokenMode::Enforce && pool.is_none() {
-        return Err(RunCredmgrError::ScopedExchangeMissingDatabase);
+    // Every exchange is authorized against durable tenant and placement
+    // state, so a vend role without the database could never issue.
+    if storage_vend_role.is_some() && pool.is_none() {
+        return Err(RunCredmgrError::StorageVendRoleMissingDatabase);
     }
 
     let private_ca_config =
         AwsPrivateCaConfig::from_env().map_err(RunCredmgrError::IntermediateCaConfig)?;
-    // Database-backed credential resolution is installed even without a
-    // provider document. Node-local deployments without DATABASE_URL skip it.
+    let secrets_manager_role_arn = crate::aws_secrets_manager::reader_role_arn_from_env()?;
+    // Database-backed credential resolution reads secrets only through the
+    // organization-scoped reader role. Without a role, or on node-local
+    // deployments without DATABASE_URL, references are not resolvable.
+    if pool.is_some() && secrets_manager_role_arn.is_none() {
+        tracing::warn!(
+            env = crate::aws_secrets_manager::SECRETS_MANAGER_ROLE_ARN_ENV,
+            "no Secrets Manager reader role; credential references are not resolvable"
+        );
+    }
+    let secrets_manager_role_arn = secrets_manager_role_arn.filter(|_| pool.is_some());
     let (private_ca_issuer, aws_secrets_manager_resolver) =
-        if private_ca_config.is_none() && pool.is_none() {
+        if private_ca_config.is_none() && secrets_manager_role_arn.is_none() {
             tracing::info!("AWS integrations disabled; skipping AWS SDK configuration");
             (None, None)
         } else {
             let aws_config = load_authority_aws_config().await;
             let private_ca_issuer = private_ca_config
                 .map(|config| Arc::new(AwsPrivateCaIssuer::from_config(config, &aws_config)));
-            let resolver = pool
-                .as_ref()
-                .map(|_| Arc::new(AwsSecretsManagerResolver::new(&aws_config)));
+            let resolver = secrets_manager_role_arn
+                .map(|role| Arc::new(AwsSecretsManagerResolver::new(&aws_config, role)));
             (private_ca_issuer, resolver)
         };
 
@@ -656,10 +678,13 @@ async fn initialize_authority_service(
     // `Arc<dyn KeyWrapper>` automatically at the call site below.
     let key_wrapper = Arc::new(composite);
 
-    let mut service = CredentialManagerService::new(key_wrapper, peer_process_check_mode)
-        .with_exchange_token_mode(exchange_token_mode);
+    let mut service = CredentialManagerService::new(key_wrapper, peer_process_check_mode);
+    service.database_pool = pool.clone();
+    let storage_exchange_enabled = storage_vend_role.is_some();
     if let Some(role) = storage_vend_role {
         service = service.with_storage_vend_role(role);
+    } else {
+        tracing::info!("no {STORAGE_VEND_ROLE_ENV}; storage credential exchange is disabled");
     }
     if let Some(issuer) = private_ca_issuer {
         service = service.with_intermediate_ca_issuer(issuer);
@@ -675,26 +700,28 @@ async fn initialize_authority_service(
             let kek_store: Arc<dyn KekStore> = Arc::new(PgKekStore::new(pool.clone()));
             let credential_store: Arc<dyn CredentialStore> =
                 Arc::new(PgCredentialStore::new(pool.clone()));
-            let storage_vend_store: Arc<dyn StorageVendStore> =
-                Arc::new(PgStorageVendStore::new(pool.clone()));
             let credential_injection_authority = CredentialInjectionAuthority::new(
                 pool.clone(),
                 CredentialInjectionBundleMaterializer::new(providers),
             );
+            if storage_exchange_enabled {
+                let storage_vend_store: Arc<dyn StorageVendStore> =
+                    Arc::new(PgStorageVendStore::new(pool.clone()));
+                service = service.with_storage_vend_store(storage_vend_store);
+            }
             let volume_wrap_store: Arc<dyn VolumeWrapStore> =
                 Arc::new(PgVolumeWrapStore::new(pool));
             service = service
                 .with_kek_store(kek_store)
                 .with_credential_store(credential_store)
-                .with_storage_vend_store(storage_vend_store)
                 .with_credential_injection_authority(credential_injection_authority)
                 .with_volume_wrap_store(volume_wrap_store);
             if let Some(provisioner) = kek_provisioner {
                 service = service.with_kek_provisioner(provisioner);
             }
             tracing::info!(
-                "database configured; ExchangeToken, Encrypt/Decrypt, \
-                 ResolveNetworkCredentials, and GetOrIssueSandboxVolumeDek enabled"
+                "database configured; Encrypt/Decrypt, ResolveNetworkCredentials, \
+                 and GetOrIssueSandboxVolumeDek enabled"
             );
         }
         None => {
@@ -708,18 +735,35 @@ async fn initialize_authority_service(
     Ok(service)
 }
 
+/// The retired mode switch no longer selects behavior. A retained `disabled`
+/// alongside a vend role was an emergency stop that this build would reverse,
+/// so it fails startup; any other retained value only warns.
+fn check_retired_exchange_token_mode(
+    configured: Result<String, std::env::VarError>,
+    storage_vend_role_configured: bool,
+) -> Result<(), RunCredmgrError> {
+    let Ok(raw) = configured else {
+        return Ok(());
+    };
+    if raw == "disabled" && storage_vend_role_configured {
+        return Err(RunCredmgrError::RetiredExchangeDisabled);
+    }
+    tracing::warn!(
+        env = RETIRED_EXCHANGE_TOKEN_MODE_ENV,
+        value = %raw,
+        "retired storage exchange mode is ignored; every exchange uses the scoped contract"
+    );
+    Ok(())
+}
+
+/// An unset role leaves storage credential exchange off; a set role must be
+/// valid so a Ready authority never discovers a malformed ARN on request.
 fn resolve_storage_vend_role(
-    mode: ExchangeTokenMode,
     configured: Result<String, std::env::VarError>,
 ) -> Result<Option<VendRoleArn>, RunCredmgrError> {
-    if mode == ExchangeTokenMode::Disabled {
-        return Ok(None);
-    }
     let raw = match configured {
         Ok(raw) => raw,
-        Err(std::env::VarError::NotPresent) => {
-            return Err(RunCredmgrError::MissingStorageVendRole);
-        }
+        Err(std::env::VarError::NotPresent) => return Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => {
             return Err(RunCredmgrError::StorageVendRoleNotUnicode);
         }
@@ -853,6 +897,17 @@ where
     F: Future<Output = Result<T, RunCredmgrError>>,
 {
     let initialized = initialize.await?;
+    if let Some(path) = config.volume_socket_path.clone() {
+        let standard_socket = config.socket_path.clone();
+        // Passive readiness lets the rollout retire the predecessor, so even
+        // publishing health must wait until the new listener can be provisioned.
+        tokio::task::spawn_blocking(move || {
+            volume_socket::preflight(&path, &standard_socket)
+                .map_err(|source| RunCredmgrError::VolumeSocketPreflight { path, source })
+        })
+        .await
+        .map_err(RunCredmgrError::VolumeSocketPreflightTask)??;
+    }
     let Some(node_local) = prepare_node_local(config, shutdown_token, service_mutex_path).await?
     else {
         return Ok(None);
@@ -922,22 +977,68 @@ fn bind_credential_manager_socket(
     .map_err(RunCredmgrError::BindSocket)
 }
 
+struct CredentialListeners {
+    standard: tokio::net::UnixListener,
+    volume: Option<tokio::net::UnixListener>,
+}
+
+impl CredentialListeners {
+    fn bind(config: &CredmgrRunConfig) -> Result<Self, RunCredmgrError> {
+        let volume = config
+            .volume_socket_path
+            .as_ref()
+            .map(|path| {
+                pplx_space_common_svc::bind_unix_socket(path, volume_socket::options())
+                    .map_err(RunCredmgrError::BindSocket)
+            })
+            .transpose()?;
+        Ok(Self {
+            standard: bind_credential_manager_socket(&config.socket_path)?,
+            volume,
+        })
+    }
+
+    fn spawn<S: CredentialManager + Clone + Send + 'static>(
+        self,
+        servers: &mut JoinSet<(CredentialManagerServerKind, Result<(), ServeError>)>,
+        service: S,
+        shutdown: &CancellationToken,
+    ) {
+        let mut listeners = vec![(self.standard, CredentialUdsAccess::Standard)];
+        if let Some(volume) = self.volume {
+            listeners.push((volume, CredentialUdsAccess::Volume));
+        }
+        for (listener, access) in listeners {
+            let service = service.clone();
+            let shutdown = shutdown.clone();
+            servers.spawn(async move {
+                (
+                    CredentialManagerServerKind::Uds,
+                    serve_uds_until(listener, service, shutdown, access).await,
+                )
+            });
+        }
+    }
+}
+
 async fn serve_uds_until<S>(
     listener: tokio::net::UnixListener,
     service: S,
     shutdown_token: CancellationToken,
+    access: CredentialUdsAccess,
 ) -> Result<(), ServeError>
 where
     S: CredentialManager,
 {
     let (_, health_service) = pplx_space_common_svc::grpc_health_service();
     pplx_space_common_svc::grpc_server_builder()
+        .layer(pplx_space_common_svc::grpc_trace_layer())
         .layer(
             pplx_space_common_svc::conservative_uds_grpc_rate_limiter_layer(
                 "space-credential-manager",
             ),
         )
-        .layer(pplx_space_common_svc::grpc_trace_layer())
+        .layer(access)
         .add_service(health_service)
         .add_service(CredentialManagerServer::new(service))
         .serve_with_incoming_shutdown(UnixListenerStream::new(listener), async move {
@@ -948,24 +1049,18 @@ where
 }
 
 async fn serve_node_local_uds<S>(
-    listener: tokio::net::UnixListener,
+    listener: CredentialListeners,
     service: S,
     production_socket: PathBuf,
     node_local: NodeLocalActivation,
     shutdown_token: CancellationToken,
 ) -> Result<(), RunCredmgrError>
 where
-    S: CredentialManager + Send + 'static,
+    S: CredentialManager + Clone + Send + 'static,
 {
     let production_shutdown_token = CancellationToken::new();
     let mut servers = JoinSet::new();
-    let server_shutdown_token = production_shutdown_token.clone();
-    servers.spawn(async move {
-        (
-            CredentialManagerServerKind::Uds,
-            serve_uds_until(listener, service, server_shutdown_token).await,
-        )
-    });
+    listener.spawn(&mut servers, service, &production_shutdown_token);
 
     tracing::info!(
         socket_path = %production_socket.display(),
@@ -983,7 +1078,7 @@ where
 }
 
 async fn serve_node_local_uds_and_tcp(
-    listener: tokio::net::UnixListener,
+    listener: CredentialListeners,
     addr: SocketAddr,
     security: TcpSecurity,
     service: CredentialManagerService,
@@ -993,14 +1088,7 @@ async fn serve_node_local_uds_and_tcp(
 ) -> Result<(), RunCredmgrError> {
     let production_shutdown_token = CancellationToken::new();
     let mut servers = JoinSet::new();
-    let uds_shutdown_token = production_shutdown_token.clone();
-    let uds_service = service.clone();
-    servers.spawn(async move {
-        (
-            CredentialManagerServerKind::Uds,
-            serve_uds_until(listener, uds_service, uds_shutdown_token).await,
-        )
-    });
+    listener.spawn(&mut servers, service.clone(), &production_shutdown_token);
     let tcp_shutdown_token = production_shutdown_token.clone();
     servers.spawn(async move {
         (
@@ -1151,7 +1239,7 @@ async fn run_agent(
     else {
         return Ok(());
     };
-    let listener = bind_credential_manager_socket(&config.socket_path)?;
+    let listener = CredentialListeners::bind(&config)?;
 
     tracing::info!(
         socket_path = %config.socket_path.display(),
@@ -1192,6 +1280,10 @@ async fn serve_tcp_until(
         .map_err(ServeError::K8sAuthConfig)?
     {
         Some(config) => {
+            let database_pool = service
+                .database_pool
+                .clone()
+                .ok_or(ServeError::K8sAuthMissingDatabase)?;
             tracing::info!(
                 %addr,
                 namespace = config.namespace(),
@@ -1200,10 +1292,12 @@ async fn serve_tcp_until(
                  the static internal token is not accepted"
             );
             crate::tcp_auth::CredmgrTcpAuthLayer::projected_token(
-                crate::k8s_identity::CredmgrTokenReviewer::new(config)
-                    .await
-                    .map_err(ServeError::TokenReviewClient)?,
+                config,
+                database_pool,
+                shutdown_token.clone(),
             )
+            .await
+            .map_err(ServeError::TokenReviewClient)?
         }
         None => {
             tracing::info!(

@@ -5,6 +5,15 @@
 
 use crate::emit::{counter, tag, timing_ms};
 
+/// Every Kubernetes caller pod authorization check, outside the TokenReview cache.
+pub fn pod_authorization(check: &str, result: &str) {
+    counter(
+        "credmgr.pod_authorization",
+        1,
+        &[tag("check", check), tag("result", result)],
+    );
+}
+
 /// Record one RPC the node credential agent forwarded upstream.
 ///
 /// `method` is the CredentialManager RPC name; `result` is `"ok"`,

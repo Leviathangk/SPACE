@@ -23,6 +23,36 @@ message Recipe {
     optional uint64 memory_bytes = 2;
     // Guest rootfs capacity in bytes.
     optional uint64 disk_bytes = 3;
+    // Opt-in Firecracker balloon device recorded in the built template's
+    // metadata. Sandboxes get it only when they cold-boot from the build,
+    // including when its base snapshot is created; restores keep the device
+    // their snapshot captured. Unset: no balloon device.
+    Balloon balloon = 4;
+  }
+
+  // Exactly one mode must be set.
+  message Balloon {
+    oneof mode {
+      Inflate inflate = 1;
+      FreePageReporting free_page_reporting = 2;
+      FreePageHinting free_page_hinting = 3;
+    }
+    // Seconds between guest statistics updates; 0 disables statistics.
+    // At most 65535.
+    uint32 stats_polling_interval_s = 4;
+
+    // A fixed-size inflation balloon.
+    message Inflate {
+      // Required. Positive and below the sandbox's guest memory.
+      uint32 amount_mib = 1;
+      // Whether the guest may deflate the balloon to avoid OOM.
+      bool deflate_on_oom = 2;
+    }
+    // The guest continuously reports freed pages to the host.
+    message FreePageReporting {}
+    // The host asks the guest to hint free pages before each suspend
+    // snapshot when the node enables it.
+    message FreePageHinting {}
   }
 
   // Origin selects a template base, a scratch image, or an OCI filesystem
@@ -97,9 +127,9 @@ message Recipe {
   message Step {
     // UI-only label shown in build logs. Not interpreted by the daemon.
     optional string display_name = 1;
-    // Host environment variable names the daemon may resolve and inject
-    // into this step's command/args. Allow-list semantics: only listed
-    // names are exposed. Ignored by steps that don't support env injection.
+    // Guest environment names, matching [A-Za-z_][A-Za-z0-9_]*. The daemon
+    // resolves NAME only from operator-configured SPACE_BUILD_EXPORT_NAME;
+    // missing exports fail the build. Values are scoped to this step.
     repeated string env_refs = 2;
 
     oneof body {
@@ -108,8 +138,39 @@ message Recipe {
       Env env = 5;
       Copy copy = 6;
       PlaywrightInstall playwright_install = 7;
+      // Required oneof arms fail closed through older builders/proxies.
+      SetRuntime set_runtime = 8;
+      ClearRuntime clear_runtime = 9;
     }
   }
+
+  // Template-only boot configuration; sandbox env is not applied to this app.
+  message SetRuntime {
+    uint32 schema_version = 1;
+    repeated RuntimeApp apps = 2;
+  }
+  message RuntimeApp {
+    string name = 1;
+    repeated string command = 2;
+    string user = 3;
+    string working_directory = 4;
+    map<string, string> env = 5;
+    oneof readiness {
+      LaunchReady launch = 6;
+      ExecReady exec = 7;
+    }
+    uint64 startup_timeout_secs = 8;
+    // Whether this app is required for the template.
+    // Currently enforced only during base-snapshot preparation.
+    StartupPolicy startup_policy = 9;
+    enum StartupPolicy {
+      BEST_EFFORT = 0;
+      REQUIRED = 1;
+    }
+    message LaunchReady {}
+    message ExecReady { repeated string command = 1; }
+  }
+  message ClearRuntime {}
 
   message PackageInstall {
     PackageManager manager = 1;

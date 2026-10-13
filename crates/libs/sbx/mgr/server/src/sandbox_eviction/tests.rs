@@ -35,7 +35,7 @@ fn unpinned(job: Option<(Uuid, u64)>) -> LocalEvidence {
 #[test]
 fn decide_skips_without_ready_backup() {
     assert_eq!(
-        decide(None, &pinned(true), 0),
+        decide(None, &unpinned(Some((v7(1_000), 0))), 0),
         PreDecision::Skip(SkipReason::NoReadyBackup)
     );
 }
@@ -44,11 +44,7 @@ fn decide_skips_without_ready_backup() {
 #[test]
 fn decide_evicts_pinned_with_backup_marker() {
     assert_eq!(
-        decide(
-            Some(SnapshotId::from_uuid(v7(2_000))),
-            &pinned(true),
-            u64::MAX
-        ),
+        decide(None, &pinned(true), u64::MAX),
         PreDecision::Evict(EvictReason::LatestBackedIdle)
     );
 }
@@ -57,10 +53,7 @@ fn decide_evicts_pinned_with_backup_marker() {
 /// the cluster — never fall back to job/generation comparison.
 #[test]
 fn decide_demands_exact_proof_for_unmarked_pin() {
-    assert_eq!(
-        decide(Some(SnapshotId::from_uuid(v7(2_000))), &pinned(false), 0),
-        PreDecision::ProvePinned
-    );
+    assert_eq!(decide(None, &pinned(false), 0), PreDecision::ProvePinned);
 }
 
 /// **Reviewer regression**: current artifact unbacked (pin present,
@@ -841,7 +834,7 @@ async fn evict_tick_below_engage_returns_before_candidate_scan() {
         [],
     )
     .unwrap();
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
     let cfg = EvictionConfig {
         enabled: true,
         engage_fraction: 0.50,
@@ -863,7 +856,7 @@ async fn evict_tick_below_engage_returns_before_candidate_scan() {
         ..Default::default()
     };
 
-    let report = evict_tick(&service, cfg, disk, &mut scan_state)
+    let report = evict_tick(&service, cfg, Some(disk), &mut scan_state)
         .await
         .unwrap();
 
@@ -871,10 +864,52 @@ async fn evict_tick_below_engage_returns_before_candidate_scan() {
     assert_eq!(report.evicted, 0);
     assert_eq!(report.skipped, 0);
     assert_eq!(report.malformed_updated_at, 1);
+    assert_eq!(report.resident_rows, 2);
     assert_eq!(
         scan_state.cursor, None,
         "closed gate must restart oldest-first"
     );
+}
+
+#[test]
+fn resident_rows_count_every_state() {
+    let conn = open_test_db();
+    insert_sandbox(&conn, "a-suspended", "suspended", 1_000);
+    insert_sandbox(&conn, "b-started", "started", 1_000);
+    insert_sandbox(&conn, "c-deleting", "deleting", 1_000);
+
+    assert_eq!(count_resident_rows(&conn).unwrap(), 3);
+}
+
+#[tokio::test]
+async fn evict_tick_without_disk_usage_fails_without_scanning() {
+    let conn = open_test_db();
+    insert_sandbox(&conn, "sbx-cold", "suspended", 1_000);
+    let service = SandboxManagerService::for_test(conn);
+    let cfg = EvictionConfig {
+        enabled: true,
+        engage_fraction: 0.0,
+        target_fraction: 0.0,
+        min_idle: std::time::Duration::from_secs(0),
+        interval: std::time::Duration::from_secs(60),
+        max_per_tick: 10,
+        reupload_max_per_tick: 5,
+    };
+    let cursor = CandidateCursor {
+        idle_witness_secs: 1_000,
+        sandbox_id: "sbx-previous".to_string(),
+    };
+    let mut scan_state = CandidateScanState {
+        cursor: Some(cursor.clone()),
+        ..Default::default()
+    };
+
+    let error = evict_tick(&service, cfg, None, &mut scan_state)
+        .await
+        .unwrap_err();
+
+    assert!(error.contains("statvfs"), "{error}");
+    assert_eq!(scan_state.cursor, Some(cursor), "nothing was scanned");
 }
 
 #[tokio::test]
@@ -882,7 +917,7 @@ async fn evict_tick_does_not_connect_when_all_candidates_are_backed_off() {
     let conn = open_test_db();
     insert_sandbox(&conn, "sbx-backed-off", "suspended", 1_000);
     insert_pinned_artifact(&conn, "sbx-backed-off", &v7(1_000).to_string(), Some("123"));
-    let service = SandboxManagerService::new(conn);
+    let service = SandboxManagerService::for_test(conn);
     let cfg = EvictionConfig {
         enabled: true,
         engage_fraction: 0.50,
@@ -899,7 +934,7 @@ async fn evict_tick_does_not_connect_when_all_candidates_are_backed_off() {
     let mut scan_state = CandidateScanState::default();
     scan_state.back_off("sbx-backed-off", Instant::now());
 
-    let report = evict_tick(&service, cfg, disk, &mut scan_state)
+    let report = evict_tick(&service, cfg, Some(disk), &mut scan_state)
         .await
         .unwrap();
 
@@ -1043,6 +1078,209 @@ fn gather_evidence_distinguishes_pinned_and_unpinned() {
         );
         assert_eq!(suspend_time_witness(&evidence), None, "{timestamp}");
     }
+}
+
+#[derive(Clone)]
+struct BackupProofServer {
+    requests: std::sync::Arc<
+        std::sync::Mutex<Vec<pplx_space_node_api_client::proto::GetArtifactBackupLocationRequest>>,
+    >,
+    reply: std::sync::Arc<
+        std::sync::Mutex<
+            Result<
+                pplx_space_node_api_client::proto::GetArtifactBackupLocationResponse,
+                tonic::Code,
+            >,
+        >,
+    >,
+}
+
+impl tonic::server::NamedService for BackupProofServer {
+    const NAME: &'static str = "space.node.api.v1.ClusterApi";
+}
+
+impl
+    tonic::server::UnaryService<pplx_space_node_api_client::proto::GetArtifactBackupLocationRequest>
+    for BackupProofServer
+{
+    type Response = pplx_space_node_api_client::proto::GetArtifactBackupLocationResponse;
+    type Future = std::future::Ready<Result<tonic::Response<Self::Response>, tonic::Status>>;
+
+    fn call(
+        &mut self,
+        request: tonic::Request<
+            pplx_space_node_api_client::proto::GetArtifactBackupLocationRequest,
+        >,
+    ) -> Self::Future {
+        self.requests.lock().unwrap().push(request.into_inner());
+        std::future::ready(match self.reply.lock().unwrap().clone() {
+            Ok(response) => Ok(tonic::Response::new(response)),
+            Err(code) => Err(tonic::Status::new(code, "synthetic proof failure")),
+        })
+    }
+}
+
+impl<B> tower::Service<http::Request<B>> for BackupProofServer
+where
+    B: http_body::Body + Send + 'static,
+    B::Error: Into<tonic::codegen::StdError> + Send + 'static,
+{
+    type Response = http::Response<tonic::body::Body>;
+    type Error = std::convert::Infallible;
+    type Future = futures_util::future::BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        // The suspend-location RPC is placement-scoped and off limits to a
+        // former host; proofs go only through readiness queries.
+        assert!(request.uri().path().ends_with("/GetArtifactBackupLocation"));
+        let service = self.clone();
+        Box::pin(async move {
+            let mut grpc = tonic::server::Grpc::new(tonic_prost::ProstCodec::default());
+            Ok(grpc.unary(service, request).await)
+        })
+    }
+}
+
+#[tokio::test]
+async fn eviction_proofs_use_known_identities_and_fail_closed() {
+    use pplx_space_node_api_client::proto::{
+        BackupReadinessQuery, GetArtifactBackupLocationRequest, GetArtifactBackupLocationResponse,
+        LocalArtifactBackupIdentity, backup_readiness_query::Artifact,
+    };
+    use std::ffi::OsStr;
+
+    if !pplx_space_test_env::enter_test_process(&[(
+        "SPACE_INTERNAL_RPC_INSECURE_DEV",
+        Some(OsStr::new("1")),
+    )]) {
+        return;
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let mock = BackupProofServer {
+        requests: Default::default(),
+        reply: std::sync::Arc::new(std::sync::Mutex::new(Err(tonic::Code::Internal))),
+    };
+    let stop = tokio_util::sync::CancellationToken::new();
+    let server = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(mock.clone())
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                stop.clone().cancelled_owned(),
+            ),
+    );
+    let mut client =
+        pplx_space_node_api_client::cluster::connect(endpoint, "synthetic-proof-token")
+            .await
+            .unwrap();
+    let sandbox_id = pplx_space_common_core::types::SandboxId::new().to_string();
+
+    for marker in [true, false] {
+        assert_eq!(
+            ready_unpinned_suspend_generation(&mut client, &sandbox_id, &pinned(marker)).await,
+            Ok(None)
+        );
+    }
+    assert!(
+        mock.requests.lock().unwrap().is_empty(),
+        "pinned caches must skip the latest-suspend query"
+    );
+
+    // The identity rides only inside `readiness`, so a server that predates
+    // it sees an empty artifact id. Only a bare acknowledgement is proof.
+    let readiness = |artifact| GetArtifactBackupLocationRequest {
+        sandbox_id: sandbox_id.clone(),
+        readiness: Some(BackupReadinessQuery {
+            artifact: Some(artifact),
+        }),
+        ..Default::default()
+    };
+    let bare = |ready| GetArtifactBackupLocationResponse {
+        ready,
+        ..Default::default()
+    };
+    let location = GetArtifactBackupLocationResponse {
+        backup_attempt_id: SnapshotId::new().to_string(),
+        storage_uri: "s3://synthetic-backups/attempt".to_string(),
+        ..Default::default()
+    };
+    for (reply, expected) in [
+        (Ok(bare(Some(true))), Ok(true)),
+        (Ok(bare(Some(false))), Ok(false)),
+        (Ok(bare(None)), Err(SkipReason::RpcError)),
+        (Ok(location.clone()), Err(SkipReason::RpcError)),
+        (
+            Ok(GetArtifactBackupLocationResponse {
+                ready: Some(true),
+                ..location.clone()
+            }),
+            Err(SkipReason::RpcError),
+        ),
+        // An older server rejects the empty artifact id; an even older one
+        // lacks the RPC. Neither retries as a location read.
+        (Err(tonic::Code::InvalidArgument), Err(SkipReason::RpcError)),
+        (Err(tonic::Code::Unimplemented), Err(SkipReason::RpcError)),
+        (
+            Err(tonic::Code::Unavailable),
+            Err(SkipReason::RpcTransportError),
+        ),
+    ] {
+        *mock.reply.lock().unwrap() = reply;
+        let conn = open_test_db();
+        let artifact_id = LocalArtifactId::new();
+        insert_sandbox(&conn, &sandbox_id, "suspended", 0);
+        insert_pinned_artifact(&conn, &sandbox_id, &artifact_id.to_string(), None);
+        let service = SandboxManagerService::for_test(conn);
+        let pin = PinnedArtifact {
+            artifact_id,
+            artifact_kind: pplx_space_common_core::types::ArtifactKind::Full,
+            backup_marker: false,
+        };
+        let proof = prove_pinned_artifact(&mut client, &service, &sandbox_id, &pin).await;
+        assert_eq!(proof, expected);
+        let (evidence, _) = {
+            let conn = service.db_conn().unwrap();
+            gather_local_evidence(&conn, &sandbox_id).unwrap().unwrap()
+        };
+        assert!(
+            matches!(evidence, LocalEvidence::Pinned(PinnedArtifact { backup_marker, .. }) if backup_marker == (expected == Ok(true)))
+        );
+        assert_eq!(
+            mock.requests.lock().unwrap().pop().unwrap(),
+            readiness(Artifact::LocalArtifact(LocalArtifactBackupIdentity {
+                local_artifact_id: artifact_id.to_string(),
+                artifact_kind: pplx_space_sbx_mgr_client::proto::ArtifactKind::Full as i32,
+            }))
+        );
+
+        let generation = SnapshotId::from_uuid(v7(1_000));
+        let unpinned_cache = unpinned(Some((generation.as_uuid(), 0)));
+        assert_eq!(
+            ready_unpinned_suspend_generation(&mut client, &sandbox_id, &unpinned_cache).await,
+            expected.map(|ready| ready.then_some(generation))
+        );
+        assert_eq!(
+            mock.requests.lock().unwrap().pop().unwrap(),
+            readiness(Artifact::LatestReadySuspendSnapshotId(
+                generation.to_string()
+            ))
+        );
+    }
+    drop(client);
+    stop.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .expect("proof server did not stop")
+        .unwrap()
+        .unwrap();
 }
 
 #[test]
@@ -1219,4 +1457,153 @@ fn a_pin_owned_by_another_sandbox_is_not_evidence_of_this_sandbox_backup() {
         ),
         "the owner's own pin still resolves: {owner:?}"
     );
+}
+
+/// Environment of a node wired to a cluster API through the given endpoint and
+/// static token, with the token file pointing at a missing test-owned path, so
+/// any cluster-api connect stops at the token probe before dialing.
+fn cluster_api_env<'a>(
+    endpoint: &'a str,
+    token: &'a str,
+    token_path: &'a Path,
+) -> Vec<(&'static str, Option<&'a std::ffi::OsStr>)> {
+    vec![
+        (
+            pplx_space_node_api_client::cluster::CLUSTER_API_ENDPOINT_ENV,
+            Some(std::ffi::OsStr::new(endpoint)),
+        ),
+        (
+            pplx_space_node_api_client::cluster::CLUSTER_API_ENDPOINT_ENV_LEGACY,
+            None,
+        ),
+        (
+            pplx_space_common_svc::bearer_token::SPACE_INTERNAL_TOKEN_ENV,
+            Some(std::ffi::OsStr::new(token)),
+        ),
+        (
+            pplx_space_common_svc::bearer_token::SPACE_CLUSTER_API_TOKEN_PATH_ENV,
+            Some(token_path.as_os_str()),
+        ),
+    ]
+}
+
+/// Refusals produced by the real reupload handler, read through the real
+/// legacy-repair classifier: a sandbox that vanished or left `Suspended` is
+/// skipped, while a node that cannot restore snapshots is a retryable failure.
+#[tokio::test]
+async fn legacy_reupload_refusals_classify_as_state_skips_or_retryable_failures() {
+    let token_dir = tempfile::tempdir().unwrap();
+    let token_path = token_dir.path().join("cluster-api.token");
+    if !pplx_space_test_env::enter_test_process(&cluster_api_env(
+        "http://127.0.0.1:9",
+        "characterization-token",
+        &token_path,
+    )) {
+        return;
+    }
+    use crate::state::SandboxState;
+    use pplx_space_common_core::types::SandboxId;
+
+    let service = SandboxManagerService::for_test(open_test_db());
+    let unknown = service
+        .reupload_legacy_sandbox_for_eviction(&SandboxId::new().to_string())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        classify_reupload_failure(&unknown),
+        Ok(LegacyRepairSkipReason::StateChanged),
+        "{unknown}"
+    );
+
+    // Not covered: a `Suspended` row passes state admission, and its artifact
+    // checks then read the fixed sandbox cache root, which this fixture cannot
+    // isolate.
+    for state in SandboxState::all() {
+        if state == SandboxState::Suspended {
+            continue;
+        }
+        let conn = open_test_db();
+        let id = SandboxId::new().to_string();
+        insert_sandbox(&conn, &id, state.as_str(), 0);
+        let service = SandboxManagerService::for_test(conn);
+
+        let refused = service
+            .reupload_legacy_sandbox_for_eviction(&id)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            classify_reupload_failure(&refused),
+            Ok(LegacyRepairSkipReason::StateChanged),
+            "{state}: {refused}"
+        );
+    }
+
+    // The snapshot-restore support check precedes the state check, so even a
+    // non-suspended row is retried rather than skipped on such a node.
+    let conn = open_test_db();
+    let id = SandboxId::new().to_string();
+    insert_sandbox(&conn, &id, SandboxState::Restoring.as_str(), 0);
+    let service = SandboxManagerService::new_with_config(
+        conn,
+        crate::service::SandboxManagerServiceOptions::for_test(),
+        crate::config::SandboxConfig {
+            hugepages: true,
+            ..Default::default()
+        },
+    );
+    let refused = service
+        .reupload_legacy_sandbox_for_eviction(&id)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        classify_reupload_failure(&refused),
+        Err(LegacyRepairFailureReason::Submission),
+        "{refused}"
+    );
+}
+
+/// Empty cluster-api wiring is operator-fixable, so eviction retries the
+/// reupload instead of skipping the sandbox.
+async fn assert_missing_wiring_reupload_is_retried() {
+    let service = SandboxManagerService::for_test(open_test_db());
+    let refused = service
+        .reupload_legacy_sandbox_for_eviction(
+            &pplx_space_common_core::types::SandboxId::new().to_string(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        classify_reupload_failure(&refused),
+        Err(LegacyRepairFailureReason::Submission),
+        "{refused}"
+    );
+}
+
+#[tokio::test]
+async fn legacy_reupload_retries_when_the_cluster_api_token_is_empty() {
+    let token_dir = tempfile::tempdir().unwrap();
+    let token_path = token_dir.path().join("cluster-api.token");
+    if !pplx_space_test_env::enter_test_process(&cluster_api_env(
+        "http://127.0.0.1:9",
+        "",
+        &token_path,
+    )) {
+        return;
+    }
+    assert_missing_wiring_reupload_is_retried().await;
+}
+
+#[tokio::test]
+async fn legacy_reupload_retries_when_the_cluster_api_endpoint_is_empty() {
+    let token_dir = tempfile::tempdir().unwrap();
+    let token_path = token_dir.path().join("cluster-api.token");
+    if !pplx_space_test_env::enter_test_process(&cluster_api_env(
+        "",
+        "characterization-token",
+        &token_path,
+    )) {
+        return;
+    }
+    assert_missing_wiring_reupload_is_retried().await;
 }

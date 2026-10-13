@@ -93,11 +93,12 @@ fn configure_test_ecw_credential_keyring(state: &mut AppState) {
 }
 
 async fn test_state() -> AppState {
-    // Nothing listens here. A route that reaches the database should fail at
-    // once, not wait out sqlx's 30 s default acquire timeout.
+    // Port 1 is closed, so this never reaches a Postgres the host happens to
+    // serve. A route that reaches the database should fail at once, not wait
+    // out sqlx's 30 s default acquire timeout.
     let pool = PgPoolOptions::new()
         .acquire_timeout(Duration::from_millis(100))
-        .connect_lazy("postgresql://postgres:postgres@localhost/space")
+        .connect_lazy("postgresql://127.0.0.1:1/unused")
         .unwrap();
 
     AppState::from_pool(pool).await.unwrap()
@@ -1543,6 +1544,12 @@ async fn sdk_v2_create_and_connect_routes_are_mounted() {
             StatusCode::BAD_REQUEST,
             "unsupported sandbox connect parameter: memory=false",
         ),
+        (
+            "/v2/sandboxes/example/connect",
+            r#"{"timeout":0}"#,
+            StatusCode::BAD_REQUEST,
+            "Timeout must be greater than 0",
+        ),
     ] {
         let response = app
             .clone()
@@ -2275,6 +2282,72 @@ fn create_translation_maps_tls_interception_metadata() {
                 assert_eq!(error.status, status, "{}", case.name);
             }
         }
+    }
+}
+
+#[test]
+fn e2b_full_network_policy_translation() {
+    use pplx_space_net_common::NetworkPolicyV1;
+    let raw = serde_json::json!({
+        "version": "v1",
+        "egress": {"default_action": "deny", "allow": [{"domain": "sensor.example.com"}],
+                   "deny": [{"ip": "192.0.2.1"}]},
+        "tls_interception": "on",
+        "tls_interception_exemptions": [{"domain": "sensor.example.com"}],
+        "network_credential_rules": [{
+            "rule_id": "api", "destination": {"exact_host": "api.example.com", "path_prefix": "/"},
+            "credential_header_bindings": [{"header_name": "Authorization",
+                "credential_reference_id": "018f1e9d-7b7a-7d3a-8000-000000000001"}],
+            "supported_http_methods": ["GET"]
+        }]
+    })
+    .to_string();
+    let expected: NetworkPolicyV1 = serde_json::from_str(&raw).unwrap();
+    let mut request = base_create_request();
+    request
+        .metadata
+        .insert("network.policy".into(), raw.clone());
+    request.metadata.insert("name".into(), "sample".into());
+    let translated = translate_create_request(request.clone()).unwrap();
+    assert_eq!(translated.native.network_policy, Some(expected));
+    assert!(!translated.native.metadata.contains_key("network.policy"));
+    assert_eq!(
+        translated.native.metadata.get("name"),
+        Some(&SandboxMetadataValue::String("sample".into()))
+    );
+
+    for conflict in [
+        "network",
+        "allow_internet_access",
+        "network.tls_interception",
+    ] {
+        let mut conflicting = request.clone();
+        match conflict {
+            "network" => conflicting.network = Some(serde_json::json!({})),
+            "allow_internet_access" => conflicting.allow_internet_access = Some(false),
+            _ => {
+                conflicting.metadata.insert(conflict.into(), "off".into());
+            }
+        }
+        assert_eq!(
+            translate_create_request(conflicting).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    for malformed in [
+        "null",
+        "[]",
+        "{",
+        r#"{"egress":{"default_action":"invalid"}}"#,
+    ] {
+        let mut invalid = request.clone();
+        invalid
+            .metadata
+            .insert("network.policy".into(), malformed.into());
+        assert_eq!(
+            translate_create_request(invalid).unwrap_err().status,
+            StatusCode::BAD_REQUEST
+        );
     }
 }
 
@@ -3238,6 +3311,7 @@ async fn connect_route_extends_deadline_without_replacing_policy() -> TestResult
 
     struct Case {
         label: &'static str,
+        path_prefix: &'static str,
         body: Option<&'static str>,
         requested_timeout_secs: Option<u32>,
     }
@@ -3256,28 +3330,69 @@ async fn connect_route_extends_deadline_without_replacing_policy() -> TestResult
 
     let cases = [
         Case {
-            label: "omitted timeout",
+            label: "legacy empty body",
+            path_prefix: "",
             body: None,
             requested_timeout_secs: None,
         },
         Case {
-            label: "shorter timeout",
+            label: "legacy empty object",
+            path_prefix: "",
+            body: Some("{}"),
+            requested_timeout_secs: None,
+        },
+        Case {
+            label: "v2 empty body",
+            path_prefix: "/v2",
+            body: None,
+            requested_timeout_secs: Some(300),
+        },
+        Case {
+            label: "v2 empty object",
+            path_prefix: "/v2",
+            body: Some("{}"),
+            requested_timeout_secs: Some(300),
+        },
+        Case {
+            label: "v2 explicit default",
+            path_prefix: "/v2",
             body: Some(r#"{"timeout":300}"#),
             requested_timeout_secs: Some(300),
         },
         Case {
-            label: "same timeout",
+            label: "v2 explicit shorter timeout",
+            path_prefix: "/v2",
+            body: Some(r#"{"timeout":60}"#),
+            requested_timeout_secs: Some(60),
+        },
+        Case {
+            label: "legacy explicit default",
+            path_prefix: "",
+            body: Some(r#"{"timeout":300}"#),
+            requested_timeout_secs: Some(300),
+        },
+        Case {
+            label: "legacy explicit longer timeout",
+            path_prefix: "",
             body: Some(r#"{"timeout":900}"#),
             requested_timeout_secs: Some(900),
         },
         Case {
-            label: "longer timeout",
+            label: "v2 explicit longer timeout",
+            path_prefix: "/v2",
             body: Some(r#"{"timeout":1200}"#),
             requested_timeout_secs: Some(1_200),
         },
     ];
 
-    for lifecycle in ["started", "suspended"] {
+    for (lifecycle, policy_timeout) in [
+        ("started", 120),
+        ("suspended", 120),
+        ("started", 300),
+        ("suspended", 300),
+        ("started", 900),
+        ("suspended", 900),
+    ] {
         for case in &cases {
             let sandbox_id = SandboxId::new();
             insert_connect_route_sandbox(
@@ -3288,26 +3403,26 @@ async fn connect_route_extends_deadline_without_replacing_policy() -> TestResult
                 Some(worker_node_id),
             )
             .await?;
-            let policy = e2b_auto_lifecycle_policy(900, true, false);
-            sqlx::query(
+            let policy = e2b_auto_lifecycle_policy(policy_timeout, true, false);
+            sqlx::query(sql!(
                 "UPDATE sandboxes
                  SET auto_lifecycle_json = $1
-                 WHERE id = $2",
-            )
+                 WHERE id = $2"
+            ))
             .bind(sqlx::types::Json(&policy))
             .bind(sandbox_id)
             .execute(&db.pool)
             .await?;
             if lifecycle == "suspended" {
-                sqlx::query(
+                sqlx::query(sql!(
                     "INSERT INTO sandbox_direct_route_provenance (
                          sandbox_id,
                          last_route_generation,
                          last_execution_generation,
                          updated_at
                      )
-                     VALUES ($1, 1, 1, NOW())",
-                )
+                     VALUES ($1, 1, 1, NOW())"
+                ))
                 .bind(sandbox_id)
                 .execute(&db.pool)
                 .await?;
@@ -3331,45 +3446,69 @@ async fn connect_route_extends_deadline_without_replacing_policy() -> TestResult
             }
 
             let accepted_at = jiff::Timestamp::now().as_second();
-            let response = app
-                .clone()
-                .oneshot(connect_route_request(
-                    sandbox_id,
-                    ConnectRouteRequestShape {
-                        label: case.label,
-                        body: case.body,
-                    },
-                )?)
-                .await?;
+            // A pre-existing extension must also survive a shorter reconnect request.
+            let previous_floor =
+                (lifecycle == "started" && policy_timeout == 900).then_some(accepted_at + 1_800);
+            if previous_floor.is_some() {
+                worker
+                    .state()
+                    .apply_access_deadline(&sandbox_id.to_string(), previous_floor, None)
+                    .await?;
+            }
+            let mut request = connect_route_request(
+                sandbox_id,
+                ConnectRouteRequestShape {
+                    label: case.label,
+                    body: case.body,
+                },
+            )?;
+            *request.uri_mut() =
+                format!("{}/sandboxes/{sandbox_id}/connect", case.path_prefix).parse()?;
+            let response = app.clone().oneshot(request).await?;
+            let completed_at = jiff::Timestamp::now().as_second();
             let status = response.status();
             let body = to_bytes(response.into_body(), usize::MAX).await?;
             assert_eq!(
                 status,
                 StatusCode::OK,
-                "{lifecycle} / {}: {}",
+                "{lifecycle} / {policy_timeout}s / {}: {}",
                 case.label,
                 String::from_utf8_lossy(&body)
             );
 
             let sqlx::types::Json(stored_policy): sqlx::types::Json<AutoLifecyclePolicy> =
-                sqlx::query_scalar(
+                sqlx::query_scalar(sql!(
                     "SELECT auto_lifecycle_json
                      FROM sandboxes
-                     WHERE id = $1",
-                )
+                     WHERE id = $1"
+                ))
                 .bind(sandbox_id)
                 .fetch_one(&db.pool)
                 .await?;
             let config = e2b_lifecycle_config_from_policy(&stored_policy)
                 .expect("connect must leave an E2B-compatible policy");
-            assert_eq!(config.timeout_secs, 900, "{lifecycle} / {}", case.label);
+            assert_eq!(
+                config.timeout_secs, policy_timeout,
+                "{lifecycle} / {policy_timeout}s / {}",
+                case.label
+            );
+            let record = worker.state().get(&sandbox_id.to_string()).await?;
             if let Some(timeout) = case.requested_timeout_secs {
-                let record = worker.state().get(&sandbox_id.to_string()).await?;
                 assert!(
-                    record
-                        .access_extended_until
-                        .is_some_and(|deadline| deadline >= accepted_at + i64::from(timeout)),
-                    "{lifecycle} / {}",
+                    record.access_extended_until.is_some_and(|deadline| {
+                        let earliest =
+                            (accepted_at + i64::from(timeout)).max(previous_floor.unwrap_or(0));
+                        let latest =
+                            (completed_at + i64::from(timeout)).max(previous_floor.unwrap_or(0));
+                        (earliest..=latest).contains(&deadline)
+                    }),
+                    "{lifecycle} / {policy_timeout}s / {}",
+                    case.label
+                );
+            } else {
+                assert_eq!(
+                    record.access_extended_until, previous_floor,
+                    "{lifecycle} / {policy_timeout}s / {} must retain legacy omission semantics",
                     case.label
                 );
             }
@@ -5551,6 +5690,7 @@ async fn timeout_observes_existing_activation_without_retargeting_or_restarting(
             120,
             observed_at,
             deadline,
+            None,
         );
         tokio::pin!(operation);
         // Observe the transaction's real commit before changing activation

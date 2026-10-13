@@ -1,7 +1,9 @@
 use pplx_space_common_core::types::{NodeId, OrgId, SandboxId, UserId};
 
 use super::*;
-use crate::controllers::substrate::{PooledClaimRefusal, PooledExecutionClaimAttempt};
+use crate::controllers::substrate::{
+    AdmittedPoolClaim, AdmittedPoolClaimLookup, PooledClaimRefusal, PooledExecutionClaimAttempt,
+};
 use crate::federated_identity::{
     DEFAULT_FEDERATED_GRANT_AUDIENCE, FEDERATED_OWNER_GRANT_PURPOSE, FederatedOwner,
     FederatedServiceGrant,
@@ -559,6 +561,7 @@ fn pooled_create_input<'a>(
         env: &req.env,
         metric_identity: SandboxApiMetricIdentity::native("create"),
         planned_sandbox_id: SandboxId::new(),
+        sandbox_id_pinned: false,
         create_owner,
         auto_lifecycle,
         backend: "fc",
@@ -635,6 +638,11 @@ struct RetryingPoolSubstrate {
     /// Reported alongside a miss, as the Kubernetes substrate does when a
     /// sandbox's node-group boundary admits no pooled pod.
     miss_refusal: Option<PooledClaimRefusal>,
+    /// Answers for `lookup_admitted_pooled_execution`, in call order.
+    admitted_lookups: Mutex<VecDeque<AdmittedPoolClaimLookup>>,
+    admitted_lookup_calls: AtomicUsize,
+    rollback_calls: AtomicUsize,
+    prepare_wait_until_ready: Mutex<Vec<bool>>,
 }
 
 impl RetryingPoolSubstrate {
@@ -656,7 +664,28 @@ impl RetryingPoolSubstrate {
             claim_calls: AtomicUsize::new(0),
             prepare_calls: AtomicUsize::new(0),
             miss_refusal: None,
+            admitted_lookups: Mutex::new(VecDeque::new()),
+            admitted_lookup_calls: AtomicUsize::new(0),
+            rollback_calls: AtomicUsize::new(0),
+            prepare_wait_until_ready: Mutex::new(Vec::new()),
         }
+    }
+
+    fn with_admitted_lookup(self, lookup: AdmittedPoolClaimLookup) -> Self {
+        self.admitted_lookups.lock().unwrap().push_back(lookup);
+        self
+    }
+
+    fn admitted_lookup_calls(&self) -> usize {
+        self.admitted_lookup_calls.load(Ordering::SeqCst)
+    }
+
+    fn rollback_calls(&self) -> usize {
+        self.rollback_calls.load(Ordering::SeqCst)
+    }
+
+    fn prepare_wait_until_ready(&self) -> Vec<bool> {
+        self.prepare_wait_until_ready.lock().unwrap().clone()
     }
 
     fn refusing(mut self, message: &str) -> Self {
@@ -839,6 +868,29 @@ impl SubstrateAdapter for RetryingPoolSubstrate {
         })
     }
 
+    async fn lookup_admitted_pooled_execution(
+        &self,
+        _request: &PooledExecutionClaimRequest<'_>,
+        _admitted: AdmittedPoolClaim,
+        _sandbox_id: SandboxId,
+    ) -> Result<AdmittedPoolClaimLookup, ControllerError> {
+        self.admitted_lookup_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self
+            .admitted_lookups
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("missing test admitted lookup"))
+    }
+
+    async fn rollback_pooled_execution_claim(
+        &self,
+        _claim: &PooledExecutionClaim,
+    ) -> Result<(), ControllerError> {
+        self.rollback_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
     async fn persist_pooled_execution_claim(
         &self,
         tx: &mut Transaction<'_, Postgres>,
@@ -932,10 +984,14 @@ impl SubstrateAdapter for RetryingPoolSubstrate {
         _request: &PooledExecutionClaimRequest<'_>,
         claim: &PooledExecutionClaim,
         policy: &AutoLifecyclePolicy,
-        _wait_until_ready: bool,
+        wait_until_ready: bool,
         _timeout: Duration,
     ) -> Result<(), ControllerError> {
         self.prepare_calls.fetch_add(1, Ordering::SeqCst);
+        self.prepare_wait_until_ready
+            .lock()
+            .unwrap()
+            .push(wait_until_ready);
         self.prepared_policies.lock().unwrap().push(policy.clone());
         let succeeds = self
             .prepare_results
@@ -973,6 +1029,235 @@ impl SubstrateAdapter for RetryingPoolSubstrate {
         _role_filter: Option<&str>,
     ) -> Result<Option<Vec<NodeInventoryEntry>>, SubstrateError> {
         panic!("unused")
+    }
+}
+
+/// The real Kubernetes substrate with only its node RPC faked: admitted-claim
+/// lookup, persistence, rollback, and failure cleanup all run against the real
+/// pool store, while `prepare_pooled_execution` (the gRPC calls into the slot's
+/// pod) records its arguments and succeeds.
+#[cfg(feature = "kubernetes")]
+struct NodeRpcStubbedKubernetes {
+    inner: crate::controllers::substrate::kubernetes::KubernetesSubstrate,
+    prepared: Mutex<Vec<(SandboxId, bool)>>,
+}
+
+#[cfg(feature = "kubernetes")]
+impl SubstrateAdapter for NodeRpcStubbedKubernetes {
+    fn managed_by(&self) -> &'static str {
+        self.inner.managed_by()
+    }
+
+    async fn create_execution(
+        &self,
+        _request: CreateExecutionRequest<'_>,
+    ) -> Result<crate::controllers::substrate::CreateExecutionOutcome, SubstrateError> {
+        panic!("unused")
+    }
+
+    async fn delete_execution(&self, _sandbox_id: SandboxId) -> Result<(), SubstrateError> {
+        panic!("unused")
+    }
+
+    async fn retire_execution(
+        &self,
+        _request: crate::controllers::substrate::RetireExecutionRequest,
+    ) -> Result<crate::controllers::substrate::RetireExecutionOutcome, SubstrateError> {
+        panic!("unused")
+    }
+
+    async fn start_execution(
+        &self,
+        _metric_identity: SandboxApiMetricIdentity,
+        _sandbox_id: SandboxId,
+        _options: ActivationOptions,
+        _charge: crate::controllers::substrate::RecoveryCharge,
+    ) -> Result<crate::controllers::substrate::ExecutionActivation, SubstrateError> {
+        panic!("unused")
+    }
+
+    async fn restore_execution(
+        &self,
+        _metric_identity: SandboxApiMetricIdentity,
+        _sandbox_id: SandboxId,
+        _options: ActivationOptions,
+        _charge: crate::controllers::substrate::RecoveryCharge,
+    ) -> Result<crate::controllers::substrate::ActivationCompletion, SubstrateError> {
+        panic!("unused")
+    }
+
+    async fn suspend_execution(
+        &self,
+        _sandbox_id: SandboxId,
+    ) -> Result<Option<crate::controllers::substrate::PublishedLocalArtifact>, SubstrateError> {
+        panic!("unused")
+    }
+
+    async fn wake_execution(
+        &self,
+        _metric_identity: SandboxApiMetricIdentity,
+        _sandbox: &Sandbox,
+        _timeout: Duration,
+        _wake_activity: Option<crate::controllers::substrate::ExecutionActivityKind>,
+        _charge: crate::controllers::substrate::RecoveryCharge,
+    ) -> Result<crate::controllers::substrate::ExecutionActivation, SubstrateError> {
+        panic!("unused")
+    }
+
+    async fn runtime_client(
+        &self,
+        _sandbox_id: SandboxId,
+        _charge: crate::controllers::substrate::RecoveryCharge,
+    ) -> Result<RuntimeClient, ControllerError> {
+        panic!("unused")
+    }
+
+    async fn reachable_runtime_client(
+        &self,
+        _sandbox_id: SandboxId,
+    ) -> Result<Option<RuntimeClient>, ControllerError> {
+        panic!("unused")
+    }
+
+    async fn probe_runtime_client(
+        &self,
+        _sandbox_id: SandboxId,
+    ) -> Result<Option<RuntimeClient>, ControllerError> {
+        panic!("unused")
+    }
+
+    async fn access_runtime_client(
+        &self,
+        _metric_identity: SandboxApiMetricIdentity,
+        _sandbox: &Sandbox,
+        _activity: ExecutionActivityKind,
+        _timeout: Duration,
+        _charge: crate::controllers::substrate::RecoveryCharge,
+    ) -> Result<RuntimeClient, ControllerError> {
+        panic!("unused")
+    }
+
+    async fn sandbox_ip(&self, _sandbox_id: SandboxId) -> Result<Option<String>, ControllerError> {
+        panic!("unused")
+    }
+
+    async fn access_sandbox_ip(
+        &self,
+        _metric_identity: SandboxApiMetricIdentity,
+        _sandbox: &Sandbox,
+        _timeout: Duration,
+        _charge: crate::controllers::substrate::RecoveryCharge,
+    ) -> Result<Option<String>, ControllerError> {
+        panic!("unused")
+    }
+
+    async fn builder_client(
+        &self,
+    ) -> Result<crate::controllers::substrate::BuilderClient, ControllerError> {
+        panic!("unused")
+    }
+
+    async fn builder_client_for_node(
+        &self,
+        _node_id: NodeId,
+    ) -> Result<crate::controllers::substrate::BuilderClient, ControllerError> {
+        panic!("unused")
+    }
+
+    async fn resolve_node_api_endpoint(
+        &self,
+        _target: &NodeApiTarget<'_>,
+    ) -> Result<String, SubstrateError> {
+        panic!("unused")
+    }
+
+    async fn list_inventory_nodes(
+        &self,
+        _role_filter: Option<&str>,
+    ) -> Result<Option<Vec<NodeInventoryEntry>>, SubstrateError> {
+        panic!("unused")
+    }
+
+    fn pool_eligible_for_request(
+        &self,
+        boot_mode: CreateBootMode,
+        backend: &str,
+        wait_until_ready: bool,
+        disk_mib: Option<u32>,
+        file_changes_enabled: bool,
+        implicit_wake_enabled: bool,
+    ) -> bool {
+        self.inner.pool_eligible_for_request(
+            boot_mode,
+            backend,
+            wait_until_ready,
+            disk_mib,
+            file_changes_enabled,
+            implicit_wake_enabled,
+        )
+    }
+
+    fn pool_supports_request_env(&self) -> bool {
+        self.inner.pool_supports_request_env()
+    }
+
+    async fn claim_pooled_execution(
+        &self,
+        _request: &PooledExecutionClaimRequest<'_>,
+    ) -> Result<PooledExecutionClaimAttempt, ControllerError> {
+        panic!("an admitted create must never claim a different slot")
+    }
+
+    async fn lookup_admitted_pooled_execution(
+        &self,
+        request: &PooledExecutionClaimRequest<'_>,
+        admitted: AdmittedPoolClaim,
+        sandbox_id: SandboxId,
+    ) -> Result<AdmittedPoolClaimLookup, ControllerError> {
+        self.inner
+            .lookup_admitted_pooled_execution(request, admitted, sandbox_id)
+            .await
+    }
+
+    async fn rollback_pooled_execution_claim(
+        &self,
+        claim: &PooledExecutionClaim,
+    ) -> Result<(), ControllerError> {
+        self.inner.rollback_pooled_execution_claim(claim).await
+    }
+
+    async fn persist_pooled_execution_claim(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        request: &PooledExecutionClaimRequest<'_>,
+        claim: &PooledExecutionClaim,
+    ) -> Result<(), ControllerError> {
+        self.inner
+            .persist_pooled_execution_claim(tx, request, claim)
+            .await
+    }
+
+    async fn cleanup_failed_pooled_prepare(
+        &self,
+        claim: &PooledExecutionClaim,
+    ) -> Result<PooledPrepareFailureCleanup, ControllerError> {
+        self.inner.cleanup_failed_pooled_prepare(claim).await
+    }
+
+    async fn prepare_pooled_execution(
+        &self,
+        _metric_identity: SandboxApiMetricIdentity,
+        _request: &PooledExecutionClaimRequest<'_>,
+        claim: &PooledExecutionClaim,
+        _policy: &AutoLifecyclePolicy,
+        wait_until_ready: bool,
+        _timeout: Duration,
+    ) -> Result<(), ControllerError> {
+        self.prepared
+            .lock()
+            .unwrap()
+            .push((claim.sandbox_id, wait_until_ready));
+        Ok(())
     }
 }
 
@@ -1407,6 +1692,152 @@ async fn postgres_pool_configured_resources_uses_enabled_release_shape() -> Test
     Ok(())
 }
 
+async fn insert_inventory_shape(
+    pool: &PgPool,
+    role: &str,
+    content_hash: &str,
+    shape: (i32, i32),
+    observed_secs_ago: i32,
+) -> TestResult {
+    let node_id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state)
+         VALUES ($1, '10.0.0.10'::INET, $2, 'space', 'ready')"
+    ))
+    .bind(node_id)
+    .bind(role)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_template_inventory (
+             node_id, template_name, content_hash, runtime, vcpu, memory_mib, observed_at
+         )
+         VALUES ($1, 'app-runtime', $2, 'fc', $3, $4, now() - make_interval(secs => $5))"
+    ))
+    .bind(node_id)
+    .bind(content_hash)
+    .bind(shape.0)
+    .bind(shape.1)
+    .bind(f64::from(observed_secs_ago))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_template_build_shape_prefers_the_builder_inventory() -> TestResult {
+    use crate::template_inventory_store::{TemplateBuildShape, release_build_shape};
+    let db = pg_test_db().await?;
+    insert_template_release(&db.pool, "app-runtime", "sha256:shape").await?;
+    insert_inventory_shape(&db.pool, "worker", "sha256:shape", (2, 2048), 0).await?;
+    insert_inventory_shape(&db.pool, "builder", "sha256:shape", (4, 4096), 60).await?;
+    insert_inventory_shape(&db.pool, "builder", "sha256:other", (8, 8192), 0).await?;
+    insert_inventory_shape(&db.pool, "builder", "sha256:partial", (4, 0), 0).await?;
+
+    let template = TemplateName::parse("app-runtime").unwrap();
+    let load = |content_hash| {
+        release_build_shape(&db.pool, &template, content_hash, RuntimeKind::Firecracker)
+    };
+    assert_eq!(
+        load("sha256:shape").await?,
+        Some(TemplateBuildShape {
+            vcpu: pplx_space_common_core::types::VcpuCount::try_from_u32(4).unwrap(),
+            memory: pplx_space_common_core::types::MemorySize::mib(4096).unwrap(),
+        })
+    );
+    assert_eq!(load("sha256:partial").await?, None);
+    assert_eq!(load("sha256:absent").await?, None);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_kubernetes_create_fills_unset_resources_from_the_template_shape() -> TestResult {
+    let db = pg_test_db().await?;
+    let release_id = insert_template_release(&db.pool, "app-runtime", "sha256:shape").await?;
+    insert_inventory_shape(&db.pool, "builder", "sha256:shape", (4, 4096), 0).await?;
+    let template = TemplateName::parse("app-runtime").unwrap();
+    let resolve_with = |managed_by, boot_mode, requested, restoring| {
+        resolve_cold_create_resources(
+            &db.pool,
+            ColdCreateShapeInput {
+                managed_by,
+                runtime: RuntimeKind::Firecracker,
+                boot_mode,
+                template: &template,
+                content_hash: "sha256:shape",
+                template_release_id: release_id,
+                requested,
+                restoring,
+            },
+        )
+    };
+    let resolve =
+        |managed_by, boot_mode, requested| resolve_with(managed_by, boot_mode, requested, false);
+    let unset = || SandboxResources {
+        vcpu: None,
+        memory_mib: None,
+        disk_mib: None,
+    };
+    let shape =
+        |resources: &SandboxResources| (resources.vcpu, resources.memory_mib, resources.disk_mib);
+
+    let (resources, _) = resolve("k8s", CreateBootMode::Fallthrough, unset()).await?;
+    assert_eq!(
+        shape(&resources),
+        (Some(4), Some(4096), None),
+        "an unshaped Kubernetes create must not boot at the shim's fixed defaults"
+    );
+
+    let (resources, _) = resolve(
+        "k8s",
+        CreateBootMode::Cold,
+        SandboxResources {
+            vcpu: None,
+            memory_mib: Some(2048),
+            disk_mib: Some(8192),
+        },
+    )
+    .await?;
+    assert_eq!(
+        shape(&resources),
+        (Some(4), Some(2048), Some(8192)),
+        "requested values win; only unset ones come from the template"
+    );
+
+    let (resources, _) = resolve("space", CreateBootMode::Fallthrough, unset()).await?;
+    assert_eq!(
+        shape(&resources),
+        (None, None, None),
+        "direct creates keep the node's snapshot or metadata shape"
+    );
+
+    let (resources, _) = resolve_with("k8s", CreateBootMode::Cold, unset(), true).await?;
+    assert_eq!(
+        shape(&resources),
+        (None, None, None),
+        "a fork keeps its source snapshot's shape"
+    );
+
+    sqlx::query(sql!(
+        "INSERT INTO kubernetes_pool_configs (
+             id, template_release_id, vcpu, memory_mib, disk_mib, target_ready_slots,
+             refill_per_tick, max_warming_slots, namespace, enabled
+         )
+         VALUES ($1, $2, 2, 8192, 32768, 1, 1, 1, 'space', true)"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(release_id)
+    .execute(&db.pool)
+    .await?;
+    let (resources, _) = resolve("k8s", CreateBootMode::Fallthrough, unset()).await?;
+    assert_eq!(
+        shape(&resources),
+        (Some(2), Some(8192), Some(32768)),
+        "a configured pool shape still wins for a fallthrough create"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn postgres_pool_miss_can_retain_rolling_policy_shape_before_materialization() -> TestResult {
     let db = pg_test_db().await?;
@@ -1416,10 +1847,9 @@ async fn postgres_pool_miss_can_retain_rolling_policy_shape_before_materializati
         "INSERT INTO warm_pool_policies (
              template_name, runtime, vcpu, memory_mib, disk_mib, min_ready_slots,
              max_ready_slots, refill_per_tick, max_warming_slots, retain_releases,
-             retain_shape_on_miss, disk_io_max_operations_per_sec,
-             disk_io_max_bandwidth_mib_per_sec
+             disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec
          )
-         VALUES ('app-runtime', 'fc', 4, 8192, 32768, 1, 4, 1, 2, 1, TRUE, 2000, 200)"
+         VALUES ('app-runtime', 'fc', 4, 8192, 32768, 1, 4, 1, 2, 1, 2000, 200)"
     ))
     .execute(&db.pool)
     .await?;
@@ -1451,10 +1881,11 @@ async fn postgres_pool_miss_can_retain_rolling_policy_shape_before_materializati
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn postgres_pool_miss_does_not_retain_policy_shape_without_opt_in() -> TestResult {
+async fn postgres_pool_miss_retains_policy_shape_without_legacy_opt_in() -> TestResult {
     let db = pg_test_db().await?;
     let release_id = insert_template_release(&db.pool, "app-runtime", "sha256:new-release").await?;
 
+    // The deprecated per-policy flag no longer gates miss sizing.
     sqlx::query(sql!(
         "INSERT INTO warm_pool_policies (
              template_name, runtime, vcpu, memory_mib, min_ready_slots,
@@ -1467,10 +1898,27 @@ async fn postgres_pool_miss_does_not_retain_policy_shape_without_opt_in() -> Tes
     .execute(&db.pool)
     .await?;
 
+    let assignment =
+        resolve_kubernetes_pool_configured_resources(&db.pool, "app-runtime", release_id)
+            .await?
+            .expect("an enabled policy supplies the cold-miss shape without the legacy flag");
+    assert_eq!(assignment.resources.vcpu, Some(4));
+    assert_eq!(assignment.resources.memory_mib, Some(8192));
+    assert_eq!(
+        assignment.disk_io_limits,
+        DiskIoLimits::try_new(2_000, 200).unwrap()
+    );
+
+    sqlx::query(sql!(
+        "UPDATE warm_pool_policies SET enabled = FALSE WHERE template_name = 'app-runtime'"
+    ))
+    .execute(&db.pool)
+    .await?;
     assert!(
         resolve_kubernetes_pool_configured_resources(&db.pool, "app-runtime", release_id)
             .await?
-            .is_none()
+            .is_none(),
+        "a disabled policy does not supply a cold-miss shape"
     );
     Ok(())
 }
@@ -1496,10 +1944,9 @@ async fn postgres_pool_miss_retains_shape_for_release_outside_warming_window() -
         "INSERT INTO warm_pool_policies (
              template_name, runtime, vcpu, memory_mib, min_ready_slots,
              max_ready_slots, refill_per_tick, max_warming_slots, retain_releases,
-             retain_shape_on_miss, disk_io_max_operations_per_sec,
-             disk_io_max_bandwidth_mib_per_sec
+             disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec
          )
-         VALUES ('app-runtime', 'fc', 4, 8192, 1, 4, 1, 2, 1, TRUE, 2000, 200)"
+         VALUES ('app-runtime', 'fc', 4, 8192, 1, 4, 1, 2, 1, 2000, 200)"
     ))
     .execute(&db.pool)
     .await?;
@@ -1532,12 +1979,11 @@ async fn postgres_pool_miss_uses_same_policy_priority_as_zero_demand_materializa
         "INSERT INTO warm_pool_policies (
              template_name, runtime, vcpu, memory_mib, min_ready_slots,
              max_ready_slots, refill_per_tick, max_warming_slots, retain_releases,
-             retain_shape_on_miss, disk_io_max_operations_per_sec,
-             disk_io_max_bandwidth_mib_per_sec
+             disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec
          )
          VALUES
-             ('app-runtime', 'fc', 4, 8192, 1, 100, 1, 2, 1, TRUE, 2000, 200),
-             ('app-runtime', 'fc', 8, 16384, 5, 10, 1, 2, 1, TRUE, 3000, 250)"
+             ('app-runtime', 'fc', 4, 8192, 1, 100, 1, 2, 1, 2000, 200),
+             ('app-runtime', 'fc', 8, 16384, 5, 10, 1, 2, 1, 3000, 250)"
     ))
     .execute(&db.pool)
     .await?;
@@ -1545,7 +1991,7 @@ async fn postgres_pool_miss_uses_same_policy_priority_as_zero_demand_materializa
     let assignment =
         resolve_kubernetes_pool_configured_resources(&db.pool, "app-runtime", release_id)
             .await?
-            .expect("a retained policy should provide the cold-miss assignment");
+            .expect("an enabled policy should provide the cold-miss assignment");
 
     assert_eq!(assignment.resources.vcpu, Some(8));
     assert_eq!(assignment.resources.memory_mib, Some(16384));
@@ -1821,6 +2267,360 @@ async fn postgres_byok_org_bypasses_warm_pool_and_cold_creates() -> TestResult {
         substrate.claim_calls(),
         0,
         "BYOK org must not touch the warm pool"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_pinned_sandbox_id_bypasses_warm_pool_and_cold_creates() -> TestResult {
+    // A create whose sandbox ID was already handed to the caller must produce
+    // exactly that ID. Warm-pool adoption returns the slot's pre-reserved ID
+    // instead, so even with a claimable, prepare-ready slot the create must
+    // fall through to the cold path without touching the pool.
+    let db = pg_test_db().await?;
+    let actor = insert_actor(&db.pool).await?;
+    let node_id = NodeId::new();
+    let release_id = insert_template_release(&db.pool, "seed", "sha256:pooled").await?;
+    let pool_config_id = Uuid::now_v7();
+    let slot_sandbox_id = SandboxId::new();
+    let auto_lifecycle = AutoLifecyclePolicy::disabled();
+    let mut req = pooled_create_request("pinned-id-cold-start", None);
+    req.boot_mode = None;
+    req.vcpu = None;
+    req.memory_mib = None;
+    req.wait_until_ready = true;
+    let template_network_policy = NetworkPolicyV1::deny_all();
+    let requested_template = TemplateReference::latest(TemplateName::parse("seed").unwrap());
+    let create_owner = SandboxCreateOwner::local(&actor);
+    let mut input = pooled_create_input(
+        &db.pool,
+        &req,
+        &requested_template,
+        &auto_lifecycle,
+        &template_network_policy,
+        &create_owner,
+    );
+    input.template_release_id = release_id;
+    input.boot_mode = CreateBootMode::Fallthrough;
+    input.sandbox_id_pinned = true;
+    assert_ne!(input.planned_sandbox_id, slot_sandbox_id);
+
+    insert_node(&db.pool, node_id).await?;
+    sqlx::query(sql!(
+        "INSERT INTO kubernetes_pool_configs (
+             id, template_release_id, vcpu, memory_mib, target_ready_slots,
+             refill_per_tick, max_warming_slots, namespace, enabled
+         )
+         VALUES ($1, $2, 4, 2048, 3, 1, 1, 'space', true)"
+    ))
+    .bind(pool_config_id)
+    .bind(release_id)
+    .execute(&db.pool)
+    .await?;
+
+    let substrate = RetryingPoolSubstrate::new(
+        db.pool.clone(),
+        pool_config_id,
+        release_id,
+        vec![pooled_claim_with_pod(
+            slot_sandbox_id,
+            node_id,
+            "space-sbx-pooled-g1",
+        )],
+        vec![true],
+    );
+
+    let response = SandboxController::try_create_from_pool_with_substrate(
+        &substrate,
+        input,
+        Arc::new(AtomicU64::new(0)),
+    )
+    .await?;
+
+    assert!(
+        response.response.is_none(),
+        "a pinned sandbox ID must cold-create, not adopt a slot with another ID"
+    );
+    assert_eq!(
+        substrate.claim_calls(),
+        0,
+        "a pinned sandbox ID must not touch the warm pool"
+    );
+
+    Ok(())
+}
+
+/// Fixture for creates admitted against a warm-pool slot: the create's
+/// public ID is the slot's reserved ID, and the request is otherwise an
+/// ordinary pool-eligible native create (which does not wait for readiness).
+struct AdmittedCreateFixture {
+    db: pplx_space_db_test_fixtures::TestDb,
+    actor: User,
+    node_id: NodeId,
+    release_id: Uuid,
+    pool_config_id: Uuid,
+    sandbox_id: SandboxId,
+    req: CreateSandboxRequest,
+    requested_template: TemplateReference,
+    auto_lifecycle: AutoLifecyclePolicy,
+    template_network_policy: NetworkPolicyV1,
+}
+
+impl AdmittedCreateFixture {
+    async fn new() -> TestResult<Self> {
+        let db = pg_test_db().await?;
+        let actor = insert_actor(&db.pool).await?;
+        let node_id = NodeId::new();
+        let release_id = insert_template_release(&db.pool, "seed", "sha256:pooled").await?;
+        let pool_config_id = Uuid::now_v7();
+        insert_node(&db.pool, node_id).await?;
+        sqlx::query(sql!(
+            "INSERT INTO kubernetes_pool_configs (
+                 id, template_release_id, vcpu, memory_mib, target_ready_slots,
+                 refill_per_tick, max_warming_slots, namespace, enabled
+             )
+             VALUES ($1, $2, 4, 2048, 3, 1, 1, 'space', true)"
+        ))
+        .bind(pool_config_id)
+        .bind(release_id)
+        .execute(&db.pool)
+        .await?;
+        let mut req = pooled_create_request("admitted-create", None);
+        req.boot_mode = None;
+        req.wait_until_ready = false;
+        Ok(Self {
+            db,
+            actor,
+            node_id,
+            release_id,
+            pool_config_id,
+            sandbox_id: SandboxId::new(),
+            req,
+            requested_template: TemplateReference::latest(TemplateName::parse("seed").unwrap()),
+            auto_lifecycle: AutoLifecyclePolicy::disabled(),
+            template_network_policy: NetworkPolicyV1::deny_all(),
+        })
+    }
+
+    fn admitted(&self) -> AdmittedPoolClaim {
+        AdmittedPoolClaim {
+            claim_id: Uuid::now_v7(),
+            pool_slot_id: Uuid::now_v7(),
+        }
+    }
+
+    fn claim(&self, admitted: AdmittedPoolClaim) -> PooledExecutionClaim {
+        let mut claim = pooled_claim(self.sandbox_id, self.node_id);
+        claim.claim_id = admitted.claim_id;
+        claim.pool_slot_id = Some(admitted.pool_slot_id);
+        claim
+    }
+
+    fn substrate(&self) -> RetryingPoolSubstrate {
+        RetryingPoolSubstrate::new(
+            self.db.pool.clone(),
+            self.pool_config_id,
+            self.release_id,
+            Vec::new(),
+            vec![true],
+        )
+    }
+
+    async fn run(
+        &self,
+        substrate: &RetryingPoolSubstrate,
+        admitted: AdmittedPoolClaim,
+        volume_encryption: bool,
+    ) -> Result<PoolCreateResult, ControllerError> {
+        let create_owner = SandboxCreateOwner::local(&self.actor);
+        let mut input = pooled_create_input(
+            &self.db.pool,
+            &self.req,
+            &self.requested_template,
+            &self.auto_lifecycle,
+            &self.template_network_policy,
+            &create_owner,
+        );
+        input.template_release_id = self.release_id;
+        input.boot_mode = CreateBootMode::Fallthrough;
+        input.planned_sandbox_id = self.sandbox_id;
+        input.sandbox_id_pinned = true;
+        input.volume_encryption = volume_encryption;
+        SandboxController::try_create_from_admitted_pool_claim_with_substrate(
+            substrate,
+            input,
+            admitted,
+            true,
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await
+    }
+
+    async fn sandbox_rows(&self) -> TestResult<i64> {
+        Ok(
+            sqlx::query_scalar(sql!("SELECT COUNT(*) FROM sandboxes WHERE id = $1"))
+                .bind(self.sandbox_id)
+                .fetch_one(&self.db.pool)
+                .await?,
+        )
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_admitted_pool_claim_adopts_the_claimed_slot_under_its_id() -> TestResult {
+    let fixture = AdmittedCreateFixture::new().await?;
+    let admitted = fixture.admitted();
+    let substrate = fixture
+        .substrate()
+        .with_admitted_lookup(AdmittedPoolClaimLookup::Adoptable {
+            claim: Box::new(fixture.claim(admitted)),
+            pool_shape: PooledExecutionPoolShape::new(4, 2048, Default::default()),
+        });
+
+    let result = fixture.run(&substrate, admitted, false).await?;
+
+    let response = result
+        .response
+        .expect("an adoptable admitted slot is adopted");
+    assert_eq!(response.id, fixture.sandbox_id);
+    assert_eq!(substrate.admitted_lookup_calls(), 1);
+    assert_eq!(
+        substrate.claim_calls(),
+        0,
+        "an admitted create must never claim a different slot"
+    );
+    assert_eq!(
+        substrate.prepare_wait_until_ready(),
+        vec![true],
+        "adoption waits for readiness even when the request does not"
+    );
+    let (lifecycle, active_node_id): (String, Option<NodeId>) = sqlx::query_as(sql!(
+        "SELECT lifecycle, active_node_id FROM sandboxes WHERE id = $1"
+    ))
+    .bind(fixture.sandbox_id)
+    .fetch_one(&fixture.db.pool)
+    .await?;
+    assert_eq!(lifecycle, "started");
+    assert_eq!(active_node_id, Some(fixture.node_id));
+    let executions: Vec<(i64, bool)> = sqlx::query_as(sql!(
+        "SELECT generation, active FROM sandbox_k8s_executions WHERE sandbox_id = $1"
+    ))
+    .bind(fixture.sandbox_id)
+    .fetch_all(&fixture.db.pool)
+    .await?;
+    assert_eq!(executions, vec![(1, true)]);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_admitted_pool_claim_released_slot_builds_cold_without_pool_calls() -> TestResult {
+    let fixture = AdmittedCreateFixture::new().await?;
+    let admitted = fixture.admitted();
+    let substrate = fixture
+        .substrate()
+        .with_admitted_lookup(AdmittedPoolClaimLookup::Released);
+
+    let result = fixture.run(&substrate, admitted, false).await?;
+
+    assert!(result.response.is_none(), "a released slot builds cold");
+    assert_eq!(substrate.claim_calls(), 0);
+    assert_eq!(substrate.prepare_calls(), 0);
+    assert_eq!(substrate.rollback_calls(), 0);
+    assert_eq!(fixture.sandbox_rows().await?, 0);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_admitted_pool_claim_waits_while_a_slot_holds_the_id() -> TestResult {
+    let fixture = AdmittedCreateFixture::new().await?;
+    let admitted = fixture.admitted();
+    let substrate = fixture
+        .substrate()
+        .with_admitted_lookup(AdmittedPoolClaimLookup::ReleasePending);
+
+    let error = match fixture.run(&substrate, admitted, false).await {
+        Ok(_) => panic!("a held slot must not resolve the create"),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        error.retry_after_cause(),
+        Some(ControllerRetryAfterCause::PoolSlotRelease)
+    );
+    assert!(error.retry_after_header().is_some());
+    assert_eq!(substrate.claim_calls(), 0);
+    assert_eq!(substrate.prepare_calls(), 0);
+    assert_eq!(fixture.sandbox_rows().await?, 0);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_admitted_pool_claim_releases_a_slot_it_may_not_adopt() -> TestResult {
+    // An encrypted create can never adopt a plaintext warm member. The slot
+    // is given back to the pool for collection rather than adopted, and the
+    // create waits for it before building cold.
+    let fixture = AdmittedCreateFixture::new().await?;
+    let admitted = fixture.admitted();
+    let substrate = fixture
+        .substrate()
+        .with_admitted_lookup(AdmittedPoolClaimLookup::Adoptable {
+            claim: Box::new(fixture.claim(admitted)),
+            pool_shape: PooledExecutionPoolShape::new(4, 2048, Default::default()),
+        });
+
+    let error = match fixture.run(&substrate, admitted, true).await {
+        Ok(_) => panic!("an encrypted create must not adopt"),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        error.retry_after_cause(),
+        Some(ControllerRetryAfterCause::PoolSlotRelease)
+    );
+    assert_eq!(substrate.rollback_calls(), 1);
+    assert_eq!(substrate.prepare_calls(), 0);
+    assert_eq!(fixture.sandbox_rows().await?, 0);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_admitted_pool_claim_prepare_failure_never_reclaims() -> TestResult {
+    // A failed adoption must not fall back to another slot (the ID is fixed)
+    // or report success. It parks the slot for the pool's cleanup and asks to
+    // be retried; the retry builds cold once that cleanup has run.
+    let fixture = AdmittedCreateFixture::new().await?;
+    let admitted = fixture.admitted();
+    let mut substrate =
+        fixture
+            .substrate()
+            .with_admitted_lookup(AdmittedPoolClaimLookup::Adoptable {
+                claim: Box::new(fixture.claim(admitted)),
+                pool_shape: PooledExecutionPoolShape::new(4, 2048, Default::default()),
+            });
+    substrate.prepare_results =
+        Mutex::new(vec![false; MAX_POOLED_PREPARE_IN_PLACE_ATTEMPTS].into());
+
+    let error = match fixture.run(&substrate, admitted, false).await {
+        Ok(_) => panic!("a failed adoption must not succeed"),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        error.retry_after_cause(),
+        Some(ControllerRetryAfterCause::PoolSlotRelease)
+    );
+    assert_eq!(substrate.claim_calls(), 0, "no other slot is claimed");
+    assert_eq!(substrate.admitted_lookup_calls(), 1);
+    assert_eq!(
+        pooled_slot_and_sandbox_state(&fixture.db.pool, fixture.sandbox_id)
+            .await?
+            .0,
+        "cleanup_pending"
     );
 
     Ok(())
@@ -2281,6 +3081,195 @@ async fn unconfigured_falcon_create_continues_to_database_access() -> TestResult
         error
             .to_string()
             .contains("failed to start federated sandbox owner transaction")
+    );
+    Ok(())
+}
+
+/// End to end across both halves: `POST /v1/sandboxes` claims a ready slot at
+/// admission, and the create executor's admitted-claim path adopts exactly
+/// that slot, so the sandbox runs under the ID the 202 returned. The real
+/// Kubernetes substrate and pool store carry the claim through; only the node
+/// RPC into the slot's pod is faked.
+#[cfg(feature = "kubernetes")]
+#[rstest::rstest]
+#[case(
+    None,
+    None,
+    "21600s",
+    pplx_space_public_api::SandboxIdleAction::Suspend
+)]
+#[case(
+    Some("600s"),
+    None,
+    "600s",
+    pplx_space_public_api::SandboxIdleAction::Suspend
+)]
+#[case(
+    Some("1.5m"),
+    Some(pplx_space_public_api::SandboxIdleAction::Suspend),
+    "90s",
+    pplx_space_public_api::SandboxIdleAction::Suspend
+)]
+#[case(
+    Some("600s"),
+    Some(pplx_space_public_api::SandboxIdleAction::Delete),
+    "600s",
+    pplx_space_public_api::SandboxIdleAction::Delete
+)]
+#[tokio::test(flavor = "current_thread")]
+async fn admission_claim_executes_and_runs_under_the_claimed_id(
+    #[case] idle_timeout: Option<&str>,
+    #[case] idle_action: Option<pplx_space_public_api::SandboxIdleAction>,
+    #[case] expected_timeout: &str,
+    #[case] expected_action: pplx_space_public_api::SandboxIdleAction,
+) -> TestResult {
+    use crate::routes::public::sandboxes::admission_test_fixture::{
+        AdmissionPoolFixture, NAMESPACE, TEMPLATE,
+    };
+    use k8s_openapi::api::core::v1::{Pod, PodSpec, PodStatus};
+
+    let fixture = AdmissionPoolFixture::new(1).await?;
+    let slot = &fixture.slots[0];
+    let node_id = NodeId::new();
+    insert_node(&fixture.db.pool, node_id).await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_k8s (node_id, k8s_node_name) VALUES ($1, $2)"
+    ))
+    .bind(node_id)
+    .bind(&slot.node_name)
+    .execute(&fixture.db.pool)
+    .await?;
+    let pod = Pod {
+        metadata: kube::api::ObjectMeta {
+            name: Some(slot.pod_name.clone()),
+            namespace: Some(NAMESPACE.to_string()),
+            uid: Some(slot.pod_uid.clone()),
+            ..Default::default()
+        },
+        spec: Some(PodSpec {
+            node_name: Some(slot.node_name.clone()),
+            ..Default::default()
+        }),
+        status: Some(PodStatus {
+            phase: Some("Running".to_string()),
+            pod_ip: Some(slot.pod_ip.clone()),
+            ..Default::default()
+        }),
+    };
+    let kubernetes = || {
+        crate::controllers::substrate::kubernetes::tests::substrate_with_inventory_caches_and_pool(
+            vec![pod.clone()],
+            Vec::new(),
+            fixture.db.pool.clone(),
+        )
+    };
+
+    // Admission: the route claims the slot and returns its reserved ID.
+    let admission_controller = AdmissionPoolFixture::controller_with(kubernetes());
+    let mut request = fixture.request();
+    request.idle_timeout = idle_timeout.map(|value| value.parse().unwrap());
+    request.idle_action = idle_action;
+    let response = fixture
+        .create(Some(&admission_controller), "admission-e2e", request)
+        .await
+        .expect("create is recorded");
+    assert_eq!(
+        response.sandbox_id,
+        pplx_space_public_api::PublicSandboxId::from(slot.reserved_sandbox_id)
+    );
+    let payload = fixture.payload(response.operation_id).await?;
+    let admitted: AdmittedPoolClaim = payload
+        .pool_claim
+        .expect("the queued create carries the claim")
+        .into();
+
+    // Execution: the executor's input for this payload, through the
+    // admitted-claim path from the previous change.
+    let actor: User = sqlx::query_as(sql!(
+        "SELECT id, email, password_hash, display_name, org_id, role, owner_source,
+                created_at, updated_at
+         FROM users WHERE id = $1"
+    ))
+    .bind(fixture.user_id)
+    .fetch_one(&fixture.db.pool)
+    .await?;
+    let create_owner = SandboxCreateOwner::local(&actor);
+    let req = crate::public_sandbox_operations::controller_create_request(
+        payload.request.clone(),
+        payload.node_pool.clone(),
+    );
+    let requested_template = req
+        .template
+        .clone()
+        .expect("native creates name a template");
+    let auto_lifecycle = req
+        .auto_lifecycle
+        .clone()
+        .expect("native creates carry the default policy");
+    let template_network_policy = NetworkPolicyV1::deny_all();
+    let content_hash = fixture.content_hash.to_string();
+    let mut input = pooled_create_input(
+        &fixture.db.pool,
+        &req,
+        &requested_template,
+        &auto_lifecycle,
+        &template_network_policy,
+        &create_owner,
+    );
+    input.template = TEMPLATE;
+    input.content_hash = &content_hash;
+    input.template_release_id = fixture.release_id;
+    input.boot_mode = CreateBootMode::Fallthrough;
+    input.planned_sandbox_id = SandboxId::from_uuid(payload.sandbox_id.as_uuid());
+    input.sandbox_id_pinned = true;
+    let substrate = NodeRpcStubbedKubernetes {
+        inner: kubernetes(),
+        prepared: Mutex::new(Vec::new()),
+    };
+    let result = SandboxController::try_create_from_admitted_pool_claim_with_substrate(
+        &substrate,
+        input,
+        admitted,
+        true,
+        Arc::new(AtomicU64::new(0)),
+    )
+    .await?;
+
+    let sandbox = result
+        .response
+        .expect("the admitted slot is adopted, not rebuilt cold");
+    assert_eq!(sandbox.id, slot.reserved_sandbox_id);
+    assert_eq!(
+        *substrate.prepared.lock().unwrap(),
+        vec![(slot.reserved_sandbox_id, true)]
+    );
+    let (lifecycle, active_node_id): (String, Option<NodeId>) = sqlx::query_as(sql!(
+        "SELECT lifecycle, active_node_id FROM sandboxes WHERE id = $1"
+    ))
+    .bind(slot.reserved_sandbox_id)
+    .fetch_one(&fixture.db.pool)
+    .await?;
+    assert_eq!(lifecycle, "started");
+    assert_eq!(active_node_id, Some(node_id));
+    let public = crate::routes::public::sandboxes::read_public_sandbox(
+        &fixture.db.pool,
+        fixture.org_id,
+        pplx_space_public_api::PublicSandboxId::from(slot.reserved_sandbox_id),
+    )
+    .await
+    .expect("created sandbox is readable");
+    assert_eq!(public.idle_timeout.as_deref(), Some(expected_timeout));
+    assert_eq!(public.idle_action, Some(expected_action));
+    let (state, claim_id): (String, Option<Uuid>) = sqlx::query_as(sql!(
+        "SELECT state, claim_id FROM kubernetes_pool_slots WHERE id = $1"
+    ))
+    .bind(slot.id)
+    .fetch_one(&fixture.db.pool)
+    .await?;
+    assert_eq!(
+        (state.as_str(), claim_id),
+        ("bound", Some(admitted.claim_id)),
+        "the admission claim is the one that bound"
     );
     Ok(())
 }

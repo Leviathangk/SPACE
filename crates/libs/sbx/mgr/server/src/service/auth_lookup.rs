@@ -703,6 +703,11 @@ impl SandboxManagerService {
             disarm_guest_activity_on_external_access(&mut state, &sandbox.auto_lifecycle, now);
             clear_error(&mut state, &sandbox.auto_lifecycle);
         }
+        // Activity is recorded at one-second resolution, so back-to-back guest
+        // operations usually leave the state as it was; skip the write then.
+        if state == sandbox.auto_lifecycle_state {
+            return Ok(());
+        }
         let db = self.db_conn()?;
         crate::db::update_auto_lifecycle_state(&db, &sandbox.id, &state)
             .map_err(|e| Status::internal(format!("db auto_lifecycle_state update failed: {e}")))
@@ -765,7 +770,7 @@ impl SandboxManagerService {
             sandbox
                 .state
                 .transition(SandboxState::Resuming)
-                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                .map_err(Status::from)?;
             sandbox
         };
         let sandbox_id_typed = sandbox
@@ -811,7 +816,7 @@ impl SandboxManagerService {
         }
         self.watchdog.record_lifecycle_edge(&sandbox.id).await;
 
-        let mut node_client = connect_node()
+        let mut node_client = connect_node(&self.node_manager)
             .await
             .map_err(|error| resident_resume_connect_error(&self.db, &sandbox.id, error))?;
 
@@ -864,6 +869,7 @@ impl SandboxManagerService {
             let observation = observe_firecracker_vm_state(
                 &sandbox_id_typed,
                 "resident resume response reconciliation",
+                &self.node_manager,
             )
             .await;
             let reason = match observation.unobservable_reason() {
@@ -913,6 +919,7 @@ impl SandboxManagerService {
                     .pause_sandbox(PauseSandboxRequest {
                         execution_fence: sandbox.node_execution_fence(),
                         sandbox_id: sandbox.id.clone(),
+                        balloon_hint_timeout_ms: None,
                     })
                     .await
                 {
@@ -921,6 +928,7 @@ impl SandboxManagerService {
                         let observation = observe_firecracker_vm_state(
                             &sandbox_id_typed,
                             "resident resume guest setup rollback",
+                            &self.node_manager,
                         )
                         .await;
                         let probe_detail = observation
@@ -998,13 +1006,15 @@ impl SandboxManagerService {
         }
 
         if inherit_template_default {
-            let resolved_template =
-                resolve_template_paths(pplx_space_template_mgr_client::proto::TemplateRef {
+            let resolved_template = resolve_template_paths(
+                self.template_resolver.as_ref(),
+                pplx_space_template_mgr_client::proto::TemplateRef {
                     name: sandbox.template.clone(),
                     content_hash: sandbox.template_hash.clone(),
                     tag: None,
-                })
-                .await?;
+                },
+            )
+            .await?;
             policy = resolved_template.default_auto_lifecycle;
         }
 

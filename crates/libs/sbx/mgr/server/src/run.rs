@@ -8,7 +8,6 @@
 //! private wiring can supply its own `main` against this library without
 //! copying any of the service.
 
-use pplx_space_common_core::types::SandboxId;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
@@ -45,7 +44,13 @@ use crate::proto::sandbox_manager_server::SandboxManagerServer;
 use crate::service::{
     EnableDependencyRestartDrainError, ReleaseDependencyRestartDrainError, SandboxManagerService,
     SandboxManagerServiceOptions, StartupRecoveryAdmissionError, StartupRecoveryError,
+    StartupRecoveryLease,
 };
+
+mod node_manager_startup;
+#[cfg(test)]
+mod test_receiver;
+use node_manager_startup::{NodeManagerStartupError, StartupPhase, wait_for_node_manager};
 
 /// The service name sandbox-manager reports to telemetry, names its health
 /// and rate-limit surfaces with, and labels its drain log lines with.
@@ -59,7 +64,7 @@ const SPACE_NODE_ROLE_ENV: &str = "SPACE_NODE_ROLE";
 const SPACE_NODE_MANAGED_BY_ENV: &str = "SPACE_NODE_MANAGED_BY";
 const SOCKET_GROUP: &str = group_names::SPACE_SBXCLIENTS;
 // Keep this above E2B_FILE_WRITE_CHUNK_BYTES (3 MiB) plus protobuf overhead.
-const SANDBOX_MANAGER_MAX_DECODE_BYTES: usize = 4 * 1024 * 1024;
+const SANDBOX_MANAGER_MAX_DECODE_BYTES: usize = pplx_space_common_core::spaced::MAX_MESSAGE_BYTES;
 const HOST_CONTROL_MAX_DECODE_BYTES: usize = 64 * 1024;
 // Hard-coded so two instances on the same host cannot be configured to use
 // different mutex files and both acquire concurrently.
@@ -75,7 +80,6 @@ const STARTUP_RECOVERY_ADMISSION_TIMEOUT: Duration = DEFAULT_SERVICE_MUTEX_TIMEO
 async fn migrate_sandbox_manager_db(
     db_path: &std::path::Path,
 ) -> Result<(), pplx_space_common_svc::sql::sqlite::SqliteError> {
-    let store = pplx_space_common_svc::sql::baselines::SANDBOX_MANAGER;
     pplx_space_common_svc::sql::sqlite::migrate_embedded(
         "sandbox-manager",
         db_path,
@@ -83,9 +87,6 @@ async fn migrate_sandbox_manager_db(
             service: &SANDBOX_MANAGER_MIGRATOR,
             common: Some(&COMMON_SCHEMA_MIGRATOR),
         },
-        Some(store.baseline_version),
-        store.migration_failure_policy,
-        Some(pplx_space_sbxmgr_migrations::prepare_migrations),
     )
     .await
 }
@@ -586,10 +587,6 @@ pub enum RunSbxMgrError {
     Migrate(#[source] pplx_space_common_svc::sql::sqlite::SqliteError),
     #[error("failed to open the sandbox-manager database: {0}")]
     OpenDatabase(#[source] pplx_space_common_svc::sql::sqlite::SqliteError),
-    #[error("snapshot upload cutover preflight failed: {0}")]
-    UploadCutover(#[source] crate::snapshot_upload_jobs::UploadCutoverError),
-    #[error("snapshot upload cutover preflight task failed: {0}")]
-    UploadCutoverTask(#[source] tokio::task::JoinError),
     #[error("invalid {SPACE_NODE_ROLE_ENV} {role:?}: {source}")]
     NodeRole {
         role: String,
@@ -604,6 +601,8 @@ pub enum RunSbxMgrError {
     EnableDependencyRestartDrain(#[source] EnableDependencyRestartDrainError),
     #[error("failed to admit startup recovery through dependency drain: {0}")]
     StartupRecoveryAdmission(#[source] StartupRecoveryAdmissionError),
+    #[error("node-manager rejected startup availability check: {0}")]
+    NodeManagerStartup(#[source] tonic::Status),
     #[error("execution authority is not ready: {0}")]
     ExecutionAuthority(#[source] tonic::Status),
     /// A persistence failure during startup recovery has no in-process retry
@@ -688,38 +687,82 @@ fn parse_node_managed_by(
     }
 }
 
-async fn start_takeover_health(
+async fn start_takeover_health<C, Fut>(
     config: &SbxMgrRunConfig,
     shutdown_token: &CancellationToken,
-    node: &mut pplx_space_node_mgr_client::NodeManagerGrpcClient,
-) -> Result<LocalHealthServer, RunSbxMgrError> {
-    // Passive readiness permits Kubernetes to retire the current owner. Check
-    // the receiver before exposing it, without opening stores or taking the
-    // mutex. Process supervision retries failures while the old owner serves.
-    tokio::select! {
-        biased;
-        _ = shutdown_token.cancelled() => return Ok(LocalHealthServer::disabled()),
-        result = tokio::time::timeout(
-            Duration::from_secs(10),
-            pplx_space_node_mgr_client::execution_fence::inspect_execution(
-                node,
-                SandboxId::new(),
-            ),
-        ) => {
-            result
-                .map_err(|_| RunSbxMgrError::ExecutionAuthority(Status::deadline_exceeded(
-                    "node-manager execution authority check timed out before takeover readiness",
-                )))?
-                .map_err(RunSbxMgrError::ExecutionAuthority)?;
-        }
-    }
-    LocalHealthServer::spawn_optional(
+    connect: C,
+) -> Result<LocalHealthServer, RunSbxMgrError>
+where
+    C: FnMut() -> Fut,
+    Fut: Future<
+        Output = Result<
+            pplx_space_node_mgr_client::NodeManagerGrpcClient,
+            pplx_space_node_mgr_client::ConnectError,
+        >,
+    >,
+{
+    // A restarted process may have no predecessor left. Keep liveness available
+    // while waiting, but never authorize takeover before the dependency answers.
+    let health_shutdown = shutdown_token.child_token();
+    let health_guard = health_shutdown.clone().drop_guard();
+    let health = LocalHealthServer::spawn_optional_waiting(
         config.health_socket_path.as_deref(),
         pplx_space_common_svc::UnixSocketOptions::new(0o660),
         SERVICE_NAME,
-        shutdown_token.clone(),
+        health_shutdown.clone(),
     )
-    .map_err(RunSbxMgrError::HealthSocket)
+    .map_err(RunSbxMgrError::HealthSocket)?;
+    let result = wait_for_node_manager(StartupPhase::BeforeTakeover, shutdown_token, connect).await;
+    match result {
+        Ok(()) => {
+            health.mark_takeover_ready();
+            health_guard.disarm();
+            Ok(health)
+        }
+        Err(error) => {
+            health_shutdown.cancel();
+            health.join().await;
+            match error {
+                NodeManagerStartupError::Cancelled => Ok(LocalHealthServer::disabled()),
+                NodeManagerStartupError::Status(status) => {
+                    Err(RunSbxMgrError::NodeManagerStartup(status))
+                }
+            }
+        }
+    }
+}
+
+/// Dependency waiting must precede the work lease: node-manager activation may
+/// need exclusive access to that gate. `None` means shutdown, with no admission.
+async fn admit_startup_recovery<C, Fut>(
+    service: &SandboxManagerService,
+    shutdown: &CancellationToken,
+    connect: C,
+) -> Result<Option<StartupRecoveryLease>, RunSbxMgrError>
+where
+    C: FnMut() -> Fut,
+    Fut: Future<
+        Output = Result<
+            pplx_space_node_mgr_client::NodeManagerGrpcClient,
+            pplx_space_node_mgr_client::ConnectError,
+        >,
+    >,
+{
+    match wait_for_node_manager(StartupPhase::BeforeRecovery, shutdown, connect).await {
+        Ok(()) => {}
+        Err(NodeManagerStartupError::Cancelled) => return Ok(None),
+        Err(NodeManagerStartupError::Status(status)) => {
+            return Err(RunSbxMgrError::NodeManagerStartup(status));
+        }
+    }
+    match service
+        .wait_for_startup_recovery_lease(shutdown, STARTUP_RECOVERY_ADMISSION_TIMEOUT)
+        .await
+    {
+        Ok(lease) => Ok(Some(lease)),
+        Err(StartupRecoveryAdmissionError::Cancelled) => Ok(None),
+        Err(error) => Err(RunSbxMgrError::StartupRecoveryAdmission(error)),
+    }
 }
 
 /// Run the sandbox manager until `shutdown_token` fires and the restart
@@ -736,12 +779,9 @@ pub async fn run(
             .map_err(RunSbxMgrError::RouteVerificationBundle)?,
     ));
 
-    let health_server = start_takeover_health(
-        &config,
-        &shutdown_token,
-        &mut pplx_space_node_mgr_client::lazy(),
-    )
-    .await?;
+    let node_manager = crate::node_manager_transport::NodeManagerConnector::host();
+    let health_server =
+        start_takeover_health(&config, &shutdown_token, || node_manager.connect_once()).await?;
     let health_socket = config
         .health_socket_path
         .as_ref()
@@ -775,17 +815,6 @@ pub async fn run(
     );
     health_server.mark_starting();
 
-    // The scan is complete but streaming: keep startup ownership off-runtime
-    // with the SQLite work so a large queue cannot starve the health watchdog.
-    let (service_mutex, upload_cutover) = tokio::task::spawn_blocking(move || {
-        let result = crate::snapshot_upload_jobs::validate_upload_cutover_path(
-            std::path::Path::new(pplx_space_common_core::host::linux::paths::SANDBOX_MANAGER_DB),
-        );
-        (service_mutex, result)
-    })
-    .await
-    .map_err(RunSbxMgrError::UploadCutoverTask)?;
-    upload_cutover.map_err(RunSbxMgrError::UploadCutover)?;
     migrate_sandbox_manager_db(std::path::Path::new(
         pplx_space_common_core::host::linux::paths::SANDBOX_MANAGER_DB,
     ))
@@ -819,6 +848,7 @@ pub async fn run(
             node_role,
             node_managed_by,
             route_ed25519_verification_bundle,
+            node_manager: node_manager.clone(),
             ..Default::default()
         },
         service_config,
@@ -832,32 +862,25 @@ pub async fn run(
         )
         .map_err(RunSbxMgrError::EnableDependencyRestartDrain)
         .inspect_err(report_active_failure)?;
-    // Capability observation alone is not a stable handoff: the process that
-    // init observed can exit while its successor starts. Admit all recovery
-    // through the work gate so dependency replacement either waits for these
-    // writes or closes admission before any recovery begins.
-    let startup_recovery_lease = match service
-        .wait_for_startup_recovery_lease(&shutdown_token, STARTUP_RECOVERY_ADMISSION_TIMEOUT)
-        .await
-    {
-        Ok(lease) => lease,
-        Err(StartupRecoveryAdmissionError::Cancelled) => {
-            tracing::warn!("terminated while waiting for startup recovery admission");
-            health_server.join().await;
-            active_ownership.exit_without_quiescence(
-                "sandbox-manager cancelled after construction without a drain proof",
-            );
-        }
-        Err(error) => {
-            let error = RunSbxMgrError::StartupRecoveryAdmission(error);
-            report_active_failure(&error);
-            return Err(error);
-        }
-    };
+    let startup_recovery_lease =
+        match admit_startup_recovery(&service, &shutdown_token, || node_manager.connect_once())
+            .await
+            .inspect_err(report_active_failure)?
+        {
+            Some(lease) => lease,
+            None => {
+                tracing::warn!("terminated while waiting for startup recovery");
+                health_server.join().await;
+                active_ownership.exit_without_quiescence(
+                    "sandbox-manager cancelled after construction without a drain proof",
+                );
+            }
+        };
     service
         .prepare_execution_authority()
         .await
-        .map_err(RunSbxMgrError::ExecutionAuthority)?;
+        .map_err(RunSbxMgrError::ExecutionAuthority)
+        .inspect_err(report_active_failure)?;
     let startup_recovery = service
         .recover_interrupted_startup_states()
         .await
@@ -955,6 +978,19 @@ pub async fn run(
         );
     }
     snapshot_upload_worker.recover_and_log("sandbox-mgr.snapshot_upload");
+    // Best effort: a hold that is not re-armed stays stopped, which is the state
+    // it was already in, and the next start tries again.
+    match service.rearm_stopped_quarantine_recoveries() {
+        Ok(0) => {}
+        Ok(rearmed) => tracing::info!(
+            rearmed,
+            "re-armed stopped quarantine recoveries; each stops again at its next plan rejection"
+        ),
+        Err(error) => tracing::warn!(
+            %error,
+            "failed to re-arm stopped quarantine recoveries; they stay stopped"
+        ),
+    }
     drop(startup_recovery_lease);
 
     service.start_auto_lifecycle_scheduler(shutdown_token.child_token(), &task_tracker);

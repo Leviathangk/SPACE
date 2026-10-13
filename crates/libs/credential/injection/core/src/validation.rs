@@ -3,8 +3,8 @@
 use crate::secret_arn::SecretArn;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("invalid credential-injection rules: {0}")]
-pub struct RulesetValidationError(pub &'static str);
+#[error("credential reference is invalid: {0}")]
+pub struct ReferenceValidationError(pub &'static str);
 
 #[derive(Clone)]
 pub enum ValidatedCredentialReference {
@@ -14,10 +14,10 @@ pub enum ValidatedCredentialReference {
 impl ValidatedCredentialReference {
     pub fn aws_secrets_manager(
         secret_arn: impl Into<String>,
-    ) -> Result<Self, RulesetValidationError> {
+    ) -> Result<Self, ReferenceValidationError> {
         SecretArn::parse(secret_arn)
             .map(Self::AwsSecretsManager)
-            .map_err(|_| RulesetValidationError("credential reference is malformed"))
+            .map_err(|_| ReferenceValidationError("credential reference is malformed"))
     }
 }
 

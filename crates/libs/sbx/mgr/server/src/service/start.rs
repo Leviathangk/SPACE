@@ -3,7 +3,7 @@
 //! Startup and periodic repair stay in `recovery`; this module owns activation
 //! request parsing, placement and memory-policy resolution, and launch sequencing.
 
-use pplx_space_common_core::types::LocalArtifactId;
+use pplx_space_common_core::types::{LocalArtifactId, RateLimiter, TokenBucket};
 
 use super::activation_support::{
     ActivationFailureStage, IdentityFreeDirectActivationAuthority, StartStateTransition,
@@ -513,6 +513,8 @@ async fn prepare_suspend_restore_dir(
                 execution_fence,
                 storage_uri,
                 transfer_scope_id,
+                &service.node_manager,
+                service.template_resolver.as_ref(),
             )
             .await
         }
@@ -521,6 +523,8 @@ async fn prepare_suspend_restore_dir(
                 &sandbox_id,
                 execution_fence,
                 transfer_scope_id,
+                &service.node_manager,
+                service.template_resolver.as_ref(),
             )
             .await
         }
@@ -750,7 +754,7 @@ impl SandboxManagerService {
         &self,
         requested_memory_mib: u32,
     ) -> Result<ResolvedSandboxMemoryPolicy, Status> {
-        let mut node_client = connect_node()
+        let mut node_client = connect_node(&self.node_manager)
             .await
             .map_err(|e| Status::internal(format!("cannot connect to node-manager: {e}")))?;
         let node_memory_policy = Self::node_sandbox_memory_policy(&mut node_client).await?;
@@ -1005,12 +1009,11 @@ impl SandboxManagerService {
                 let observed_encrypted =
                     super::recovery_cross_node::encrypted_from_staged_sidecar(sandbox_id);
                 cross_node_start.emit(observed_encrypted);
-                pplx_space_metrics::snapshot::restore_failed(
+                pplx_space_metrics::snapshot::restore_stage_failed(
                     "cross_node",
                     cross_node_codec_at_start,
                     observed_encrypted,
-                    "stage",
-                    "stage_failed",
+                    error.stage_error_kind(),
                     cross_node_started_at,
                 );
                 Err(Status::unavailable(format!(
@@ -1177,6 +1180,7 @@ impl SandboxManagerService {
                 completion: CleanupCompletion::MarkSuspended,
                 published_artifact: None,
                 immediate_kill: Self::cleanup_immediate_kill(CleanupCompletion::MarkSuspended),
+                guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
             };
             if let Some(cleanup_id) = cleanup_id {
                 start_stage(
@@ -1360,6 +1364,7 @@ impl SandboxManagerService {
 
         if !vmstate_path.exists() {
             let resolved_template = resolve_template_paths_for_start(
+                self.template_resolver.as_ref(),
                 pplx_space_template_mgr_client::proto::TemplateRef {
                     name: sandbox.template.clone(),
                     content_hash: sandbox.template_hash.clone(),
@@ -1642,7 +1647,7 @@ impl SandboxManagerService {
             "fresh.template_prepare_source",
             START_TEMPLATE_RESOLUTION_TIMEOUT,
             &sandbox.id,
-            template_source_for_sandbox_prepare(&sandbox),
+            template_source_for_sandbox_prepare(self.template_resolver.as_ref(), &sandbox),
         )
         .await?;
         let selection_mode = if prepare_source.existing_artifact {
@@ -1658,7 +1663,11 @@ impl SandboxManagerService {
             START_TEMPLATE_RESOLUTION_TIMEOUT,
             &sandbox.id,
             TemplateRuntimeDefaults::default(),
-            template_runtime_defaults_for_sandbox_start(&sandbox, prepare_template_dir.as_deref()),
+            template_runtime_defaults_for_sandbox_start(
+                self.template_resolver.as_ref(),
+                &sandbox,
+                prepare_template_dir.as_deref(),
+            ),
         )
         .await;
 
@@ -1669,7 +1678,7 @@ impl SandboxManagerService {
             .await?;
         if let Err(error) = sandbox.state.transition(SandboxState::Starting) {
             activation_admission_permit.finish(AdmissionPermitOutcome::Failed);
-            return Err(Status::failed_precondition(error.to_string()));
+            return Err(Status::from(error));
         }
         if let Err(error) = self.resolve_start_context_route_identity(&sandbox, &mut start_ctx) {
             activation_admission_permit.finish(AdmissionPermitOutcome::Failed);
@@ -1779,7 +1788,7 @@ impl SandboxManagerService {
             START_NODE_METADATA_TIMEOUT,
             id,
             async {
-                connect_node()
+                connect_node(&self.node_manager)
                     .await
                     .map_err(|e| Status::internal(format!("cannot connect to node-manager: {e}")))
             },
@@ -1801,6 +1810,12 @@ impl SandboxManagerService {
         let memory_policy =
             self.resolve_sandbox_memory_policy(requested_memory_mib, node_memory_policy);
         let mem_mib = memory_policy.effective_memory_mib;
+        // Like boot args, the balloon device exists only from a cold boot:
+        // snapshots carry the device state they were taken with.
+        let balloon = template_defaults
+            .balloon
+            .for_memory_mib(mem_mib)
+            .map_err(|error| activation_cleanup.failure(error))?;
         if mem_mib < requested_memory_mib {
             tracing::info!(
                 sandbox_id = %id,
@@ -1914,32 +1929,39 @@ impl SandboxManagerService {
         } else {
             ""
         };
+        let is_builder = sandbox.user.kind() == SandboxOwnerKind::Builder;
+        let runtime_boot_args = if is_builder {
+            format!(
+                " {}",
+                pplx_space_common_core::types::TEMPLATE_RUNTIME_BUILD_MASK
+            )
+        } else {
+            String::new()
+        };
         // This only applies on cold boot. Restored sandboxes inherit the
         // kernel state captured in their snapshot, so templates/base snapshots
         // must be rebuilt to roll out boot-arg changes.
         let boot_args = format!(
-            "reboot=k panic=1 pci=off rw root=/dev/vda{clocksource_args} transparent_hugepage=never 8250.nr_uarts={nr_uarts}{console_args} ip={GUEST_IP}::{GUEST_GATEWAY}:{GUEST_NETMASK}:instance:{GUEST_NETWORK_INTERFACE}:off",
+            "reboot=k panic=1 pci=off rw root=/dev/vda{runtime_boot_args}{clocksource_args} transparent_hugepage=never 8250.nr_uarts={nr_uarts}{console_args} ip={GUEST_IP}::{GUEST_GATEWAY}:{GUEST_NETMASK}:instance:{GUEST_NETWORK_INTERFACE}:off",
             clocksource_args = clocksource_args,
             nr_uarts = nr_uarts,
             console_args = console_args,
         );
         // Build-manager VMs retain their existing rate-limiter exemption. All
         // other sandboxes use the immutable assignment stored on their row.
-        let is_builder = sandbox.user.kind() == SandboxOwnerKind::Builder;
-        let disk_rate_limiter = firecracker_disk_rate_limiter(is_builder, sandbox.disk_io_limits);
+        let disk_rate_limiter = firecracker_rate_limiter_field(
+            "rate_limiter",
+            self.rootfs_rate_limiter(is_builder, sandbox.disk_io_limits)
+                .as_ref(),
+        );
         let net_rate_limiters = if is_builder {
             String::new()
         } else {
-            r#",
-    "rx_rate_limiter": {
-      "bandwidth": { "size": 52428800, "refill_time": 1000 },
-      "ops": { "size": 10000, "refill_time": 1000 }
-    },
-    "tx_rate_limiter": {
-      "bandwidth": { "size": 52428800, "refill_time": 1000 },
-      "ops": { "size": 10000, "refill_time": 1000 }
-    }"#
-            .to_string()
+            format!(
+                "{}{}",
+                firecracker_rate_limiter_field("rx_rate_limiter", Some(&NET_RATE_LIMITER)),
+                firecracker_rate_limiter_field("tx_rate_limiter", Some(&NET_RATE_LIMITER)),
+            )
         };
 
         let huge_pages = if self.config.hugepages {
@@ -1975,8 +1997,9 @@ impl SandboxManagerService {
   "vsock": {{
     "guest_cid": {guest_cid},
     "uds_path": "/v.sock"
-  }}
+  }}{balloon}
 }}"#,
+            balloon = firecracker_balloon_field(balloon),
             guest_network_interface = GUEST_NETWORK_INTERFACE,
             guest_mac = alloc.guest_mac,
             tap_device = alloc.tap_device,
@@ -2042,23 +2065,26 @@ impl SandboxManagerService {
         let netgtw_db = Arc::clone(&self.db);
         let netgtw_launch_config =
             net_gateway_launch_config(&self.feature_flags, &netgtw_sandbox_id);
-        let netgtw_task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
-            register_net_gateway_launch(
-                &netgtw_db,
-                &netgtw_sandbox_id,
-                sbx_uid,
-                launch_net_gateway_via_node(
-                    &mut netgtw_client,
-                    execution_fence,
+        let netgtw_task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+            async move {
+                register_net_gateway_launch(
+                    &netgtw_db,
                     &netgtw_sandbox_id,
                     sbx_uid,
-                    netgtw_no_identity,
-                    Some(&netgtw_route_identity),
-                    &netgtw_launch_config,
-                ),
-            )
-            .await
-        }));
+                    launch_net_gateway_via_node(
+                        &mut netgtw_client,
+                        execution_fence,
+                        &netgtw_sandbox_id,
+                        sbx_uid,
+                        netgtw_no_identity,
+                        Some(&netgtw_route_identity),
+                        &netgtw_launch_config,
+                    ),
+                )
+                .await
+            }
+            .in_current_span(),
+        ));
 
         let prepare_response = match prepare_sandbox.await {
             Ok(response) => response.into_inner(),
@@ -2111,12 +2137,17 @@ impl SandboxManagerService {
         // one node-local round-trip for the warm-pool composite *shape* below
         // — a device-layout choice, not an encryption decision.
         let rootfs_block_device_path = if sandbox.volume_encryption {
-            match crate::rootfs_encryption::prepare_encrypted_rootfs(id, execution_fence, None)
-                .instrument(tracing::info_span!(
-                    "sbxmgr.start.encrypted_rootfs_prepare",
-                    sandbox_id = %id
-                ))
-                .await
+            match crate::rootfs_encryption::prepare_encrypted_rootfs(
+                id,
+                execution_fence,
+                None,
+                &self.node_manager,
+            )
+            .instrument(tracing::info_span!(
+                "sbxmgr.start.encrypted_rootfs_prepare",
+                sandbox_id = %id
+            ))
+            .await
             {
                 Ok(path) => Some(path),
                 Err(e) => {
@@ -2153,12 +2184,16 @@ impl SandboxManagerService {
             // it; booting it past an existing COW (cow.plain, or cow.luks
             // from an unstamped re-home) silently rolls back every write the
             // guest made through it.
-            match crate::rootfs_encryption::prepare_snapshot_rootfs(id, execution_fence)
-                .instrument(tracing::info_span!(
-                    "sbxmgr.start.pool_snapshot_rootfs_prepare",
-                    sandbox_id = %id
-                ))
-                .await
+            match crate::rootfs_encryption::prepare_snapshot_rootfs(
+                id,
+                execution_fence,
+                &self.node_manager,
+            )
+            .instrument(tracing::info_span!(
+                "sbxmgr.start.pool_snapshot_rootfs_prepare",
+                sandbox_id = %id
+            ))
+            .await
             {
                 Ok(path) => Some(path),
                 Err(e)
@@ -2489,23 +2524,69 @@ impl SandboxManagerService {
     }
 }
 
-fn firecracker_disk_rate_limiter(
-    is_builder: bool,
-    limits: pplx_space_common_core::types::DiskIoLimits,
-) -> String {
-    if is_builder {
-        return String::new();
+impl SandboxManagerService {
+    /// A sandbox VM's rootfs rate limiter, at cold boot and after a snapshot
+    /// load alike. Build-manager VMs keep their exemption; every other sandbox
+    /// uses the immutable assignment stored on its row.
+    pub(super) fn rootfs_rate_limiter(
+        &self,
+        is_builder: bool,
+        limits: pplx_space_common_core::types::DiskIoLimits,
+    ) -> Option<RateLimiter> {
+        (!is_builder).then(|| RateLimiter::for_disk(limits, self.config.disk_io_burst_secs()))
     }
+}
 
-    let bandwidth_bytes_per_sec = limits.max_bandwidth_mib_per_sec() * 1024 * 1024;
-    format!(
-        r#",
-    "rate_limiter": {{
-      "bandwidth": {{ "size": {bandwidth_bytes_per_sec}, "refill_time": 1000 }},
-      "ops": {{ "size": {operations_per_sec}, "refill_time": 1000 }}
-    }}"#,
-        operations_per_sec = limits.max_operations_per_sec(),
-    )
+/// The limiter for node-manager to apply after a snapshot load, which
+/// otherwise keeps the limiter of the VM the snapshot was taken from.
+pub(super) fn drive_rate_limit_proto(
+    limiter: RateLimiter,
+) -> pplx_space_node_mgr_client::proto::DriveRateLimit {
+    let bucket = |bucket: TokenBucket| pplx_space_node_mgr_client::proto::TokenBucket {
+        size: bucket.size,
+        refill_time_ms: bucket.refill_time_ms,
+    };
+    pplx_space_node_mgr_client::proto::DriveRateLimit {
+        bandwidth: Some(bucket(limiter.bandwidth)),
+        operations: Some(bucket(limiter.operations)),
+    }
+}
+
+/// Each direction of a sandbox's network interface: 50 MiB/s and 10000
+/// packets/s, refilled every second.
+const NET_RATE_LIMITER: RateLimiter = RateLimiter {
+    bandwidth: TokenBucket {
+        size: 52_428_800,
+        refill_time_ms: 1000,
+    },
+    operations: TokenBucket {
+        size: 10_000,
+        refill_time_ms: 1000,
+    },
+};
+
+/// `name`'s entry in the VM configuration's JSON, following the previous
+/// field; nothing without a limiter.
+fn firecracker_rate_limiter_field(name: &str, limiter: Option<&RateLimiter>) -> String {
+    limiter.map_or_else(String::new, |limiter| {
+        format!(
+            ",\n    \"{name}\": {}",
+            pplx_space_node_runtime_core::fc_api::rate_limiter_json(limiter)
+        )
+    })
+}
+
+/// The top-level `balloon` member of a cold-boot VM configuration, or nothing
+/// at all when the template has no balloon so the configuration is unchanged.
+fn firecracker_balloon_field(
+    balloon: Option<pplx_space_common_core::types::BalloonConfig>,
+) -> String {
+    balloon.map_or_else(String::new, |balloon| {
+        format!(
+            ",\n  \"balloon\": {}",
+            pplx_space_node_runtime_core::fc_api::balloon_json(balloon)
+        )
+    })
 }
 
 #[cfg(test)]

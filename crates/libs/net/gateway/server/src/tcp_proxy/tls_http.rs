@@ -15,6 +15,7 @@ use hyper::body::{Body as HttpBody, Bytes, Incoming};
 use hyper::client::conn::{http1, http2};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::server::conn::auto;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Mutex, MutexGuard, OnceCell};
 use tokio_util::sync::CancellationToken;
@@ -34,7 +35,9 @@ mod leg;
 mod upgrade;
 
 type Body = Either<ForwardingBody, Empty<Bytes>>;
-const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+const H2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const H2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HEADERS: usize = 128;
 const MAX_HEADER_BYTES: u32 = 32 * 1024;
 const MAX_STREAMS: u32 = 32;
@@ -140,7 +143,6 @@ impl HttpBody for ForwardingBody {
 }
 
 struct Session<F> {
-    protocol: HttpProtocol,
     binding: HostBinding,
     lease: Arc<CertificateLease>,
     connect: Mutex<Option<F>>,
@@ -151,16 +153,25 @@ struct Session<F> {
     draining: CancellationToken,
 }
 
+/// Serve inspected HTTP on an established guest TLS stream.
+///
+/// The HTTP version is detected from the guest's first bytes: an HTTP/2
+/// connection preface selects hyper's h2 server, anything else selects h1.
+/// Go's `net/http` offers `h2` to an `https://` forward proxy and then writes
+/// an HTTP/1.1 `CONNECT`; parsing that as h2 would answer the CONNECT with a
+/// SETTINGS frame and a `PROTOCOL_ERROR` GOAWAY.
+///
+/// Protocol detection has no timeout; hyper's timers apply after it completes.
+/// `connect` lazily opens the origin with the detected guest protocol.
 pub(super) async fn serve<C, F, Fut, U>(
     guest: C,
-    protocol: HttpProtocol,
     binding: HostBinding,
     lease: Arc<CertificateLease>,
     connect: F,
 ) -> Result<(), TlsTransportError>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    F: FnOnce() -> Fut + Send + 'static,
+    F: FnOnce(HttpProtocol) -> Fut + Send + 'static,
     Fut: Future<Output = Result<(U, HttpProtocol), TlsTransportError>> + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -168,7 +179,6 @@ where
     // Dropping this future on revocation also closes every origin socket.
     let _cancel = shutdown.clone().drop_guard();
     let session = Arc::new(Session {
-        protocol,
         binding,
         lease,
         connect: Mutex::new(Some(connect)),
@@ -180,42 +190,24 @@ where
     });
     let service = service_fn(|request: Request<Incoming>| {
         let session = session.clone();
+        let protocol = HttpProtocol::of(request.version());
+        tracing::Span::current().record("protocol", protocol.as_str());
         let request = SanitizedRequest::try_from(request);
         async move {
             Ok::<_, Infallible>(match request {
                 Ok(request) => session.forward(request).await,
-                Err(_) => session.refuse("invalid_headers", StatusCode::BAD_REQUEST),
+                Err(_) => session.refuse(protocol, "invalid_headers", StatusCode::BAD_REQUEST),
             })
         }
     });
-    let result = match protocol {
-        HttpProtocol::Http1 => {
-            let connection = hyper::server::conn::http1::Builder::new()
-                .timer(TokioTimer::new())
-                .header_read_timeout(HEADER_TIMEOUT)
-                .max_headers(MAX_HEADERS)
-                .max_buf_size(MAX_HEADER_BYTES as usize)
-                .serve_connection(TokioIo::new(guest), service)
-                .with_upgrades();
-            tokio::pin!(connection);
-            tokio::select! {
-                result = &mut connection => result,
-                () = session.draining.cancelled() => {
-                    connection.as_mut().graceful_shutdown();
-                    connection.await
-                }
-            }
-        }
-        HttpProtocol::Http2 => {
-            let connection = guest_http2_builder().serve_connection(TokioIo::new(guest), service);
-            tokio::pin!(connection);
-            tokio::select! {
-                result = &mut connection => result,
-                () = session.draining.cancelled() => {
-                    connection.as_mut().graceful_shutdown();
-                    connection.await
-                }
-            }
+    let builder = guest_http_builder();
+    let connection = builder.serve_connection_with_upgrades(TokioIo::new(guest), service);
+    tokio::pin!(connection);
+    let result = tokio::select! {
+        result = &mut connection => result,
+        () = session.draining.cancelled() => {
+            connection.as_mut().graceful_shutdown();
+            connection.await
         }
     };
     session.upgrades.close();
@@ -223,30 +215,40 @@ where
     session.shutdown.cancel();
     session.tasks.close();
     session.tasks.wait().await;
-    result.map_err(Into::into)
+    result.map_err(TlsTransportError::from)
 }
 
-fn guest_http2_builder() -> hyper::server::conn::http2::Builder<TokioExecutor> {
-    let mut builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+fn guest_http_builder() -> auto::Builder<TokioExecutor> {
+    let mut builder = auto::Builder::new(TokioExecutor::new());
     builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEADER_TIMEOUT)
+        .max_headers(MAX_HEADERS)
+        .max_buf_size(MAX_HEADER_BYTES as usize);
+    builder
+        .http2()
         .timer(TokioTimer::new())
         .max_concurrent_streams(MAX_STREAMS)
         .max_header_list_size(MAX_HEADER_BYTES)
         .max_send_buf_size(64 * 1024)
         .initial_stream_window_size(GUEST_H2_STREAM_WINDOW)
         .initial_connection_window_size(GUEST_H2_CONNECTION_WINDOW)
-        .keep_alive_interval(Some(Duration::from_secs(30)))
-        .keep_alive_timeout(HEADER_TIMEOUT);
+        .keep_alive_interval(Some(H2_KEEP_ALIVE_INTERVAL))
+        .keep_alive_timeout(H2_KEEP_ALIVE_TIMEOUT);
     builder
 }
 
 impl<F, Fut, U> Session<F>
 where
-    F: FnOnce() -> Fut + Send + 'static,
+    F: FnOnce(HttpProtocol) -> Fut + Send + 'static,
     Fut: Future<Output = Result<(U, HttpProtocol), TlsTransportError>> + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    async fn sender(&self) -> Result<&Sender, TlsTransportError> {
+    /// The origin leg is established lazily, by the first request that passes
+    /// authorization. `guest_protocol` is that request's HTTP version so the
+    /// upstream ALPN offer can match what the guest actually speaks.
+    async fn sender(&self, guest_protocol: HttpProtocol) -> Result<&Sender, TlsTransportError> {
         self.upstream
             .get_or_try_init(|| async {
                 // A failed or cancelled initializer has consumed the connector.
@@ -258,7 +260,7 @@ where
                     .await
                     .take()
                     .ok_or(TlsTransportError::Invalidated)?;
-                let (io, protocol) = connect().await?;
+                let (io, protocol) = connect(guest_protocol).await?;
                 let io = TokioIo::new(UpstreamIo {
                     inner: io,
                     _lifetime: self.draining.clone().drop_guard(),
@@ -288,8 +290,12 @@ where
             .await
     }
 
-    fn forwarding_body(&self, body: Incoming, operation: &'static str) -> ForwardingBody {
-        ForwardingBody::new(body, self.protocol.as_str(), operation)
+    fn forwarding_body(
+        protocol: HttpProtocol,
+        body: Incoming,
+        operation: &'static str,
+    ) -> ForwardingBody {
+        ForwardingBody::new(body, protocol.as_str(), operation)
     }
 
     fn drive(&self, connection: impl Future<Output = Result<(), hyper::Error>> + Send + 'static) {
@@ -321,11 +327,16 @@ where
         );
     }
 
-    fn refuse(&self, reason: &'static str, status: StatusCode) -> Response<Body> {
-        self.record(reason, status);
+    fn refuse(
+        &self,
+        protocol: HttpProtocol,
+        reason: &'static str,
+        status: StatusCode,
+    ) -> Response<Body> {
+        Self::record(protocol, reason, status);
         let mut response = Response::new(Either::Right(Empty::new()));
         *response.status_mut() = status;
-        if self.protocol == HttpProtocol::Http1 {
+        if protocol == HttpProtocol::Http1 {
             response
                 .headers_mut()
                 .insert(header::CONNECTION, http::HeaderValue::from_static("close"));
@@ -333,17 +344,17 @@ where
         response
     }
 
-    fn record(&self, outcome: &'static str, status: StatusCode) {
+    fn record(protocol: HttpProtocol, outcome: &'static str, status: StatusCode) {
         pplx_space_metrics::gateway::domain_binding("tcp", "tls_http", outcome, None);
         tracing::debug!(
-            protocol = self.protocol.as_str(),
+            protocol = protocol.as_str(),
             outcome,
             status = status.as_u16(),
             "inspected HTTP request"
         );
         if !matches!(outcome, "allowed" | "websocket" | "connect_forwarded") {
             tracing::info!(
-                protocol = self.protocol.as_str(),
+                protocol = protocol.as_str(),
                 outcome,
                 status = status.as_u16(),
                 "inspected HTTP request refused"

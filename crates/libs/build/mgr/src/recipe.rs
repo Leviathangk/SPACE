@@ -5,8 +5,9 @@ use std::str::FromStr;
 use oci_spec::distribution::{ParseError as OciReferenceParseError, Reference as OciReference};
 use pplx_space_build_mgr_client::proto as build_proto;
 use pplx_space_common_core::types::{
-    ArtifactVersion, ArtifactVersionParseError, Digest, DigestParseError, TemplateReference,
-    TemplateReferenceParseError, TemplateSelector,
+    ArtifactVersion, ArtifactVersionParseError, Digest, DigestParseError, EnvKey, EnvMap,
+    EnvParseError, TemplateReference, TemplateReferenceParseError, TemplateRuntime,
+    TemplateRuntimeError, TemplateSelector,
 };
 use serde::Deserialize;
 
@@ -68,8 +69,25 @@ pub enum RecipeAdapterError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RecipeProtoError {
+    #[error("runtime declaration must be the only runtime step, last, with no env_refs")]
+    RuntimePlacement,
+    #[error("invalid runtime declaration: {0}")]
+    Runtime(#[from] TemplateRuntimeError),
+    #[error("recipe step {index} {field}: {source}")]
+    Environment {
+        index: usize,
+        field: &'static str,
+        #[source]
+        source: EnvParseError,
+    },
     #[error("recipe metadata is required")]
     MissingMetadata,
+    #[error("recipe build_config balloon mode is required")]
+    MissingBalloonMode,
+    #[error("recipe build_config balloon stats_polling_interval_s {value} exceeds 65535")]
+    BalloonStatsIntervalOutOfRange { value: u32 },
+    #[error("recipe build_config balloon inflate amount_mib must be greater than 0")]
+    ZeroBalloonAmount,
     #[error("recipe origin is required")]
     MissingOrigin,
     #[error("recipe origin kind is required")]
@@ -78,6 +96,11 @@ pub enum RecipeProtoError {
     MissingScratchSource,
     #[error("scratch recipe source kind is required")]
     MissingScratchSourceKind,
+    #[error("scratch recipe source {field} {value:?} is invalid; expected {}", field.expected())]
+    InvalidScratchSource {
+        field: ScratchSourceField,
+        value: String,
+    },
     #[error("pinned scratch recipe guest kernel is required")]
     MissingScratchGuestKernel,
     #[error("OCI image reference {value:?} is invalid: {source}")]
@@ -152,6 +175,9 @@ pub struct BuildConfig {
     pub vcpu: Option<u8>,
     pub memory_mib: Option<u32>,
     pub disk_size_mb: Option<u32>,
+    /// Recorded in the built template's metadata for its sandboxes'
+    /// cold boots; the build VM itself boots with its base's setting.
+    pub balloon: Option<pplx_space_common_core::types::BalloonConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,13 +215,15 @@ pub struct SourceConfig {
 pub struct NamedStep {
     /// User-supplied step name, retained as recipe data but omitted from diagnostics.
     pub display_name: Option<String>,
-    /// Host environment variable names to inject into this step.
-    pub env_refs: Vec<String>,
+    /// Guest names resolved from the operator's SPACE_BUILD_EXPORT_<NAME> values.
+    pub env_refs: Vec<EnvKey>,
     pub step: Step,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Step {
+    SetRuntime(TemplateRuntime),
+    ClearRuntime,
     PackageInstall {
         manager: PackageManager,
         packages: Vec<String>,
@@ -206,7 +234,7 @@ pub enum Step {
         user: Option<String>,
     },
     Env {
-        vars: HashMap<String, String>,
+        vars: EnvMap,
     },
     Copy {
         payload: CopyPayload,
@@ -264,6 +292,8 @@ pub struct TomlRecipeMetadata {
     pub vcpu: Option<u8>,
     pub memory_mib: Option<u32>,
     pub disk_size_mb: Option<u32>,
+    /// Same shape as template `metadata.json` `balloon`.
+    pub balloon: Option<pplx_space_common_core::types::BalloonConfig>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -295,6 +325,10 @@ fn default_browsers() -> Vec<String> {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum TomlStep {
+    SetRuntime {
+        declaration: TemplateRuntime,
+    },
+    ClearRuntime,
     AptInstall {
         packages: Vec<String>,
     },
@@ -452,6 +486,7 @@ impl TomlRecipe {
                     .map_err(|_overflow| RecipeAdapterError::DiskOverflow {
                         value: self.metadata.disk_size_mb.unwrap_or_default(),
                     })?,
+                balloon: self.metadata.balloon.map(balloon_proto),
             }),
             origin: Some(origin),
             steps: self
@@ -577,6 +612,14 @@ impl TomlNamedStep {
             display_name: self.name,
             env_refs: self.env_refs,
             body: Some(match self.step {
+                TomlStep::SetRuntime { declaration } => {
+                    build_proto::recipe::step::Body::SetRuntime(
+                        pplx_space_build_mgr_client::runtime::encode(&declaration),
+                    )
+                }
+                TomlStep::ClearRuntime => build_proto::recipe::step::Body::ClearRuntime(
+                    build_proto::recipe::ClearRuntime {},
+                ),
                 TomlStep::AptInstall { packages } => {
                     build_proto::recipe::step::Body::PackageInstall(
                         build_proto::recipe::PackageInstall {
@@ -679,6 +722,18 @@ impl TryFrom<build_proto::Recipe> for Recipe {
     type Error = RecipeProtoError;
 
     fn try_from(recipe: build_proto::Recipe) -> Result<Self, Self::Error> {
+        for (index, step) in recipe.steps.iter().enumerate() {
+            if matches!(
+                step.body,
+                Some(
+                    build_proto::recipe::step::Body::SetRuntime(_)
+                        | build_proto::recipe::step::Body::ClearRuntime(_)
+                )
+            ) && (index + 1 != recipe.steps.len() || !step.env_refs.is_empty())
+            {
+                return Err(RecipeProtoError::RuntimePlacement);
+            }
+        }
         let metadata = recipe.metadata.ok_or(RecipeProtoError::MissingMetadata)?;
         let build_config = recipe.build_config.unwrap_or_default();
         Ok(Self {
@@ -728,8 +783,54 @@ impl TryFrom<build_proto::recipe::BuildConfig> for BuildConfig {
                 .map_err(|_| RecipeProtoError::DiskOutOfRange {
                     value: config.disk_bytes.unwrap_or_default(),
                 })?,
+            balloon: config.balloon.map(balloon_from_proto).transpose()?,
         })
     }
+}
+
+fn balloon_proto(
+    balloon: pplx_space_common_core::types::BalloonConfig,
+) -> build_proto::recipe::Balloon {
+    use build_proto::recipe::balloon::{FreePageHinting, FreePageReporting, Inflate, Mode};
+    use pplx_space_common_core::types::BalloonDevice;
+    let mode = match balloon.device() {
+        BalloonDevice::Inflate {
+            amount_mib,
+            deflate_on_oom,
+        } => Mode::Inflate(Inflate {
+            amount_mib: amount_mib.get(),
+            deflate_on_oom,
+        }),
+        BalloonDevice::FreePageReporting => Mode::FreePageReporting(FreePageReporting {}),
+        BalloonDevice::FreePageHinting => Mode::FreePageHinting(FreePageHinting {}),
+    };
+    build_proto::recipe::Balloon {
+        mode: Some(mode),
+        stats_polling_interval_s: u32::from(balloon.stats_polling_interval_s()),
+    }
+}
+
+fn balloon_from_proto(
+    balloon: build_proto::recipe::Balloon,
+) -> Result<pplx_space_common_core::types::BalloonConfig, RecipeProtoError> {
+    use build_proto::recipe::balloon::Mode;
+    use pplx_space_common_core::types::{BalloonConfig, BalloonDevice};
+    let device = match balloon.mode.ok_or(RecipeProtoError::MissingBalloonMode)? {
+        Mode::Inflate(inflate) => BalloonDevice::Inflate {
+            amount_mib: std::num::NonZeroU32::new(inflate.amount_mib)
+                .ok_or(RecipeProtoError::ZeroBalloonAmount)?,
+            deflate_on_oom: inflate.deflate_on_oom,
+        },
+        Mode::FreePageReporting(_) => BalloonDevice::FreePageReporting,
+        Mode::FreePageHinting(_) => BalloonDevice::FreePageHinting,
+    };
+    let stats_polling_interval_s =
+        u16::try_from(balloon.stats_polling_interval_s).map_err(|_| {
+            RecipeProtoError::BalloonStatsIntervalOutOfRange {
+                value: balloon.stats_polling_interval_s,
+            }
+        })?;
+    Ok(BalloonConfig::new(device, stats_polling_interval_s))
 }
 
 impl TryFrom<build_proto::recipe::Origin> for Origin {
@@ -834,12 +935,86 @@ impl TryFrom<build_proto::recipe::Source> for SourceConfig {
             .ok_or(RecipeProtoError::MissingScratchSourceKind)?
         {
             build_proto::recipe::source::Kind::UbuntuMinimalCloudSquashfs(source) => Ok(Self {
-                release: source.release,
-                version: source.version,
-                date: source.date,
+                release: ScratchSourceField::Release.validate(source.release)?,
+                version: ScratchSourceField::Version.validate(source.version)?,
+                date: ScratchSourceField::Date.validate(source.date)?,
             }),
         }
     }
+}
+
+/// Ubuntu Minimal Cloud selectors become URL path segments and values staged
+/// for a privileged build container, so only the published shapes are
+/// accepted: `minimal/releases/<release>/<date>/ubuntu-<version>-...`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScratchSourceField {
+    Release,
+    Version,
+    Date,
+}
+
+impl ScratchSourceField {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Release => "release",
+            Self::Version => "version",
+            Self::Date => "date",
+        }
+    }
+
+    fn expected(self) -> &'static str {
+        match self {
+            Self::Release => "a lowercase Ubuntu codename such as \"resolute\"",
+            Self::Version => "an Ubuntu version such as \"26.04\"",
+            Self::Date => "\"release\" or \"release-YYYYMMDD[.N]\"",
+        }
+    }
+
+    fn accepts(self, value: &str) -> bool {
+        match self {
+            Self::Release => {
+                (1..=32).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_lowercase())
+            }
+            Self::Version => {
+                let mut parts = value.split('.');
+                let (Some(year), Some(month), point, None) =
+                    (parts.next(), parts.next(), parts.next(), parts.next())
+                else {
+                    return false;
+                };
+                is_ascii_digits(year, 2..=2)
+                    && is_ascii_digits(month, 2..=2)
+                    && point.is_none_or(|point| is_ascii_digits(point, 1..=2))
+            }
+            Self::Date => match value.strip_prefix("release-") {
+                None => value == "release",
+                Some(stamp) => match stamp.split_once('.') {
+                    None => is_ascii_digits(stamp, 8..=8),
+                    Some((day, serial)) => {
+                        is_ascii_digits(day, 8..=8) && is_ascii_digits(serial, 1..=3)
+                    }
+                },
+            },
+        }
+    }
+
+    fn validate(self, value: String) -> Result<String, RecipeProtoError> {
+        if self.accepts(&value) {
+            Ok(value)
+        } else {
+            Err(RecipeProtoError::InvalidScratchSource { field: self, value })
+        }
+    }
+}
+
+impl std::fmt::Display for ScratchSourceField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+fn is_ascii_digits(value: &str, len: std::ops::RangeInclusive<usize>) -> bool {
+    len.contains(&value.len()) && value.bytes().all(|b| b.is_ascii_digit())
 }
 
 trait ProtoStepExt {
@@ -848,13 +1023,23 @@ trait ProtoStepExt {
 
 impl ProtoStepExt for build_proto::recipe::Step {
     fn try_into_named_step(self, index: usize) -> Result<NamedStep, RecipeProtoError> {
+        let env_refs = self
+            .env_refs
+            .into_iter()
+            .map(EnvKey::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| RecipeProtoError::Environment {
+                index,
+                field: "env_refs",
+                source,
+            })?;
         let step = self
             .body
             .ok_or(RecipeProtoError::MissingStep { index })?
             .try_into_step(index)?;
         Ok(NamedStep {
             display_name: empty_to_none(self.display_name),
-            env_refs: self.env_refs,
+            env_refs,
             step,
         })
     }
@@ -867,6 +1052,10 @@ trait ProtoStepBodyExt {
 impl ProtoStepBodyExt for build_proto::recipe::step::Body {
     fn try_into_step(self, index: usize) -> Result<Step, RecipeProtoError> {
         match self {
+            build_proto::recipe::step::Body::SetRuntime(value) => Ok(Step::SetRuntime(
+                pplx_space_build_mgr_client::runtime::decode(value)?,
+            )),
+            build_proto::recipe::step::Body::ClearRuntime(_) => Ok(Step::ClearRuntime),
             build_proto::recipe::step::Body::PackageInstall(step) => {
                 let manager = match build_proto::recipe::PackageManager::try_from(step.manager) {
                     Ok(build_proto::recipe::PackageManager::Unspecified) => {
@@ -898,7 +1087,16 @@ impl ProtoStepBodyExt for build_proto::recipe::step::Body {
                     user: empty_to_none(step.user),
                 })
             }
-            build_proto::recipe::step::Body::Env(step) => Ok(Step::Env { vars: step.vars }),
+            build_proto::recipe::step::Body::Env(step) => {
+                let vars = EnvMap::try_from(step.vars).map_err(|source| {
+                    RecipeProtoError::Environment {
+                        index,
+                        field: "env",
+                        source,
+                    }
+                })?;
+                Ok(Step::Env { vars })
+            }
             build_proto::recipe::step::Body::Copy(step) => {
                 if step.dest.is_empty() {
                     return Err(RecipeProtoError::EmptyCopyDest { index });
@@ -998,8 +1196,10 @@ impl std::fmt::Display for Step {
             Step::PackageInstall {
                 manager, packages, ..
             } => write!(f, "{manager} ({} packages)", packages.len()),
+            Step::SetRuntime(_) => write!(f, "set runtime"),
+            Step::ClearRuntime => write!(f, "clear runtime"),
             Step::Run { .. } => write!(f, "run"),
-            Step::Env { vars } => write!(f, "env ({} vars)", vars.len()),
+            Step::Env { vars } => write!(f, "env ({} vars)", vars.as_map().len()),
             Step::Copy { .. } => write!(f, "copy payload"),
             Step::PlaywrightInstall { browsers } => {
                 write!(f, "playwright-install ({} browsers)", browsers.len())

@@ -19,6 +19,7 @@ def test_shards_run_every_eligible_scenario_once_and_propagate_failures(surface)
         if surface in scenario.api_surfaces
         and "kind" in scenario.backends
         and scenario.quarantined is None
+        and scenario.ignored is None
         and scenario.applies_to(None)
     }
     seen = []
@@ -37,7 +38,10 @@ def test_shards_run_every_eligible_scenario_once_and_propagate_failures(surface)
             {"SPACE_SMOKE_BACKEND": "kind", "SPACE_SMOKE_API_SURFACE": surface},
             clear=True,
         ),
-        mock.patch("space_smoke.__main__.SmokeServices.from_environment"),
+        mock.patch(
+            "space_smoke.__main__.SmokeServices.from_environment",
+            **{"return_value.telemetry_mode.return_value": "otel"},
+        ),
         mock.patch("space_smoke.__main__.run_scenarios", side_effect=execute),
         redirect_stdout(StringIO()),
     ):

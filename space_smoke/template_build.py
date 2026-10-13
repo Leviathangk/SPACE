@@ -13,13 +13,14 @@ The scenario verifies three cross-service contracts:
    accepted the job — `find_builder_node(job_id)` then
    `builder_client_for_node`, which resolves the accepting builder's own
    node-api directly (`controllers/template.rs`,
-   `substrate/kubernetes/adapter.rs`). The scenario submits with the Service
-   pinned to one builder, then, once a builder has accepted the alias and
-   committed the prepared rootfs, moves the Service to the *other* builder for
-   the rest of the build. A build that still completes shows the polls did not
-   depend on where the Service pointed, which is the owner-pinned routing
-   working; `service_routed_to` records where the Service pointed, not who
-   answered the polls (that is not observable from outside the API).
+   `substrate/kubernetes/adapter/substrate_adapter.rs`). The scenario submits
+   with the Service pinned to one builder, then, once a builder has accepted
+   the alias and committed the prepared rootfs, moves the Service to the
+   *other* builder for the rest of the build. A build that still completes
+   shows the polls did not depend on where the Service pointed, which is the
+   owner-pinned routing working; `service_routed_to` records where the Service
+   pointed, not who answered the polls (that is not observable from outside
+   the API).
 2. **Published artefacts.** On the accepting builder, the published template's
    `metadata.json` names the `spaced` bundle version actually installed in the
    rootfs (`/etc/spaced/bundle-version`, read with `debugfs`) and the
@@ -82,6 +83,11 @@ BUILD_DELAY_SECONDS = 15
 # ≤ 60 s, route clear and sandbox kill a few seconds each.
 SETTLE_BUDGET_SECONDS = 30.0
 TEMPLATE_DELETE_BUDGET_SECONDS = 60.0
+# The accepting builder must commit the prepared rootfs within this budget. It
+# is probed in short windows so a build that has already failed surfaces its
+# own error instead of a missing rootfs at the end of the budget.
+HANDOFF_BUDGET_SECONDS = 60.0
+HANDOFF_PROBE_WINDOW_SECONDS = 5
 
 
 def oci_recipe(image: str = OCI_IMAGE) -> TemplateRecipe:
@@ -250,20 +256,20 @@ class TemplateBuildAssertions:
     def pin_builders(self) -> tuple[str, str]:
         """Two Ready builders; the Service is routed to the first (the route clear is armed first)."""
 
-        pods = self._control.builder_node_stack_pods()
+        builders = self._control.builder_nodes()
         self._fixture.verify(
-            len(pods) == 2,
-            "the handoff proof needs exactly two Ready builder node stacks",
-            builder_pods=pods,
+            len(builders) == 2,
+            "the handoff proof needs exactly two builders with a Ready node-api",
+            builder_nodes=builders,
         )
-        self._submit, self._peer = pods[0], pods[1]
+        self._submit, self._peer = builders[0], builders[1]
         self._route_clear = self._scope.defer(
             "clear the builder Service route", self._control.clear_builder_service_route, critical=True
         )
         self._control.clear_builder_service_route()
         self._control.route_builder_service("submit", self._submit)
         self._fixture.record("pinned_submit_builder", self._submit)
-        self._fixture.record("builder_pods", list(pods))
+        self._fixture.record("builder_nodes", list(builders))
         return self._submit, self._peer
 
     # --- the build ------------------------------------------------------------
@@ -329,7 +335,7 @@ class TemplateBuildAssertions:
                 time.monotonic() < deadline,
                 "no builder accepted the build within the budget",
                 pinned_submit_builder=submit,
-                builder_pods=[submit, peer],
+                builder_nodes=[submit, peer],
                 alias=self.alias,
             )
             self._fixture.wait(0.5)
@@ -345,7 +351,7 @@ class TemplateBuildAssertions:
         self._fixture.record("accepted_by", accepted)
         self._fixture.record("poll_peer_builder", other)
         self._fixture.record("pinned_submit_honoured", accepted == submit)
-        handoff_error = self._control.prepared_rootfs_handoff(accepted)
+        handoff_error = self._await_prepared_rootfs(accepted, work)
         self._fixture.verify(
             handoff_error is None,
             "the accepting builder did not commit a prepared rootfs for the build",
@@ -373,6 +379,28 @@ class TemplateBuildAssertions:
         self._fixture.record("build_id", self._result.build_id)
         self._fixture.record("build_log_tail", list(self._result.log_tail))
         return self._result
+
+    def _await_prepared_rootfs(self, builder: str, work: BackgroundWork) -> str | None:
+        """None once `builder` committed the build's prepared rootfs; else the probe's failure text.
+
+        A build that ended before the handoff re-raises its own failure, with the
+        SDK's message, rather than being reported as a missing rootfs.
+        """
+
+        deadline = time.monotonic() + HANDOFF_BUDGET_SECONDS
+        while True:
+            error = self._control.prepared_rootfs_handoff(
+                builder, window_seconds=HANDOFF_PROBE_WINDOW_SECONDS
+            )
+            if error is None:
+                return None
+            if not work.running:
+                # A build that succeeded without a probe seeing its rootfs
+                # still fails the handoff below.
+                work.join(timeout=1)
+                return error
+            if time.monotonic() >= deadline:
+                return error
 
     # --- artefacts on the builder --------------------------------------------
 

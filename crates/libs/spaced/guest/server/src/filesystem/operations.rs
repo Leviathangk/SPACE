@@ -11,7 +11,11 @@ use tonic::Status;
 const RETENTION: Duration = Duration::from_secs(60);
 // Guest-wide rather than worker-multiplied budgets. Refuse new work instead of
 // evicting active executions or shortening an acknowledged replay window.
-const MAX_RECORDS: usize = 4096;
+// Every keyed mutation keeps its record for RETENTION, so this caps the
+// sustained rate at MAX_RECORDS / 60s: 4096 allowed only ~68 writes/s and
+// failed a fifth of the writes of 30 agents sharing a sandbox. Records are
+// small, and MAX_KEY_BYTES still bounds their memory.
+const MAX_RECORDS: usize = 16_384;
 const MAX_KEY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_WAITERS: usize = 1024;
 
@@ -95,11 +99,11 @@ impl Operations {
             return Ok(Lookup::New(Reservation { claim: None }));
         };
         let key = (user, key);
-        let _waiter = self
-            .waiters
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| Status::resource_exhausted("too many filesystem retry waiters"))?;
+        let _waiter = self.waiters.clone().try_acquire_owned().map_err(|_| {
+            crate::refused(Status::resource_exhausted(
+                "too many filesystem retry waiters",
+            ))
+        })?;
         let deadline = tokio::time::Instant::now() + RETENTION;
         loop {
             let notification = {
@@ -155,9 +159,9 @@ impl Operations {
                             );
                             state.last_capacity_warning = Some(Instant::now());
                         }
-                        return Err(Status::resource_exhausted(
+                        return Err(crate::refused(Status::resource_exhausted(
                             "filesystem retry capacity exhausted",
-                        ));
+                        )));
                     }
                     let generation = Arc::new(Notify::new());
                     state.bytes += key_bytes(&key);
@@ -271,21 +275,50 @@ pub(super) fn outcome(result: Result<mutation_result::Outcome, Status>) -> Mutat
     MutationResult {
         outcome: Some(match result {
             Ok(outcome) => outcome,
-            Err(status) => mutation_result::Outcome::Failure(OperationFailure {
-                code: status.code() as i32,
-                message: status.message().to_owned(),
-            }),
+            Err(status) => mutation_result::Outcome::Failure(operation_failure(&status)),
         }),
     }
+}
+
+/// A failed operation's status as it crosses from a worker to the router,
+/// keeping its error reason.
+pub(super) fn operation_failure(status: &Status) -> OperationFailure {
+    OperationFailure {
+        code: status.code() as i32,
+        message: status.message().to_owned(),
+        reason: status
+            .metadata()
+            .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
+            .and_then(|reason| reason.to_str().ok())
+            .unwrap_or_default()
+            .to_owned(),
+    }
+}
+
+fn failure_status(failure: OperationFailure) -> Status {
+    let mut status = Status::new(tonic::Code::from_i32(failure.code), failure.message);
+    if let Ok(reason) = tonic::metadata::MetadataValue::try_from(failure.reason.as_str())
+        && !failure.reason.is_empty()
+    {
+        status.metadata_mut().insert(
+            pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+            reason,
+        );
+    }
+    // The reason survives the worker round trip but the retry hint does not;
+    // a refusal gets its hint back, so it reaches the caller whole.
+    if pplx_space_common_grpc::is_refused_before_start(&status) {
+        return crate::refused(status);
+    }
+    status
 }
 
 pub(super) fn checked_outcome(result: MutationResult) -> Result<mutation_result::Outcome, Status> {
     match result.outcome {
         Some(mutation_result::Outcome::Failure(error))
-        | Some(mutation_result::Outcome::RejectedBeforeExecution(error)) => Err(Status::new(
-            tonic::Code::from_i32(error.code),
-            error.message,
-        )),
+        | Some(mutation_result::Outcome::RejectedBeforeExecution(error)) => {
+            Err(failure_status(error))
+        }
         Some(mutation_result::Outcome::Interrupted(_)) | None => Err(unknown_outcome()),
         Some(outcome) => Ok(outcome),
     }

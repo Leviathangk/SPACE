@@ -1,32 +1,40 @@
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use futures_util::{StreamExt, stream};
 use pplx_space_api::cluster_admission::{ClusterSandboxAdmission, ClusterSandboxAdmissionConfig};
 use pplx_space_api::controllers::sandbox::SandboxController;
 use pplx_space_api::controllers::substrate::Substrate;
 use pplx_space_api::fork_operation_executor::ForkSandboxOperationExecutor;
 use pplx_space_api::public_operations::{
     ApiProduct, ClaimPublicOperations, ClaimedPublicOperation, CompleteClaimedPublicOperation,
-    FailClaimedPublicOperation, PublicOperationRequeueReason, PublicOperationStore,
-    ReleaseClaimedPublicOperation,
+    FailClaimedPublicOperation, PublicOperationClaim, PublicOperationRequeueReason,
+    PublicOperationStore, ReleaseClaimedPublicOperation,
 };
 use pplx_space_api::public_sandbox_operations::{
     CreateSandboxOperationExecutor, PublicOperationExecutionResult,
     SandboxLifecycleOperationExecutor, UpdateSandboxOperationExecutor,
 };
 use pplx_space_api::public_template_operations::DeleteTemplateOperationExecutor;
+use pplx_space_api::tls_interception_exemptions::TlsInterceptionExemptions;
 use pplx_space_common_core::types::time::format_simple_duration;
 use pplx_space_feature_flags::FeatureFlagClient;
 use pplx_space_public_api::{OperationKind, OperationState, PublicErrorCode};
 use sqlx::PgPool;
 use std::sync::Arc;
+use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
 use crate::env_config;
 
-const DEFAULT_TICK: Duration = Duration::from_secs(1);
+/// How often the dispatcher looks for newly queued operations. The claim is
+/// one indexed `FOR UPDATE SKIP LOCKED` statement that returns no rows when the
+/// queue is empty, so a short tick keeps pickup latency low at little cost.
+/// Pickup waits half a tick on average, which at 200 ms was a large share of
+/// a warm-pool create's latency.
+const DEFAULT_TICK: Duration = Duration::from_millis(25);
+/// A failing claim fails on every tick; warn about it at most this often.
+const CLAIM_FAILURE_WARN_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_CLAIM_LIMIT: u32 = 64;
 const DEFAULT_CLAIM_STALE_AFTER: Duration = Duration::from_secs(60);
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(5);
@@ -92,12 +100,14 @@ impl ReconcilerConfig {
                 DEFAULT_CLAIM_LIMIT,
                 1024,
             ),
-            execution_concurrency: config
-                .test_positive_usize(
-                    "SPACE_PUBLIC_OPERATION_DISPATCHER_EXECUTION_CONCURRENCY",
-                    DEFAULT_EXECUTION_CONCURRENCY,
-                )
-                .min(MAX_EXECUTION_CONCURRENCY),
+            // A deployment setting, unlike the test hooks around it: each
+            // execution holds its slot for the whole operation, so this bounds
+            // the dispatcher's throughput.
+            execution_concurrency: config.bounded_usize(
+                "SPACE_PUBLIC_OPERATION_DISPATCHER_EXECUTION_CONCURRENCY",
+                DEFAULT_EXECUTION_CONCURRENCY,
+                MAX_EXECUTION_CONCURRENCY,
+            ),
             claim_stale_after: config.test_duration_secs(
                 "SPACE_PUBLIC_OPERATION_DISPATCHER_CLAIM_STALE_SECS",
                 DEFAULT_CLAIM_STALE_AFTER,
@@ -179,6 +189,7 @@ impl NativePublicOperationExecutor {
         substrate: Substrate,
         feature_flags: FeatureFlagClient,
         grant_audience: pplx_space_common_core::types::FederatedGrantAudience,
+        tls_interception_exemptions: Option<TlsInterceptionExemptions>,
     ) -> Result<Self, pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Error>
     {
         let route_ed25519_authority = Arc::new(
@@ -191,6 +202,7 @@ impl NativePublicOperationExecutor {
             feature_flags,
             route_ed25519_authority,
             grant_audience,
+            tls_interception_exemptions,
         ))
     }
 
@@ -203,6 +215,7 @@ impl NativePublicOperationExecutor {
             pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Authority,
         >,
         grant_audience: pplx_space_common_core::types::FederatedGrantAudience,
+        tls_interception_exemptions: Option<TlsInterceptionExemptions>,
     ) -> Self {
         // Absent an SDK key the injected client is disabled and the dynamic
         // gate defaults on, leaving the limiter env-var-gated exactly as
@@ -215,7 +228,8 @@ impl NativePublicOperationExecutor {
         let controller =
             SandboxController::with_cluster_admission(substrate.clone(), cluster_admission.clone())
                 .with_route_ed25519_authority(Some(route_ed25519_authority))
-                .with_federated_grant_audience(grant_audience);
+                .with_federated_grant_audience(grant_audience)
+                .with_tls_interception_exemptions(tls_interception_exemptions);
         Self {
             cluster_admission,
             create_sandbox: CreateSandboxOperationExecutor::new(pool.clone(), controller.clone()),
@@ -355,37 +369,137 @@ pub async fn run<E>(
             "public-operation-dispatcher is enabled but has no supported operation kinds"
         );
     }
+    // The effective width, after the ceiling clamp. Nothing else exposes it,
+    // so without this line an over-ceiling setting looks like it took effect.
+    tracing::info!(
+        execution_concurrency = config.execution_concurrency,
+        "starting public-operation-dispatcher"
+    );
 
     let mut interval = tokio::time::interval(config.tick);
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     interval.tick().await;
 
+    // Executions run independently of the claim loop: a slow operation holds
+    // one of `execution_concurrency` slots but does not delay pickup of newly
+    // queued operations into the remaining slots.
+    let concurrency = config.execution_concurrency.max(1);
+    let execution_config = OperationExecutionConfig::from(&config);
+    let mut in_flight = JoinSet::new();
+    let mut last_claim_failure_warn: Option<Instant> = None;
+    let mut suppressed_claim_failures: u64 = 0;
+
     loop {
         tokio::select! {
             _ = interval.tick() => {
+                let free = concurrency.saturating_sub(in_flight.len());
+                if free == 0 {
+                    continue;
+                }
                 let started = Instant::now();
-                match tick(&config, &store, &executor).await {
-                    Ok(report) => {
-                        tracing::debug!(
-                            claimed = report.claimed,
-                            succeeded = report.succeeded,
-                            failed = report.failed,
-                            retried = report.retried,
-                            stale_claims = report.stale_claims,
-                            elapsed_ms = started.elapsed().as_millis(),
-                            "public-operation-dispatcher tick completed"
-                        );
+                match claim_up_to(&config, &store, &executor, free).await {
+                    Ok(claim) => {
+                        let claimed = claim.operations.len();
+                        for operation in claim.operations {
+                            in_flight.spawn(execute_claimed_operation(
+                                store.clone(),
+                                executor.clone(),
+                                claim.claim_token.clone(),
+                                execution_config,
+                                operation,
+                            ));
+                        }
+                        if claimed > 0 {
+                            tracing::debug!(
+                                claimed,
+                                in_flight = in_flight.len(),
+                                elapsed_ms = started.elapsed().as_millis(),
+                                "public-operation-dispatcher claimed operations"
+                            );
+                        }
                     }
                     Err(error) => {
-                        tracing::warn!(error = %error, "public-operation-dispatcher tick failed");
+                        if last_claim_failure_warn
+                            .is_none_or(|at| at.elapsed() >= CLAIM_FAILURE_WARN_INTERVAL)
+                        {
+                            tracing::warn!(
+                                error = %error,
+                                suppressed = suppressed_claim_failures,
+                                "public-operation-dispatcher claim failed"
+                            );
+                            last_claim_failure_warn = Some(Instant::now());
+                            suppressed_claim_failures = 0;
+                        } else {
+                            suppressed_claim_failures += 1;
+                        }
                     }
                 }
+            }
+            Some(joined) = in_flight.join_next(), if !in_flight.is_empty() => {
+                log_execution_outcome(joined);
             }
             _ = shutdown_token.cancelled() => break,
         }
     }
+
+    // Stop claiming, but let claimed executions finish and record their
+    // outcome, matching the previous behavior of completing the in-progress
+    // batch before exiting.
+    while let Some(joined) = in_flight.join_next().await {
+        log_execution_outcome(joined);
+    }
 }
 
+fn log_execution_outcome(
+    joined: Result<
+        Result<TickReport, pplx_space_api::public_operations::PublicOperationStoreError>,
+        tokio::task::JoinError,
+    >,
+) {
+    match joined {
+        Ok(Ok(report)) => tracing::debug!(
+            succeeded = report.succeeded,
+            failed = report.failed,
+            retried = report.retried,
+            stale_claims = report.stale_claims,
+            "public-operation-dispatcher execution completed"
+        ),
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, "public-operation-dispatcher execution failed");
+        }
+        // The claim is no longer renewed, so the operation becomes claimable
+        // again once `claim_stale_after` elapses.
+        Err(error) => {
+            tracing::error!(error = %error, "public-operation-dispatcher execution task panicked");
+        }
+    }
+}
+
+async fn claim_up_to<E>(
+    config: &ReconcilerConfig,
+    store: &PublicOperationStore,
+    executor: &E,
+    free_slots: usize,
+) -> Result<PublicOperationClaim, pplx_space_api::public_operations::PublicOperationStoreError>
+where
+    E: PublicOperationExecutor,
+{
+    let limit = u32::try_from(free_slots)
+        .unwrap_or(u32::MAX)
+        .min(config.claim_limit);
+    store
+        .claim_operations(ClaimPublicOperations {
+            limit,
+            claim_stale_after: config.claim_stale_after,
+            claimable_kinds: executor.supported_kinds(),
+        })
+        .await
+}
+
+/// Claim one batch and run it to completion. [`run`] does not use this: it
+/// keeps a bounded in-flight set so slow executions never block pickup. This
+/// remains as a deterministic single pass for tests.
+#[cfg(test)]
 pub async fn tick<E>(
     config: &ReconcilerConfig,
     store: &PublicOperationStore,
@@ -394,6 +508,8 @@ pub async fn tick<E>(
 where
     E: PublicOperationExecutor + Clone,
 {
+    use futures_util::{StreamExt, stream};
+
     let claim = store
         .claim_operations(ClaimPublicOperations {
             limit: config.claim_limit,
@@ -718,6 +834,7 @@ fn is_native_m1_terminalized_kind(api_product: ApiProduct, kind: OperationKind) 
         )
 }
 
+#[cfg(test)]
 impl TickReport {
     fn merge(&mut self, other: Self) {
         self.claimed += other.claimed;

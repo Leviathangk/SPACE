@@ -4181,6 +4181,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "multer"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83e87776546dc87511aa5ee218730c92b666d7264ab6ed41f9d215af9cd5224b"
+dependencies = [
+ "bytes",
+ "encoding_rs",
+ "futures-util",
+ "http 1.5.0",
+ "httparse",
+ "memchr",
+ "mime",
+ "spin 0.9.9",
+ "version_check",
+]
+
+[[package]]
 name = "multimap"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4958,6 +4975,7 @@ dependencies = [
  "prost",
  "prost-types",
  "rand 0.10.2",
+ "rcgen",
  "redis",
  "regex",
  "rstest",
@@ -4998,6 +5016,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-archcheck"
+version = "0.8.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "toml",
+]
+
+[[package]]
 name = "pplx-space-aws-client"
 version = "0.8.0"
 dependencies = [
@@ -5028,8 +5057,11 @@ dependencies = [
  "pplx-space-build-mgr-client",
  "pplx-space-common-core",
  "pplx-space-common-svc",
+ "pplx-space-credmgr",
  "pplx-space-credmgr-client",
+ "pplx-space-db-test-fixtures",
  "pplx-space-execution-common",
+ "pplx-space-internal-api-server",
  "pplx-space-metrics",
  "pplx-space-net-common",
  "pplx-space-node-api-client",
@@ -5038,6 +5070,7 @@ dependencies = [
  "pplx-space-sbx-mgr-client",
  "pplx-space-spaced-common",
  "pplx-space-template-mgr-client",
+ "pplx-space-test-env",
  "prost",
  "reqwest 0.13.5",
  "rstest",
@@ -5045,13 +5078,17 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "sqlx",
  "tar",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-stream",
+ "tokio-util",
  "toml",
  "tonic",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -5059,10 +5096,15 @@ name = "pplx-space-build-mgr-cli"
 version = "0.8.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
+ "http-body-util",
+ "hyper",
  "pplx-space-build-mgr",
  "pplx-space-build-mgr-client",
  "pplx-space-common-cli",
+ "pplx-space-node-api-client",
+ "prost",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -5074,6 +5116,7 @@ name = "pplx-space-build-mgr-client"
 version = "0.8.0"
 dependencies = [
  "anyhow",
+ "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-common-proto-build",
  "pplx-space-common-svc",
@@ -5081,6 +5124,7 @@ dependencies = [
  "prost",
  "rcgen",
  "rustls",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -5152,7 +5196,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "aws-config",
- "aws-sdk-s3",
  "aws-smithy-types",
  "bytes",
  "dashmap",
@@ -5291,6 +5334,7 @@ dependencies = [
  "sqlx",
  "tempfile",
  "thiserror 2.0.20",
+ "toml",
  "tracing",
  "uuid",
 ]
@@ -5300,7 +5344,7 @@ name = "pplx-space-common-grpc"
 version = "0.8.0"
 dependencies = [
  "bytes",
- "futures-util",
+ "futures-core",
  "http 1.5.0",
  "http-body 1.1.0",
  "hyper-util",
@@ -5313,7 +5357,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
- "tokio-rustls",
  "tokio-stream",
  "tokio-util",
  "tonic",
@@ -5415,7 +5458,6 @@ dependencies = [
  "pplx-space-db-test-fixtures",
  "pplx-space-metrics",
  "pplx-space-observability",
- "pplx-space-sqlite-migrations",
  "pplx-space-test-env",
  "rand 0.10.2",
  "redis",
@@ -5519,6 +5561,7 @@ dependencies = [
  "aws-credential-types",
  "aws-sdk-acmpca",
  "aws-sdk-secretsmanager",
+ "aws-smithy-runtime-api",
  "aws-smithy-types",
  "base64 0.23.1",
  "bytes",
@@ -5534,6 +5577,7 @@ dependencies = [
  "jiff",
  "k8s-openapi",
  "kube",
+ "lru 0.18.4",
  "nix 0.31.3",
  "pplx-space-common-core",
  "pplx-space-common-svc",
@@ -5620,6 +5664,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "insta",
+ "multer",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-common-svc",
@@ -5632,6 +5677,7 @@ dependencies = [
  "pplx-space-test-env",
  "prost",
  "prost-types",
+ "rand 0.10.2",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -5656,6 +5702,8 @@ dependencies = [
  "clap",
  "pplx-space-common-svc",
  "pplx-space-data-plane-server",
+ "pplx-space-test-env",
+ "tikv-jemallocator",
  "tokio",
 ]
 
@@ -5669,9 +5717,7 @@ dependencies = [
  "pplx-space-common-svc",
  "pplx-space-db-test-fixtures",
  "pplx-space-sbxmgr-migrations",
- "pplx-space-sqlite-migrations",
  "pplx-space-test-env",
- "pplx-space-volmgr-migrations",
  "rusqlite",
  "sqlx",
  "tempfile",
@@ -5807,7 +5853,6 @@ version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
- "pplx-space-api",
  "pplx-space-common-svc",
  "pplx-space-internal-api-server",
  "tikv-jemallocator",
@@ -5962,6 +6007,7 @@ dependencies = [
  "pplx-space-common-grpc",
  "pplx-space-common-proto-build",
  "pplx-space-net-common",
+ "pplx-space-test-env",
  "prost",
  "tempfile",
  "thiserror 2.0.20",
@@ -6075,6 +6121,7 @@ dependencies = [
  "pplx-space-sbx-mgr-client",
  "pplx-space-template-mgr-client",
  "pplx-space-test-env",
+ "rstest",
  "serde",
  "serde_json",
  "socket2",
@@ -6239,6 +6286,7 @@ dependencies = [
  "pplx-space-node-mgr-client",
  "pplx-space-node-runtime-core",
  "pplx-space-observability",
+ "pplx-space-test-env",
  "reqwest 0.13.5",
  "rstest",
  "rtnetlink",
@@ -6346,7 +6394,9 @@ dependencies = [
  "async-trait",
  "aws-sdk-s3",
  "bytes",
+ "flate2",
  "futures-util",
+ "http 1.5.0",
  "jiff",
  "libc",
  "md-5 0.11.0",
@@ -6355,14 +6405,18 @@ dependencies = [
  "pplx-space-common-jobs",
  "pplx-space-common-svc",
  "pplx-space-execution-common",
+ "pplx-space-node-mgr-client",
  "pplx-space-node-runtime-core",
  "pplx-space-node-runtime-manager-client",
+ "pplx-space-s3-http-client",
+ "reqwest 0.13.5",
  "rusqlite",
  "rustix",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "sqlx",
+ "tar",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -6421,18 +6475,29 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-sdk-s3",
+ "aws-smithy-async",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
+ "axum",
+ "base64 0.23.1",
  "bytes",
+ "futures-util",
  "http 1.5.0",
+ "http-body 1.1.0",
+ "hyper",
+ "hyper-util",
  "jiff",
+ "md-5 0.11.0",
  "percent-encoding",
  "pplx-space-common-core",
  "pplx-space-metrics",
+ "pplx-space-s3-http-client",
+ "rand 0.10.2",
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -6535,6 +6600,14 @@ dependencies = [
  "clap",
  "pplx-space-common-core",
  "pplx-space-node-runtime-supervisor",
+]
+
+[[package]]
+name = "pplx-space-s3-http-client"
+version = "0.8.0"
+dependencies = [
+ "aws-smithy-http-client",
+ "aws-smithy-runtime-api",
 ]
 
 [[package]]
@@ -6692,10 +6765,7 @@ dependencies = [
 name = "pplx-space-sbxmgr-migrations"
 version = "0.8.0"
 dependencies = [
- "pplx-space-sqlite-migrations",
- "rusqlite",
  "sqlx",
- "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -6738,7 +6808,9 @@ version = "0.8.0"
 dependencies = [
  "aws-sdk-s3",
  "aws-smithy-types",
+ "aws-types",
  "pplx-space-common-core",
+ "pplx-space-s3-http-client",
  "thiserror 2.0.20",
  "tokio",
 ]
@@ -6959,15 +7031,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pplx-space-sqlite-migrations"
-version = "0.8.0"
-dependencies = [
- "rusqlite",
- "sqlx",
- "thiserror 2.0.20",
-]
-
-[[package]]
 name = "pplx-space-ssh-cli"
 version = "0.8.0"
 dependencies = [
@@ -6992,7 +7055,9 @@ dependencies = [
  "pplx-space-common-jobs",
  "pplx-space-common-lru-reaper",
  "pplx-space-common-svc",
+ "pplx-space-db-test-fixtures",
  "pplx-space-execution-common",
+ "pplx-space-internal-api-server",
  "pplx-space-metrics",
  "pplx-space-net-common",
  "pplx-space-node-api-client",
@@ -7110,6 +7175,7 @@ name = "pplx-space-volmgr"
 version = "0.8.0"
 dependencies = [
  "async-trait",
+ "axum",
  "bytes",
  "dashmap",
  "futures-util",
@@ -7121,9 +7187,9 @@ dependencies = [
  "pplx-space-common-svc",
  "pplx-space-credmgr-client",
  "pplx-space-metrics",
+ "pplx-space-node-mgr-client",
  "pplx-space-object-store",
  "pplx-space-volmgr-client",
- "pplx-space-volmgr-migrations",
  "rusqlite",
  "serde",
  "serde_json",
@@ -7178,24 +7244,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "pplx-space-volmgr-migrations"
-version = "0.8.0"
-dependencies = [
- "pplx-space-sqlite-migrations",
- "rusqlite",
- "sqlx",
- "thiserror 2.0.20",
-]
-
-[[package]]
 name = "pplx-space-volmgr-svc"
 version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "pplx-space-common-core",
  "pplx-space-common-svc",
+ "pplx-space-credmgr-client",
  "pplx-space-volmgr",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tower",
+ "uuid",
 ]
 
 [[package]]

@@ -6,6 +6,13 @@ use super::spaced_bridge::*;
 use super::tail_support::*;
 use super::*;
 
+fn cpu_stat_usage_usec(content: &str) -> Option<u64> {
+    content.lines().find_map(|line| {
+        line.strip_prefix("usage_usec ")
+            .and_then(|value| value.trim().parse::<u64>().ok())
+    })
+}
+
 fn parse_operation_user(user: Option<String>) -> Result<Option<GuestUserName>, Status> {
     user.map(GuestUserName::parse)
         .transpose()
@@ -33,7 +40,7 @@ impl SandboxManagerService {
             .slot
             .ok_or_else(|| Status::failed_precondition("sandbox has no allocated network slot"))?;
 
-        let mut node_client = connect_node()
+        let mut node_client = connect_node(&self.node_manager)
             .await
             .map_err(|e| Status::internal(format!("cannot connect to node-manager: {e}")))?;
 
@@ -50,17 +57,20 @@ impl SandboxManagerService {
             .map_err(|e| Status::internal(format!("inspect failed: {e}")))?
             .into_inner();
 
-        // Read cumulative CPU time from cgroup cpu.stat
-        let cpu_usage_usec =
-            std::fs::read_to_string(format!("/sys/fs/cgroup/space/sbx-{id}/cpu.stat"))
-                .ok()
-                .and_then(|content| {
-                    content.lines().find_map(|line| {
-                        line.strip_prefix("usage_usec ")
-                            .and_then(|v| v.trim().parse::<u64>().ok())
-                    })
-                })
-                .unwrap_or(0);
+        // CPU time comes from the cgroup inspect reads `cpu_max` from. Only
+        // node-manager can read it: sandbox-manager runs in its own cgroup
+        // namespace, without the host cgroup tree. A sandbox without a cgroup
+        // has no running VM to account for. An inspected cgroup without a
+        // usage line is logged: a silent zero is how a wrong cgroup path once
+        // went unnoticed.
+        let cpu_usage_usec = if inspect.cgroup_exists {
+            cpu_stat_usage_usec(&inspect.cgroup_cpu_stat).unwrap_or_else(|| {
+                tracing::warn!(sandbox_id = %id, "inspected cgroup has no cpu.stat usage_usec");
+                0
+            })
+        } else {
+            0
+        };
         let health = self.watchdog.get_health(id).await;
         let network_tx_bytes = health
             .as_ref()
@@ -194,7 +204,7 @@ impl SandboxManagerService {
         }
 
         if updates_resources {
-            let mut node_client = connect_node()
+            let mut node_client = connect_node(&self.node_manager)
                 .await
                 .map_err(|e| Status::unavailable(format!("cannot connect to node-manager: {e}")))?;
 
@@ -576,10 +586,11 @@ impl SandboxManagerService {
             .await?;
         route_auth.authorize_sandbox(&sandbox)?;
         let client = self.connect_spaced_host(&sandbox).await?;
-        let mut entries = Vec::new();
-        for entry in operation.entries.iter().cloned() {
-            entries.push(write_batch_entry_to_host(entry));
-        }
+        let entries = operation
+            .entries
+            .into_iter()
+            .map(write_batch_entry_to_host)
+            .collect();
         let response = client
             .write_batch_as_user(
                 entries,
@@ -1008,3 +1019,6 @@ impl SandboxManagerService {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -189,6 +189,7 @@ fn peer_request(uid: u32) -> Request<ResolveRequest> {
 #[test]
 fn exchange_forwarding_overwrites_untrusted_actor_claims() {
     for (uid, expected_actor) in [
+        (users::SPACE_VOLMGR.uid, ClientService::VolumeManager),
         (users::SPACE_SBXMGR.uid, ClientService::VolumeManager),
         (users::SPACE_TMPLMGR.uid, ClientService::TemplateManager),
     ] {
@@ -250,6 +251,7 @@ async fn gateway_signing_authorizes_sandbox_manager_before_acquiring_a_ca() {
         // whether this caller reached the signer without issuing a real CA.
         for (uid, expected) in [
             (users::SPACE_SBXMGR.uid, Code::InvalidArgument),
+            (users::SPACE_VOLMGR.uid, Code::PermissionDenied),
             (0, Code::PermissionDenied),
             (65534, Code::PermissionDenied),
         ] {

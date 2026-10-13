@@ -163,7 +163,7 @@ async fn authenticates_discovered_server_before_any_bearer_is_sent() {
 }
 
 #[tokio::test]
-async fn rollout_accepts_both_protocols_without_downgrading_tls_or_blocking_on_idle_peers() {
+async fn tls_identity_rejects_plaintext_without_blocking_other_peers() {
     use tokio_util::sync::CancellationToken;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let temp = tempfile::tempdir().unwrap();
@@ -173,17 +173,17 @@ async fn rollout_accepts_both_protocols_without_downgrading_tls_or_blocking_on_i
     let key = temp.path().join("server.key");
     std::fs::write(&cert, identity.cert.pem()).unwrap();
     std::fs::write(&key, identity.signing_key.serialize_pem()).unwrap();
-    for compatibility in [false, true] {
+    for insecure_dev in [false, true] {
         let mut env = Env::default();
         env.put(CERT_ENV, cert.as_os_str());
         env.put(KEY_ENV, key.as_os_str());
-        env.put(ALLOW_PLAINTEXT_ROLLOUT_ENV, compatibility.to_string());
-        let transport = ServerTransport::from_environment(&env).unwrap();
-        // Discovery is protocol-neutral while listeners admit both versions.
-        // Strict clients choose HTTPS; prepared plaintext clients choose HTTP.
+        env.put(INSECURE_DEV_ENV, insecure_dev.to_string());
+        let mut builder = server_builder_from_environment(&env).unwrap();
+        // A configured TLS listener advertises HTTPS even when development
+        // callers have opted into plaintext for other endpoints.
         assert_eq!(
             advertised_endpoint_prefix_from_environment(&env),
-            if compatibility { "" } else { "https://" }
+            "https://"
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -205,25 +205,15 @@ async fn rollout_accepts_both_protocols_without_downgrading_tls_or_blocking_on_i
             },
         );
         let shutdown = CancellationToken::new();
-        let server = tokio::spawn(
-            transport
-                .server_builder()
-                .add_service(health)
-                .serve_with_incoming_shutdown(
-                    transport.incoming(TcpListenerStream::new(listener), shutdown.clone()),
-                    shutdown.clone().cancelled_owned(),
-                ),
-        );
+        let server = tokio::spawn(builder.add_service(health).serve_with_incoming_shutdown(
+            Incoming::new(TcpListenerStream::new(listener), shutdown.clone()),
+            shutdown.clone().cancelled_owned(),
+        ));
         // This peer sends no preface; another peer must still be admitted promptly.
         let idle = tokio::net::TcpStream::connect(address).await.unwrap();
         for (tls, ca, name, accepted) in [
             (true, identity.cert.pem(), "internal.example", true),
-            (
-                false,
-                identity.cert.pem(),
-                "internal.example",
-                compatibility,
-            ),
+            (false, identity.cert.pem(), "internal.example", false),
             (true, wrong.cert.pem(), "internal.example", false),
             (true, identity.cert.pem(), "impostor.example", false),
         ] {
@@ -269,10 +259,101 @@ async fn rollout_accepts_both_protocols_without_downgrading_tls_or_blocking_on_i
             .unwrap();
         drop(idle);
     }
-    // Opting into compatibility still requires a complete valid identity.
+}
+
+#[tokio::test]
+async fn handshake_budget_releases_on_completion_failure_and_saturated_shutdown() {
+    use std::time::Duration;
+    use tokio_stream::StreamExt;
+    use tokio_util::sync::CancellationToken;
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let temp = tempfile::tempdir().unwrap();
+    let identity = rcgen::generate_simple_self_signed(vec!["internal.example".into()]).unwrap();
+    let cert = temp.path().join("server.pem");
+    let key = temp.path().join("server.key");
+    std::fs::write(&cert, identity.cert.pem()).unwrap();
+    std::fs::write(&key, identity.signing_key.serialize_pem()).unwrap();
     let mut env = Env::default();
-    env.put(ALLOW_PLAINTEXT_ROLLOUT_ENV, "true");
-    assert!(ServerTransport::from_environment(&env).is_err());
     env.put(CERT_ENV, cert.as_os_str());
-    assert!(ServerTransport::from_environment(&env).is_err());
+    env.put(KEY_ENV, key.as_os_str());
+    let mut builder = server_builder_from_environment(&env).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let observed = accepted.clone();
+    let sockets = TcpListenerStream::new(listener).map(move |socket| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        socket
+    });
+    let shutdown = CancellationToken::new();
+    let incoming = incoming::Incoming::with_capacity(sockets, shutdown.clone(), 2);
+    let (_, health) = tonic_health::server::health_reporter();
+    let server = tokio::spawn(
+        builder
+            .add_service(health)
+            .serve_with_incoming_shutdown(incoming, std::future::pending()),
+    );
+    let endpoint = Endpoint::from_shared(format!("https://{address}"))
+        .unwrap()
+        .tls_config(
+            ClientTlsConfig::new()
+                .ca_certificate(Certificate::from_pem(identity.cert.pem()))
+                .domain_name("internal.example"),
+        )
+        .unwrap();
+    let wait_for_accepts = |count| {
+        let accepted = accepted.clone();
+        async move {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while accepted.load(Ordering::SeqCst) < count {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+    };
+    let idle = tokio::net::TcpStream::connect(address).await.unwrap();
+    let other_idle = tokio::net::TcpStream::connect(address).await.unwrap();
+    wait_for_accepts(2).await;
+    // This deadline is shorter than the ten-second TLS handshake deadline.
+    // A third handshake must wait for capacity even though TCP can connect.
+    tokio::time::timeout(Duration::from_millis(100), endpoint.connect())
+        .await
+        .unwrap_err();
+    assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    drop(idle);
+    // A failed handshake frees its slot; completed TLS channels also free slots
+    // while they remain open, so neither channel below consumes the budget.
+    let first = tokio::time::timeout(Duration::from_secs(1), endpoint.connect())
+        .await
+        .unwrap()
+        .unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(1), endpoint.connect())
+        .await
+        .unwrap()
+        .unwrap();
+    let before = accepted.load(Ordering::SeqCst);
+    let saturating = tokio::net::TcpStream::connect(address).await.unwrap();
+    wait_for_accepts(before + 1).await;
+    shutdown.cancel();
+    let replacement = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match tokio::net::TcpListener::bind(address).await {
+                Ok(listener) => break listener,
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                    tokio::task::yield_now().await
+                }
+                Err(error) => panic!("replacement bind failed: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("saturated handshakes must not retain the listening socket");
+    drop((first, second, other_idle, saturating, replacement));
+    tokio::time::timeout(Duration::from_secs(1), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 }
