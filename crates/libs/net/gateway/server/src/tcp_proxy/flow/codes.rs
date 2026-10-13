@@ -168,6 +168,7 @@ impl Codes {
         match self.io_kind {
             Some(
                 io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionRefused
                 | io::ErrorKind::ConnectionAborted
                 | io::ErrorKind::BrokenPipe,
             ) => Close::RemoteReset,
@@ -210,3 +211,6 @@ fn certificate_name(error: &rustls::CertificateError) -> &'static str {
         _ => "_OTHER",
     }
 }
+
+#[cfg(test)]
+mod tests;

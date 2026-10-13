@@ -88,7 +88,7 @@ impl Request {
             return;
         }
         self.finished = true;
-        let mut state = self.flow.0.lock();
+        let mut state = self.flow.state.lock();
         state.requests.in_flight -= 1;
         if completed {
             state.requests.completed += 1;
@@ -142,6 +142,7 @@ impl Request {
             &termination,
         );
         tracing::info!(
+            connection_id = %self.flow.id,
             protocol = self.protocol.as_str(), outcome, side, close,
             http.response.status_code = status, status_source, injected = self.injected,
             h2_error_code = h2, h2_origin = termination.h2_origin,

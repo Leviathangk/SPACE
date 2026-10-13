@@ -8,6 +8,8 @@ use super::tls::TlsTransportError;
 
 pub(super) mod codes;
 mod request;
+#[cfg(test)]
+mod tests;
 use codes::Codes;
 pub(super) use request::{Request, RequestErrors, StatusSource};
 
@@ -54,10 +56,6 @@ pub(super) struct Requests {
 }
 
 impl Requests {
-    pub(super) const fn active_rq(self) -> &'static str {
-        if self.in_flight == 0 { "0" } else { "1+" }
-    }
-
     const fn phase(self) -> Phase {
         if self.in_flight == 0 {
             Phase::HttpIdle
@@ -81,9 +79,17 @@ struct State {
     requests: Requests,
     failure: Option<Failure>,
     closed: Option<(Phase, Side)>,
+    phase: Option<Phase>,
 }
 
 impl State {
+    fn current_phase(&self) -> Option<Phase> {
+        self.phase.map(|phase| match phase {
+            Phase::HttpExchange | Phase::HttpIdle => self.requests.phase(),
+            phase => phase,
+        })
+    }
+
     fn observe(&mut self, failure: Failure) {
         match &mut self.failure {
             Some(first)
@@ -99,16 +105,50 @@ impl State {
     }
 }
 
-#[derive(Clone, Default)]
-pub(super) struct Flow(Arc<Mutex<State>>);
+#[derive(Clone)]
+pub(super) struct Flow {
+    state: Arc<Mutex<State>>,
+    pub(super) id: uuid::Uuid,
+}
+
+impl Default for Flow {
+    fn default() -> Self {
+        Self {
+            state: Arc::default(),
+            id: uuid::Uuid::now_v7(),
+        }
+    }
+}
 
 impl Flow {
+    pub(super) fn at_phase(&self, phase: Phase) {
+        self.state.lock().phase = Some(phase);
+    }
+
+    pub(super) fn cancelled(&self) {
+        let mut state = self.state.lock();
+        if let Some(phase) = state.current_phase() {
+            let requests = state.requests;
+            state.observe(Failure {
+                phase,
+                side: Side::Downstream,
+                requests,
+                outcome: "shutdown_or_policy_resweep",
+                codes: Codes::default(),
+            });
+        }
+    }
+
+    pub(super) fn requests(&self) -> Requests {
+        self.state.lock().requests
+    }
+
     pub(super) fn failure(&self) -> Option<Failure> {
-        self.0.lock().failure
+        self.state.lock().failure
     }
 
     pub(super) fn failed(&self, error: &TlsTransportError, phase: Phase, side: Side) {
-        let mut state = self.0.lock();
+        let mut state = self.state.lock();
         let requests = state.requests;
         state.observe(Failure {
             phase,
@@ -120,10 +160,11 @@ impl Flow {
     }
 
     pub(super) fn http_failed(&self, error: &TlsTransportError, side: Side) {
-        let mut state = self.0.lock();
+        let mut state = self.state.lock();
         let requests = state.requests;
+        let phase = state.current_phase().unwrap_or(requests.phase());
         state.observe(Failure {
-            phase: requests.phase(),
+            phase,
             side,
             requests,
             outcome: error.as_str(),
@@ -132,7 +173,7 @@ impl Flow {
     }
 
     pub(super) fn http_io_failed(&self, error: &std::io::Error, side: Side) {
-        let mut state = self.0.lock();
+        let mut state = self.state.lock();
         let requests = state.requests;
         state.observe(Failure {
             phase: requests.phase(),
@@ -147,7 +188,7 @@ impl Flow {
     }
 
     pub(super) fn io_failed(&self, error: &std::io::Error, phase: Phase, side: Side) {
-        let mut state = self.0.lock();
+        let mut state = self.state.lock();
         let requests = state.requests;
         state.observe(Failure {
             phase,
@@ -163,15 +204,21 @@ impl Flow {
     }
 
     pub(super) fn closed(&self, phase: Phase, side: Side) {
-        self.0.lock().closed.get_or_insert((phase, side));
+        self.state.lock().closed.get_or_insert((phase, side));
     }
 
     pub(super) fn closed_by(&self) -> Option<(Phase, Side)> {
-        self.0.lock().closed
+        self.state.lock().closed
+    }
+
+    pub(super) fn http_closed(&self, side: Side) {
+        let mut state = self.state.lock();
+        let phase = state.requests.phase();
+        state.closed.get_or_insert((phase, side));
     }
 
     pub(super) fn request(&self, protocol: super::tls::HttpProtocol) -> Request {
-        self.0.lock().requests.in_flight += 1;
+        self.state.lock().requests.in_flight += 1;
         Request::new(self.clone(), protocol)
     }
 }

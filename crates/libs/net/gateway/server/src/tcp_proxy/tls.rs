@@ -501,8 +501,11 @@ pub(super) async fn accept<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    flow.at_phase(Phase::TlsHandshake);
     let deadline = tokio::time::Instant::now() + HANDSHAKE_BUDGET;
-    let _permit = admit_handshake(interception, TlsHandshakeLeg::ClientToNetgw, deadline).await?;
+    let _permit = admit_handshake(interception, TlsHandshakeLeg::ClientToNetgw, deadline)
+        .await
+        .inspect_err(|error| flow.failed(error, Phase::TlsHandshake, Side::Downstream))?;
     let mut attempt = HandshakeAttempt::new(TlsHandshakeLeg::ClientToNetgw);
     let result = async {
         let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
@@ -531,6 +534,7 @@ where
             return Err(TlsTransportError::Target);
         }
         let protocol = HttpProtocol::negotiated(downstream.get_ref().1.alpn_protocol())?;
+        flow.at_phase(Phase::HttpIdle);
         Ok((
             TlsIo::new(downstream, TlsHandshakeLeg::ClientToNetgw, flow.clone()),
             protocol,
@@ -862,7 +866,16 @@ impl<T: AsyncRead + Unpin> AsyncRead for TlsIo<T> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let capacity = buf.remaining();
         let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(result, Poll::Ready(Ok(()))) && capacity > 0 && before == buf.filled().len() {
+            let side = match self.leg {
+                TlsHandshakeLeg::ClientToNetgw => Side::Downstream,
+                TlsHandshakeLeg::NetgwToOrigin => Side::Upstream,
+            };
+            self.flow.http_closed(side);
+        }
         if let Poll::Ready(Err(error)) = &result {
             self.record_error("read", error);
         }

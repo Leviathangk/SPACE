@@ -1,3 +1,14 @@
+//! Gateway counters use two denominators: `tcp.connection` ends once per
+//! accepted flow; `http.request.started` and `http.request` count individual
+//! inspected requests, including HTTP/2 streams. An aborted stream need not
+//! end its connection. Passthrough tunnels have no request-level observations.
+//!
+//! Request completion is response-body EOS at the gateway, not acknowledgement
+//! by the remote application. Completed responses retain HTTP error statuses.
+//! For a finite drained workload, started = completed + aborted; live windows
+//! can also contain requests still in flight. Exact per-flow counts and IDs
+//! belong in terminal logs, never metric tags.
+
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

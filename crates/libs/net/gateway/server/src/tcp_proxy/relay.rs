@@ -28,6 +28,7 @@ pub(super) async fn run(
     dst: SocketAddr,
     flow: &Flow,
 ) -> Result<(u64, u64), Failure> {
+    flow.at_phase(Phase::TcpConnect);
     let upstream = connect(dst)
         .await
         .inspect_err(|error| flow.io_failed(error, Phase::TcpConnect, Side::Upstream))
@@ -42,6 +43,7 @@ async fn transfer(
     mut upstream: TcpStream,
     flow: &Flow,
 ) -> io::Result<(u64, u64)> {
+    flow.at_phase(Phase::Relay);
     // Borrowed TCP halves avoid the mutex in tokio::io::split. Each EOF shuts
     // down only the opposite writer; the reverse direction continues draining.
     let (client_read, client_write) = client.split();
