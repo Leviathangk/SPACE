@@ -189,32 +189,97 @@ final code: 300/300 iterations passed (2400/2400 test runs, 0 failures, 310 s), 
 - Environment notes: builds used a target dir on the container's root
   overlay with debuginfo off, because `/home/dev` was 100% full.
 
-**Step 2 (Kind): not run; ENVIRONMENTAL blocker.**
-- `/home/dev` has 1.4 GB free (393 GB disk; 295 GB is other sessions' worktree
-  `target/` dirs, 84 GB is the deliberately preserved `~/.kind-data` node
-  containerd cache).
-- The Docker daemon sees only that shared disk. A bind-mount probe of the
-  container's `/var/tmp` came back empty, so the Kind data root and the Kind
-  Rust caches cannot be moved elsewhere.
-- This change relinks every Rust binary. The changed artifact layers come to
-  about 1.3 GB per image set (api ≈92 MB, worker ≈570 MB, node-stack ≈565 MB,
-  cluster-controller 66 MB, data-plane 30 MB, …). `kind load` puts them into
-  all six nodes' containerd stores, an estimated 8–16 GB on `/home/dev`.
-- Freeing that much would need deleting other sessions' worktrees or pruning
-  the shared Kind cache. Neither is authorized: the task's disk
-  pre-authorization covers Docker-root images only, and AGENTS.md excludes
-  shared-cache pruning.
-- I did not attempt a bring-up that would fill the disk holding the git
-  repository and session state.
-- Done within scope: Docker root was 6.7 GB free (< 20 GiB), so I listed and
-  removed 187 stale `space-*:tilt-*` tags, keeping the newest image per repo.
-  No `space-rust-chef-base`/`space-rust-build-kind` image was superseded.
-  Docker root now has 22 GB free.
-- No cluster, Tilt or port-forward was started, so there was nothing to tear
-  down.
-- Unblock: free roughly 20 GB on `/home/dev`, then run
-  `DATA_PLANE_URL=http://127.0.0.1:8090 SPACE_KIND_OBSERVABILITY=off SPACE_KIND_TELEMETRY_MODE=datadog bash scripts/tests/smoke-kind-e2e.sh`,
-  followed by the typed suite with `SKIP_BOOTSTRAP=1`.
+**Step 2 (Kind): PASS.**
+
+*First attempt (blocked).* `/home/dev` had 1.4 GB free (393 GB disk; 295 GB
+other sessions' worktree `target/` dirs, 84 GB the preserved `~/.kind-data`
+node containerd cache). The Docker daemon sees only that shared disk (a
+bind-mount probe of the container's `/var/tmp` came back empty), and a
+bring-up was estimated to need 8–16 GB there. Freeing it was not authorized,
+so the first report recorded an ENVIRONMENTAL blocker. Within the original
+scope: Docker root was 6.7 GB free (< 20 GiB), so 187 stale `space-*:tilt-*`
+tags were listed and removed, keeping the newest image per repo (no
+`space-rust-chef-base`/`space-rust-build-kind` image was superseded); Docker
+root then had 22 GB free.
+
+*Disk, with the box owner's later authorization.* Confirmed first:
+`kind get clusters` found none, no Kind node containers existed, and no
+`tilt up` process ran. Then `~/.kind-data` was removed entirely; nothing else
+was touched. `df -h /home/dev`: before 393G size / 392G used / 1.4G avail
+(100%); after 393G / 308G / 86G avail (79%), above the 30 GB threshold.
+
+*Build shape.* No separate rebuild was needed. The debuginfo-off settings
+applied only to the host nextest target dir, which had already been deleted.
+The Kind images come from `build-rust-artifacts.sh` with its own settings:
+incremental mode, `cargo --release`, its own target and cargo home under
+`~/.space-devbox/kind`, and the CI-identical artifact layout. The bring-up
+shell did not set any `CARGO_*` overrides. The first artifact build synced
+121 changed sources and compiled for 175 s, the glibc guard passed, and every
+deployed image carries revision `8234955707b7`.
+
+*Prerequisites, as CI does them.* `install-prereqs.sh` with
+`INSTALL_DIR=~/.local/bin` installed the pinned AWS CLI; kind, kubectl, helm,
+grpcurl and tilt were already at their pins. `space_smoke_prepare_encrypted_targets`
+reported the host dm-crypt and dm-snapshot targets ready, with the modules
+already loaded, so no host change was made. `/dev/kvm` is accessible to the
+`kvm` group.
+
+*Baseline.* `BOOTSTRAP_TIMEOUT=1800 DATA_PLANE_URL=http://127.0.0.1:8090
+SPACE_KIND_OBSERVABILITY=off SPACE_KIND_TELEMETRY_MODE=datadog bash
+scripts/tests/smoke-kind-e2e.sh` ran from a fresh cluster (18:22–18:29 UTC)
+and passed: `[7/7] PASS round-trip ok`, exit 0.
+
+*Typed suite.* `SKIP_BOOTSTRAP=1 bash scripts/tests/smoke-kind-typed.sh all`
+ran unsharded, i.e. all four CI shards' scenarios, on that cluster. The
+environment matched the CI shard step: an admin session token file from
+`root@local`, a fresh 0700 cold-receipts dir, uv from `ci/scripts/ensure-uv.sh`
+on PATH, aws/curl/jq present, and a data-plane `/healthz` wait. It ran
+18:30–19:19 UTC with exit 0:
+- ECW API surface: 77 passed, 0 warned, 0 failed, 0 inconclusive.
+- Native API surface: 23 passed, 0 warned, 0 failed, 0 inconclusive.
+- No scenario was quarantined.
+
+No failures, so no rerun or base comparison was needed.
+
+*Connect failures and replays in the logs, captured while the stack was up.*
+Sources: all 56 `space` pods' logs and the Tilt log for this run. No pod had
+a previous container still retained.
+- "tcp connect error": 52,286 pod-log lines (64,174 in the Tilt log).
+  - More than 99.8% are the Datadog trace exporter (libdd `send_with_retry`
+    / "Error sending traces"). It is an HTTP client, not a gRPC channel, and
+    is refused because no Datadog agent runs with
+    `SPACE_KIND_OBSERVABILITY=off SPACE_KIND_TELEMETRY_MODE=datadog`. Every
+    service shows it, and it is unrelated to this change.
+  - The gRPC remainder comes from node-ctl's lazy cluster-api channel, which
+    now goes through `ConnectEndpoint::connect_lazy`, as "outbound facet sync
+    failed … cluster node state publish failed". These lines confirm the
+    marker in production code: the logged source chains read
+    `tonic::transport::Error → ConnectError → ConnectPhaseError → hyper-util
+    ConnectError → io`, for DNS lookup failures (98), refused dials (70) and
+    timed-out dials (2). They occur only at 18:27 (cluster-api starting
+    during bring-up) and 18:51–18:52 (a scenario-driven control-plane
+    restart), and the sync then recovered.
+  - `ConnectPhaseError` appears only in the four node-ctl pods' logs (191
+    occurrences).
+- "exhausted TCP gRPC connect retry budget": 4 lines, all at 18:27:35–36
+  during bring-up. They come from the four credential-manager agents dialing
+  `space-credmgr-authority` before it served. Each made 13 attempts in about
+  9.7 s, which is exactly the unchanged `DEFAULT_GRPC_CONNECT_RETRY_POLICY`
+  (12 retries, 10 s). Those four pods restarted once (exit 1 at 18:27:40) and
+  stayed up for the rest of the run; these were their only restarts. This is
+  bring-up ordering, not a suite failure, and was not compared with base.
+- "cluster api connect failed": 40 lines from sandbox-, template- and
+  volume-manager, all at 18:27 or 18:51–18:52, i.e. the same cluster-api
+  start and restart windows.
+- Runtime-RPC replay line ("runtime RPC was not transmitted; retrying on a
+  fresh worker connection"): 0. It is logged at debug level, and the pods run
+  at info, so replays are not observable at this log level. The typed suite's
+  worker-restart and recovery scenarios all passed.
+
+*Teardown.* `infra/space/kind/scripts/teardown.sh` stopped the Tilt watcher
+and deleted cluster `space-local` with all six nodes. Afterwards no Kind
+cluster, Kind container, Tilt or port-forward remained. `/home/dev` was left
+at 64 GB free.
 
 ## Decisions
 
@@ -229,7 +294,7 @@ final code: 300/300 iterations passed (2400/2400 test runs, 0 failures, 310 s), 
   no connector hook; the second is not internal transport.
 - **Marker `Display`.** Transparent, so status messages and any log or text
   consumers are unchanged.
-- **Kind.** Step 2 skipped rather than attempted on a disk with 1.4 GB free.
+- **Kind.** First skipped rather than attempted on a disk with 1.4 GB free. Rerun after the box owner authorized deleting `~/.kind-data`. No separate rebuild, because the Kind images use their own release build. The typed suite ran unsharded (`all`), covering every shard on one cluster.
 
 ## Results
 
@@ -241,8 +306,10 @@ final code: 300/300 iterations passed (2400/2400 test runs, 0 failures, 310 s), 
 | nextest grpc + 70 dependents | 7787/7819. The 32 failures are identical on base: ENVIRONMENTAL / PRE-EXISTING |
 | Mutations M1–M10 | All caught |
 | 300× stress of new tests | 300/300 iterations passed (2400/2400 test runs, 0 failures, 310 s), on HEAD `8234955` |
-| Kind bring-up + typed suite | NOT RUN: ENVIRONMENTAL (disk) |
+| Kind disk prep (`~/.kind-data` removed, owner-authorized) | `/home/dev` 1.4 GB → 86 GB free |
+| Kind baseline smoke (`smoke-kind-e2e.sh`) | PASS (exit 0) |
+| Typed Kind suite, all scenarios | PASS: ECW 77/77, native 23/23, 0 inconclusive, exit 0 |
+| Live log sweep | Marker observed on node-ctl's cluster-api channel (DNS, refused, timed out); no unexplained connect failures |
+| Teardown | Cluster deleted, Tilt and port-forwards stopped |
 
-**Verdict:** the change is complete and validated through step 1. Kind
-validation is blocked by disk on this box and still needs to be run once
-`/home/dev` has room.
+**Verdict:** PASS. The change is complete, and validation steps 1 and 2 pass on this box. The only failures, 32 process-spawn tests, are identical on base and are ENVIRONMENTAL / PRE-EXISTING.
