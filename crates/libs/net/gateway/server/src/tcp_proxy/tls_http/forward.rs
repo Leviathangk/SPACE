@@ -88,8 +88,7 @@ where
         if sender.is_http1() {
             translate_to_http1(&mut request);
         }
-        let request =
-            request.map(|body| Either::Left(Self::forwarding_body(protocol, body, "request_body")));
+        let request = request.map(|body| Self::forwarding_body(protocol, body, "request_body"));
         let response = sender.send(request).await;
 
         match response {
@@ -111,14 +110,12 @@ where
                         .in_current_span(),
                 );
                 forwarding.finish(Outcome::Success, "response_headers");
-                response.map(|_| Either::Right(Empty::new()))
+                response.map(|_| Body::default())
             }
             Ok(response) if response.status() != StatusCode::SWITCHING_PROTOCOLS => {
                 Self::record(protocol, "allowed", response.status());
                 forwarding.finish(Outcome::Success, "response_headers");
-                response.map(|body| {
-                    Either::Left(Self::forwarding_body(protocol, body, "response_body"))
-                })
+                response.map(|body| Self::forwarding_body(protocol, body, "response_body"))
             }
             Ok(_) => {
                 forwarding.finish(Outcome::Error, "unexpected_upgrade");

@@ -10,7 +10,6 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use http::{Request, Response, StatusCode, Version, header};
-use http_body_util::{Either, Empty};
 use hyper::body::{Body as HttpBody, Bytes, Incoming};
 use hyper::client::conn::{http1, http2};
 use hyper::service::service_fn;
@@ -31,10 +30,9 @@ use crate::certificates::CertificateLease;
 mod connect;
 mod credentials;
 mod forward;
-mod leg;
 mod upgrade;
 
-type Body = Either<ForwardingBody, Empty<Bytes>>;
+type Body = ForwardingBody;
 const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 const H2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const H2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -98,9 +96,9 @@ impl ReadySender<'_> {
     }
 }
 
+#[derive(Default)]
 struct ForwardingBody {
-    inner: Incoming,
-    attempt: Attempt,
+    inner: Option<(Incoming, Attempt)>,
 }
 
 impl ForwardingBody {
@@ -109,7 +107,9 @@ impl ForwardingBody {
         if inner.is_end_stream() {
             attempt.finish(Outcome::Success, "body_complete");
         }
-        Self { inner, attempt }
+        Self {
+            inner: Some((inner, attempt)),
+        }
     }
 }
 
@@ -121,12 +121,15 @@ impl HttpBody for ForwardingBody {
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
     ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
-        let result = Pin::new(&mut self.inner).poll_frame(context);
+        let Some((inner, attempt)) = self.inner.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let result = Pin::new(&mut *inner).poll_frame(context);
         match &result {
-            Poll::Ready(Some(Err(_))) => self.attempt.finish(Outcome::Error, "body_error"),
-            Poll::Ready(None) => self.attempt.finish(Outcome::Success, "body_complete"),
-            Poll::Ready(Some(Ok(_))) if self.inner.is_end_stream() => {
-                self.attempt.finish(Outcome::Success, "body_complete");
+            Poll::Ready(Some(Err(_))) => attempt.finish(Outcome::Error, "body_error"),
+            Poll::Ready(None) => attempt.finish(Outcome::Success, "body_complete"),
+            Poll::Ready(Some(Ok(_))) if inner.is_end_stream() => {
+                attempt.finish(Outcome::Success, "body_complete");
             }
             Poll::Ready(Some(Ok(_))) | Poll::Pending => {}
         }
@@ -134,11 +137,16 @@ impl HttpBody for ForwardingBody {
     }
 
     fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
+        self.inner
+            .as_ref()
+            .is_none_or(|(inner, _)| inner.is_end_stream())
     }
 
     fn size_hint(&self) -> hyper::body::SizeHint {
-        self.inner.size_hint()
+        self.inner.as_ref().map_or_else(
+            || hyper::body::SizeHint::with_exact(0),
+            |(inner, _)| inner.size_hint(),
+        )
     }
 }
 
@@ -334,7 +342,7 @@ where
         status: StatusCode,
     ) -> Response<Body> {
         Self::record(protocol, reason, status);
-        let mut response = Response::new(Either::Right(Empty::new()));
+        let mut response = Response::new(Body::default());
         *response.status_mut() = status;
         if protocol == HttpProtocol::Http1 {
             response

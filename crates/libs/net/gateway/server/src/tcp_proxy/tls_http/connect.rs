@@ -3,7 +3,7 @@
 
 use hyper::upgrade::OnUpgrade;
 
-use super::leg::{RelayFault, RelayWitness, Side};
+use super::super::leg::{RelayFault, RelayWitness, Side};
 use super::*;
 
 /// The authority forwarded in an HTTP/1.1 CONNECT request.
@@ -137,7 +137,7 @@ where
             return self.refuse(protocol, "lease_invalidated", StatusCode::FORBIDDEN);
         }
         let mut response = match request
-            .map(|body| Either::Left(Self::forwarding_body(protocol, body, "request_body")))
+            .map(|body| Self::forwarding_body(protocol, body, "request_body"))
             .send_http1(&mut sender)
             .await
         {
@@ -155,8 +155,7 @@ where
         if !response.status().is_success() {
             Self::record(protocol, "connect_proxy_refused", response.status());
             forwarding.finish(Outcome::Success, "response_headers");
-            return response
-                .map(|body| Either::Left(Self::forwarding_body(protocol, body, "response_body")));
+            return response.map(|body| Self::forwarding_body(protocol, body, "response_body"));
         }
         let origin = hyper::upgrade::on(&mut response);
         response.headers_mut().remove(header::CONTENT_LENGTH);
@@ -164,7 +163,7 @@ where
             .spawn(relay(guest, origin, self.shutdown.clone()).in_current_span());
         Self::record(protocol, "connect_forwarded", response.status());
         forwarding.finish(Outcome::Success, "response_headers");
-        response.map(|_| Either::Right(Empty::new()))
+        response.map(|_| Body::default())
     }
 }
 

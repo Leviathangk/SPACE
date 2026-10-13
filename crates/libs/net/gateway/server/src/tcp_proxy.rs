@@ -34,6 +34,7 @@ use crate::tls_interception::{TlsInterception, TlsInterceptionError};
 mod accounting;
 mod admission;
 mod http_host;
+mod leg;
 mod relay;
 mod reserved_dns;
 mod routing_headers;

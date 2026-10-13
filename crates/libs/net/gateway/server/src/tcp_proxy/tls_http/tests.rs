@@ -3,6 +3,7 @@ use super::forward::authorize_authority;
 use super::*;
 use crate::certificates::NetworkCredentialAccessError;
 use http::HeaderMap;
+use http_body_util::Empty;
 use pplx_space_common_core::types::CredentialReferenceId;
 
 #[test]

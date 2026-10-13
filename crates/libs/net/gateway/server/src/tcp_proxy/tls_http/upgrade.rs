@@ -11,8 +11,8 @@ use hyper_util::rt::TokioIo;
 use tokio_util::sync::CancellationToken;
 
 use super::super::accounting::{Attempt, Outcome};
+use super::super::leg::{RelayFault, RelayWitness};
 use super::SanitizedRequest;
-use super::leg::{RelayFault, RelayWitness};
 
 pub(super) enum Handshake {
     WebSocket { accept: HeaderValue },
