@@ -120,3 +120,50 @@ fn execution_roots_must_not_alias_the_managed_store() {
     paths.kernels = paths.store.kernels.clone();
     assert!(separate_store(&paths).is_err());
 }
+
+#[tokio::test]
+async fn compiled_environment_removal_is_refused_even_without_inventory() {
+    use crate::service::tests::service_tests::{root_request, service_for_unit_tests};
+    let initial = InitialEnvironment::for_architecture(host_arch().unwrap()).unwrap();
+    let runtime = NodeArtifact {
+        artifact: Some(node_artifact::Artifact::RuntimeRelease(
+            RuntimeReleaseArtifact {
+                runtime_kind: pplx_space_execution_common::proto::RuntimeKind::Firecracker as i32,
+                version: initial.release.release.version.to_string(),
+                digest: initial.release.digest().to_string(),
+            },
+        )),
+    };
+    let kernel = NodeArtifact {
+        artifact: Some(node_artifact::Artifact::Component(ComponentArtifact {
+            kind: pplx_space_execution_common::proto::ArtifactComponentKind::Kernel as i32,
+            version: initial.kernel.version.to_string(),
+            digest: initial.kernel.sha256.to_string(),
+        })),
+    };
+    // Independent service instances represent restart; neither has a discovered
+    // inventory or any artifact files. The binding still protects removal.
+    for artifact in [runtime, kernel] {
+        let service = service_for_unit_tests().await;
+        let status = service
+            .remove_artifact(root_request(RemoveArtifactRequest {
+                artifact: Some(artifact),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains("compiled E0"));
+    }
+    let candidate = RuntimeCatalog::compiled()
+        .unwrap()
+        .releases(
+            pplx_space_common_core::types::RuntimeKind::Firecracker,
+            host_arch().unwrap(),
+        )
+        .find(|pin| pin.release.version.as_str() == "1.17.0")
+        .unwrap()
+        .clone();
+    Artifact::Release(candidate.release.clone(), candidate.digest())
+        .check_removal(&initial)
+        .unwrap();
+}
