@@ -560,6 +560,12 @@ pub fn check_recipe_file(path: &Path) -> Result<CheckedRecipe, RecipeError> {
         .steps
         .iter()
         .map(|named| match &named.step {
+            TomlStep::SetRuntime { .. } => CheckedStep::Other {
+                kind: "set-runtime",
+            },
+            TomlStep::ClearRuntime => CheckedStep::Other {
+                kind: "clear-runtime",
+            },
             TomlStep::Run { command, user } => CheckedStep::Run {
                 command: command.clone(),
                 user: user.clone(),
