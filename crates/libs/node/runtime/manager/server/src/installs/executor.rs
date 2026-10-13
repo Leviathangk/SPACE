@@ -14,7 +14,8 @@ use super::store::{self, JobOutcome, JobPhase, JobResult};
 use pplx_space_common_core::types::{Arch, Digest, JobId};
 use pplx_space_common_jobs::{Job, JobError, JobExecutor};
 use pplx_space_node_runtime_core::artifact_store::{
-    StagedName, kernel_staging, release_directory, release_staging,
+    StagedName, kernel_staging, managed_kernel_directory, managed_release_directory,
+    release_staging,
 };
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
@@ -98,14 +99,18 @@ impl InstallExecutor {
 
     pub(super) fn target(&self, artifact: &NodeArtifactRef) -> Result<PathBuf, JobError> {
         match artifact {
-            NodeArtifactRef::Kernel(version, _) => {
-                Ok(self.context.kernels_root.join(version.as_str()))
-            }
-            NodeArtifactRef::Release(release, _) => self
+            NodeArtifactRef::Kernel(version, digest) => Ok(self.context.kernels_root.join(
+                managed_kernel_directory(version.artifact_version(), *digest),
+            )),
+            NodeArtifactRef::Release(release, digest) => self
                 .context
                 .releases
                 .as_ref()
-                .map(|context| context.root.join(release_directory(release)))
+                .map(|context| {
+                    context
+                        .root
+                        .join(managed_release_directory(release, *digest))
+                })
                 .ok_or_else(|| JobError::permanent("release management is disabled")),
         }
     }

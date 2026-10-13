@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::io::Read;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 use pplx_space_common_core::types::{
@@ -13,6 +14,8 @@ use sha2::{Digest as _, Sha256};
 
 pub mod diagnostic;
 pub mod kernel_release;
+#[cfg(feature = "artifact-store")]
+mod managed;
 
 const BOOT_COMPONENT_ROLE: &str = "boot";
 const VMLINUX_COMPONENT_FORMAT: &str = "vmlinux";
@@ -136,6 +139,30 @@ pub struct RuntimeInventory {
     /// The release each runtime root's `default` alias names. New cold boots
     /// use it, so installing another release never changes what they boot.
     defaults: Vec<RuntimeIdentity>,
+    fingerprints: Vec<(PathBuf, FileFingerprint)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FileFingerprint {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified: (i64, i64),
+    mode: u32,
+    owner: u32,
+}
+
+impl FileFingerprint {
+    fn of(md: &std::fs::Metadata) -> Self {
+        Self {
+            device: md.dev(),
+            inode: md.ino(),
+            size: md.len(),
+            modified: (md.mtime(), md.mtime_nsec()),
+            mode: md.mode(),
+            owner: md.uid(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -171,6 +198,9 @@ pub trait ExecutionResolver {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeInventoryError {
+    #[cfg(feature = "artifact-store")]
+    #[error("managed execution artifact: {0}")]
+    ManagedArtifact(#[from] crate::artifact_store::PublishError),
     #[error("read runtime directory {path}: {source}")]
     ReadDir {
         path: PathBuf,
@@ -223,8 +253,8 @@ pub enum RuntimeInventoryError {
     },
     #[error("no installed {runtime} runtime can execute the requested artifact")]
     NoCompatibleRuntime { runtime: RuntimeKind },
-    /// The alias exists but does not name a listed release. Without an alias
-    /// the newest release is used; a broken one is not silently replaced.
+    /// The alias exists but does not name a listed release. It cannot supply
+    /// a default, and must never imply selection of the newest release.
     #[error("{} does not name an installed runtime release", alias.display())]
     InvalidDefaultRelease { alias: PathBuf },
     #[error("persisted-state restore metadata is missing a state format")]
@@ -258,6 +288,8 @@ impl RuntimeInventoryError {
     /// fails an activation that a second attempt would have satisfied.
     pub fn is_transient(&self) -> bool {
         match self {
+            #[cfg(feature = "artifact-store")]
+            Self::ManagedArtifact(error) => error.is_transient(),
             Self::ReadDir { source, .. }
             | Self::InspectKernel { source, .. }
             | Self::ProbeInventoryPath { source, .. } => {
@@ -309,7 +341,7 @@ impl RuntimeInventoryError {
 /// with an unlucky stat. `default` and `legacy-default` are the marker symlinks
 /// the scan resolves separately, never installations in their own right.
 fn kernel_candidate_version(entry_name: &std::ffi::OsStr) -> Option<ArtifactVersion> {
-    let entry_name = entry_name.to_str()?;
+    let entry_name = crate::catalog::artifact_label(entry_name.to_str()?);
     if matches!(entry_name, "default" | "legacy-default") {
         return None;
     }
@@ -557,10 +589,16 @@ impl RuntimeDriver for FirecrackerDriver {
         &self,
         root: &Path,
     ) -> Result<Vec<RuntimeInstallation>, RuntimeInventoryError> {
-        let entries = std::fs::read_dir(root).map_err(|source| RuntimeInventoryError::ReadDir {
-            path: root.to_path_buf(),
-            source,
-        })?;
+        let entries = match std::fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => {
+                return Err(RuntimeInventoryError::ReadDir {
+                    path: root.to_path_buf(),
+                    source,
+                });
+            }
+        };
         let mut runtimes = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|source| RuntimeInventoryError::ReadDir {
@@ -586,10 +624,6 @@ impl RuntimeDriver for FirecrackerDriver {
             }
             match self.inspect_installation(path, directory_version) {
                 Ok(installation) => runtimes.push(installation),
-                Err(
-                    error @ RuntimeInventoryError::UnknownFirecrackerSnapshotFormat(_)
-                    | error @ RuntimeInventoryError::InvalidVersionOutput { .. },
-                ) => return Err(error),
                 Err(error) if unreadable_candidate(&error) == UnreadableCandidate::FailScan => {
                     return Err(error);
                 }
@@ -695,6 +729,25 @@ impl RuntimeDriverRegistry {
 static DRIVERS: RuntimeDriverRegistry = RuntimeDriverRegistry::new();
 
 impl RuntimeInventory {
+    /// Root-owned artifacts are immutable; missing/replaced files invalidate a
+    /// cached snapshot before it can be used by admission or observation.
+    #[cfg(feature = "artifact-store")]
+    fn paths(&self) -> impl Iterator<Item = &Path> {
+        self.runtimes
+            .iter()
+            .flat_map(|entry| entry.files.files.values().map(PathBuf::as_path))
+            .chain(self.components.iter().map(|entry| entry.path.as_path()))
+    }
+
+    /// Blocking, metadata-only validation of root-controlled immutable files.
+    /// ctime is deliberately excluded: each jail's kernel hard link changes it
+    /// without changing the approved bytes or their ownership.
+    pub fn files_unchanged(&self) -> bool {
+        self.fingerprints.iter().all(|(path, fingerprint)| {
+            std::fs::metadata(path).is_ok_and(|md| FileFingerprint::of(&md) == *fingerprint)
+        })
+    }
+
     fn first_compatible<'a>(
         &'a self,
         driver: &dyn RuntimeDriver,
@@ -723,12 +776,18 @@ impl RuntimeInventory {
         };
         let mut runtimes = Vec::new();
         let mut defaults = Vec::new();
-        let mut searched_roots = Vec::new();
         for root in runtime_roots {
             let driver = DRIVERS.get(root.kind)?;
-            searched_roots.push(root.path.clone());
             let installations = driver.discover_installations(&root.path)?;
-            if let Some(version) = driver.default_release(&root.path)? {
+            let default = match driver.default_release(&root.path) {
+                Ok(default) => default,
+                Err(error) if error.is_transient() => return Err(error),
+                Err(error) => {
+                    tracing::warn!(%error, "ignoring invalid runtime default alias");
+                    None
+                }
+            };
+            if let Some(version) = default {
                 let default = RuntimeIdentity {
                     kind: root.kind,
                     version,
@@ -737,21 +796,12 @@ impl RuntimeInventory {
                     .iter()
                     .any(|installation| installation.runtime == default)
                 {
-                    return Err(RuntimeInventoryError::InvalidDefaultRelease {
-                        alias: root.path.join("default"),
-                    });
+                    tracing::warn!(path = %root.path.display(), "ignoring default alias without an installed release");
+                } else {
+                    defaults.push(default);
                 }
-                defaults.push(default);
             }
             runtimes.extend(installations);
-        }
-        if runtimes.is_empty() {
-            return Err(RuntimeInventoryError::Empty(
-                searched_roots
-                    .into_iter()
-                    .next()
-                    .unwrap_or_else(|| PathBuf::from("<runtime roots>")),
-            ));
         }
         runtimes.sort_by(|left, right| {
             if left.runtime.kind == right.runtime.kind {
@@ -769,6 +819,7 @@ impl RuntimeInventory {
             runtimes,
             components: kernels,
             defaults,
+            fingerprints: Vec::new(),
         })
     }
 
@@ -783,9 +834,8 @@ impl RuntimeInventory {
             .find(|installation| installation.runtime == *default)
     }
 
-    /// The default release when it can serve `requested`, otherwise the
-    /// newest that can. A node without a default alias falls back to the
-    /// newest, as before defaults were honoured.
+    /// Restore may use the selected loader or another compatible installed
+    /// loader. Cold boots never use this fallback.
     fn default_or_first_compatible<'a>(
         &'a self,
         driver: &dyn RuntimeDriver,
@@ -819,20 +869,21 @@ impl RuntimeInventory {
         let selected_runtime = match requested {
             None => self
                 .default_installation(runtime)
-                .or_else(|| {
-                    self.runtimes
-                        .iter()
-                        .find(|installation| installation.runtime.kind == runtime)
-                })
                 .ok_or(RuntimeInventoryError::NoInstalledRuntime(runtime))?,
             Some(requested) => {
                 if requested.runtime().kind != runtime {
                     return Err(RuntimeInventoryError::NoCompatibleRuntime { runtime });
                 }
                 match mode {
-                    ExecutionSelectionMode::NewColdBoot => self
-                        .default_or_first_compatible(driver, runtime, requested, mode)?
-                        .ok_or(RuntimeInventoryError::NoCompatibleRuntime { runtime })?,
+                    ExecutionSelectionMode::NewColdBoot => {
+                        let selected = self
+                            .default_installation(runtime)
+                            .ok_or(RuntimeInventoryError::NoCompatibleRuntime { runtime })?;
+                        if !driver.can_execute(selected, requested, mode)? {
+                            return Err(RuntimeInventoryError::NoCompatibleRuntime { runtime });
+                        }
+                        selected
+                    }
                     ExecutionSelectionMode::ExistingColdBoot => {
                         let installation = self
                             .runtimes
@@ -1023,6 +1074,7 @@ fn component_metadata_identity(
 fn version_from_dir(path: &Path) -> Option<RuntimeVersion> {
     path.file_name()
         .and_then(|value| value.to_str())
+        .map(crate::catalog::artifact_label)
         .and_then(|value| RuntimeVersion::parse(value.strip_prefix('v').unwrap_or(value)).ok())
 }
 
@@ -1135,12 +1187,6 @@ fn discover_kernels(root: &Path) -> Result<Vec<KernelInstallation>, RuntimeInven
                 .is_some_and(|legacy_default| canonical_path.as_ref() == Some(legacy_default)),
         ));
     }
-    if kernels.is_empty() {
-        // Every candidate that could not be read transiently already returned
-        // above, so an empty list here means the node genuinely has no usable
-        // kernel installation — a terminal verdict.
-        return Err(RuntimeInventoryError::Empty(root.to_path_buf()));
-    }
     Ok(kernels)
 }
 
@@ -1149,7 +1195,7 @@ fn discover_legacy_kernels(
 ) -> Result<Vec<KernelInstallation>, RuntimeInventoryError> {
     let kernel = asset_root.join("default/kernel/vmlinux.bin");
     if !probe_inventory_path(&kernel)?.is_some_and(|metadata| metadata.is_file()) {
-        return Err(RuntimeInventoryError::IncompleteKernelInstallation(kernel));
+        return Ok(Vec::new());
     }
     let digest = sha256_file(&kernel)?;
     let digest_hex = digest.hex_string();

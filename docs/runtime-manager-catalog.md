@@ -2,8 +2,9 @@
 
 The compiled catalog pins installable Firecracker releases and guest kernels for
 both `x86_64` and `aarch64`. Installing an artifact does not select it as a node's
-default. Execution continues to use the image-provided Firecracker 1.15.1 /
-Linux 6.1.155 pair.
+default. Node-manager selects compiled E0 (Firecracker 1.15.1 / Linux 6.1.155)
+for new work and stock legacy fallback. Verified managed copies can supply this
+binding; other installed candidates remain outside execution discovery.
 
 | Firecracker | Snapshot format | Kernel options | Upstream kernel directory |
 | --- | --- | --- | --- |
@@ -57,49 +58,63 @@ node-manager. Existing files must match the SHA-256 pin before a new install
 reports them as already provided. An MD5, when published, is checked as an
 additional transfer checksum.
 
-## Install/delete prototype and rollout
+## Managed E0 execution and rollout
 
-Execution keeps reading the existing image-provided Firecracker and kernel
-paths, including their default/legacy aliases and cache copies. The managed
-store at `/space/vendor/artifacts/{firecracker,kernels}` is separate: launch/build/
-restore discovery and control-plane execution inventory do not read it. There
-is no activation API, selection database, bootstrap reconciler or new runtime
-backend. The store deliberately does not reuse `/space/vendor/node`, which
-earlier prototype images linked into execution roots. Installing candidates does not establish that a workload boots or
-restores successfully with them.
+The managed store at `/space/vendor/artifacts/{firecracker,kernels}` is separate
+from external vendor layouts. Releases occupy `v<version>--<release-digest-hex>`
+and kernels `<version>--<kernel-digest-hex>`. Release identity hashes the pinned
+binary names and hashes in layout order; it is not the download-archive hash.
+Different builds sharing a label occupy different directories. The approved
+catalog still admits one executable runtime identity per version/platform.
 
-Node-manager creates missing managed directories without moving, re-owning or
-linking any execution artifact. It is the only writer of the managed store.
-Runtime-manager downloads into `/space/cache/.rtmgr-staging`; node-manager
-copies verified bytes into fresh root-owned files under an interprocess lock.
-Uninstall addresses an immutable identity within that store only. Any managed
-copy whose required files can be measured and match the requested digest can be
-removed, including copies of Firecracker 1.15.1 / Linux 6.1.155 and the last
-candidate. Execution files and aliases are outside that store and cannot be
-removed through this API.
+Node-manager owns the compiled E0 binding without a selection database or
+activation RPC. On x86_64 its runtime release digest is
+`sha256:7225701e6d651bb351c6858e3587994fb75a9932fb16d744dfec30fb8bfdd027`;
+its kernel digest is
+`sha256:e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2`.
+Runtime-manager stages downloads unprivileged under `/space/cache/.rtmgr-staging`.
+Node-manager independently checks catalog pins and copies bytes into fresh
+root-owned files under an interprocess store lock. Installing candidates does
+not qualify or select them.
 
-A missing required file or unreadable identity needs operator repair; reinstall
-never overwrites a conflicting directory. First disable management and stop its
-worker, then let any in-flight node-manager artifact RPC finish. With exclusive
-access to the affected store root's directory `flock` (the same lock node-manager
-uses), remove only the damaged version directory beneath that managed root.
-Never remove the root itself, replace its inode, or touch execution files or
-aliases. Release the lock, restart management, and resubmit the install. This
-manual recovery requires host-administrator access; the ordinary API deliberately
-cannot delete a directory without evidence of its identity.
+Execution discovery verifies E0 binaries, preferring a managed copy over an
+identical baked copy. It stages managed E0's kernel as a real, independently
+verified file under `/space/cache/firecracker/managed/kernels`, on the jail
+filesystem. It does not rewrite image aliases or adopt external files. Supported
+explicit historical runtime/component bindings remain resolvable from external
+layouts; absent kernel metadata binds by E0 digest rather than a mutable alias.
+An empty inventory can be reported, but cannot resolve a launch. New cold boots
+never fall back to the newest installed candidate.
 
-Fresh images bake the fixed pair into the execution layout and leave the
-managed store empty. Existing images need only the new account, protected
-state/staging directories and matching services. No filesystem adoption or
-prototype ownership import runs. If an earlier prototype granted runtime-manager
-write access to execution artifacts, its startup audit disables management and
-reports the unsafe paths. Execution is not gated on this audit. Track these
-images for replacement before enabling downloads. Disabling management does not revoke the account's existing write authority over execution
-files; it only keeps the installer disabled. Any alternative repair needs its
-own ownership handoff design; recursively changing ownership of live files is
-insufficient when another process may retain writable descriptors. Node-manager
-also refuses mutations if execution roots resolve into the managed store, as
-on an earlier prototype image. It does not rewrite those links or gate launches.
+Publication invalidates and rebuilds the executable snapshot after staging.
+Failed staging leaves the artifact installed and reports unusable execution;
+later inventory requests retry reconstruction. Service restart discovers the
+durable store again. Cached inventory checks file metadata before reuse; cache
+loss forces reconstruction without downloading. Existing valid cache files are
+verified and reused, never overwritten or pruned under running jails.
+
+Node-manager refuses removal of E0 identities even with empty inventory or after
+restart. Other managed candidates remain removable because they cannot execute
+from that store. External execution files cannot be removed through the API.
+Removing E0 in place is not a supported upgrade mechanism.
+
+Deploy on baked images first. Upgrade node-manager and runtime-manager together,
+with artifact mutations quiesced during the layout transition: an old publisher
+or remover does not understand the new layout/protection contract. Old prototype
+version-only managed copies are not adopted into execution. Reinstall through the
+new services to create digest-addressed copies; retain the old copies until a
+separate operator cleanup. Do not treat an old completed operation's path as
+proof that the digest-addressed copy exists. No bootstrap reconciler, placement
+enforcement, builder selection API or image-payload removal is introduced here.
+Those are subsequent rollout stages.
+
+A damaged selected identity fails closed rather than being overwritten. Repair
+requires host-administrator ownership of the affected node, quiesced artifact
+mutations and execution users, and the store/cache lock appropriate to the
+operation. Do not remove a root, replace its inode, modify a kernel linked into a
+jail, or recursively re-own live files. Runtime-manager never acquires write
+access to execution files. Unsafe/overlapping roots require provisioning repair;
+node-manager does not rewrite links to make them pass.
 
 Deploy node-manager support before enabling mutations. During a partial rollout,
 old node-manager RPCs or catalog entries may reject requests. Runtime-manager's
@@ -124,8 +139,8 @@ separately and does not replace a completed mutation or permanent refusal.
 The lifecycle API is `ListAvailableArtifacts`, `InstallArtifact`, and
 `UninstallArtifact`. Identities distinguish runtime releases from components;
 both carry a version and digest. Runtime compatibility is separate from identity.
-The Firecracker adapter has one kernel slot per version and refuses conflicting
-bytes. Availability presence only reports a local slot; mutation rechecks the
+Managed storage includes the digest in each slot name; catalog approval remains
+separate from storage identity. Availability presence only reports a local slot; mutation rechecks the
 bytes against the identity at node-manager. CLI `runtimes`, `kernels`, and
 `components` are conveniences over the same API. The kernel shorthand refuses
 ambiguous versions; explicit component operations take a digest.
@@ -141,16 +156,20 @@ space-rtmgr kernels uninstall 6.18.44
 space-rtmgr runtimes uninstall fc-1.17.0
 ```
 
-Acceptance must cover both a fresh image and an upgrade from the currently
-supported image. Before and after install, repeat install, delete, lost-reply
-retry, runtime-manager restart/outage and host reboot, verify:
+Acceptance must cover both a fresh baked image and an upgrade from the currently
+supported image. Before and after install, repeat install, candidate removal,
+lost-reply retry, runtime-manager restart/outage and host reboot, verify:
 
 - New launches and builds still resolve the original pair; existing sandboxes
   and compatible snapshot restores keep working.
-- Execution aliases, bytes and published execution inventory are unchanged.
-- Managed artifacts survive reboot; deleting all managed candidates works.
-- An unavailable/unsafe managed store refuses management without blocking
-  execution. Diagnostics identify the cause and operator retry is explicit.
+- External execution aliases and bytes are unchanged. Published execution paths
+  may move to verified managed copies of the same E0 identity.
+- Managed artifacts survive reboot; unselected candidates can be removed, while
+  E0 removal is rejected even after restart or cache loss.
+- A bad unselected candidate does not disable E0. A damaged selected artifact
+  fails execution closed; diagnostics identify the cause and repair is explicit.
+- Cache loss reconstructs managed E0 without downloads, preserves existing jail
+  inodes, and permits subsequent execution.
 - Disabling runtime-manager leaves execution usable. Rollback uses the supported
   deployment path and does not roll back or reinterpret prototype database state.
 

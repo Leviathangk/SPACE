@@ -338,6 +338,61 @@ pub fn release_digest<'a>(binaries: impl IntoIterator<Item = (&'a str, Digest)>)
     Digest::sha256(Sha256::digest(text.as_bytes()).into())
 }
 
+/// Managed directories include the immutable content identity. The version is
+/// only a diagnostic label; a different build never overwrites an older one.
+pub fn artifact_directory(version: &str, digest: Digest) -> String {
+    format!("{version}--{}", digest.hex_string())
+}
+
+/// Strip a managed identity suffix without interpreting arbitrary version text
+/// containing `--` as a digest-addressed directory.
+pub fn artifact_label(name: &str) -> &str {
+    match name.rsplit_once("--") {
+        Some((label, digest))
+            if digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            label
+        }
+        _ => name,
+    }
+}
+
+/// The immutable stock environment. Selection does not depend on mutable
+/// aliases or on which other approved artifacts happen to be installed.
+#[derive(Clone, Debug)]
+pub struct InitialEnvironment {
+    pub release: PinnedRelease,
+    pub kernel: PinnedKernel,
+}
+
+impl InitialEnvironment {
+    pub fn for_architecture(architecture: Arch) -> Result<Self, CatalogError> {
+        use pplx_space_common_core::types::{
+            INITIAL_FIRECRACKER_KERNEL_VERSION, INITIAL_FIRECRACKER_RUNTIME_VERSION,
+        };
+        let catalog = RuntimeCatalog::compiled()?;
+        let release = catalog
+            .releases(RuntimeKind::Firecracker, architecture)
+            .find(|pin| pin.release.version.as_str() == INITIAL_FIRECRACKER_RUNTIME_VERSION);
+        let kernel = catalog.kernels.iter().find(|pin| {
+            pin.architecture == architecture
+                && pin.runtime == RuntimeKind::Firecracker
+                && pin.version.as_str() == INITIAL_FIRECRACKER_KERNEL_VERSION
+        });
+        match (release, kernel) {
+            (Some(release), Some(kernel)) => Ok(Self {
+                release: release.clone(),
+                kernel: kernel.clone(),
+            }),
+            _ => Err(CatalogError::Compiled {
+                entry: format!("initial environment {architecture}"),
+                field: "platform",
+                value: "missing initial environment pins",
+            }),
+        }
+    }
+}
+
 /// Why the catalog could not be loaded. Loading fails closed: a catalog
 /// directory or file another account could write is refused, not skipped.
 #[derive(Debug, thiserror::Error)]

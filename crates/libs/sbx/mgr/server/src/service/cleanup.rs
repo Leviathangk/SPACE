@@ -2579,7 +2579,7 @@ impl SandboxManagerService {
         }
         // Recheck immediately before the persistence-failure escape hatch. A
         // failed/unknown ownership read must never become permission to delete.
-        {
+        let row_missing = {
             let db = self
                 .db
                 .lock()
@@ -2588,11 +2588,40 @@ impl SandboxManagerService {
             crate::db::cleanup_episode(&db, sandbox_id).map_err(|_| {
                 Status::unavailable("cleanup ownership cannot be decoded; retain resources")
             })?;
-        }
+            request.completion == CleanupCompletion::DeleteRow
+                && crate::db::current_state_label(&db, sandbox_id)
+                    .map_err(|error| {
+                        Status::unavailable(format!(
+                            "inspect sandbox after unpersisted delete: {error}"
+                        ))
+                    })?
+                    .is_none()
+        };
         self.cancel_route_streams_for_generation(
             parsed_sandbox_id,
             admission.expected_execution_generation(parsed_sandbox_id)?,
         )?;
+        if row_missing {
+            // A late legacy Delete can arrive after durable deletion removed
+            // the row. Durable DeleteRow completes only after node-manager
+            // verified the canonical cache directory absent, so a missing row
+            // with no cache directory is completed deletion: not authority to
+            // send an unfenced node cleanup or acknowledge it. A rowless
+            // sandbox whose cache directory remains was selected from disk and
+            // is not deleted; keep it retryable rather than reporting success.
+            let cache_dir = self.sandbox_cache_root().join(sandbox_id);
+            return match std::fs::symlink_metadata(&cache_dir) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Ok(_) => Err(Status::unavailable(format!(
+                    "sandbox {sandbox_id} has no row but {} remains; retain resources",
+                    cache_dir.display()
+                ))),
+                Err(error) => Err(Status::unavailable(format!(
+                    "inspect rowless sandbox cache {}: {error}; retain resources",
+                    cache_dir.display()
+                ))),
+            };
+        }
         node_dispatch().await
     }
 

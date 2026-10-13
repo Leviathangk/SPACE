@@ -381,17 +381,27 @@ path differs from its unprivileged path, for example one that switches to
 another uid only when it can: in the unprivileged half it would pass without
 exercising its root assertions. Either list it in the group or split it into a
 root test there and an unprivileged test outside it. Make a privileged test
-assert its requirement rather than return early: an assertion fails the
-unprivileged half if the test is missing from the group, while an early
-return passes there without testing anything. Keep the group small; a test
-that needs privilege only for an incidental step should lose that step
-instead.
+assert its requirement rather than return early. For root, call
+`pplx_space_test_env::root_or_skip(...)` and return when it returns false:
+run locally without root, it prints a SKIPPED line, and when CI sets
+`SPACE_CI_REQUIRE_TEST_PRIVILEGE` to anything but empty or `0` it fails, so a
+test missing from the group fails the unprivileged half instead of passing
+there without testing anything. Keep the group small; a test that needs
+privilege only for an incidental step should lose that step instead.
 
 The group's filter has one clause per line. The job checks that each clause
 matches at least one test and that every test it matches is in the group, so
 a rename or typo fails CI rather than moving a test to the unprivileged half.
 The check cannot find a privileged test that no clause names; only that test's
 own assertion can.
+
+The split keeps ordinary tests from mutating the host by accident. It is not a
+trust boundary: the unprivileged half has the whole checkout read-write, so it
+can write everything the root half runs from. That is the target directory
+(the test binaries, nextest's metadata and the privileged test list) and the
+scripts and configuration the root half executes (`ci/scripts/run-rust-checks.sh`,
+`.config/nextest.toml` and the nextest setup scripts). A hostile test or build
+script in the unprivileged half still reaches root.
 
 The privileged half can reach whatever its host offers, and the unprivileged
 half can still reach the network, so tests must not touch host state they do
