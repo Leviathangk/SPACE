@@ -542,14 +542,63 @@ pub fn tcp_in_flight(active: usize) {
     );
 }
 
-/// Emitted exactly once for every TCP connection that reaches the proxy's
-/// per-connection handler. `detail` is the bounded detail within `status`.
-pub fn tcp_connection(status: &str, detail: &str) {
-    counter(
-        "gateway.tcp.connection",
-        1,
-        &[tag("status", status), tag("detail", detail)],
-    );
+/// Bounded protocol/library attributes. Identifiers and exact request counts belong in logs.
+#[derive(Debug, Default)]
+pub struct Termination<'a> {
+    pub phase: Option<&'a str>,
+    pub side: Option<&'a str>,
+    pub close: Option<&'a str>,
+    pub tls_alert: Option<&'a str>,
+    pub tls_alert_dir: Option<&'a str>,
+    pub tls_cert_error: Option<&'a str>,
+    pub h2_error_code: Option<&'a str>,
+    pub h2_origin: Option<&'a str>,
+    pub errno: Option<&'a str>,
+    pub http_lib_reason: Option<&'a str>,
+    pub error_type: Option<&'a str>,
+}
+
+impl Termination<'_> {
+    fn tags(&self) -> Vec<String> {
+        [
+            ("phase", self.phase),
+            ("side", self.side),
+            ("close", self.close),
+            ("tls_alert", self.tls_alert),
+            ("tls_alert_dir", self.tls_alert_dir),
+            ("tls_cert_error", self.tls_cert_error),
+            ("h2_error_code", self.h2_error_code),
+            ("h2_origin", self.h2_origin),
+            ("errno", self.errno),
+            ("http_lib_reason", self.http_lib_reason),
+            ("error.type", self.error_type),
+        ]
+        .into_iter()
+        .filter_map(|(key, value)| value.map(|value| tag(key, value)))
+        .collect()
+    }
+}
+
+/// Emitted exactly once per accepted TCP flow. Legacy `status`/`detail` remain
+/// unchanged for existing queries; `outcome` retains the specific transport or
+/// admission result. No sandbox, destination, or request-count tags are emitted.
+pub fn tcp_connection(
+    status: &str,
+    detail: &str,
+    outcome: &str,
+    guardrail_id: Option<&str>,
+    termination: &Termination<'_>,
+) {
+    let mut tags = termination.tags();
+    tags.extend([
+        tag("status", status),
+        tag("detail", detail),
+        tag("outcome", outcome),
+    ]);
+    if let Some(guardrail_id) = guardrail_id {
+        tags.push(tag("guardrail_id", guardrail_id));
+    }
+    counter("gateway.tcp.connection", 1, &tags);
 }
 
 /// One terminal inspection-admission outcome per accepted non-DNS TCP flow.

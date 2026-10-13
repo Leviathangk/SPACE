@@ -657,7 +657,44 @@ impl TcpProxy {
         flow: &flow::Flow,
     ) -> bool {
         let (status, detail) = outcome.metric_tags();
-        if let Some(failure) = flow.failure() {
+        let failure = flow.failure();
+        let codes = failure.map(|failure| failure.codes);
+        let h2_error_code = codes.and_then(|codes| codes.h2_error_code());
+        let errno = codes
+            .and_then(|codes| codes.errno)
+            .map(|errno| format!("{errno:?}"));
+        let error_type = codes.map(|codes| codes.error_type());
+        let termination = pplx_space_metrics::gateway::Termination {
+            phase: failure.map(|failure| failure.phase.as_str()),
+            side: failure.map(|failure| failure.side.as_str()),
+            close: codes.map(|codes| codes.close().as_str()),
+            tls_alert: codes.and_then(|codes| codes.alert_name()),
+            tls_alert_dir: codes
+                .and_then(|codes| codes.tls_alert)
+                .map(|(_, direction)| direction.as_str()),
+            tls_cert_error: codes.and_then(|codes| codes.tls_cert_error),
+            h2_error_code: h2_error_code.as_deref(),
+            h2_origin: codes
+                .and_then(|codes| codes.http)
+                .and_then(|http| http.h2_origin),
+            errno: errno.as_deref(),
+            http_lib_reason: codes.and_then(|codes| codes.http_lib_reason()),
+            error_type: error_type.as_deref(),
+        };
+        let specific_outcome = failure.map_or_else(
+            || match &outcome {
+                FlowOutcome::Rejected(Rejection::TlsInterception(error)) => error.as_str(),
+                _ => detail,
+            },
+            |failure| failure.outcome,
+        );
+        let guardrail_id = match &outcome {
+            FlowOutcome::Rejected(Rejection::Admission(TcpAdmissionDenial::DnsAttribution(
+                pplx_space_net_common::DenyReason::PlatformGuardrail { guardrail_id },
+            ))) => Some(*guardrail_id),
+            _ => None,
+        };
+        if let Some(failure) = failure {
             info!(
                 sandbox_id = self.sandbox_id,
                 destination_port = dst.port(),
@@ -679,7 +716,13 @@ impl TcpProxy {
                 "TCP flow ended"
             );
         }
-        pplx_space_metrics::gateway::tcp_connection(status, detail);
+        pplx_space_metrics::gateway::tcp_connection(
+            status,
+            detail,
+            specific_outcome,
+            guardrail_id,
+            &termination,
+        );
         let reported = if let (Some(host), Some(reason)) = (host, outcome.failure_reason()) {
             self.known_egress_state
                 .report_tcp_failure(self.sandbox_id, dst, host, reason.as_ref())
