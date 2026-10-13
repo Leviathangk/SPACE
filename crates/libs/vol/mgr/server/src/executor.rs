@@ -3527,13 +3527,17 @@ impl TransferExecutor {
     fn credential_error(&self, job: &Job, error: tonic::Status) -> JobError {
         let message = format!("credential exchange failed: {error}");
         match error.code() {
-            tonic::Code::InvalidArgument
-            | tonic::Code::PermissionDenied
-            | tonic::Code::Unauthenticated
-            | tonic::Code::NotFound => JobError::retriable(message),
             // The authority may report a failed STS role assumption as
             // FailedPrecondition. That is not necessarily invalid local input.
-            _ => self.dependency_error(job, message),
+            tonic::Code::Unavailable
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::ResourceExhausted
+            | tonic::Code::Internal
+            | tonic::Code::Unknown
+            | tonic::Code::Cancelled
+            | tonic::Code::Aborted
+            | tonic::Code::FailedPrecondition => self.dependency_error(job, message),
+            _ => JobError::retriable(message),
         }
     }
 

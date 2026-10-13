@@ -1041,6 +1041,10 @@ fn credential_outage_budget_does_not_extend_non_transient_or_pull_errors() {
         (tonic::Code::PermissionDenied, true),
         (tonic::Code::Unauthenticated, true),
         (tonic::Code::InvalidArgument, true),
+        (tonic::Code::NotFound, true),
+        (tonic::Code::OutOfRange, true),
+        (tonic::Code::Unimplemented, true),
+        (tonic::Code::DataLoss, true),
     ] {
         let error =
             executor.credential_error(&job, tonic::Status::new(code, "synthetic exchange failure"));
