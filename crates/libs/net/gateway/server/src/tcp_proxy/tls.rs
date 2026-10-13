@@ -442,15 +442,22 @@ impl TcpProxy {
                 };
                 tls_http::serve(downstream, binding, lease.clone(), flow.clone(), connect).await
             };
+            tokio::pin!(operation);
             let result = tokio::select! {
                 biased;
                 // These look identical to a client but have different
                 // operators: shutdown is ours to schedule, while an
                 // invalidated lease is the policy, identity or CA layer
                 // changing underneath a live session.
-                () = self.shutdown_token.cancelled() => Err(TlsTransportError::Withdrawn),
-                () = lease.invalidated() => Err(TlsTransportError::Invalidated),
-                result = operation => result,
+                () = self.shutdown_token.cancelled() => {
+                    flow.http_failed(&TlsTransportError::Withdrawn, Side::Downstream);
+                    Err(TlsTransportError::Withdrawn)
+                },
+                () = lease.invalidated() => {
+                    flow.http_failed(&TlsTransportError::Invalidated, Side::Downstream);
+                    Err(TlsTransportError::Invalidated)
+                },
+                result = &mut operation => result,
             };
             if result.is_ok() {
                 tracing::Span::current().record("otel.status_code", "OK");

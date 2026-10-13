@@ -601,6 +601,42 @@ pub fn tcp_connection(
     counter("gateway.tcp.connection", 1, &tags);
 }
 
+/// One start per inspected HTTP request, including requests refused by the gateway.
+pub fn http_request_started(protocol: &str) {
+    counter(
+        "gateway.http.request.started",
+        1,
+        &[tag("protocol", protocol)],
+    );
+}
+
+/// Exactly one ending per started request. Completion means the response body
+/// reached end-of-stream; an HTTP error status is still a completed response.
+/// Cancellation before headers and dropped response bodies count as aborted.
+/// Status source and credential injection are request-local, including on h2.
+pub fn http_request(
+    protocol: &str,
+    outcome: &str,
+    status: Option<u16>,
+    status_source: Option<&str>,
+    injected: bool,
+    termination: &Termination<'_>,
+) {
+    let mut tags = termination.tags();
+    tags.extend([
+        tag("protocol", protocol),
+        tag("outcome", outcome),
+        tag("injected", injected),
+    ]);
+    if let Some(status) = status {
+        tags.push(tag("http.response.status_code", status));
+    }
+    if let Some(source) = status_source {
+        tags.push(tag("status_source", source));
+    }
+    counter("gateway.http.request", 1, &tags);
+}
+
 /// One terminal inspection-admission outcome per accepted non-DNS TCP flow.
 pub fn inspection_admission(outcome: &str, reason: &str) {
     counter(

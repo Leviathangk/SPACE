@@ -56,19 +56,21 @@ impl Codes {
             TlsTransportError::Downstream(error) | TlsTransportError::Upstream(error) => {
                 Self::io(error)
             }
-            TlsTransportError::Http(error) => {
-                let h2 = cause::<h2::Error>(error);
-                let io = cause::<io::Error>(error).or_else(|| h2.and_then(h2::Error::get_io));
-                Self {
-                    http: Some(HttpFailure::classify(error)),
-                    ..io.map(Self::io).unwrap_or_default()
-                }
-            }
+            TlsTransportError::Http(error) => Self::error(error),
             TlsTransportError::Timeout => Self {
                 timeout: true,
                 ..Self::default()
             },
             _ => Self::default(),
+        }
+    }
+
+    pub(in crate::tcp_proxy) fn error(error: &(dyn std::error::Error + 'static)) -> Self {
+        let h2 = cause::<h2::Error>(error);
+        let io = cause::<io::Error>(error).or_else(|| h2.and_then(h2::Error::get_io));
+        Self {
+            http: cause::<hyper::Error>(error).map(HttpFailure::classify),
+            ..io.map(Self::io).unwrap_or_default()
         }
     }
 

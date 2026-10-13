@@ -23,7 +23,7 @@ use tokio_util::task::TaskTracker;
 use tracing::Instrument;
 
 use super::accounting::{Attempt, Outcome};
-use super::flow::{Flow, Side};
+use super::flow::{Flow, RequestErrors, Side, StatusSource};
 use super::http_host::HostBinding;
 use super::routing_headers::{SanitizedBody, SanitizedRequest};
 use super::tls::{HttpProtocol, TlsTransportError};
@@ -103,6 +103,7 @@ impl ReadySender<'_> {
 struct ForwardingBody {
     inner: Incoming,
     attempt: Attempt,
+    request_errors: Option<RequestErrors>,
 }
 
 impl ForwardingBody {
@@ -111,7 +112,11 @@ impl ForwardingBody {
         if inner.is_end_stream() {
             attempt.finish(Outcome::Success, "body_complete");
         }
-        Self { inner, attempt }
+        Self {
+            inner,
+            attempt,
+            request_errors: None,
+        }
     }
 }
 
@@ -125,7 +130,12 @@ impl HttpBody for ForwardingBody {
     ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
         let result = Pin::new(&mut self.inner).poll_frame(context);
         match &result {
-            Poll::Ready(Some(Err(_))) => self.attempt.finish(Outcome::Error, "body_error"),
+            Poll::Ready(Some(Err(error))) => {
+                if let Some(errors) = &self.request_errors {
+                    errors.observe(error, Side::Downstream);
+                }
+                self.attempt.finish(Outcome::Error, "body_error");
+            }
             Poll::Ready(None) => self.attempt.finish(Outcome::Success, "body_complete"),
             Poll::Ready(Some(Ok(_))) if self.inner.is_end_stream() => {
                 self.attempt.finish(Outcome::Success, "body_complete");
@@ -197,13 +207,21 @@ where
         let session = session.clone();
         let protocol = HttpProtocol::of(request.version());
         tracing::Span::current().record("protocol", protocol.as_str());
-        let progress = session.flow.request();
+        let mut progress = session.flow.request(protocol);
         let request = SanitizedRequest::try_from(request);
         async move {
             let response = match request {
-                Ok(request) => session.forward(request).await,
+                Ok(request) => session.forward(request, &mut progress).await,
                 Err(_) => session.refuse(protocol, "invalid_headers", StatusCode::BAD_REQUEST),
             };
+            progress.response(
+                response.status(),
+                response
+                    .extensions()
+                    .get::<StatusSource>()
+                    .copied()
+                    .unwrap_or(StatusSource::Upstream),
+            );
             Ok::<_, Infallible>(
                 response.map(|body| response_body::ResponseBody::new(body, progress)),
             )
@@ -351,6 +369,7 @@ where
         Self::record(protocol, reason, status);
         let mut response = Response::new(Either::Right(Empty::new()));
         *response.status_mut() = status;
+        response.extensions_mut().insert(StatusSource::Gateway);
         if protocol == HttpProtocol::Http1 {
             response
                 .headers_mut()

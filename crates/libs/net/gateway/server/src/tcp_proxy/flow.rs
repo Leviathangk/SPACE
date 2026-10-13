@@ -7,7 +7,9 @@ use parking_lot::Mutex;
 use super::tls::TlsTransportError;
 
 pub(super) mod codes;
+mod request;
 use codes::Codes;
+pub(super) use request::{Request, RequestErrors, StatusSource};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Side {
@@ -75,7 +77,6 @@ pub(super) struct Failure {
 #[derive(Default)]
 struct State {
     requests: Requests,
-    interrupted: Option<Requests>,
     failure: Option<Failure>,
 }
 
@@ -105,7 +106,7 @@ impl Flow {
 
     pub(super) fn failed(&self, error: &TlsTransportError, phase: Phase, side: Side) {
         let mut state = self.0.lock();
-        let requests = state.interrupted.unwrap_or(state.requests);
+        let requests = state.requests;
         state.observe(Failure {
             phase,
             side,
@@ -117,7 +118,7 @@ impl Flow {
 
     pub(super) fn http_failed(&self, error: &TlsTransportError, side: Side) {
         let mut state = self.0.lock();
-        let requests = state.interrupted.unwrap_or(state.requests);
+        let requests = state.requests;
         state.observe(Failure {
             phase: requests.phase(),
             side,
@@ -142,40 +143,8 @@ impl Flow {
         });
     }
 
-    pub(super) fn request(&self) -> Request {
+    pub(super) fn request(&self, protocol: super::tls::HttpProtocol) -> Request {
         self.0.lock().requests.in_flight += 1;
-        Request {
-            flow: self.clone(),
-            completed: false,
-        }
-    }
-}
-
-/// Moves from the service future into the response body. A dropped body must
-/// preserve the counts at interruption before Hyper drops the rest of a stream.
-pub(super) struct Request {
-    flow: Flow,
-    completed: bool,
-}
-
-impl Request {
-    pub(super) fn complete(&mut self) {
-        if !self.completed {
-            self.completed = true;
-            let mut state = self.flow.0.lock();
-            state.requests.in_flight -= 1;
-            state.requests.completed += 1;
-        }
-    }
-}
-
-impl Drop for Request {
-    fn drop(&mut self) {
-        if !self.completed {
-            let mut state = self.flow.0.lock();
-            let requests = state.requests;
-            state.interrupted.get_or_insert(requests);
-            state.requests.in_flight -= 1;
-        }
+        Request::new(self.clone(), protocol)
     }
 }

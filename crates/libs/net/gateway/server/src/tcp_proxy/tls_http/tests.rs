@@ -1317,3 +1317,132 @@ async fn untrusted_ca_preserves_the_alert_on_each_tls_leg() {
     assert_eq!(failure.codes.tls_alert.unwrap().1.as_str(), "sent");
     assert_eq!(failure.codes.tls_cert_error, Some("UnknownIssuer"));
 }
+
+#[tokio::test]
+async fn http2_stream_resets_end_requests_without_ending_the_connection() {
+    use http_body_util::BodyExt;
+    let (state, provider) = credential_provider(false).await;
+    let lease = provider
+        .get("allowed.test".parse().unwrap(), 443)
+        .await
+        .unwrap();
+    let binding = HostBinding::new(
+        "test",
+        "192.0.2.1:443".parse().unwrap(),
+        state,
+        Default::default(),
+    );
+    let (origin, origin_peer) = tokio::io::duplex(65536);
+    let (reset, mut reset_now) = tokio::sync::oneshot::channel();
+    let origin_task = tokio::spawn(async move {
+        let mut connection = h2::server::handshake(origin_peer).await.unwrap();
+        let mut streams = Vec::new();
+        let mut waiting = true;
+        loop {
+            tokio::select! {
+                _ = &mut reset_now, if waiting => {
+                    waiting = false;
+                    for mut stream in streams.drain(..) { h2::SendStream::send_reset(&mut stream, h2::Reason::CANCEL); }
+                }
+                request = connection.accept() => {
+                    let Some(request) = request else { break; };
+                    let (request, mut response) = request.unwrap();
+                    let mut stream = response.send_response(Response::builder().header(header::CONTENT_LENGTH, "4").body(()).unwrap(), false).unwrap();
+                    if request.uri().path() == "/reset" { streams.push(stream); }
+                    else { stream.send_data(Bytes::from_static(b"done"), true).unwrap(); }
+                }
+            }
+        }
+    });
+    let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+    let (guest, guest_peer) = tokio::io::duplex(65536);
+    let flow = Flow::default();
+    let gateway = tokio::spawn(serve(
+        guest,
+        binding,
+        lease,
+        flow.clone(),
+        move |_| async move { Ok((origin, HttpProtocol::Http2)) },
+    ));
+    let (mut sender, connection) = http2::handshake(TokioExecutor::new(), TokioIo::new(guest_peer))
+        .await
+        .unwrap();
+    let client = tokio::spawn(connection);
+    let mut responses = Vec::new();
+    for i in 0..20 {
+        let path = if i < 3 { "reset" } else { "public" };
+        responses.push(
+            sender
+                .send_request(
+                    Request::get(format!("https://allowed.test/{path}"))
+                        .body(Empty::<Bytes>::new())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    reset.send(()).unwrap();
+    let results =
+        futures_util::future::join_all(responses.into_iter().map(|r| r.into_body().collect()))
+            .await;
+    assert_eq!(results.iter().filter(|r| r.is_err()).count(), 3);
+    for body in results.into_iter().filter_map(Result::ok) {
+        assert_eq!(body.to_bytes(), "done");
+    }
+    let response = sender
+        .send_request(
+            Request::get("https://allowed.test/public")
+                .body(Empty::<Bytes>::new())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        "done"
+    );
+    drop(sender);
+    client.abort();
+    let _connection_result = tokio::time::timeout(Duration::from_secs(3), gateway)
+        .await
+        .unwrap()
+        .unwrap();
+    origin_task.await.unwrap();
+    assert!(
+        flow.failure().is_none(),
+        "stream resets must not become connection errors"
+    );
+    let metrics = capture.finish();
+    let endings = metrics
+        .iter()
+        .filter(|m| m.name == "gateway.http.request")
+        .collect::<Vec<_>>();
+    assert_eq!(endings.len(), 21);
+    assert_eq!(
+        metrics
+            .iter()
+            .filter(|m| m.name == "gateway.http.request.started")
+            .map(|m| m.value)
+            .sum::<u64>(),
+        21
+    );
+    let aborted = endings
+        .iter()
+        .filter(|m| m.tags.iter().any(|t| t == "outcome:aborted"))
+        .collect::<Vec<_>>();
+    assert_eq!(aborted.len(), 3);
+    for request in aborted {
+        for fact in [
+            "side:upstream",
+            "close:remote_reset",
+            "h2_error_code:CANCEL",
+        ] {
+            assert!(
+                request.tags.iter().any(|t| t == fact),
+                "{fact}: {:?}",
+                request.tags
+            );
+        }
+    }
+}

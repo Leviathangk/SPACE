@@ -5,13 +5,13 @@ use hyper::body::{Body, Frame, SizeHint};
 
 use super::super::flow::Request;
 
-pub(super) struct ResponseBody<B> {
-    inner: B,
+pub(super) struct ResponseBody {
+    inner: super::Body,
     request: Request,
 }
 
-impl<B: Body> ResponseBody<B> {
-    pub(super) fn new(inner: B, mut request: Request) -> Self {
+impl ResponseBody {
+    pub(super) fn new(inner: super::Body, mut request: Request) -> Self {
         if inner.is_end_stream() {
             request.complete();
         }
@@ -19,9 +19,9 @@ impl<B: Body> ResponseBody<B> {
     }
 }
 
-impl<B: Body + Unpin> Body for ResponseBody<B> {
-    type Data = B::Data;
-    type Error = B::Error;
+impl Body for ResponseBody {
+    type Data = <super::Body as Body>::Data;
+    type Error = <super::Body as Body>::Error;
 
     fn poll_frame(
         mut self: Pin<&mut Self>,
@@ -29,6 +29,10 @@ impl<B: Body + Unpin> Body for ResponseBody<B> {
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let result = Pin::new(&mut self.inner).poll_frame(cx);
         match &result {
+            Poll::Ready(Some(Err(error))) => self
+                .request
+                .errors()
+                .observe(error.as_ref(), super::super::flow::Side::Upstream),
             Poll::Ready(None) => self.request.complete(),
             Poll::Ready(Some(Ok(_))) if self.inner.is_end_stream() => self.request.complete(),
             _ => {}
