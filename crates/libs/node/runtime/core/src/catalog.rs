@@ -27,6 +27,9 @@ use sha2::{Digest as _, Sha256};
 
 use crate::runtime_inventory::diagnostic::ReleaseLayout;
 
+mod environment;
+pub use environment::{InitialEnvironmentDefinitionError, ResolveEnvironmentError};
+
 /// The catalog file version this build reads.
 pub const CATALOG_SCHEMA: u32 = 1;
 

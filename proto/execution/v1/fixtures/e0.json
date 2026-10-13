@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "reference": "sha256:3168c96b5719ce62543ae53e6641a4eb80416a9f01e5585f6f76c3c70111fa0b",
+  "descriptor": {
+    "host": {
+      "os": "linux",
+      "architecture": "x86_64"
+    },
+    "guest": {
+      "os": "linux",
+      "architecture": "x86_64"
+    },
+    "runtime": {
+      "provider": "managed_release",
+      "release": {
+        "runtime": {
+          "kind": "firecracker",
+          "version": "1.15.1"
+        },
+        "digest": "sha256:7225701e6d651bb351c6858e3587994fb75a9932fb16d744dfec30fb8bfdd027",
+        "target": {
+          "os": "linux",
+          "architecture": "x86_64"
+        },
+        "layout": "firecracker_release_v1"
+      }
+    },
+    "backend": "kvm",
+    "boot": {
+      "profile": "linux_direct_v1",
+      "kernel": {
+        "kind": "kernel",
+        "version": "6.1.155",
+        "digest": "sha256:e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2"
+      }
+    },
+    "isolation": "hardware_vm",
+    "compatibility": {
+      "profile": "firecracker_snapshot_v1",
+      "state_format": {
+        "format": "firecracker-snapshot",
+        "version": "9.0.0"
+      }
+    }
+  }
+}
