@@ -44,6 +44,8 @@ use crate::{encrypted_volume, rootfs_dmcrypt};
 
 use super::{ALLOW_NODE_ADMIN_OR_SBXMGR, NodeManagerService};
 
+mod pool_drive_switch;
+
 /// Plaintext, reflinked-from-template rootfs file inside `instance/` — the
 /// dm-snapshot origin of the encrypted rootfs.
 const ROOTFS_ORIGIN_FILE: &str = "rootfs.ext4";
@@ -167,10 +169,14 @@ impl NodeManagerService {
             .inspect_err(|_| metric.failed(pplx_space_metrics::byok::PHASE_DEK))?;
 
         let prepared = if adoption.is_some() {
+            let drive = rootfs_dmcrypt::prepare_pool_drive_switch(sandbox_id, origin_path.clone())
+                .await
+                .map_err(|e| Status::internal(format!("prepare pool drive switch: {e}")))?;
+            pool_drive_switch::switch(&sandbox_id, &drive.mapper_path).await?;
             rootfs_dmcrypt::encrypt_pool_rootfs(
                 sandbox_id,
                 origin_path,
-                instance_dir.join(rootfs_dmcrypt::POOL_COW_FILE),
+                instance_dir.join(rootfs_dmcrypt::POOL_ROOTFS_FILE),
                 cow_path,
                 &plaintext_dek,
             )
@@ -198,9 +204,8 @@ impl NodeManagerService {
         }))
     }
 
-    /// Warm-pool member shape: the same composite, over a plaintext COW.
-    /// No DEK is fetched — at fill time the member has no owner, so there is
-    /// no org whose key could be used.
+    /// Keep a reflink of the original rootfs for a later BYOK claim. The warm
+    /// VM writes its ordinary file and needs no device-mapper stack.
     pub(super) async fn prepare_snapshot_rootfs(
         &self,
         request: Request<PrepareSnapshotRootfsRequest>,
@@ -234,11 +239,6 @@ impl NodeManagerService {
         sandbox_id: SandboxId,
         adoption: Option<crate::proto::PoolRootfsAdoption>,
     ) -> Result<Response<PrepareSnapshotRootfsResponse>, Status> {
-        // Counted before any request validation so the attempted/failed rate
-        // covers parameter rejections too; the guard's drop arm records them.
-        // The caller degrades a failure here to the plaintext rootfs file
-        // with only a warn log, so this series is the ONLY place a node whose
-        // pool fills all fail is visible.
         let metric = DeviceOpMetric::prepare(pplx_space_metrics::byok::OP_POOL_ROOTFS);
         let instance_dir = PathBuf::from(paths::sandbox_instance_dir(&sandbox_id.to_string()));
 
@@ -258,15 +258,9 @@ impl NodeManagerService {
                     "encrypted COW cannot be adopted as plaintext",
                 ));
             }
-            rootfs_dmcrypt::collapse_pool_rootfs(sandbox_id, origin_path, cow_path).await
+            rootfs_dmcrypt::adopt_plain_pool_rootfs(sandbox_id, origin_path, cow_path).await
         } else {
-            rootfs_dmcrypt::prepare_plaintext_snapshot(
-                &sandbox_id,
-                &origin_path,
-                &cow_path,
-                &encrypted_cow_path,
-            )
-            .await
+            rootfs_dmcrypt::retain_pool_origin(origin_path).await
         };
         let prepared = record_outcome(&metric, result)?;
 

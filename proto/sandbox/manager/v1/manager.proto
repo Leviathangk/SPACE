@@ -391,7 +391,7 @@ message CreateRequest {
   // Older callers omit these and receive the platform defaults.
   optional uint64 disk_io_max_operations_per_sec = 28;
   optional uint64 disk_io_max_bandwidth_mib_per_sec = 29;
-  // Internal pool-fill intent; guest writes use a convertible plaintext COW.
+  // Internal pool-fill intent; retain a pre-boot origin for claim-time encryption.
   bool encryptable_pool_member = 30;
 }
 

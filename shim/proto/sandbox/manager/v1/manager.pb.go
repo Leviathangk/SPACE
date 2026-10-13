@@ -1741,7 +1741,7 @@ type CreateRequest struct {
 	// Older callers omit these and receive the platform defaults.
 	DiskIoMaxOperationsPerSec   *uint64 `protobuf:"varint,28,opt,name=disk_io_max_operations_per_sec,json=diskIoMaxOperationsPerSec,proto3,oneof" json:"disk_io_max_operations_per_sec,omitempty"`
 	DiskIoMaxBandwidthMibPerSec *uint64 `protobuf:"varint,29,opt,name=disk_io_max_bandwidth_mib_per_sec,json=diskIoMaxBandwidthMibPerSec,proto3,oneof" json:"disk_io_max_bandwidth_mib_per_sec,omitempty"`
-	// Internal pool-fill intent; guest writes use a convertible plaintext COW.
+	// Internal pool-fill intent; retain a pre-boot origin for claim-time encryption.
 	EncryptablePoolMember bool `protobuf:"varint,30,opt,name=encryptable_pool_member,json=encryptablePoolMember,proto3" json:"encryptable_pool_member,omitempty"`
 	unknownFields         protoimpl.UnknownFields
 	sizeCache             protoimpl.SizeCache

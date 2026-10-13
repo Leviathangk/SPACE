@@ -90,6 +90,7 @@ impl Backing {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn create(path: &Path) -> io::Result<Self> {
         Self::open_with(path, OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL)?
             .ok_or_else(|| io::Error::other("new backing disappeared"))
