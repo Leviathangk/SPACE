@@ -42,7 +42,6 @@ pub(crate) use operations::{
     OperationState, SubmitOperationError,
 };
 pub use operations::{InstallLimits, OpenInstallerError};
-pub(crate) use pplx_space_node_runtime_core::artifact_store::release_directory;
 pub(crate) use publisher::{DirectoryCatalog, NodeManagerPublisher, PinSource};
 pub(crate) use release::ReleaseContext;
 pub use release_source::{

@@ -1,8 +1,8 @@
 //! The node's artifact store: publishing runtime releases and guest kernels
 //! the runtime manager staged, and removing them.
 //!
-//! Node-manager is the store's only writer. Execution does not read this
-//! store. Node-manager decides what gets in: it loads the catalog's pins
+//! Node-manager is the store's only writer and exposes only the compiled E0
+//! binding to execution. It decides what gets in: it loads the catalog's pins
 //! itself for every request and publishes only bytes that match them (see
 //! [`pplx_space_node_runtime_core::artifact_store`]). The runtime manager
 //! names an artifact by what it is, never by a path. A catalog that cannot
@@ -15,7 +15,7 @@ use pplx_space_node_runtime_core::artifact_store::{
     ArtifactStore, Publication, PublishError, PublishOutcome, RemoveError, RemoveOutcome,
     StagedName,
 };
-use pplx_space_node_runtime_core::catalog::RuntimeCatalog;
+use pplx_space_node_runtime_core::catalog::{InitialEnvironment, RuntimeCatalog};
 use tonic::{Request, Response, Status};
 
 use crate::proto::{
@@ -42,6 +42,25 @@ enum Artifact {
 }
 
 impl Artifact {
+    fn belongs_to_initial(&self, initial: &InitialEnvironment) -> bool {
+        match self {
+            Self::Release(release, digest) => {
+                *release == initial.release.release && *digest == initial.release.digest()
+            }
+            Self::Kernel(_, digest) => *digest == initial.kernel.sha256,
+        }
+    }
+
+    fn check_removal(&self, initial: &InitialEnvironment) -> Result<(), Status> {
+        // E0 remains protected even without discovered inventory or after restart.
+        if self.belongs_to_initial(initial) {
+            Err(Status::failed_precondition(
+                "artifact belongs to the compiled E0 execution environment",
+            ))
+        } else {
+            Ok(())
+        }
+    }
     fn parse(artifact: Option<&NodeArtifact>) -> Result<Self, Status> {
         match artifact.and_then(|artifact| artifact.artifact.as_ref()) {
             Some(node_artifact::Artifact::RuntimeRelease(release)) => {
@@ -82,6 +101,45 @@ impl Artifact {
             None => Err(Status::invalid_argument("name the artifact")),
         }
     }
+}
+
+pub(super) fn execution_inventory(
+    paths: &crate::config::RuntimePaths,
+) -> Result<super::RuntimeInventory, Status> {
+    if execution_roots_overlap(paths)
+        .map_err(|error| Status::failed_precondition(describe(&error)))?
+    {
+        tracing::warn!(
+            "managed provisioning disabled; retaining prototype external execution until layout migration"
+        );
+        return super::RuntimeInventory::discover(
+            [
+                pplx_space_node_runtime_core::runtime_inventory::RuntimeInstallationRoot::new(
+                    pplx_space_common_core::types::RuntimeKind::Firecracker,
+                    &paths.vendor,
+                ),
+            ],
+            &paths.assets,
+            &paths.kernels,
+        )
+        .map_err(super::RuntimeInventoryError::into_status);
+    }
+    let initial = InitialEnvironment::for_architecture(host_arch()?)
+        .map_err(|error| Status::failed_precondition(describe(&error)))?;
+    let store = ArtifactStore::new(
+        &paths.store.releases,
+        &paths.store.kernels,
+        &paths.store.staging,
+        MAX_ARTIFACT_FILE_BYTES,
+    );
+    super::RuntimeInventory::discover_with_store(
+        &store,
+        &initial,
+        &paths.vendor,
+        &paths.assets,
+        &paths.kernels,
+    )
+    .map_err(super::RuntimeInventoryError::into_status)
 }
 
 fn host_arch() -> Result<Arch, Status> {
@@ -131,9 +189,19 @@ fn remove_status(error: RemoveError) -> Status {
 }
 
 /// Earlier prototype images linked execution roots into the store. Refuse
-/// mutations there without changing launch behavior. Root-owned deployment
+/// mutations there while retaining the existing external execution path. Root-owned deployment
 /// configuration is stable during a mutation; recheck it on each request.
 fn separate_store(paths: &crate::config::RuntimePaths) -> Result<(), std::io::Error> {
+    if execution_roots_overlap(paths)? {
+        Err(std::io::Error::other(
+            "execution and managed artifact roots overlap; repair provisioning before managing artifacts",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn execution_roots_overlap(paths: &crate::config::RuntimePaths) -> Result<bool, std::io::Error> {
     fn resolve(path: &std::path::Path) -> Result<std::path::PathBuf, std::io::Error> {
         match std::fs::canonicalize(path) {
             Ok(path) => Ok(path),
@@ -163,13 +231,11 @@ fn separate_store(paths: &crate::config::RuntimePaths) -> Result<(), std::io::Er
         ] {
             let execution = resolve(execution)?;
             if execution.starts_with(&managed) || managed.starts_with(&execution) {
-                return Err(std::io::Error::other(
-                    "execution and managed artifact roots overlap; repair provisioning before managing artifacts",
-                ));
+                return Ok(true);
             }
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 impl NodeManagerService {
@@ -245,10 +311,7 @@ impl NodeManagerService {
         let store = self.artifact_store();
         let paths = self.runtime_paths.clone();
         let catalog_dir = self.runtime_paths.store.catalog.clone();
-        let slot = self.artifact_slot()?;
-        let publication: Publication = self
-            .off_runtime("publish artifact", move || {
-                let _slot = slot;
+        let publication = self.publish_artifact_work(artifact.clone(), move || {
                 separate_store(&paths)
                     .map_err(|error| Status::failed_precondition(describe(&error)))?;
                 let catalog = RuntimeCatalog::load(&catalog_dir)
@@ -281,13 +344,56 @@ impl NodeManagerService {
                         store.publish_kernel(pin, &staged).map_err(publish_status)
                     }
                 }
-            })
-            .await?;
+            }).await?;
         Ok(Response::new(PublishArtifactResponse {
             path: publication.path.to_string_lossy().into_owned(),
             digest: publication.digest.to_string(),
             already_present: publication.outcome == PublishOutcome::AlreadyPresent,
         }))
+    }
+
+    async fn publish_artifact_work(
+        &self,
+        artifact: Artifact,
+        publish: impl FnOnce() -> Result<Publication, Status> + Send + 'static,
+    ) -> Result<Publication, Status> {
+        let initial = InitialEnvironment::for_architecture(host_arch()?)
+            .map_err(|error| Status::failed_precondition(describe(&error)))?;
+        let affects_execution = artifact.belongs_to_initial(&initial);
+        let slot = self.artifact_slot()?;
+        // Serialize selected publication with discovery, while readers keep the
+        // previous immutable snapshot. Candidates never contend with discovery.
+        let guard = if affects_execution {
+            Some(
+                self.runtime_inventory_refresh_lock
+                    .clone()
+                    .lock_owned()
+                    .await,
+            )
+        } else {
+            None
+        };
+        let snapshot = self.runtime_inventory.clone();
+        let paths = self.runtime_paths.clone();
+        self.off_runtime("publish artifact", move || {
+            let _slot = slot;
+            let _guard = guard;
+            let publication = publish()?;
+            let unchanged = publication.outcome == PublishOutcome::AlreadyPresent
+                && snapshot.load_full().is_some_and(|inventory| inventory.files_unchanged());
+            if affects_execution && !unchanged {
+                // Build first, then swap. E0 verification failures withdraw only
+                // that binding; a scan failure prevents advertising stale state.
+                match execution_inventory(&paths) {
+                    Ok(inventory) => snapshot.store(Some(std::sync::Arc::new(inventory))),
+                    Err(error) => {
+                        snapshot.store(None);
+                        tracing::warn!(%error, "artifact published but execution discovery is unavailable");
+                    }
+                }
+            }
+            Ok(publication)
+        }).await
     }
 
     pub(super) async fn remove_artifact(
@@ -296,9 +402,15 @@ impl NodeManagerService {
     ) -> Result<Response<RemoveArtifactResponse>, Status> {
         self.authorize_peer(&request, "RemoveArtifact", ALLOW_ROOT_OR_RTMGR)?;
         let artifact = Artifact::parse(request.get_ref().artifact.as_ref())?;
+        artifact.check_removal(
+            &InitialEnvironment::for_architecture(host_arch()?)
+                .map_err(|error| Status::failed_precondition(describe(&error)))?,
+        )?;
         let store = self.artifact_store();
         let paths = self.runtime_paths.clone();
         let slot = self.artifact_slot()?;
+        // Only unselected candidates reach removal. Neither external files
+        // nor E0 can be removed, so executable inventory is unaffected.
         let outcome = self
             .off_runtime("remove artifact", move || {
                 let _slot = slot;

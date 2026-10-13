@@ -83,6 +83,8 @@ mount_space_cache_nvme_if_available() {
   mkdir -p /space/cache/firecracker/{templates,sandboxes,jails,builds}
   chown -R root:space-cache-rw /space/cache 2>/dev/null || true
   chmod -R 2775 /space/cache
+  # Cache services must not displace root-owned kernel/cache namespaces.
+  chmod +t /space/cache /space/cache/firecracker
   chown root:root /space/cache/firecracker/jails
   chmod 0755 /space/cache/firecracker/jails
   df -Th /space/cache

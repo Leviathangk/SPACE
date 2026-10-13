@@ -1,8 +1,7 @@
 //! The node's store of runtime releases and guest kernels, and the only way
 //! anything is published into it or removed from it.
 //!
-//! The store is root-owned: `<releases>/v<version>/bin/…` and
-//! `<kernels>/<version>/vmlinux.bin`. Execution does not discover these roots. The runtime manager, which downloads and unpacks
+//! The store is root-owned and digest-addressed. The runtime manager, which downloads and unpacks
 //! releases and kernels unprivileged, stages them in its own directory; the
 //! store copies the staged bytes into a root-owned temporary directory,
 //! hashing them as it goes, and publishes them only if every byte matches the
@@ -25,9 +24,9 @@
 //! `<runtime>/kernels/<staged>/` (see [`release_staging`] and
 //! [`kernel_staging`]), so other artifact kinds can share the root later.
 //!
-//! Every verified managed copy may be removed, including a copy of the
-//! image-provided version. Execution roots and their aliases are separate;
-//! callers must refuse overlapping roots before mutating this store.
+//! The privileged service must guard removal of executable identities. This
+//! filesystem layer enforces byte identity, not execution policy. External
+//! execution roots and aliases remain outside its mutation authority.
 
 use std::io::{Read as _, Write as _};
 use std::os::fd::OwnedFd;
@@ -40,7 +39,7 @@ use pplx_space_common_core::types::{ArtifactVersion, Digest, RuntimeIdentity, Ru
 use rustix::fs::{Mode, OFlags};
 use sha2::{Digest as _, Sha256};
 
-use crate::catalog::{PinnedKernel, PinnedRelease};
+use crate::catalog::{PinnedKernel, PinnedRelease, artifact_directory};
 
 /// A kernel's image within its directory.
 pub const KERNEL_IMAGE: &str = "vmlinux.bin";
@@ -93,6 +92,14 @@ fn lock_root_with(
 /// The directory a release occupies in its root: `v<version>`.
 pub fn release_directory(release: &RuntimeIdentity) -> String {
     format!("v{}", release.version)
+}
+
+pub fn managed_release_directory(release: &RuntimeIdentity, digest: Digest) -> String {
+    artifact_directory(&release_directory(release), digest)
+}
+
+pub fn managed_kernel_directory(version: &ArtifactVersion, digest: Digest) -> String {
+    artifact_directory(version.as_str(), digest)
 }
 
 /// The name of a staging directory the runtime manager prepared: one path
@@ -287,6 +294,126 @@ impl ArtifactStore {
         &self.kernels_root
     }
 
+    /// Verify a managed release before exposing its binaries to execution.
+    /// No subprocess is needed to establish the approved release identity.
+    pub fn verify_release(&self, pin: &PinnedRelease) -> Result<Publication, PublishError> {
+        check_root(&self.releases_root, self.owner)
+            .map_err(|(path, problem)| PublishError::UnsafeRoot { path, problem })?;
+        let _locked = lock_root(&self.releases_root)
+            .map_err(|source| io_publish("lock", &self.releases_root, source))?;
+        let target = self
+            .releases_root
+            .join(managed_release_directory(&pin.release, pin.digest()));
+        self.verify_release_at(pin, &target)
+    }
+
+    /// Verify a baked release without adopting or changing its files.
+    pub fn verify_release_at(
+        &self,
+        pin: &PinnedRelease,
+        target: &Path,
+    ) -> Result<Publication, PublishError> {
+        check_root(&target.join("bin"), self.owner)
+            .map_err(|(path, problem)| PublishError::UnsafeRoot { path, problem })?;
+        let files: Vec<_> = pin
+            .binaries
+            .iter()
+            .map(|binary| PlannedFile {
+                path: binary.path,
+                sha256: binary.sha256,
+                size: None,
+                mode: 0o755,
+            })
+            .collect();
+        self.already_present(target, &files, pin.digest(), RootProtection::Store)
+    }
+
+    /// Validate a baked E0 kernel in place without adopting its inode.
+    pub fn verify_kernel_at(
+        &self,
+        pin: &PinnedKernel,
+        image: &Path,
+    ) -> Result<Publication, PublishError> {
+        let directory = image.parent().ok_or_else(|| PublishError::TargetDiffers {
+            path: image.to_path_buf(),
+        })?;
+        self.already_present(
+            directory,
+            &[PlannedFile {
+                path: KERNEL_IMAGE,
+                sha256: pin.sha256,
+                size: Some(pin.size),
+                mode: 0o644,
+            }],
+            pin.sha256,
+            RootProtection::ExecutionCache,
+        )
+    }
+
+    /// Create an isolated execution-cache namespace below a protected or
+    /// sticky root-owned parent. Never repair ownership of existing paths.
+    pub fn prepare_execution_cache(&self, parent: &Path) -> Result<PathBuf, PublishError> {
+        check_directories(parent, self.owner, true, true)
+            .map_err(|(path, problem)| PublishError::UnsafeRoot { path, problem })?;
+        let managed = parent.join("managed");
+        let kernels = managed.join("kernels");
+        for directory in [&managed, &kernels] {
+            match std::fs::DirBuilder::new().mode(0o755).create(directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(source) => return Err(io_publish("create execution cache", directory, source)),
+            }
+            RootProtection::ExecutionCache.check(directory, self.owner)?;
+        }
+        Ok(kernels)
+    }
+
+    /// Publish a verified, independent kernel inode onto the execution cache
+    /// filesystem. The caller supplies a protected cache root, never a path
+    /// from an RPC. Existing copies are verified and never overwritten.
+    pub fn stage_kernel(
+        &self,
+        pin: &PinnedKernel,
+        cache: &Path,
+    ) -> Result<Publication, PublishError> {
+        check_root(&self.kernels_root, self.owner)
+            .map_err(|(path, problem)| PublishError::UnsafeRoot { path, problem })?;
+        let _source_lock = lock_root(&self.kernels_root)
+            .map_err(|source| io_publish("lock", &self.kernels_root, source))?;
+        RootProtection::ExecutionCache.check(cache, self.owner)?;
+        let _cache_lock = lock_root(cache).map_err(|source| io_publish("lock", cache, source))?;
+        let source = Self {
+            staging_root: self.kernels_root.clone(),
+            ..self.clone()
+        };
+        let directory = managed_kernel_directory(&pin.version, pin.sha256);
+        let target = cache.join(&directory);
+        // Cache loss can unlink the image while leaving its directory. Reclaim
+        // only an empty, protected directory; never replace an existing image
+        // or unlink an inode that might still be used by a jail.
+        if matches!(std::fs::symlink_metadata(target.join(KERNEL_IMAGE)), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+            && std::fs::symlink_metadata(&target).is_ok()
+        {
+            RootProtection::ExecutionCache.check(&target, self.owner)?;
+            std::fs::remove_dir(&target).map_err(|source| {
+                io_publish("remove empty execution cache directory", &target, source)
+            })?;
+        }
+        source.publish(
+            cache,
+            &directory,
+            &[&directory],
+            &[PlannedFile {
+                path: KERNEL_IMAGE,
+                sha256: pin.sha256,
+                size: Some(pin.size),
+                mode: 0o644,
+            }],
+            pin.sha256,
+            RootProtection::ExecutionCache,
+        )
+    }
+
     /// Create only missing managed directories under a protected vendor parent.
     /// Existing paths are verified, never re-owned or linked to execution roots.
     /// Failure disables management, not execution. Blocking.
@@ -344,11 +471,15 @@ impl ArtifactStore {
             .collect();
         self.publish(
             &self.releases_root,
-            &directory,
-            &release_staging(pin.release.kind),
-            staged,
+            &managed_release_directory(&pin.release, pin.digest()),
+            &[
+                &release_staging(pin.release.kind),
+                staged.as_str(),
+                &directory,
+            ],
             &files,
             pin.digest(),
+            RootProtection::Store,
         )
     }
 
@@ -377,11 +508,15 @@ impl ArtifactStore {
             .map_err(|source| io_publish("lock", &self.kernels_root, source))?;
         self.publish(
             &self.kernels_root,
-            pin.version.as_str(),
-            &kernel_staging(pin.runtime),
-            staged,
+            &managed_kernel_directory(&pin.version, pin.sha256),
+            &[
+                &kernel_staging(pin.runtime),
+                staged.as_str(),
+                pin.version.as_str(),
+            ],
             &files,
             pin.sha256,
+            RootProtection::Store,
         )
     }
 
@@ -395,7 +530,7 @@ impl ArtifactStore {
         check_root(root, self.owner)
             .map_err(|(path, problem)| RemoveError::UnsafeRoot { path, problem })?;
         let _locked = lock_root(root).map_err(|source| io("lock", root, source))?;
-        let target = root.join(release_directory(release));
+        let target = root.join(managed_release_directory(release, digest));
         if !exists(&target).map_err(|source| io("inspect", &target, source))? {
             return Ok(RemoveOutcome::Absent);
         }
@@ -439,7 +574,7 @@ impl ArtifactStore {
         check_root(root, self.owner)
             .map_err(|(path, problem)| RemoveError::UnsafeRoot { path, problem })?;
         let _locked = lock_root(root).map_err(|source| io("lock", root, source))?;
-        let target = root.join(version.as_str());
+        let target = root.join(managed_kernel_directory(version, digest));
         if !exists(&target).map_err(|source| io("inspect", &target, source))? {
             return Ok(RemoveOutcome::Absent);
         }
@@ -548,16 +683,15 @@ impl ArtifactStore {
         &self,
         root: &Path,
         directory: &str,
-        namespace: &str,
-        staged: &StagedName,
+        source_components: &[&str],
         files: &[PlannedFile],
         digest: Digest,
+        protection: RootProtection,
     ) -> Result<Publication, PublishError> {
-        check_root(root, self.owner)
-            .map_err(|(path, problem)| PublishError::UnsafeRoot { path, problem })?;
+        protection.check(root, self.owner)?;
         let target = root.join(directory);
         if exists(&target).map_err(|source| io_publish("inspect", &target, source))? {
-            return self.already_present(&target, files, digest);
+            return self.already_present(&target, files, digest, protection);
         }
 
         // This publication's own directory: created here, so nothing else's
@@ -568,7 +702,7 @@ impl ArtifactStore {
             .create(&incoming)
             .map_err(|source| io_publish("create", &incoming, source))?;
         let _cleanup = IncomingWork(incoming.clone());
-        self.copy_staged(namespace, staged, directory, &incoming, files)?;
+        self.copy_staged(source_components, &incoming, files)?;
         std::fs::set_permissions(&incoming, std::fs::Permissions::from_mode(0o755))
             .map_err(|source| io_publish("chmod", &incoming, source))?;
         sync_dir(&incoming).map_err(|source| io_publish("sync", &incoming, source))?;
@@ -576,7 +710,7 @@ impl ArtifactStore {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 // Published meanwhile: what is there decides.
-                return self.already_present(&target, files, digest);
+                return self.already_present(&target, files, digest, protection);
             }
             Err(source) => {
                 return Err(io_publish("publish", &target, source));
@@ -595,9 +729,7 @@ impl ArtifactStore {
     /// against its pin, and make every written file and directory durable.
     fn copy_staged(
         &self,
-        namespace: &str,
-        staged: &StagedName,
-        directory: &str,
+        source_components: &[&str],
         incoming: &Path,
         files: &[PlannedFile],
     ) -> Result<(), PublishError> {
@@ -614,8 +746,10 @@ impl ArtifactStore {
                     .map_err(|source| io_publish("create", parent, source))?;
                 directories.push(parent.to_path_buf());
             }
-            let mut components: Vec<&str> = namespace.split('/').collect();
-            components.extend([staged.as_str(), directory]);
+            let mut components: Vec<&str> = source_components
+                .iter()
+                .flat_map(|part| part.split('/'))
+                .collect();
             components.extend(file.path.split('/'));
             let shown = self.staging_root.join(components.join("/"));
             let mut source = self.open_staged(&components, &shown)?;
@@ -761,9 +895,11 @@ impl ArtifactStore {
         target: &Path,
         files: &[PlannedFile],
         digest: Digest,
+        protection: RootProtection,
     ) -> Result<Publication, PublishError> {
         for file in files {
             let path = target.join(file.path);
+            protection.check(path.parent().unwrap_or(target), self.owner)?;
             let differs = || PublishError::TargetDiffers {
                 path: target.to_path_buf(),
             };
@@ -804,9 +940,33 @@ struct PlannedFile {
     mode: u32,
 }
 
+/// Only execution-cache namespaces may live below shared sticky parents.
+/// Durable publication and removal keep the stricter store-root contract.
+#[derive(Clone, Copy)]
+enum RootProtection {
+    Store,
+    ExecutionCache,
+}
+
+impl RootProtection {
+    fn check(self, root: &Path, owner: u32) -> Result<(), PublishError> {
+        check_directories(root, owner, matches!(self, Self::ExecutionCache), false)
+            .map_err(|(path, problem)| PublishError::UnsafeRoot { path, problem })
+    }
+}
+
 /// Refuse a store root that another account could write or swap. Returns
 /// the offending path and the problem.
 fn check_root(root: &Path, owner: u32) -> Result<(), (PathBuf, &'static str)> {
+    check_directories(root, owner, false, false)
+}
+
+fn check_directories(
+    root: &Path,
+    owner: u32,
+    sticky_ancestors: bool,
+    sticky_root: bool,
+) -> Result<(), (PathBuf, &'static str)> {
     for path in [
         Some(root),
         root.parent(),
@@ -826,7 +986,13 @@ fn check_root(root: &Path, owner: u32) -> Result<(), (PathBuf, &'static str)> {
         if metadata.uid() != owner {
             return Err((path.to_path_buf(), "owned by another account"));
         }
-        if metadata.permissions().mode() & 0o022 != 0 {
+        if metadata.permissions().mode() & 0o022 != 0
+            && ((if path == root {
+                !sticky_root
+            } else {
+                !sticky_ancestors
+            }) || metadata.permissions().mode() & 0o1000 == 0)
+        {
             return Err((path.to_path_buf(), "writable by its group or others"));
         }
     }
