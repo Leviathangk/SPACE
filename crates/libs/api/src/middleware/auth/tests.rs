@@ -36,3 +36,35 @@ fn rejects_empty_api_key_header() {
 
     assert_eq!(api_key(&headers), None);
 }
+
+#[test]
+fn a_remembered_service_credential_expires_unless_seen_again() {
+    let known = super::KnownServiceCredentials::default();
+    let start = std::time::Instant::now();
+    known.remember_at("hash".to_string(), start);
+    let ttl = super::KNOWN_SERVICE_CREDENTIAL_TTL;
+    assert!(known.contains_at("hash", start + ttl / 2));
+    assert!(!known.contains_at("hash", start + ttl), "expired");
+    assert!(!known.contains_at("other", start));
+
+    known.remember_at("hash".to_string(), start + ttl);
+    assert!(known.contains_at("hash", start + ttl + ttl / 2), "renewed");
+    known.forget("hash");
+    assert!(!known.contains_at("hash", start + ttl));
+}
+
+#[test]
+fn remembered_service_credentials_are_bounded() {
+    let known = super::KnownServiceCredentials::default();
+    let start = std::time::Instant::now();
+    for index in 0..super::KNOWN_SERVICE_CREDENTIALS_MAX {
+        known.remember_at(format!("hash-{index}"), start);
+    }
+    known.remember_at("one-too-many".to_string(), start);
+    assert!(!known.contains_at("one-too-many", start), "the set is full");
+
+    // Expired entries make room.
+    let later = start + super::KNOWN_SERVICE_CREDENTIAL_TTL;
+    known.remember_at("one-too-many".to_string(), later);
+    assert!(known.contains_at("one-too-many", later));
+}

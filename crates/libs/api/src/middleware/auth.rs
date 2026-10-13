@@ -256,19 +256,22 @@ pub async fn require_native_auth(
         .into_response();
     };
 
-    match crate::auth::get_session_user(pool, token).await {
-        Ok(Some((user, org))) => {
-            if owner_headers_present(request.headers()) {
-                return PublicApiError::forbidden("sessions may not assert an owner")
-                    .into_response();
+    // A bearer this process already saw authenticate as a service credential
+    // skips the session lookup: tokens are 256 random bits, so it cannot also
+    // be a session. The credential lookup below still runs on every request,
+    // so revocation and surface scope take effect at once.
+    let token_hash = crate::auth::hash_token(token);
+    let known_credentials = &state.known_service_credentials;
+    let known_service_credential = known_credentials.contains(&token_hash);
+    if !known_service_credential {
+        match crate::auth::get_session_user(pool, token).await {
+            Ok(Some((user, org))) => {
+                return native_session_response(request, next, user, org).await;
             }
-            request.extensions_mut().insert(AuthUser(user));
-            request.extensions_mut().insert(AuthOrg(org));
-            return next.run(request).await;
-        }
-        Ok(None) => {}
-        Err(error) => {
-            return crate::routes::public::error::PublicApiError::from(error).into_response();
+            Ok(None) => {}
+            Err(error) => {
+                return crate::routes::public::error::PublicApiError::from(error).into_response();
+            }
         }
     }
 
@@ -277,6 +280,7 @@ pub async fn require_native_auth(
     // case; only a miss costs the second lookup.
     match crate::auth::get_api_key_org(pool, token, ApiSurface::Native).await {
         Ok(Some(mut context)) => {
+            known_credentials.remember(token_hash);
             let federated_owner = match native_federated_owner(&state, &context, request.headers())
             {
                 Ok(owner) => owner,
@@ -315,6 +319,21 @@ pub async fn require_native_auth(
             }
             next.run(request).await
         }
+        Ok(None) if known_service_credential => {
+            // The credential is gone. Answer exactly as for an unseen bearer,
+            // whose session lookup ran first.
+            known_credentials.forget(&token_hash);
+            match crate::auth::get_session_user(pool, token).await {
+                Ok(Some((user, org))) => native_session_response(request, next, user, org).await,
+                Ok(None) => crate::routes::public::error::PublicApiError::unauthorized(
+                    "Invalid or expired credentials",
+                )
+                .into_response(),
+                Err(error) => {
+                    crate::routes::public::error::PublicApiError::from(error).into_response()
+                }
+            }
+        }
         Ok(None) => crate::routes::public::error::PublicApiError::unauthorized(
             "Invalid or expired credentials",
         )
@@ -323,6 +342,77 @@ pub async fn require_native_auth(
             tracing::error!(%error, "native service-credential lookup failed");
             crate::routes::public::error::PublicApiError::from(error).into_response()
         }
+    }
+}
+
+async fn native_session_response(
+    mut request: Request,
+    next: Next,
+    user: User,
+    org: Organization,
+) -> Response {
+    if owner_headers_present(request.headers()) {
+        return PublicApiError::forbidden("sessions may not assert an owner").into_response();
+    }
+    request.extensions_mut().insert(AuthUser(user));
+    request.extensions_mut().insert(AuthOrg(org));
+    next.run(request).await
+}
+
+/// How long a remembered credential skips the session lookup without being
+/// seen again.
+const KNOWN_SERVICE_CREDENTIAL_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+/// Credentials remembered at once; past it, new ones are not remembered.
+const KNOWN_SERVICE_CREDENTIALS_MAX: usize = 1024;
+
+/// Hashes of bearers this process has seen authenticate as a native service
+/// credential, so their requests skip the session lookup. Holding a hash only
+/// changes which lookup runs first, never what authenticates: every request
+/// still resolves its credential from the database.
+#[derive(Default)]
+pub(crate) struct KnownServiceCredentials {
+    seen: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+}
+
+impl KnownServiceCredentials {
+    fn contains(&self, token_hash: &str) -> bool {
+        self.contains_at(token_hash, std::time::Instant::now())
+    }
+
+    fn contains_at(&self, token_hash: &str, now: std::time::Instant) -> bool {
+        self.lock().get(token_hash).is_some_and(|seen_at| {
+            now.saturating_duration_since(*seen_at) < KNOWN_SERVICE_CREDENTIAL_TTL
+        })
+    }
+
+    fn remember(&self, token_hash: String) {
+        self.remember_at(token_hash, std::time::Instant::now());
+    }
+
+    fn remember_at(&self, token_hash: String, now: std::time::Instant) {
+        let mut seen = self.lock();
+        if !seen.contains_key(&token_hash) && seen.len() >= KNOWN_SERVICE_CREDENTIALS_MAX {
+            seen.retain(|_, seen_at| {
+                now.saturating_duration_since(*seen_at) < KNOWN_SERVICE_CREDENTIAL_TTL
+            });
+            if seen.len() >= KNOWN_SERVICE_CREDENTIALS_MAX {
+                return;
+            }
+        }
+        seen.insert(token_hash, now);
+    }
+
+    fn forget(&self, token_hash: &str) {
+        self.lock().remove(token_hash);
+    }
+
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, std::time::Instant>> {
+        // The set holds no invariant a panicking holder could break.
+        self.seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 

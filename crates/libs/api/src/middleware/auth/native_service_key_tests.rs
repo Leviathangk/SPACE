@@ -159,6 +159,49 @@ async fn a_native_scoped_key_authenticates_without_a_user() -> TestResult {
 }
 
 #[tokio::test]
+async fn a_remembered_key_still_resolves_from_the_database_every_time() -> TestResult {
+    let fixture = fixture().await?;
+
+    let (status, first) = send(app(fixture.state.clone()), NATIVE_KEY).await?;
+    assert_eq!(status, StatusCode::OK);
+    // The second request skips the session lookup but authenticates the same.
+    let (status, second) = send(app(fixture.state.clone()), NATIVE_KEY).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first, second);
+
+    // Revocation takes effect on the very next request.
+    sqlx::query(sql!("DELETE FROM api_keys WHERE key_hash = $1"))
+        .bind(crate::auth::hash_token(NATIVE_KEY))
+        .execute(&fixture.state.pool)
+        .await?;
+    let (status, _) = send(app(fixture.state.clone()), NATIVE_KEY).await?;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_remembered_key_that_is_gone_falls_back_to_the_session_lookup() -> TestResult {
+    // A bearer remembered as a credential is answered exactly as an unseen
+    // one once the credential is gone, including by a session, however
+    // unlikely a session token matching a former key is.
+    let fixture = fixture().await?;
+    seed_key(&fixture.state.pool, SESSION_TOKEN, &["native"]).await?;
+    let (status, body) = send(app(fixture.state.clone()), SESSION_TOKEN).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.ends_with("no-user"), "{body}");
+
+    sqlx::query(sql!("DELETE FROM api_keys WHERE key_hash = $1"))
+        .bind(crate::auth::hash_token(SESSION_TOKEN))
+        .execute(&fixture.state.pool)
+        .await?;
+    seed_session(&fixture).await?;
+    let (status, body) = send(app(fixture.state.clone()), SESSION_TOKEN).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("user:"), "the session authenticates: {body}");
+    Ok(())
+}
+
+#[tokio::test]
 async fn an_ecw_scoped_key_is_rejected_on_native() -> TestResult {
     let fixture = fixture().await?;
 

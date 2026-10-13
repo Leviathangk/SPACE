@@ -55,6 +55,9 @@ pub struct AppState {
     pub feature_flags: pplx_space_feature_flags::FeatureFlagClient,
     pub ecw_credential_keyring:
         std::sync::Arc<pplx_space_common_svc::ecw_credential::EcwCredentialKeyring>,
+    /// Bearers already seen authenticating as native service credentials.
+    pub(crate) known_service_credentials:
+        std::sync::Arc<crate::middleware::auth::KnownServiceCredentials>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -171,6 +174,7 @@ impl AppState {
             data_plane_base_url,
             feature_flags,
             ecw_credential_keyring,
+            known_service_credentials: std::sync::Arc::default(),
         })
     }
 
