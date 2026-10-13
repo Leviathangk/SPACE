@@ -3297,6 +3297,7 @@ async fn seed_sandbox(pool: &sqlx::PgPool) -> TestResult<SandboxId> {
     .bind(node_id)
     .execute(pool)
     .await?;
+    seed_active_k8s_execution(pool, sandbox_id, 1, "127.0.0.1").await?;
     Ok(sandbox_id)
 }
 
@@ -3801,6 +3802,14 @@ async fn seed_active_k8s_execution(
     generation: i64,
     pod_ip: &str,
 ) -> TestResult {
+    let node: NodeId = sqlx::query_scalar(sql!(
+        "SELECT COALESCE(active_node_id,target_node_id) FROM sandboxes WHERE id=$1"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(pool)
+    .await?;
+    sqlx::query(sql!("INSERT INTO node_k8s (node_id,k8s_node_name,k8s_node_uid) VALUES ($1,$2,$3) ON CONFLICT (node_id) DO NOTHING"))
+        .bind(node).bind(format!("worker-{node}")).bind(format!("uid-{node}")).execute(pool).await?;
     sqlx::query(
         "INSERT INTO sandbox_k8s_executions (
                  sandbox_id, generation, pod_name, pod_namespace, pod_uid,
@@ -3818,6 +3827,8 @@ async fn seed_active_k8s_execution(
     .bind(pod_ip)
     .execute(pool)
     .await?;
+    sqlx::query(sql!("UPDATE sandbox_k8s_executions execution SET k8s_node_name=node.k8s_node_name,k8s_node_uid=node.k8s_node_uid FROM node_k8s node WHERE execution.sandbox_id=$1 AND execution.generation=$2 AND node.node_id=$3"))
+        .bind(sandbox_id).bind(generation).bind(node).execute(pool).await?;
     Ok(())
 }
 
@@ -3978,6 +3989,22 @@ async fn seed_suspend_snapshot_with_identity(
     let storage_uri = ExactStorageUri::parse(&storage_uri)
         .map_err(|e| tonic::Status::invalid_argument(format!("invalid storage_uri: {e}")))?;
     let execution_metadata = snapshot_execution_metadata(Some(&execution))?;
+    // Legacy lookup fixtures omit artifact identity, but finalization tests
+    // require explicitly known source-incarnation evidence.
+    let source: Option<NodeId> = sqlx::query_scalar(sql!(
+        "SELECT COALESCE(active_node_id,target_node_id) FROM sandboxes WHERE id=$1"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(&service.pool)
+    .await
+    .map_err(|e| Status::internal(format!("seed source: {e}")))?;
+    let source_uid: Option<K8sNodeUid> =
+        sqlx::query_scalar(sql!("SELECT k8s_node_uid FROM node_k8s WHERE node_id=$1"))
+            .bind(source)
+            .fetch_optional(&service.pool)
+            .await
+            .map_err(|e| Status::internal(format!("seed source UID: {e}")))?
+            .flatten();
     let snapshot = service
         .lookup_snapshot_sandbox(sandbox_id)
         .await?
@@ -3988,6 +4015,8 @@ async fn seed_suspend_snapshot_with_identity(
             SnapshotState::Creating,
             storage_uri,
         )?
+        .with_source_node_id(source)
+        .with_source_node_uid(source_uid)
         .with_execution_metadata(execution_metadata);
     let mut tx = service
         .pool
@@ -4143,6 +4172,7 @@ async fn finalize(
     service
         .finalize_artifact_backup(request_from_node(
             FinalizeArtifactBackupRequest {
+                metadata_binding_digest: None,
                 backup_attempt_id: snapshot_id.to_string(),
                 target_state: target as i32,
                 bytes_uploaded: bytes,
@@ -4259,19 +4289,27 @@ async fn finalize_artifact_backup_from_node(
     node_ip: std::net::IpAddr,
     backup_attempt_id: SnapshotId,
 ) -> Result<(), tonic::Status> {
-    service
-        .finalize_artifact_backup(request_from_node(
-            FinalizeArtifactBackupRequest {
-                backup_attempt_id: backup_attempt_id.to_string(),
-                target_state: SuspendSnapshotTerminalState::Ready as i32,
-                bytes_uploaded: 42,
-                failure_reason: None,
-                artifact_digests: Vec::new(),
-            },
-            node_ip,
-        ))
-        .await
-        .map(|_| ())
+    let mut request = request_from_node(
+        FinalizeArtifactBackupRequest {
+            metadata_binding_digest: None,
+            backup_attempt_id: backup_attempt_id.to_string(),
+            target_state: SuspendSnapshotTerminalState::Ready as i32,
+            bytes_uploaded: 42,
+            failure_reason: None,
+            artifact_digests: Vec::new(),
+        },
+        node_ip,
+    );
+    let uid: Option<K8sNodeUid> = sqlx::query_scalar(sql!(
+        "SELECT k.k8s_node_uid FROM node_k8s k JOIN nodes n ON n.id=k.node_id WHERE host(n.address)::INET=$1::INET"
+    )).bind(normalize_ip(node_ip).to_string()).fetch_optional(&service.pool).await
+        .map_err(|e| Status::internal(format!("mock caller identity: {e}")))?;
+    if let Some(uid) = uid {
+        request
+            .extensions_mut()
+            .insert(backup_admission::TestVerifiedCaller(uid));
+    }
+    service.finalize_artifact_backup(request).await.map(|_| ())
 }
 
 /// Two worker nodes at distinct addresses; the sandbox is placed on the first.
@@ -4295,6 +4333,7 @@ async fn seed_sandbox_on_source_node(
     .await?;
     let sandbox_id = SandboxId::new();
     seed_active_k8s_sandbox(pool, sandbox_id, source_node).await?;
+    seed_active_k8s_execution(pool, sandbox_id, 1, "10.0.0.40").await?;
     Ok((sandbox_id, source_ip, other_ip))
 }
 
@@ -4306,7 +4345,7 @@ async fn place_sandbox_on_node_at(
 ) -> TestResult {
     sqlx::query(
         "UPDATE sandboxes s
-            SET placement = 'on_node', lifecycle = 'started',
+            SET placement = 'on_node', lifecycle = 'started', placement_changed_at=NOW(),
                 active_node_id = n.id, target_node_id = n.id
            FROM nodes n
           WHERE s.id = $1 AND host(n.address) = $2",
@@ -4315,6 +4354,19 @@ async fn place_sandbox_on_node_at(
     .bind(node_ip.to_string())
     .execute(pool)
     .await?;
+    let generation: i64 = sqlx::query_scalar(sql!(
+        "SELECT COALESCE(MAX(generation),0)+1 FROM sandbox_k8s_executions WHERE sandbox_id=$1"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions SET active=false WHERE sandbox_id=$1"
+    ))
+    .bind(sandbox_id)
+    .execute(pool)
+    .await?;
+    seed_active_k8s_execution(pool, sandbox_id, generation, &node_ip.to_string()).await?;
     Ok(())
 }
 
@@ -4414,7 +4466,7 @@ async fn begin_artifact_backup_admits_only_the_sandboxes_source_node() -> TestRe
         pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend,
     )
     .await
-    .expect_err("a sandbox with no node has no node that may publish for it");
+    .expect_err("a sandbox with no node must wait for verified source evidence");
     assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
     Ok(())
 }
@@ -4543,6 +4595,29 @@ async fn finalize_artifact_backup_admits_only_the_attempts_source_node() -> Test
         .expect_err("a node that did not open the attempt must not finalize it");
     assert_eq!(err.code(), Code::PermissionDenied, "{err}");
     assert_eq!(snapshot_state(pool, backup_attempt_id).await?, "creating");
+
+    // A registered attempt cannot acquire a missing source through later
+    // placement reconciliation; Finalize must retain its permanent refusal.
+    let source: Option<NodeId> =
+        sqlx::query_scalar(sql!("SELECT source_node_id FROM snapshots WHERE id=$1"))
+            .bind(backup_attempt_id)
+            .fetch_one(pool)
+            .await?;
+    sqlx::query(sql!("UPDATE snapshots SET source_node_id=NULL WHERE id=$1"))
+        .bind(backup_attempt_id)
+        .execute(pool)
+        .await?;
+    let missing =
+        finalize_artifact_backup_from_node(&fixture.service, source_ip, backup_attempt_id)
+            .await
+            .unwrap_err();
+    assert_eq!(missing.code(), Code::FailedPrecondition);
+    assert_eq!(snapshot_state(pool, backup_attempt_id).await?, "creating");
+    sqlx::query(sql!("UPDATE snapshots SET source_node_id=$2 WHERE id=$1"))
+        .bind(backup_attempt_id)
+        .bind(source)
+        .execute(pool)
+        .await?;
 
     finalize_artifact_backup_from_node(&fixture.service, source_ip, backup_attempt_id).await?;
     assert_eq!(snapshot_state(pool, backup_attempt_id).await?, "ready");
@@ -5498,6 +5573,7 @@ async fn finalize_failed_persists_failure_reason() -> TestResult {
         .service
         .finalize_artifact_backup(request_from_node(
             FinalizeArtifactBackupRequest {
+                metadata_binding_digest: None,
                 backup_attempt_id: snapshot_id.to_string(),
                 target_state: SuspendSnapshotTerminalState::Failed as i32,
                 bytes_uploaded: 0,
@@ -5567,6 +5643,7 @@ async fn finalize_failed_blank_reason_is_treated_as_absent() -> TestResult {
         .service
         .finalize_artifact_backup(request_from_node(
             FinalizeArtifactBackupRequest {
+                metadata_binding_digest: None,
                 backup_attempt_id: snapshot_id.to_string(),
                 target_state: SuspendSnapshotTerminalState::Failed as i32,
                 bytes_uploaded: 0,
@@ -5857,8 +5934,8 @@ async fn last_attempt_at(
 }
 
 /// `TouchArtifactBackup` bumps `last_attempt_at` on a `creating` row.
-/// A new row leaves it NULL (the reaper falls back to
-/// `timestamp`), and the heartbeat is the first thing to populate it.
+/// Registration starts liveness independently of the artifact capture timestamp;
+/// subsequent heartbeats advance it without rewriting capture freshness.
 #[tokio::test(flavor = "current_thread")]
 async fn touch_bumps_last_attempt_at_for_creating_row() -> TestResult {
     let Some(fixture) = cluster_fixture().await? else {
@@ -5868,19 +5945,12 @@ async fn touch_bumps_last_attempt_at_for_creating_row() -> TestResult {
     let snapshot_id = SnapshotId::new();
 
     seed_suspend_snapshot(&fixture.service, sandbox_id, snapshot_id).await?;
-    assert!(
-        last_attempt_at(&fixture.service.pool, snapshot_id)
-            .await?
-            .is_none(),
-        "begin must leave last_attempt_at NULL"
-    );
-
+    let registered = last_attempt_at(&fixture.service.pool, snapshot_id)
+        .await?
+        .expect("registration must start liveness");
     touch(&fixture.service, snapshot_id).await?;
     let after = last_attempt_at(&fixture.service.pool, snapshot_id).await?;
-    assert!(
-        after.is_some(),
-        "touch must populate last_attempt_at for a creating row"
-    );
+    assert!(after.is_some_and(|heartbeat| heartbeat >= registered));
 
     // A second heartbeat advances it (monotonic non-decreasing).
     let first = after.unwrap();
@@ -5915,21 +5985,12 @@ async fn touch_is_noop_on_terminal_rows() -> TestResult {
         seed_suspend_snapshot(&fixture.service, sandbox_id, snapshot_id).await?;
         finalize(&fixture.service, snapshot_id, target, 0).await?;
 
-        // Terminalizing does not touch the heartbeat column, so it is
-        // still NULL going into the touch.
-        assert!(
-            last_attempt_at(&fixture.service.pool, snapshot_id)
-                .await?
-                .is_none(),
-            "{target:?} row should have NULL last_attempt_at before touch"
-        );
-
-        // Touch succeeds (no error) but must not write the column.
+        let before = last_attempt_at(&fixture.service.pool, snapshot_id).await?;
+        assert!(before.is_some(), "registration must have recorded liveness");
         touch(&fixture.service, snapshot_id).await?;
-        assert!(
-            last_attempt_at(&fixture.service.pool, snapshot_id)
-                .await?
-                .is_none(),
+        assert_eq!(
+            last_attempt_at(&fixture.service.pool, snapshot_id).await?,
+            before,
             "touch must not bump last_attempt_at on a {target:?} row"
         );
 
@@ -6730,6 +6791,7 @@ async fn finalize_ready_with_digests(
     service
         .finalize_artifact_backup(request_from_node(
             FinalizeArtifactBackupRequest {
+                metadata_binding_digest: None,
                 backup_attempt_id: backup_attempt_id.to_string(),
                 target_state: SuspendSnapshotTerminalState::Ready as i32,
                 bytes_uploaded: 4096 + (1 << 30),
@@ -7182,4 +7244,837 @@ async fn node_template_and_policy_reads_follow_placement() -> TestResult {
     );
     assert_eq!(active.sandboxes, vec![sandbox_id.to_string()]);
     Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn backup_admission_preserves_artifact_and_node_identity() -> TestResult {
+    use pplx_space_sbx_mgr_client::proto::{ArtifactKind as Kind, ArtifactOrigin as Origin};
+    #[derive(Clone, Copy, Debug)]
+    enum Case {
+        Active,
+        UnverifiedCaller,
+        TargetActive,
+        RetiredFirst,
+        RetiredTarget,
+        InventoryOnly,
+        ReplacementActive,
+        ReplacementTarget,
+        PriorRetired,
+        PriorMappedIp,
+        PinKind,
+        PinOrigin,
+        PriorRelocated,
+        PriorNewerPin,
+        PriorReplacement,
+        LegacyReplay,
+        LegacyRetry,
+        LegacyExecution,
+        PendingExecution,
+        DifferentKind,
+        DifferentOrigin,
+        DifferentName,
+        PriorDeleting,
+        ReplacementFinalize,
+        Direct,
+    }
+    for case in [
+        Case::Active,
+        Case::UnverifiedCaller,
+        Case::TargetActive,
+        Case::RetiredFirst,
+        Case::RetiredTarget,
+        Case::InventoryOnly,
+        Case::ReplacementActive,
+        Case::ReplacementTarget,
+        Case::PriorRetired,
+        Case::PriorMappedIp,
+        Case::PinKind,
+        Case::PinOrigin,
+        Case::PriorRelocated,
+        Case::PriorNewerPin,
+        Case::PriorReplacement,
+        Case::LegacyReplay,
+        Case::LegacyRetry,
+        Case::LegacyExecution,
+        Case::PendingExecution,
+        Case::DifferentKind,
+        Case::DifferentOrigin,
+        Case::DifferentName,
+        Case::PriorDeleting,
+        Case::ReplacementFinalize,
+        Case::Direct,
+    ] {
+        let Some(mut fixture) = cluster_fixture().await? else {
+            return Ok(());
+        };
+        fixture.service.backup_flags =
+            pplx_space_feature_flags::FeatureFlagClient::fixed_bools([(
+                pplx_space_feature_flags::STRICT_BACKUP_OWNERSHIP.key(),
+                true,
+            )]);
+        let pool = &fixture.service.pool;
+        let (sandbox, ip, other_ip) = seed_sandbox_on_source_node(pool).await?;
+        let ip = if matches!(case, Case::PriorMappedIp) {
+            match ip {
+                IpAddr::V4(ip) => IpAddr::V6(ip.to_ipv6_mapped()),
+                ip => ip,
+            }
+        } else {
+            ip
+        };
+        let node: NodeId =
+            sqlx::query_scalar(sql!("SELECT active_node_id FROM sandboxes WHERE id=$1"))
+                .bind(sandbox)
+                .fetch_one(pool)
+                .await?;
+        let artifact = LocalArtifactId::new();
+        let prior = SnapshotId::new();
+        let request = |attempt: SnapshotId, kind: Kind, origin: Origin, name: Option<&str>| {
+            let mut request = request_from_node(
+                BeginArtifactBackupRequest {
+                    sandbox_id: sandbox.to_string(),
+                    local_artifact_id: artifact.to_string(),
+                    artifact_kind: kind as i32,
+                    artifact_origin: origin as i32,
+                    snapshot_name: name.map(str::to_string),
+                    backup_attempt_id: attempt.to_string(),
+                    storage_uri: test_storage_uri(sandbox, attempt),
+                    execution: Some(test_snapshot_execution()),
+                },
+                ip,
+            );
+            if !matches!(case, Case::UnverifiedCaller) {
+                request
+                    .extensions_mut()
+                    .insert(backup_admission::TestVerifiedCaller(
+                        K8sNodeUid::parse(format!("uid-{node}")).expect("synthetic UID"),
+                    ));
+            }
+            request
+        };
+        let has_prior = matches!(
+            case,
+            Case::PriorRetired
+                | Case::PriorMappedIp
+                | Case::PriorRelocated
+                | Case::PriorNewerPin
+                | Case::PriorReplacement
+                | Case::LegacyReplay
+                | Case::LegacyRetry
+                | Case::DifferentKind
+                | Case::DifferentOrigin
+                | Case::DifferentName
+                | Case::PriorDeleting
+        );
+        if has_prior {
+            let (origin, name) = if matches!(case, Case::DifferentName) {
+                (Origin::Snapshot, Some("original"))
+            } else {
+                (Origin::Suspend, None)
+            };
+            fixture
+                .service
+                .begin_artifact_backup(request(prior, Kind::Full, origin, name))
+                .await?;
+            sqlx::query(sql!("UPDATE snapshots SET state='failed' WHERE id=$1"))
+                .bind(prior)
+                .execute(pool)
+                .await?;
+        }
+        if has_prior
+            || matches!(
+                case,
+                Case::RetiredFirst | Case::RetiredTarget | Case::InventoryOnly
+            )
+        {
+            sqlx::query(sql!("UPDATE sandboxes SET active_node_id=NULL,target_node_id=NULL,placement='unplaced',lifecycle='suspended' WHERE id=$1"))
+                .bind(sandbox).execute(pool).await?;
+            sqlx::query(sql!("UPDATE sandbox_k8s_executions SET active=false,state='suspended' WHERE sandbox_id=$1"))
+                .bind(sandbox).execute(pool).await?;
+        }
+        let expected = match case {
+            Case::Active | Case::PriorRetired | Case::PriorMappedIp | Case::ReplacementFinalize => {
+                None
+            }
+            Case::UnverifiedCaller => Some(if cfg!(feature = "kubernetes") {
+                Code::PermissionDenied
+            } else {
+                Code::FailedPrecondition
+            }),
+            Case::PinKind | Case::PinOrigin => {
+                sqlx::query(sql!("UPDATE sandboxes SET current_local_artifact_id=$2,current_local_artifact_kind='full',current_local_artifact_origin='suspend' WHERE id=$1"))
+                    .bind(sandbox).bind(artifact).execute(pool).await?;
+                Some(Code::FailedPrecondition)
+            }
+            Case::TargetActive | Case::ReplacementTarget | Case::RetiredTarget => {
+                sqlx::query(sql!(
+                    "UPDATE sandboxes SET active_node_id=NULL,target_node_id=$2 WHERE id=$1"
+                ))
+                .bind(sandbox)
+                .bind(node)
+                .execute(pool)
+                .await?;
+                match case {
+                    Case::TargetActive => None,
+                    Case::ReplacementTarget => Some(Code::PermissionDenied),
+                    _ => Some(Code::FailedPrecondition),
+                }
+            }
+            Case::RetiredFirst | Case::PriorDeleting => {
+                if matches!(case, Case::PriorDeleting) {
+                    sqlx::query(sql!("UPDATE snapshots SET state='deleting' WHERE id=$1"))
+                        .bind(prior)
+                        .execute(pool)
+                        .await?;
+                }
+                Some(Code::FailedPrecondition)
+            }
+            Case::InventoryOnly => {
+                sqlx::query(sql!("INSERT INTO node_local_backup_pending (node_id,sandbox_id,artifact_id,artifact_kind) VALUES ($1,$2,$3,'full')"))
+                    .bind(node).bind(sandbox).bind(artifact).execute(pool).await?;
+                sqlx::query(sql!("UPDATE sandboxes SET current_local_artifact_id=$2,current_local_artifact_kind='full',current_local_artifact_origin='suspend' WHERE id=$1"))
+                    .bind(sandbox).bind(artifact).execute(pool).await?;
+                Some(Code::FailedPrecondition)
+            }
+            Case::ReplacementActive | Case::PriorReplacement => Some(Code::PermissionDenied),
+            Case::PriorRelocated => {
+                place_sandbox_on_node_at(pool, sandbox, other_ip).await?;
+                None
+            }
+            Case::PriorNewerPin => {
+                sqlx::query(sql!("UPDATE sandboxes SET current_local_artifact_id=$2,current_local_artifact_kind='full',current_local_artifact_origin='suspend' WHERE id=$1"))
+                    .bind(sandbox).bind(LocalArtifactId::new()).execute(pool).await?;
+                None
+            }
+            Case::LegacyReplay | Case::LegacyRetry => {
+                sqlx::query(sql!(
+                    "UPDATE snapshots SET source_node_uid=NULL WHERE id=$1"
+                ))
+                .bind(prior)
+                .execute(pool)
+                .await?;
+                Some(Code::FailedPrecondition)
+            }
+            Case::LegacyExecution | Case::PendingExecution => {
+                sqlx::query(sql!("UPDATE sandbox_k8s_executions SET k8s_node_uid=NULL,k8s_node_name=CASE WHEN $2 THEN NULL ELSE k8s_node_name END WHERE sandbox_id=$1"))
+                    .bind(sandbox).bind(matches!(case, Case::PendingExecution)).execute(pool).await?;
+                Some(if matches!(case, Case::PendingExecution) {
+                    Code::Unavailable
+                } else {
+                    Code::FailedPrecondition
+                })
+            }
+            Case::DifferentKind | Case::DifferentOrigin | Case::DifferentName => {
+                Some(Code::FailedPrecondition)
+            }
+            Case::Direct => {
+                sqlx::query(sql!("UPDATE nodes SET managed_by='space' WHERE id=$1"))
+                    .bind(node)
+                    .execute(pool)
+                    .await?;
+                sqlx::query(sql!("DELETE FROM node_k8s WHERE node_id=$1"))
+                    .bind(node)
+                    .execute(pool)
+                    .await?;
+                sqlx::query(sql!(
+                    "DELETE FROM sandbox_k8s_executions WHERE sandbox_id=$1"
+                ))
+                .bind(sandbox)
+                .execute(pool)
+                .await?;
+                None
+            }
+        };
+        if matches!(
+            case,
+            Case::ReplacementActive
+                | Case::ReplacementTarget
+                | Case::PriorReplacement
+                | Case::LegacyReplay
+        ) {
+            sqlx::query(sql!(
+                "UPDATE node_k8s SET k8s_node_uid='replacement-uid' WHERE node_id=$1"
+            ))
+            .bind(node)
+            .execute(pool)
+            .await?;
+        }
+        if matches!(case, Case::Active) {
+            let mut registration = pool.begin().await?;
+            let identity = snapshot_store::SnapshotArtifact::new(
+                Some(artifact),
+                ArtifactKind::Full,
+                ArtifactOrigin::Suspend,
+                None,
+            )?;
+            let admitted =
+                backup_admission::source_node(&mut registration, sandbox, &identity, Some(ip))
+                    .await?;
+            let source = admitted.source().expect("current execution is authorized");
+            fixture
+                .service
+                .authorize_backup_source_node(
+                    &mut registration,
+                    Some(source.node_id),
+                    source.node_uid.as_ref(),
+                    &backup_admission::BackupCaller {
+                        remote_addr: Some(std::net::SocketAddr::new(ip, 1234)),
+                        node_uid: Ok(K8sNodeUid::parse(format!("uid-{node}"))?),
+                        strict: true,
+                    },
+                    "test attempt",
+                )
+                .await?;
+            // Replacement, address changes, and activation must wait until
+            // the registration transaction has committed its ownership proof.
+            for (query, id) in [
+                (
+                    "UPDATE sandboxes SET target_node_id=NULL WHERE id=$1",
+                    sandbox.as_uuid(),
+                ),
+                (
+                    "UPDATE nodes SET address='10.0.0.99' WHERE id=$1",
+                    node.as_uuid(),
+                ),
+                (
+                    "UPDATE node_k8s SET k8s_node_uid='replacement' WHERE node_id=$1",
+                    node.as_uuid(),
+                ),
+            ] {
+                let mut contender = pool.begin().await?;
+                sqlx::query(sql!("SET LOCAL lock_timeout='50ms'"))
+                    .execute(&mut *contender)
+                    .await?;
+                let blocked = sqlx::query(sqlx::AssertSqlSafe(sql!(query)))
+                    .bind(id)
+                    .execute(&mut *contender)
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    blocked
+                        .as_database_error()
+                        .and_then(|e| e.code())
+                        .as_deref(),
+                    Some("55P03")
+                );
+                contender.rollback().await?;
+            }
+            registration.rollback().await?;
+        }
+        let attempt = if matches!(case, Case::LegacyReplay) {
+            prior
+        } else {
+            SnapshotId::new()
+        };
+        let (kind, origin, name) = match case {
+            Case::DifferentKind | Case::PinKind => (Kind::Disk, Origin::Suspend, None),
+            Case::DifferentOrigin | Case::PinOrigin => (Kind::Full, Origin::Fork, None),
+            Case::DifferentName => (Kind::Full, Origin::Snapshot, Some("renamed")),
+            _ => (Kind::Full, Origin::Suspend, None),
+        };
+        let result = fixture
+            .service
+            .begin_artifact_backup(request(attempt, kind, origin, name))
+            .await;
+        if let Some(code) = expected {
+            assert_eq!(
+                result.expect_err(&format!("refuse {case:?}")).code(),
+                code,
+                "{case:?}"
+            );
+            assert_eq!(
+                snapshot_row_count(pool, attempt).await?,
+                i64::from(matches!(case, Case::LegacyReplay)),
+                "{case:?}: rejected admission changed catalog"
+            );
+            if matches!(case, Case::LegacyReplay) {
+                assert_eq!(
+                    finalize_artifact_backup_from_node(&fixture.service, ip, attempt)
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    Code::FailedPrecondition
+                );
+            }
+        } else {
+            result.unwrap_or_else(|error| panic!("{case:?}: {error}"));
+            let stored = snapshot_store::get(pool, attempt).await?.unwrap();
+            assert_eq!(stored.source_node_id(), Some(node), "{case:?}");
+            if has_prior {
+                let original = snapshot_store::get(pool, prior).await?.unwrap();
+                assert_eq!(
+                    stored.timestamp(),
+                    original.timestamp(),
+                    "{case:?}: retry must not refresh old artifact age"
+                );
+            }
+            if matches!(case, Case::Direct) {
+                assert!(stored.source_node_uid().is_none());
+            } else {
+                assert_eq!(
+                    stored.source_node_uid().unwrap().as_str(),
+                    format!("uid-{node}")
+                );
+            }
+            if matches!(case, Case::ReplacementFinalize) {
+                sqlx::query(sql!(
+                    "UPDATE node_k8s SET k8s_node_uid='replacement-uid' WHERE node_id=$1"
+                ))
+                .bind(node)
+                .execute(pool)
+                .await?;
+                assert_eq!(
+                    finalize_artifact_backup_from_node(&fixture.service, ip, attempt)
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    Code::PermissionDenied
+                );
+                assert_eq!(snapshot_state(pool, attempt).await?, "creating");
+            } else {
+                finalize_artifact_backup_from_node(&fixture.service, ip, attempt).await?;
+                assert_eq!(snapshot_state(pool, attempt).await?, "ready");
+                if matches!(case, Case::PriorRelocated) {
+                    let predicate =
+                        pplx_space_sandbox_portability::fresh_ready_snapshot_exists("s");
+                    let query = format!("SELECT {predicate} FROM sandboxes s WHERE s.id=$1");
+                    let fresh: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(query.as_str())))
+                        .bind(sandbox)
+                        .fetch_one(pool)
+                        .await?;
+                    assert!(
+                        !fresh,
+                        "an old artifact retry must not become current after relocation"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn compatibility_backup_never_invents_historical_node_identity() -> TestResult {
+    use pplx_space_sbx_mgr_client::proto::{ArtifactKind as Kind, ArtifactOrigin as Origin};
+    let Some(mut fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let (sandbox, ip, _) = seed_sandbox_on_source_node(&fixture.service.pool).await?;
+    let node: NodeId = sqlx::query_scalar(sql!("SELECT active_node_id FROM sandboxes WHERE id=$1"))
+        .bind(sandbox)
+        .fetch_one(&fixture.service.pool)
+        .await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET active_node_id=NULL,lifecycle='suspended' WHERE id=$1"
+    ))
+    .bind(sandbox)
+    .execute(&fixture.service.pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions SET active=false,state='suspended' WHERE sandbox_id=$1"
+    ))
+    .bind(sandbox)
+    .execute(&fixture.service.pool)
+    .await?;
+    let artifact = LocalArtifactId::new();
+    let attempt = SnapshotId::new();
+    let make_request = || {
+        let mut request = request_from_node(
+            BeginArtifactBackupRequest {
+                sandbox_id: sandbox.to_string(),
+                local_artifact_id: artifact.to_string(),
+                artifact_kind: Kind::Full as i32,
+                artifact_origin: Origin::Suspend as i32,
+                snapshot_name: None,
+                backup_attempt_id: attempt.to_string(),
+                storage_uri: test_storage_uri(sandbox, attempt),
+                execution: Some(test_snapshot_execution()),
+            },
+            ip,
+        );
+        request
+            .extensions_mut()
+            .insert(backup_admission::TestVerifiedCaller(
+                K8sNodeUid::parse(format!("uid-{node}")).expect("fixture UID"),
+            ));
+        request
+    };
+    fixture
+        .service
+        .begin_artifact_backup(make_request())
+        .await?;
+    let stored = snapshot_store::get(&fixture.service.pool, attempt)
+        .await?
+        .expect("compatibility attempt");
+    assert_eq!(stored.source_node_id(), Some(node));
+    assert!(
+        stored.source_node_uid().is_none(),
+        "present caller identity is not historical ownership"
+    );
+    fixture.service.backup_flags = pplx_space_feature_flags::FeatureFlagClient::fixed_bools([(
+        pplx_space_feature_flags::STRICT_BACKUP_OWNERSHIP.key(),
+        true,
+    )]);
+    assert_eq!(
+        fixture
+            .service
+            .begin_artifact_backup(make_request())
+            .await
+            .expect_err("strict replay needs historical proof")
+            .code(),
+        Code::FailedPrecondition
+    );
+    fixture.service.backup_flags = pplx_space_feature_flags::FeatureFlagClient::fixed_bools([(
+        pplx_space_feature_flags::STRICT_BACKUP_OWNERSHIP.key(),
+        false,
+    )]);
+    finalize_artifact_backup_from_node(&fixture.service, ip, attempt).await?;
+    assert_eq!(
+        snapshot_state(&fixture.service.pool, attempt).await?,
+        "ready"
+    );
+    assert!(
+        snapshot_store::get(&fixture.service.pool, attempt)
+            .await?
+            .expect("same attempt")
+            .source_node_uid()
+            .is_none()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn recovery_grant_lifecycle_binds_proofs_and_never_creates_permanent_retry_authority()
+-> TestResult {
+    use pplx_space_common_core::types::{Digest as ContentDigest, SnapshotArtifact as File};
+    use snapshot_store::recovery::{self, RecoveryGrantId, RecoveryManifest};
+    #[derive(Clone, Copy, Debug)]
+    enum Case {
+        Ready,
+        DigestDrift,
+        MetadataDrift,
+        MissingProof,
+        Successor,
+        PointerChanged,
+        Replacement,
+        Revoked,
+        Expired,
+        Unverified,
+    }
+    for case in [
+        Case::Ready,
+        Case::DigestDrift,
+        Case::MetadataDrift,
+        Case::MissingProof,
+        Case::Successor,
+        Case::PointerChanged,
+        Case::Replacement,
+        Case::Revoked,
+        Case::Expired,
+        Case::Unverified,
+    ] {
+        let Some(fixture) = cluster_fixture().await? else {
+            return Ok(());
+        };
+        let pool = &fixture.service.pool;
+        let (sandbox, ip, _) = seed_sandbox_on_source_node(pool).await?;
+        let node: NodeId =
+            sqlx::query_scalar(sql!("SELECT active_node_id FROM sandboxes WHERE id=$1"))
+                .bind(sandbox)
+                .fetch_one(pool)
+                .await?;
+        let uid = K8sNodeUid::parse(format!("uid-{node}"))?;
+        let artifact = LocalArtifactId::new();
+        sqlx::query(sql!("UPDATE sandboxes SET active_node_id=NULL,target_node_id=NULL,lifecycle='suspended',placement='unplaced',current_local_artifact_id=$2,current_local_artifact_kind='full',current_local_artifact_origin='suspend' WHERE id=$1"))
+            .bind(sandbox).bind(artifact).execute(pool).await?;
+        sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions SET active=false,state='suspended' WHERE sandbox_id=$1"
+        ))
+        .bind(sandbox)
+        .execute(pool)
+        .await?;
+        let manifest = RecoveryManifest {
+            execution: snapshot_execution_metadata(Some(&test_snapshot_execution()))?,
+            metadata_binding_digest: ContentDigest::sha256([3; 32]),
+            vcpu: 2,
+            memory_mib: 1024,
+            template_id: TemplateName::parse("seed")?,
+            content_hash: None,
+            artifacts: vec![
+                snapshot_store::SnapshotArtifactDigest {
+                    artifact: File::EncryptedSnapshotVolume,
+                    digest: ContentDigest::sha256([1; 32]),
+                    size_bytes: 16,
+                },
+                snapshot_store::SnapshotArtifactDigest {
+                    artifact: File::EncryptedRootfsCow,
+                    digest: ContentDigest::sha256([2; 32]),
+                    size_bytes: 32,
+                },
+            ],
+        };
+        let now: OffsetDateTime = sqlx::query_scalar(sql!("SELECT NOW()"))
+            .fetch_one(pool)
+            .await?;
+        let captured_at = now - time::Duration::hours(1);
+        let id = RecoveryGrantId::new();
+        let mut tx = pool.begin().await?;
+        recovery::approve(
+            &mut tx,
+            recovery::ApproveRecovery {
+                id,
+                sandbox_id: sandbox,
+                artifact_id: artifact,
+                generation: ExecutionGeneration::new(1)?,
+                uploader_node_id: node,
+                uploader_node_uid: &uid,
+                captured_at,
+                expires_at: now + time::Duration::hours(1),
+                actor: UserId::from_uuid(SEEDED_USER_ID),
+                reason: "verified retained snapshot in synthetic reproduction",
+                manifest: &manifest,
+            },
+        )
+        .await?;
+        tx.commit().await?;
+        let begin = |attempt: SnapshotId| {
+            let mut request = request_from_node(
+                BeginArtifactBackupRequest {
+                    sandbox_id: sandbox.to_string(),
+                    local_artifact_id: artifact.to_string(),
+                    artifact_kind: pplx_space_sbx_mgr_client::proto::ArtifactKind::Full as i32,
+                    artifact_origin: pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend
+                        as i32,
+                    snapshot_name: None,
+                    backup_attempt_id: attempt.to_string(),
+                    storage_uri: test_storage_uri(sandbox, attempt),
+                    execution: Some(test_snapshot_execution()),
+                },
+                ip,
+            );
+            request
+                .extensions_mut()
+                .insert(backup_admission::TestVerifiedCaller(uid.clone()));
+            request
+        };
+        let mut attempt = SnapshotId::new();
+        fixture
+            .service
+            .begin_artifact_backup(begin(attempt))
+            .await?;
+        fixture
+            .service
+            .begin_artifact_backup(begin(attempt))
+            .await?;
+        assert!(
+            fixture
+                .service
+                .begin_artifact_backup(begin(SnapshotId::new()))
+                .await
+                .is_err(),
+            "one active attempt: {case:?}"
+        );
+        // A failed accepted transfer can retry under the same unexpired grant.
+        sqlx::query(sql!("UPDATE snapshots SET state='failed' WHERE id=$1"))
+            .bind(attempt)
+            .execute(pool)
+            .await?;
+        attempt = SnapshotId::new();
+        fixture
+            .service
+            .begin_artifact_backup(begin(attempt))
+            .await?;
+        let record = snapshot_store::get(pool, attempt).await?.unwrap();
+        assert_eq!(record.recovery_grant_id(), Some(id));
+        assert_eq!(
+            record.timestamp().as_nanosecond(),
+            captured_at.unix_timestamp_nanos()
+        );
+        assert_eq!(record.generation(), Some(ExecutionGeneration::new(1)?));
+        let mut proofs: Vec<_> = manifest
+            .artifacts
+            .iter()
+            .map(|p| crate::proto::SnapshotArtifactDigest {
+                artifact: p.artifact.to_string(),
+                digest: p.digest.to_string(),
+                size_bytes: p.size_bytes,
+            })
+            .collect();
+        let mut metadata = Some(manifest.metadata_binding_digest.to_string());
+        match case {
+            Case::Ready => {}
+            Case::DigestDrift => proofs[0].digest = ContentDigest::sha256([9; 32]).to_string(),
+            Case::MetadataDrift => metadata = Some(ContentDigest::sha256([9; 32]).to_string()),
+            Case::MissingProof => proofs.clear(),
+            Case::Successor => {
+                sqlx::query(sql!("UPDATE sandboxes SET target_node_id=$2 WHERE id=$1"))
+                    .bind(sandbox)
+                    .bind(node)
+                    .execute(pool)
+                    .await?;
+                seed_active_k8s_execution(pool, sandbox, 2, &ip.to_string()).await?;
+            }
+            Case::PointerChanged => {
+                sqlx::query(sql!(
+                    "UPDATE sandboxes SET current_local_artifact_id=$2 WHERE id=$1"
+                ))
+                .bind(sandbox)
+                .bind(LocalArtifactId::new())
+                .execute(pool)
+                .await?;
+            }
+            Case::Replacement => {
+                sqlx::query(sql!(
+                    "UPDATE node_k8s SET k8s_node_uid='replacement' WHERE node_id=$1"
+                ))
+                .bind(node)
+                .execute(pool)
+                .await?;
+            }
+            Case::Revoked => {
+                let mut tx = pool.begin().await?;
+                assert!(
+                    recovery::revoke(
+                        &mut tx,
+                        sandbox,
+                        id,
+                        UserId::from_uuid(SEEDED_USER_ID),
+                        "withdraw synthetic approval"
+                    )
+                    .await?
+                );
+                tx.commit().await?;
+            }
+            Case::Expired => {
+                sqlx::query(sql!("UPDATE backup_recovery_grants SET approved_at=NOW()-INTERVAL '2 hours',captured_at=NOW()-INTERVAL '3 hours',expires_at=NOW()-INTERVAL '1 hour' WHERE id=$1")).bind(id).execute(pool).await?;
+            }
+            Case::Unverified => {}
+        }
+        let finalize = || {
+            let mut request = request_from_node(
+                FinalizeArtifactBackupRequest {
+                    backup_attempt_id: attempt.to_string(),
+                    target_state: SuspendSnapshotTerminalState::Ready as i32,
+                    bytes_uploaded: 48,
+                    failure_reason: None,
+                    artifact_digests: proofs.clone(),
+                    metadata_binding_digest: metadata.clone(),
+                },
+                ip,
+            );
+            if !matches!(case, Case::Unverified) {
+                request
+                    .extensions_mut()
+                    .insert(backup_admission::TestVerifiedCaller(uid.clone()));
+            }
+            request
+        };
+        let result = fixture.service.finalize_artifact_backup(finalize()).await;
+        if matches!(case, Case::Ready) {
+            result?;
+            fixture.service.finalize_artifact_backup(finalize()).await?;
+            assert_eq!(snapshot_state(pool, attempt).await?, "ready");
+            fixture
+                .service
+                .begin_artifact_backup(begin(attempt))
+                .await?;
+            assert!(
+                fixture
+                    .service
+                    .begin_artifact_backup(begin(SnapshotId::new()))
+                    .await
+                    .is_err(),
+                "consumption forbids fresh attempts"
+            );
+        } else {
+            assert!(
+                result.is_err(),
+                "invalid recovery published Ready: {case:?}"
+            );
+            assert_eq!(snapshot_state(pool, attempt).await?, "creating");
+            let consumed: Option<SnapshotId> = sqlx::query_scalar(sql!(
+                "SELECT consumed_attempt_id FROM backup_recovery_grants WHERE id=$1"
+            ))
+            .bind(id)
+            .fetch_one(pool)
+            .await?;
+            assert!(consumed.is_none(), "refusal rolls back consumption");
+        }
+        // Even after retention of earlier attempts, a grant-backed row is not
+        // authority for the ordinary retry rule. Inventory is not consulted.
+        let identity = snapshot_store::SnapshotArtifact::new(
+            Some(artifact),
+            ArtifactKind::Full,
+            ArtifactOrigin::Suspend,
+            None,
+        )?;
+        let mut conn = pool.acquire().await?;
+        assert!(
+            snapshot_store::earliest_registered_artifact_for_caller(
+                &mut conn,
+                sandbox,
+                &identity,
+                Some(ip)
+            )
+            .await?
+            .is_none()
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn shadow_admission_reports_retired_targets_and_unknown_inventory_without_locks() -> TestResult
+{
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    let (sandbox, _, _) = seed_sandbox_on_source_node(pool).await?;
+    let node: NodeId = sqlx::query_scalar(sql!("SELECT active_node_id FROM sandboxes WHERE id=$1"))
+        .bind(sandbox)
+        .fetch_one(pool)
+        .await?;
+    let artifact = LocalArtifactId::new();
+    sqlx::query(sql!("UPDATE sandboxes SET active_node_id=NULL,lifecycle='suspended',current_local_artifact_id=$2,current_local_artifact_kind='full',current_local_artifact_origin='suspend' WHERE id=$1")).bind(sandbox).bind(artifact).execute(pool).await?;
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions SET active=false WHERE sandbox_id=$1"
+    ))
+    .bind(sandbox)
+    .execute(pool)
+    .await?;
+    // Hold the row lock while the read-only scanner runs. A scanner which calls
+    // live admission deadlocks here until its statement timeout and fails.
+    let mut locked = pool.begin().await?;
+    sqlx::query(sql!("SELECT id FROM sandboxes WHERE id=$1 FOR UPDATE"))
+        .bind(sandbox)
+        .fetch_one(&mut *locked)
+        .await?;
+    let page = backup_admission_shadow_page(pool, node, None, 10).await?;
+    assert_eq!(page.rows.len(), 1);
+    assert_eq!(page.rows[0].decision, "permanently_refused");
+    locked.rollback().await?;
+    sqlx::query(sql!("UPDATE sandboxes SET target_node_id=NULL,current_local_artifact_id=NULL,current_local_artifact_kind=NULL,current_local_artifact_origin=NULL WHERE id=$1")).bind(sandbox).execute(pool).await?;
+    sqlx::query(sql!("INSERT INTO node_local_backup_pending(node_id,sandbox_id,artifact_id,artifact_kind) VALUES($1,$2,$3,'full')")).bind(node).bind(sandbox).bind(artifact).execute(pool).await?;
+    let page = backup_admission_shadow_page(pool, node, None, 10).await?;
+    assert_eq!(page.rows.len(), 1);
+    assert_eq!(page.rows[0].artifact_id, Some(artifact));
+    assert_eq!(page.rows[0].decision, "insufficient_evidence");
+    assert!(page.complete_inventory_reported_at.is_none());
+    Ok(())
+}
+
+#[test]
+fn runtime_backup_gate_fails_closed_when_provider_cannot_resolve() {
+    use backup_admission::OwnershipMode;
+    let missing = pplx_space_feature_flags::FeatureFlagClient::disabled();
+    assert!(!OwnershipMode::Compatibility.enforcing(&missing));
+    assert!(OwnershipMode::Runtime.enforcing(&missing));
+    assert!(OwnershipMode::Strict.enforcing(&missing));
+    let legacy = pplx_space_feature_flags::FeatureFlagClient::fixed_bools([(
+        pplx_space_feature_flags::STRICT_BACKUP_OWNERSHIP.key(),
+        false,
+    )]);
+    assert!(!OwnershipMode::Runtime.enforcing(&legacy));
+    assert!(OwnershipMode::Strict.enforcing(&legacy));
 }

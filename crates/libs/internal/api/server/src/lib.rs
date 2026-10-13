@@ -32,6 +32,7 @@ pub use run::{
 };
 
 use pplx_space_common_core::sql;
+use pplx_space_common_core::types::{K8sNodeUid, NodeManagedBy};
 use std::net::IpAddr;
 use std::str::FromStr;
 
@@ -275,6 +276,8 @@ fn published_node_status_db(status: PublishedNodeStatus) -> Result<PublishedNode
 
 #[derive(Clone)]
 pub struct ClusterApiService {
+    backup_flags: pplx_space_feature_flags::FeatureFlagClient,
+    backup_ownership_mode: backup_admission::OwnershipMode,
     ingress_activation: Option<std::sync::Arc<dyn ingress_activation::IngressActivation>>,
     reserved_template_names: template_publication::ReservedTemplateNames,
     trusted_template_storage: trusted_storage::TrustedTemplateStorageBuckets,
@@ -363,8 +366,6 @@ struct OriginNode {
 #[derive(FromRow)]
 struct SnapshotSandboxRow {
     org_id: OrgId,
-    active_node_id: Option<NodeId>,
-    target_node_id: Option<NodeId>,
     vcpu: Option<i32>,
     memory_mib: Option<i32>,
     template_id: Option<String>,
@@ -372,20 +373,6 @@ struct SnapshotSandboxRow {
 }
 
 impl SnapshotSandboxRow {
-    /// The node the snapshot is physically uploading **from**, recorded as
-    /// `snapshots.source_node_id`. For a fresh suspend the VM is still placed,
-    /// so `active_node_id` is the source. For a **reupload** of an
-    /// already-suspended sandbox, `active_node_id` is NULL (cleared at
-    /// suspend), but the on-disk artifacts and the reupload worker live on
-    /// `target_node_id` (preserved across suspend) — so fall back to it.
-    /// Without this, reupload snapshots get a NULL `source_node_id` and the
-    /// node-scoped in-flight-upload drain guard can't attribute them to the
-    /// node actually running the upload, letting that node be terminated
-    /// mid-reupload.
-    fn source_node_id(&self) -> Option<NodeId> {
-        self.active_node_id.or(self.target_node_id)
-    }
-
     fn new_snapshot(
         &self,
         id: SnapshotId,
@@ -408,7 +395,6 @@ impl SnapshotSandboxRow {
             .map(SnapshotContentHash::from_stored);
         Ok(
             snapshot_store::NewSnapshot::new(id, sandbox_id, kind, state, self.org_id, storage_uri)
-                .with_source_node_id(self.source_node_id())
                 .with_resources(self.vcpu, self.memory_mib)
                 .with_template(template_id, content_hash),
         )
@@ -447,7 +433,8 @@ fn parse_artifact_digests(
 
 fn snapshot_insert_status(error: snapshot_store::InsertSnapshotError) -> Status {
     match error {
-        snapshot_store::InsertSnapshotError::IdentityConflict { .. }
+        snapshot_store::InsertSnapshotError::InvalidRetrySource { .. }
+        | snapshot_store::InsertSnapshotError::IdentityConflict { .. }
         | snapshot_store::InsertSnapshotError::StorageLocationConflict { .. } => {
             Status::failed_precondition(error.to_string())
         }
@@ -467,6 +454,20 @@ fn storage_uri_names_backup_attempt(
     key_prefix == attempt_prefix || key_prefix.ends_with(&format!("/{attempt_prefix}"))
 }
 
+struct BackupContentProof<'a> {
+    artifacts: &'a [snapshot_store::SnapshotArtifactDigest],
+    metadata: Option<Digest>,
+}
+
+fn recovery_status(error: snapshot_store::recovery::RecoveryError) -> Status {
+    match error {
+        snapshot_store::recovery::RecoveryError::Refused(message) => {
+            Status::failed_precondition(message)
+        }
+        other => Status::internal(format!("recovery authority: {other}")),
+    }
+}
+
 impl ClusterApiService {
     pub fn new(pool: sqlx::PgPool) -> Self {
         let route_ed25519_authority =
@@ -482,6 +483,9 @@ impl ClusterApiService {
             .expect("ClusterApiService template storage configuration must be valid");
         Self {
             trusted_template_storage,
+            backup_flags: pplx_space_feature_flags::FeatureFlagClient::from_env(),
+            backup_ownership_mode: backup_admission::OwnershipMode::from_env()
+                .expect("backup ownership configuration must be valid"),
             ..Self::with_security_state(pool, route_ed25519_authority, ecw_credential_keyring)
         }
     }
@@ -500,6 +504,11 @@ impl ClusterApiService {
         let template_releases_store =
             template_releases_store::TemplateReleasesStore::new(pool.clone());
         Self {
+            backup_flags: pplx_space_feature_flags::FeatureFlagClient::fixed_bools([(
+                pplx_space_feature_flags::STRICT_BACKUP_OWNERSHIP.key(),
+                false,
+            )]),
+            backup_ownership_mode: backup_admission::OwnershipMode::Runtime,
             ingress_activation: None,
             reserved_template_names: template_publication::ReservedTemplateNames::default(),
             trusted_template_storage: trusted_storage::TrustedTemplateStorageBuckets::default(),
@@ -511,6 +520,10 @@ impl ClusterApiService {
             route_ed25519_authority,
             ecw_credential_keyring,
         }
+    }
+
+    fn strict_backup_ownership(&self) -> bool {
+        self.backup_ownership_mode.enforcing(&self.backup_flags)
     }
 
     /// Point the template-visibility lookup at its own pool.
@@ -556,6 +569,8 @@ impl ClusterApiService {
     ) -> Result<Self, Status> {
         let mut service =
             Self::with_security_state(pool, route_ed25519_authority, ecw_credential_keyring);
+        service.backup_flags = pplx_space_feature_flags::FeatureFlagClient::from_env();
+        service.backup_ownership_mode = backup_admission::OwnershipMode::from_env()?;
         service.reserved_template_names = template_publication::ReservedTemplateNames::from_env()?;
         service.trusted_template_storage =
             trusted_storage::TrustedTemplateStorageBuckets::from_env()
@@ -578,24 +593,79 @@ impl ClusterApiService {
     /// ([`ClusterApiService::finalize_artifact_backup`]) rejects anything
     /// else before calling this.
     ///
-    /// Only the attempt's source node may close it; the check precedes the
-    /// transaction so a refused caller writes nothing.
+    /// Only the attempt's source incarnation may close it. Authorization holds
+    /// registration locks through the transaction; a refusal writes nothing.
     async fn finalize_backup_attempt(
         &self,
         snapshot_id: SnapshotId,
         target_state: SnapshotState,
         bytes_uploaded: i64,
         failure_reason: Option<&str>,
-        artifact_digests: &[snapshot_store::SnapshotArtifactDigest],
-        remote_addr: Option<std::net::SocketAddr>,
+        proof: BackupContentProof<'_>,
+        caller: &backup_admission::BackupCaller,
     ) -> Result<(), Status> {
         let attempt = self
             .registered_backup_attempt(snapshot_id)
             .await?
             .ok_or_else(|| Status::not_found(format!("snapshot {snapshot_id} not found")))?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| Status::internal(format!("begin finalize snapshot tx: {e}")))?;
+        sqlx::query(sql!("SELECT id FROM sandboxes WHERE id=$1 FOR UPDATE"))
+            .bind(attempt.sandbox_id())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| Status::internal(format!("lock backup sandbox: {e}")))?;
+        let grant = snapshot_store::recovery::for_attempt(&mut tx, snapshot_id)
+            .await
+            .map_err(recovery_status)?;
+        if attempt.recovery_grant_id().is_some() && grant.is_none() {
+            return Err(Status::failed_precondition("recovery approval is absent"));
+        }
+        let mut caller = caller.clone();
+        if grant.is_some() {
+            caller.strict = true;
+        }
         let source_node = self
-            .authorize_backup_source_node(attempt.source_node_id(), remote_addr, "backup attempt")
+            .authorize_backup_source_node(
+                &mut tx,
+                attempt.source_node_id(),
+                attempt.source_node_uid(),
+                &caller,
+                "backup attempt",
+            )
             .await?;
+
+        if let Some(grant) = &grant {
+            let uid = caller.node_uid.as_ref().map_err(Clone::clone)?;
+            if target_state.is_ready() {
+                if !grant
+                    .manifest
+                    .matches(proof.artifacts, proof.metadata, bytes_uploaded)
+                    .map_err(recovery_status)?
+                {
+                    return Err(Status::failed_precondition(
+                        "uploaded content differs from the approved recovery manifest",
+                    ));
+                }
+                // Ready replay acknowledges the same terminal proof, without
+                // re-projecting old bytes onto a successor sandbox state.
+                if grant.consumed_attempt_id == Some(snapshot_id) && attempt.state().is_ready() {
+                    return Ok(());
+                }
+            }
+            grant
+                .validate_live(&mut tx, uid)
+                .await
+                .map_err(recovery_status)?;
+            if grant.active_attempt_id != Some(snapshot_id) {
+                return Err(Status::failed_precondition(
+                    "recovery attempt is no longer active",
+                ));
+            }
+        }
 
         // For READY, persist the uploaded bytes and clear any
         // prior-attempt failure reason. For FAILED, persist the operator
@@ -608,18 +678,19 @@ impl ClusterApiService {
             failure_reason.map(str::trim).filter(|s| !s.is_empty())
         };
 
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| Status::internal(format!("begin finalize snapshot tx: {e}")))?;
-
         // `RETURNING` the sandbox so a READY transition can wake the
         // cohort-restore listener without a second lookup, and the node and
         // artifact identity so it can clear exactly this artifact's row from
         // the node's pending-backup mirror. Taking all four from the row this
         // statement just flipped is what makes that delete safe: nothing else
         // here knows which artifact the caller finalized.
+        if target_state.is_ready()
+            && let Some(grant) = &grant
+        {
+            snapshot_store::recovery::consume(&mut tx, grant, snapshot_id)
+                .await
+                .map_err(recovery_status)?;
+        }
         let finalized_snapshot: Option<FinalizedSnapshotRow> = sqlx::query_as(sql!(
             "UPDATE snapshots
                 SET state = $2,
@@ -630,12 +701,17 @@ impl ClusterApiService {
                     END
               WHERE id = $1
                 AND state IN ('creating', $2)
+                AND sandbox_id=$5 AND source_node_id=$6
+                AND source_node_uid IS NOT DISTINCT FROM $7
             RETURNING sandbox_id, source_node_id, local_artifact_id, artifact_kind"
         ))
         .bind(snapshot_id)
         .bind(target_state.as_str())
         .bind(size_bytes)
         .bind(failure_reason)
+        .bind(attempt.sandbox_id())
+        .bind(attempt.source_node_id())
+        .bind(attempt.source_node_uid())
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| Status::internal(format!("finalize snapshot: {e}")))?;
@@ -656,7 +732,7 @@ impl ClusterApiService {
                     "snapshot {snapshot_id} not found"
                 ))),
                 Some(existing) => Err(Status::failed_precondition(format!(
-                    "snapshot {snapshot_id} already in terminal state {existing:?}; \
+                    "snapshot {snapshot_id} has changed ownership or is in terminal state {existing:?}; \
                      cannot transition to {}",
                     target_state.as_str()
                 ))),
@@ -671,7 +747,7 @@ impl ClusterApiService {
         let sandbox_id = finalized_snapshot.sandbox_id;
 
         if target_state.is_ready() {
-            snapshot_store::record_artifact_digests(&mut tx, snapshot_id, artifact_digests)
+            snapshot_store::record_artifact_digests(&mut tx, snapshot_id, proof.artifacts)
                 .await
                 .map_err(|error| match &error {
                     snapshot_store::RecordArtifactDigestsError::Conflict { .. } => {
@@ -774,7 +850,10 @@ impl ClusterApiService {
         &self,
         request: Request<BeginArtifactBackupRequest>,
     ) -> Result<Response<BeginArtifactBackupResponse>, Status> {
-        let remote_addr = request.remote_addr();
+        let caller =
+            backup_admission::BackupCaller::from_request(&request, self.strict_backup_ownership())
+                .await;
+        let remote_addr = caller.remote_addr;
         let req = request.into_inner();
         let sandbox_id = SandboxId::from_str(req.sandbox_id.trim())
             .map_err(|e| Status::invalid_argument(format!("invalid sandbox_id: {e}")))?;
@@ -837,6 +916,54 @@ impl ClusterApiService {
         }
         let execution_metadata = snapshot_execution_metadata(req.execution.as_ref())?;
         let sandbox = self.lookup_snapshot_sandbox(sandbox_id).await?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| Status::internal(format!("begin tx: {e}")))?;
+        let strict_admission = backup_admission::source_node(
+            &mut tx,
+            sandbox_id,
+            &artifact,
+            remote_addr.map(|address| address.ip()),
+        )
+        .await
+        .map_err(|e| Status::internal(format!("backup source: {e}")))?;
+        let shadow_decision = strict_admission.decision(&caller);
+        pplx_space_metrics::snapshot::backup_admission(shadow_decision, caller.strict);
+        let admitted_with_proof =
+            shadow_decision == pplx_space_metrics::snapshot::BackupAdmissionDecision::Allowed;
+        let admission = if caller.strict
+            || admitted_with_proof
+            || matches!(
+                strict_admission,
+                backup_admission::Admission::ConflictingArtifact
+            ) {
+            strict_admission
+        } else {
+            tracing::warn!(sandbox_id = %sandbox_id, decision = ?strict_admission, "backup ownership shadow check would refuse or lacks caller proof");
+            // Compatibility retains the old placement policy. In particular it
+            // must not stamp today's UID onto a legacy-only registration.
+            let node: Option<NodeId> = sqlx::query_scalar(sql!(
+                "SELECT COALESCE(active_node_id,target_node_id) FROM sandboxes WHERE id=$1"
+            ))
+            .bind(sandbox_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| Status::internal(format!("legacy backup placement: {e}")))?
+            .flatten();
+            match node {
+                Some(node_id) => {
+                    backup_admission::Admission::Authorized(backup_admission::BackupSource {
+                        node_id,
+                        node_uid: None,
+                        retry_of: None,
+                    })
+                }
+                None => backup_admission::Admission::UnregisteredArtifact,
+            }
+        };
+        let source = admission.source();
         let snapshot = sandbox
             .new_snapshot(
                 snapshot_id,
@@ -845,24 +972,47 @@ impl ClusterApiService {
                 SnapshotState::Creating,
                 storage_uri,
             )?
+            .with_source_node_id(source.map(|source| source.node_id))
+            .with_source_node_uid(source.and_then(|source| source.node_uid.clone()))
+            .with_retry_of(source.and_then(|source| source.retry_of))
             .with_artifact(artifact)
             .with_execution_metadata(execution_metadata);
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| Status::internal(format!("begin tx: {e}")))?;
 
-        let persisted = snapshot_store::insert(&mut tx, &snapshot)
+        let mut caller = caller;
+        let existing_grant = snapshot_store::recovery::for_attempt(&mut tx, snapshot_id)
             .await
-            .map_err(snapshot_insert_status)?;
+            .map_err(recovery_status)?;
+        let grant = match existing_grant {
+            Some(grant) => Some(grant),
+            None => snapshot_store::recovery::for_artifact(&mut tx, sandbox_id, local_artifact_id)
+                .await
+                .map_err(recovery_status)?,
+        };
+        let persisted = if let Some(grant) = &grant {
+            caller.strict = true;
+            let uid = caller.node_uid.as_ref().map_err(Clone::clone)?;
+            snapshot_store::recovery::register(&mut tx, grant, snapshot, uid)
+                .await
+                .map_err(recovery_status)?
+        } else {
+            snapshot_store::insert(&mut tx, &snapshot)
+                .await
+                .map_err(snapshot_insert_status)?
+        };
         // Authorize on the persisted row: a replay stays bound to the node
         // that registered the attempt even after retirement or relocation,
         // and a read before the transaction could see a row retention
         // deletes before the insert. A refusal rolls the insert back.
+        // A replay uses its stored owner even if current execution admission
+        // now refuses a new attempt.
+        if persisted.source_node_id().is_none() {
+            return Err(admission.refusal());
+        }
         self.authorize_backup_source_node(
+            &mut tx,
             persisted.source_node_id(),
-            remote_addr,
+            persisted.source_node_uid(),
+            &caller,
             "backup attempt",
         )
         .await?;
@@ -880,7 +1030,9 @@ impl ClusterApiService {
         &self,
         request: Request<FinalizeArtifactBackupRequest>,
     ) -> Result<Response<FinalizeArtifactBackupResponse>, Status> {
-        let remote_addr = request.remote_addr();
+        let caller =
+            backup_admission::BackupCaller::from_request(&request, self.strict_backup_ownership())
+                .await;
         let req = request.into_inner();
         let backup_attempt_id = BackupAttemptId::from_str(req.backup_attempt_id.trim())
             .map_err(|e| Status::invalid_argument(format!("invalid backup_attempt_id: {e}")))?;
@@ -899,8 +1051,20 @@ impl ClusterApiService {
             target_state,
             req.bytes_uploaded,
             req.failure_reason.as_deref(),
-            &artifact_digests,
-            remote_addr,
+            BackupContentProof {
+                artifacts: &artifact_digests,
+                metadata: req
+                    .metadata_binding_digest
+                    .as_deref()
+                    .map(Digest::from_str)
+                    .transpose()
+                    .map_err(|error| {
+                        Status::invalid_argument(format!(
+                            "invalid metadata binding digest: {error}"
+                        ))
+                    })?,
+            },
+            &caller,
         )
         .await?;
         Ok(Response::new(FinalizeArtifactBackupResponse {}))
@@ -910,11 +1074,64 @@ impl ClusterApiService {
         &self,
         request: Request<TouchArtifactBackupRequest>,
     ) -> Result<Response<TouchArtifactBackupResponse>, Status> {
+        let caller =
+            backup_admission::BackupCaller::from_request(&request, self.strict_backup_ownership())
+                .await;
         let req = request.into_inner();
         let backup_attempt_id = BackupAttemptId::from_str(req.backup_attempt_id.trim())
             .map_err(|e| Status::invalid_argument(format!("invalid backup_attempt_id: {e}")))?;
-        self.touch_backup_attempt(SnapshotId::from_uuid(backup_attempt_id.as_uuid()))
-            .await?;
+        if let Some(attempt) = self
+            .registered_backup_attempt(SnapshotId::from_uuid(backup_attempt_id.as_uuid()))
+            .await?
+        {
+            if caller.strict || attempt.recovery_grant_id().is_some() {
+                let mut tx = self.pool.begin().await.map_err(|error| {
+                    Status::internal(format!("touch backup transaction: {error}"))
+                })?;
+                sqlx::query(sql!("SELECT id FROM sandboxes WHERE id=$1 FOR UPDATE"))
+                    .bind(attempt.sandbox_id())
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|error| {
+                        Status::internal(format!("lock heartbeat sandbox: {error}"))
+                    })?;
+                let mut caller = caller;
+                if attempt.recovery_grant_id().is_some() {
+                    caller.strict = true;
+                    let grant = snapshot_store::recovery::for_attempt(&mut tx, attempt.id())
+                        .await
+                        .map_err(recovery_status)?
+                        .ok_or_else(|| {
+                            Status::failed_precondition("recovery approval is absent")
+                        })?;
+                    grant
+                        .validate_live(&mut tx, caller.node_uid.as_ref().map_err(Clone::clone)?)
+                        .await
+                        .map_err(recovery_status)?;
+                    if grant.active_attempt_id != Some(attempt.id()) {
+                        return Err(Status::failed_precondition(
+                            "recovery attempt is no longer active",
+                        ));
+                    }
+                }
+                self.authorize_backup_source_node(
+                    &mut tx,
+                    attempt.source_node_id(),
+                    attempt.source_node_uid(),
+                    &caller,
+                    "backup heartbeat",
+                )
+                .await?;
+                sqlx::query(sql!("UPDATE snapshots SET last_attempt_at=NOW() WHERE id=$1 AND state='creating' AND source_node_id=$2 AND source_node_uid IS NOT DISTINCT FROM $3"))
+                    .bind(attempt.id()).bind(attempt.source_node_id()).bind(attempt.source_node_uid()).execute(&mut *tx).await
+                    .map_err(|e| Status::internal(format!("touch authorized backup: {e}")))?;
+                tx.commit()
+                    .await
+                    .map_err(|error| Status::internal(format!("commit heartbeat: {error}")))?;
+            } else {
+                self.touch_backup_attempt(attempt.id()).await?;
+            }
+        }
         Ok(Response::new(TouchArtifactBackupResponse {}))
     }
 
@@ -1038,7 +1255,7 @@ impl ClusterApiService {
 
     /// Shared sandbox lookup for the artifact-backup write path. Fetches
     /// the org-scoped, capture-time fields that the `snapshots` row inherits
-    /// from the source sandbox (org_id, active_node_id, vcpu, memory_mib,
+    /// from the source sandbox (org_id, vcpu, memory_mib,
     /// template_id, content_hash).
     async fn lookup_snapshot_sandbox(
         &self,
@@ -1048,7 +1265,7 @@ impl ClusterApiService {
             // A primary-key fetch is sufficient: `snapshot_execution_metadata`
             // requires caller-supplied execution metadata, so no template or
             // runtime-guest lookup is needed here.
-            "SELECT org_id, active_node_id, target_node_id, vcpu, memory_mib,
+            "SELECT org_id, vcpu, memory_mib,
                     template_id, content_hash
              FROM sandboxes
              WHERE id = $1"
@@ -1219,6 +1436,49 @@ impl ClusterApiService {
         .map_err(|err| Status::internal(format!("query nodes: {err}")))
     }
 
+    async fn resolve_registered_origin_node(
+        executor: impl sqlx::PgExecutor<'_>,
+        node_id: NodeId,
+        role_hint: Option<SpaceNodeRole>,
+    ) -> Result<OriginNode, Status> {
+        let value = node_id.to_string();
+        let role_hint_str = role_hint.map(SpaceNodeRole::as_str);
+        let row = sqlx::query_as::<_, OriginNodeRow>(sql!(
+            "SELECT n.id,
+                host(n.address) AS address,
+                n.role
+         FROM nodes n
+         WHERE n.id = $1
+           AND ($2::TEXT IS NULL OR n.role = $2)
+           AND n.managed_by IN ('space', 'k8s')
+           AND COALESCE(n.state, 'registered') != 'deleted'
+         LIMIT 1"
+        ))
+        .bind(node_id.as_uuid())
+        .bind(role_hint_str)
+        .fetch_optional(executor)
+        .await
+        .map_err(|err| Status::internal(format!("resolve origin node: {err}")))?;
+        if let Some(row) = row {
+            let role = SpaceNodeRole::parse(&row.role).map_err(|error| {
+                Status::internal(format!(
+                    "registered node {} has unknown role {}: {error}",
+                    value, row.role
+                ))
+            })?;
+            return Ok(OriginNode {
+                id: row.id,
+                display_id: value.to_string(),
+                address: parse_origin_address(row.address.as_deref())?,
+                role,
+                bootstrapped: false,
+            });
+        }
+        Err(Status::not_found(format!(
+            "origin_node_id {value} is not registered"
+        )))
+    }
+
     async fn resolve_origin_node_id(
         &self,
         value: &str,
@@ -1226,42 +1486,8 @@ impl ClusterApiService {
         remote_addr: Option<std::net::SocketAddr>,
     ) -> Result<OriginNode, Status> {
         let value = trimmed_required(value, "origin_node_id")?;
-        let role_hint_str = role_hint.map(SpaceNodeRole::as_str);
         if let Ok(node_id) = value.parse::<NodeId>() {
-            let row = sqlx::query_as::<_, OriginNodeRow>(sql!(
-                "SELECT n.id,
-                        host(n.address) AS address,
-                        n.role
-                 FROM nodes n
-                 WHERE n.id = $1
-                   AND ($2::TEXT IS NULL OR n.role = $2)
-                   AND n.managed_by IN ('space', 'k8s')
-                   AND COALESCE(n.state, 'registered') != 'deleted'
-                 LIMIT 1"
-            ))
-            .bind(node_id.as_uuid())
-            .bind(role_hint_str)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|err| Status::internal(format!("resolve origin node: {err}")))?;
-            if let Some(row) = row {
-                let role = SpaceNodeRole::parse(&row.role).map_err(|error| {
-                    Status::internal(format!(
-                        "registered node {} has unknown role {}: {error}",
-                        value, row.role
-                    ))
-                })?;
-                return Ok(OriginNode {
-                    id: row.id,
-                    display_id: value.to_string(),
-                    address: parse_origin_address(row.address.as_deref())?,
-                    role,
-                    bootstrapped: false,
-                });
-            }
-            return Err(Status::not_found(format!(
-                "origin_node_id {value} is not registered"
-            )));
+            return Self::resolve_registered_origin_node(&self.pool, node_id, role_hint).await;
         }
 
         let Some(role_hint) = role_hint else {
@@ -1439,8 +1665,10 @@ impl ClusterApiService {
     /// name a node. No source node fails closed. Returns the admitted node.
     async fn authorize_backup_source_node(
         &self,
+        conn: &mut sqlx::PgConnection,
         source_node_id: Option<NodeId>,
-        remote_addr: Option<std::net::SocketAddr>,
+        source_node_uid: Option<&K8sNodeUid>,
+        caller: &backup_admission::BackupCaller,
         subject: &str,
     ) -> Result<NodeId, Status> {
         let node_id = source_node_id.ok_or_else(|| {
@@ -1448,10 +1676,30 @@ impl ClusterApiService {
                 "{subject} has no source node that may publish a backup for it"
             ))
         })?;
-        let origin = self
-            .resolve_origin_node_id(&node_id.to_string(), None, None)
-            .await?;
-        validate_origin_remote_addr(&origin, remote_addr)?;
+        let (managed_by, current_uid) = backup_admission::node_identity(conn, node_id)
+            .await
+            .map_err(|e| Status::internal(format!("lock backup source identity: {e}")))?
+            .ok_or_else(|| Status::permission_denied("backup source is not a registered worker"))?;
+        if caller.strict && managed_by == NodeManagedBy::Kubernetes && source_node_uid.is_none() {
+            return Err(Status::failed_precondition(
+                "backup attempt has no recorded Kubernetes node incarnation; historical ownership cannot be inferred",
+            ));
+        }
+        if source_node_uid.is_some() && source_node_uid != current_uid.as_ref() {
+            return Err(Status::permission_denied(
+                "backup attempt belongs to a different Kubernetes node incarnation",
+            ));
+        }
+        if caller.strict && managed_by == NodeManagedBy::Kubernetes {
+            let verified_uid = caller.node_uid.as_ref().map_err(Clone::clone)?;
+            if source_node_uid != Some(verified_uid) {
+                return Err(Status::permission_denied(
+                    "caller does not prove the attempt's node incarnation",
+                ));
+            }
+        }
+        let origin = Self::resolve_registered_origin_node(&mut *conn, node_id, None).await?;
+        validate_origin_remote_addr(&origin, caller.remote_addr)?;
         Ok(node_id)
     }
 }
@@ -1515,6 +1763,10 @@ fn normalize_ip(value: IpAddr) -> IpAddr {
 
 mod adapter;
 mod auto_lifecycle_delete_completions;
+mod backup_admission;
+pub use backup_admission::{
+    BackupShadowPage, BackupShadowRow, shadow_page as backup_admission_shadow_page,
+};
 mod metadata;
 mod node_local_backup_pending;
 mod publish;

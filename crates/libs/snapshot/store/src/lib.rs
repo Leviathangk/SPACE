@@ -1,9 +1,12 @@
 #![doc = include_str!("../README.md")]
 
+pub mod recovery;
+
 use std::str::FromStr;
 
 use jiff::Timestamp;
 use pplx_space_common_core::sql;
+use pplx_space_common_core::types::K8sNodeUid;
 use pplx_space_common_core::types::{
     ArtifactKind, ArtifactKindParseError, ArtifactOrigin, ArtifactOriginParseError,
     ExactStorageUri, ExecutionGeneration, ExecutionGenerationParseError, LocalArtifactId, NodeId,
@@ -99,6 +102,12 @@ pub enum GetSnapshotError {
 /// Inserting a snapshot catalog aggregate failed.
 #[derive(Debug, thiserror::Error)]
 pub enum InsertSnapshotError {
+    #[error("snapshot {snapshot_id} has no matching retry registration {prior_snapshot_id}")]
+    InvalidRetrySource {
+        snapshot_id: SnapshotId,
+        prior_snapshot_id: SnapshotId,
+    },
+
     #[error(transparent)]
     Database(#[from] sqlx::Error),
 
@@ -134,6 +143,9 @@ pub struct NewSnapshot {
     kind: SnapshotKind,
     state: SnapshotState,
     source_node_id: Option<NodeId>,
+    source_node_uid: Option<K8sNodeUid>,
+    retry_of: Option<SnapshotId>,
+    recovery_grant_id: Option<recovery::RecoveryGrantId>,
     vcpu: Option<i32>,
     memory_mib: Option<i32>,
     size_bytes: Option<i64>,
@@ -161,6 +173,9 @@ impl NewSnapshot {
             kind,
             state,
             source_node_id: None,
+            source_node_uid: None,
+            retry_of: None,
+            recovery_grant_id: None,
             vcpu: None,
             memory_mib: None,
             size_bytes: None,
@@ -203,6 +218,21 @@ impl NewSnapshot {
         self
     }
 
+    /// Preserve the original registration time when opening a fresh attempt.
+    /// The store verifies the prior row's artifact and source under a row lock;
+    /// retries must not make older bytes newer for markerless restore selectors.
+    pub fn with_retry_of(mut self, prior: Option<SnapshotId>) -> Self {
+        self.retry_of = prior;
+        self
+    }
+
+    /// Bind a Kubernetes backup to its source incarnation. Historical and
+    /// directly managed attempts may have no Kubernetes identity.
+    pub fn with_source_node_uid(mut self, uid: Option<K8sNodeUid>) -> Self {
+        self.source_node_uid = uid;
+        self
+    }
+
     /// Set artifact-backup identity for a snapshot backed by a local artifact.
     pub fn with_artifact(mut self, artifact: SnapshotArtifact) -> Self {
         self.artifact = Some(artifact);
@@ -228,6 +258,8 @@ pub struct SnapshotRecord {
     state: SnapshotState,
     timestamp: Timestamp,
     source_node_id: Option<NodeId>,
+    source_node_uid: Option<K8sNodeUid>,
+    recovery_grant_id: Option<recovery::RecoveryGrantId>,
     label: Option<String>,
     retention_tier: Option<String>,
     vcpu: Option<i32>,
@@ -261,12 +293,20 @@ impl SnapshotRecord {
         self.state
     }
 
+    pub const fn recovery_grant_id(&self) -> Option<recovery::RecoveryGrantId> {
+        self.recovery_grant_id
+    }
+
     pub const fn timestamp(&self) -> Timestamp {
         self.timestamp
     }
 
     pub const fn source_node_id(&self) -> Option<NodeId> {
         self.source_node_id
+    }
+
+    pub fn source_node_uid(&self) -> Option<&K8sNodeUid> {
+        self.source_node_uid.as_ref()
     }
 
     pub fn label(&self) -> Option<&str> {
@@ -448,6 +488,8 @@ struct SnapshotRow {
     state: String,
     timestamp: OffsetDateTime,
     source_node_id: Option<NodeId>,
+    source_node_uid: Option<K8sNodeUid>,
+    recovery_grant_id: Option<recovery::RecoveryGrantId>,
     label: Option<String>,
     retention_tier: Option<String>,
     vcpu: Option<i32>,
@@ -518,7 +560,7 @@ pub async fn delete_snapshot_catalog(
 /// Content digest of one artifact file in a snapshot attempt, as reported by
 /// the node that uploaded it. Restore compares the bytes it pulls against this
 /// instead of trusting the object store.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotArtifactDigest {
     pub artifact: SnapshotArtifactFile,
     pub digest: Digest,
@@ -669,7 +711,7 @@ pub async fn get(
 ) -> Result<Option<SnapshotRecord>, GetSnapshotError> {
     let row: Option<SnapshotRow> = sqlx::query_as(sql!(
         "SELECT sn.id, sn.sandbox_id, sn.type AS snapshot_kind, sn.state,
-                sn.timestamp, sn.source_node_id, sn.label, sn.retention_tier,
+                sn.timestamp, sn.source_node_id, sn.source_node_uid, sn.recovery_grant_id, sn.label, sn.retention_tier,
                 sn.vcpu, sn.memory_mib, sn.size_bytes, sn.template_id,
                 sn.content_hash, sn.org_id, sn.failure_reason,
                 sn.last_attempt_at, sn.local_artifact_id, sn.artifact_kind,
@@ -763,6 +805,8 @@ impl TryFrom<SnapshotRow> for SnapshotRecord {
             state,
             timestamp,
             source_node_id: row.source_node_id,
+            source_node_uid: row.source_node_uid,
+            recovery_grant_id: row.recovery_grant_id,
             label: row.label,
             retention_tier: row.retention_tier,
             vcpu: row.vcpu,
@@ -873,6 +917,63 @@ fn snapshot_artifact(
         .map_err(|_| GetSnapshotError::InvalidArtifactIdentity { snapshot_id })
 }
 
+/// Exact registration evidence, distinct from current worker inventory.
+#[derive(Debug, sqlx::FromRow)]
+pub struct ArtifactRegistration {
+    pub snapshot_id: SnapshotId,
+    pub node_id: NodeId,
+    pub node_uid: Option<K8sNodeUid>,
+}
+
+/// Find the earliest qualifying registration from this caller's registered
+/// worker. The admitting workflow must lock and verify the current worker
+/// incarnation. `insert` independently rechecks the chosen prior under lock,
+/// so retention or concurrent catalog changes cannot turn this read into a grant.
+/// Conflicting catalog identity is a refusal even in compatibility mode.
+pub async fn artifact_provenance_conflicts(
+    conn: impl sqlx::PgExecutor<'_>,
+    sandbox: SandboxId,
+    artifact: &SnapshotArtifact,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(sql!("SELECT EXISTS(SELECT 1 FROM snapshots WHERE sandbox_id=$1 AND local_artifact_id=$2 AND (artifact_kind IS DISTINCT FROM $3 OR artifact_origin IS DISTINCT FROM $4 OR artifact_snapshot_name IS DISTINCT FROM $5))"))
+        .bind(sandbox).bind(artifact.local_artifact_id()).bind(artifact.kind().as_str()).bind(artifact.origin().as_str()).bind(artifact.snapshot_name().map(SnapshotName::as_str)).fetch_one(conn).await
+}
+
+pub async fn earliest_registered_artifact_for_caller(
+    conn: &mut sqlx::PgConnection,
+    sandbox_id: SandboxId,
+    artifact: &SnapshotArtifact,
+    caller_ip: Option<std::net::IpAddr>,
+) -> Result<Option<ArtifactRegistration>, sqlx::Error> {
+    let caller_ip = caller_ip.map(|ip| match ip {
+        std::net::IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map(std::net::IpAddr::V4)
+            .unwrap_or(std::net::IpAddr::V6(ip)),
+        ip => ip,
+    });
+    let mapped = caller_ip.map(|ip| match ip {
+        std::net::IpAddr::V4(ip) => ip.to_ipv6_mapped().to_string(),
+        std::net::IpAddr::V6(ip) => ip.to_string(),
+    });
+    sqlx::query_as(sql!(
+        "SELECT prior.id AS snapshot_id, prior.source_node_id AS node_id, prior.source_node_uid AS node_uid
+           FROM snapshots prior JOIN nodes owner ON owner.id=prior.source_node_id
+          WHERE prior.sandbox_id=$1 AND prior.local_artifact_id=$2
+            AND prior.artifact_kind=$3 AND prior.artifact_origin=$4
+            AND prior.artifact_snapshot_name IS NOT DISTINCT FROM $5
+            AND prior.state IN ('creating','failed','ready') AND prior.recovery_grant_id IS NULL
+            AND owner.role='worker' AND host(owner.address)::INET IN ($6::INET, $7::INET)
+            AND (owner.managed_by <> 'k8s' OR prior.source_node_uid IS NOT NULL)
+          ORDER BY prior.timestamp ASC, prior.id ASC LIMIT 1"
+    ))
+    .bind(sandbox_id).bind(artifact.local_artifact_id())
+    .bind(artifact.kind().as_str()).bind(artifact.origin().as_str())
+    .bind(artifact.snapshot_name().map(SnapshotName::as_str))
+    .bind(caller_ip.map(|ip| ip.to_string())).bind(mapped)
+    .fetch_optional(conn).await
+}
+
 /// Insert one snapshot and its single durable storage location.
 ///
 /// The operation is idempotent for the same durable identity and exact URI.
@@ -894,6 +995,50 @@ pub async fn insert(
         .as_ref()
         .map(SnapshotContentHash::as_stored);
 
+    let registration_time: Option<OffsetDateTime> = if let Some(grant) = snapshot.recovery_grant_id
+    {
+        Some(
+            sqlx::query_scalar(sql!(
+                "SELECT captured_at FROM backup_recovery_grants WHERE id=$1 FOR UPDATE"
+            ))
+            .bind(grant)
+            .fetch_one(&mut **tx)
+            .await?,
+        )
+    } else if let Some(prior) = snapshot.retry_of {
+        Some(
+            sqlx::query_scalar(sql!(
+                "SELECT timestamp FROM snapshots
+              WHERE id=$1 AND sandbox_id=$2 AND local_artifact_id=$3
+                AND artifact_kind=$4 AND artifact_origin=$5
+                AND artifact_snapshot_name IS NOT DISTINCT FROM $6
+                AND source_node_id=$7 AND source_node_uid IS NOT DISTINCT FROM $8
+                AND state IN ('creating','failed','ready') AND recovery_grant_id IS NULL
+              FOR SHARE"
+            ))
+            .bind(prior)
+            .bind(snapshot.sandbox_id)
+            .bind(artifact.and_then(SnapshotArtifact::local_artifact_id))
+            .bind(artifact.map(|artifact| artifact.kind().as_str()))
+            .bind(artifact.map(|artifact| artifact.origin().as_str()))
+            .bind(
+                artifact
+                    .and_then(SnapshotArtifact::snapshot_name)
+                    .map(SnapshotName::as_str),
+            )
+            .bind(snapshot.source_node_id)
+            .bind(snapshot.source_node_uid.as_ref())
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or(InsertSnapshotError::InvalidRetrySource {
+                snapshot_id: snapshot.id,
+                prior_snapshot_id: prior,
+            })?,
+        )
+    } else {
+        None
+    };
+
     // Keep the conflict target implicit: snapshots has both a primary key on
     // id and a unique constraint on (id, org_id), and concurrent idempotent
     // inserts may collide on either one.
@@ -904,9 +1049,9 @@ pub async fn insert(
               local_artifact_id, artifact_kind, artifact_origin,
               artifact_snapshot_name, runtime, runtime_version, guest_os,
               guest_arch, state_format_name, state_format_version,
-              execution_metadata)
+              execution_metadata, source_node_uid, timestamp, last_attempt_at, recovery_grant_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                 $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+                 $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, COALESCE($24, NOW()), NOW(), $25)
          ON CONFLICT DO NOTHING
          RETURNING id"
     ))
@@ -940,6 +1085,9 @@ pub async fn insert(
     .bind(state_format.map(|identity| identity.format.as_str()))
     .bind(state_format.map(|identity| identity.version.as_str()))
     .bind(snapshot.execution_metadata.as_ref().map(Json))
+    .bind(snapshot.source_node_uid.as_ref())
+    .bind(registration_time)
+    .bind(snapshot.recovery_grant_id)
     .fetch_optional(&mut **tx)
     .await?;
 

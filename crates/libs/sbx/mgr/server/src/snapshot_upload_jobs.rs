@@ -261,7 +261,19 @@ impl JobExecutor for SnapshotUploadExecutor {
             .collect::<Vec<_>>();
         let vm_total_bytes = vm_artifact_total_bytes(&artifact_bytes, vm_artifact_count);
         let finalize_started_at = Instant::now();
-        let finalize_result = finalize_with_cluster_api_ready(&snapshot_id, vm_total_bytes).await;
+        let digests = artifact_results
+            .iter()
+            .flat_map(|observation| observation.digests.iter().cloned())
+            .collect();
+        let finalize_result = finalize_with_cluster_api_ready(
+            &snapshot_id,
+            vm_total_bytes,
+            digests,
+            artifact_results
+                .iter()
+                .find_map(|o| o.metadata_binding_digest.clone()),
+        )
+        .await;
         pplx_space_metrics::snapshot::delivery_duration_ms(
             "cluster_finalize",
             origin,
@@ -839,8 +851,10 @@ fn vm_artifact_total_bytes(polled_bytes: &[u64], vm_artifact_count: usize) -> u6
 }
 
 /// Completed transfer bytes and persisted queue/transfer timing.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct ArtifactTransferObservation {
+    metadata_binding_digest: Option<String>,
+    digests: Vec<pplx_space_node_api_client::proto::SnapshotArtifactDigest>,
     bytes: u64,
     queue_duration_ms: Option<f64>,
     transfer_duration_ms: Option<f64>,
@@ -933,6 +947,40 @@ async fn poll_artifact_job(
                         sqlite_duration_ms(started_at, completed_at)
                     });
                 return Ok(ArtifactTransferObservation {
+                    metadata_binding_digest: job
+                        .logical_artifact_digests
+                        .iter()
+                        .find(|p| {
+                            p.artifact
+                                == pplx_space_volmgr_client::proto::SnapshotArtifact::Metadata
+                                    as i32
+                        })
+                        .and_then(|p| p.metadata_binding_digest.clone()),
+                    digests: job
+                        .logical_artifact_digests
+                        .into_iter()
+                        .filter(|p| {
+                            p.artifact
+                                != pplx_space_volmgr_client::proto::SnapshotArtifact::Metadata
+                                    as i32
+                        })
+                        .map(|proof| {
+                            let artifact =
+                                pplx_space_volmgr_client::proto::SnapshotArtifact::try_from(
+                                    proof.artifact,
+                                )
+                                .ok()
+                                .and_then(pplx_space_volmgr_client::snapshot_artifact_from_proto)
+                                .ok_or_else(|| {
+                                    JobError::permanent("invalid logical upload artifact")
+                                })?;
+                            Ok(pplx_space_node_api_client::proto::SnapshotArtifactDigest {
+                                artifact: artifact.file_name().to_owned(),
+                                digest: proof.digest,
+                                size_bytes: proof.size_bytes,
+                            })
+                        })
+                        .collect::<Result<_, JobError>>()?,
                     bytes: job.bytes_transferred,
                     queue_duration_ms,
                     transfer_duration_ms,
@@ -1127,6 +1175,8 @@ pub(crate) async fn begin_with_cluster_api(
 async fn finalize_with_cluster_api_ready(
     snapshot_id: &str,
     bytes_uploaded: u64,
+    artifact_digests: Vec<pplx_space_node_api_client::proto::SnapshotArtifactDigest>,
+    metadata_binding_digest: Option<String>,
 ) -> Result<(), JobError> {
     let bytes = bytes_uploaded_i64(snapshot_id, bytes_uploaded);
     let mut client = connect_cluster_api().await?;
@@ -1135,7 +1185,8 @@ async fn finalize_with_cluster_api_ready(
         target_state: pplx_space_node_api_client::proto::SuspendSnapshotTerminalState::Ready as i32,
         bytes_uploaded: bytes,
         failure_reason: None,
-        artifact_digests: Vec::new(),
+        artifact_digests,
+        metadata_binding_digest,
     };
 
     match client.finalize_artifact_backup(req).await {
@@ -1213,6 +1264,7 @@ pub(crate) async fn finalize_with_cluster_api_failed(snapshot_id: &str, reason: 
         bytes_uploaded: 0,
         failure_reason: Some(reason.to_string()),
         artifact_digests: Vec::new(),
+        metadata_binding_digest: None,
     };
     if let Err(status) = client.finalize_artifact_backup(req).await {
         tracing::warn!(

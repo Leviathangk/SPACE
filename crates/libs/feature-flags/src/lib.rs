@@ -171,6 +171,16 @@ pub use provider::{
     AttributeValue, Attributes, FeatureFlagProvider, ProviderState, UnavailableProvider, Unresolved,
 };
 
+/// Separate rollout gate for issuing new operator recovery authority.
+pub const BACKUP_RECOVERY_GRANTS_ENABLED: BoolFlag =
+    BoolFlag::new("space-backup-recovery-grants-enabled", false);
+
+/// Strict backup ownership requires verified caller and historical node identity.
+/// Used only after SPACE_BACKUP_OWNERSHIP_MODE=runtime is explicitly enabled.
+/// Unresolved assignments enforce ownership; provider outages must not reopen
+/// legacy admission. Compatibility rollout is the separate default mode.
+pub const STRICT_BACKUP_OWNERSHIP: BoolFlag = BoolFlag::new("space-strict-backup-ownership", true);
+
 /// Boolean flag acting as a dynamic cluster-wide kill-switch for the
 /// Redis-backed sandbox activation rate limiter. Layered under the static
 /// `SPACE_CLUSTER_ACTIVATION_ADMISSION_ENABLED` env master by [`policy`].

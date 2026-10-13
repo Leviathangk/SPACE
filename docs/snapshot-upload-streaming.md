@@ -399,3 +399,191 @@ Before widening enablement, use a small canary and matched controls to verify:
 Broad enablement remains pending these measurements. Disabling new captures
 stops further accumulation; existing bundles and leases still follow their
 normal ownership and retirement rules.
+
+## Backup registration authority
+
+An artifact ID binds immutable kind, origin, and optional snapshot name. An
+attempt has its own prefix and immutable uploader identity. Ordinary Kubernetes
+registrations record the execution's original Node UID. Recovery registrations
+record the approved **present uploader**, with separate grant provenance; they
+do not establish historical ownership.
+
+### Materialization and placement
+
+New executions receive a per-materialization UUID. The pod carries it in
+`space.pplx.net/materialization-id`. Retries of the same authorized create reuse
+it, including adoption after a 409 or a lost create response. Metadata observers
+can adopt only the matching token and can never replace a recorded pod UID.
+Same-generation recreation rotates the token under the sandbox lock and clears
+both node name and UID. Delayed predecessor observations and cleanup cannot bind
+or retire the successor. Cleanup uses an observed pod-UID delete precondition.
+Warm-pool adoption remains a separate slot-claim transition: promotion captures
+the UID before readiness probing, rechecks it afterwards, and adoption copies
+that evidence. Missing node identity prevents promotion, but not warming timeout
+cleanup. Existing rows are not backfilled with today's incarnation.
+
+Placement first tries a transaction that locks the sandbox and revalidates the
+node with shared locks. A missing registry row, or an unbound execution with
+stale inventory, causes that transaction to end before a separate inventory
+upsert. Placement then retries once and rechecks identity and tombstones. An
+execution's recorded UID conflicting with observation is a refusal, never
+permission to rewrite inventory. The exclusive inventory upsert therefore never
+runs while placement holds a sandbox lock.
+
+The existing stale-create recovery threshold is 300 seconds. Expiry alone does
+not authorize deleting a pod: recovery still needs the expected materialization
+and UID. A missing matching pod can retire the fenced claim; conflicting or
+unknown evidence leaves recovery refused and visible for operator review.
+
+### Strict policy
+
+Every Kubernetes begin, heartbeat, and finalize requires a TokenReview-bound
+caller. The shared verifier retains the reviewed namespace, service account,
+pod UID, node name, and node UID, and checks the live daemon pod, Running state,
+absence of deletion, service account, node binding, and peer IP on every call.
+It has a five-second total budget and at most eight concurrent verifications.
+The daemon's projected token is independent of the sandbox pod being torn down.
+The API then compares the verified incarnation with locked registry and attempt
+records. Static-token callers cannot use strict Kubernetes admission or grants.
+Direct workers retain their existing registered node/address policy.
+
+| Request or evidence | Outcome |
+| --- | --- |
+| First registration, current execution with matching original Node UID | Admit; active placement and target-only placement use the same rule. |
+| First registration after retirement | Refuse unless a separate recovery approval applies. Inventory and target affinity do not grant authority. |
+| New attempt for an exact ordinary verified prior registration | Admit even after retirement or relocation. Preserve original capture freshness; initialize `last_attempt_at` for the new attempt. |
+| Replay | Keep persisted ownership and artifact identity. |
+| Same-name replacement or conflicting artifact kind/origin/name | Refuse; preserve existing evidence. |
+| Historical Kubernetes UID unknown | Refuse without inventing history. |
+| Active execution awaiting first placement | Wait through the worker's existing bounded retry budget. |
+| Only grant-backed priors, deleting priors, or no remaining priors | No ordinary retry authority. |
+
+Registration and finalization hold sandbox and shared node locks through the
+catalog write. Store retry checks remain atomic and independent of the advisory
+scanner. `PermissionDenied` and `FailedPrecondition` are terminal to the existing
+upload worker. `Unavailable` uses its configured retry budget; there is no new
+unbounded fresh-attempt loop. Exhaustion preserves the canonical local artifact
+for diagnosis; temporary transfer staging follows its existing lifecycle.
+
+### Compatibility and rollout gates
+
+`SPACE_BACKUP_OWNERSHIP_MODE` has three explicit modes:
+
+- `compatibility` (default): retain legacy placement admission and emit shadow
+  outcomes. A legacy-only admission records an unknown historical UID even when
+  today's caller proves a UID. Such rows never become verified retry authority.
+- `runtime`: evaluate `space-strict-backup-ownership` for the cluster. Set it
+  explicitly false while draining legacy work, then true after the gates below.
+  An unresolved flag enforces strict checks, so a provider outage cannot reopen
+  legacy admission.
+- `strict`: enforce regardless of the runtime assignment.
+
+Apply additive migrations first, then deploy every API and pool writer. Deploy
+all internal API replicas with compatibility admission and all worker digest
+readers/writers before issuing recovery approvals. Old writers remain
+schema-compatible but leave unknown identities. Old volume jobs and old workers
+may have no logical proofs; this remains acceptable for ordinary backups, but
+never for a recovery grant. Do not enable grants or enforcement during a mixed
+internal-API rollout: old servers do not enforce the new authority.
+
+`GET /v1/nodes/{node_id}/backup-admission-shadow` (or the shared-host
+`/admin/api/v1` prefix) returns at most 100 candidates per page, with `after`
+pagination. Each page uses read-only REPEATABLE READ and a five-second statement
+budget. It uses the same admission evaluator as registration and includes the
+shared drain-gate predicate plus retained inventory and legacy identity rows.
+Inventory may measure backlog; it never authorizes an upload. Unpinned or
+conflicting inventory is reported as insufficient evidence. The response also
+includes ready pool slots without UIDs, active bound executions without UIDs,
+creating attempts without source UIDs, and the latest complete inventory-report
+time. A database scan cannot prove live TokenReview identity or writer rollout;
+its eligible Kubernetes rows remain insufficient evidence for that reason.
+
+Before enforcement, require:
+
+1. Every API/controller writer and backup caller is on the required version;
+   all intended Kubernetes callers use verified daemon tokens.
+2. No ready pool slots or active bound executions with unknown UIDs, and no
+   creating pre-UID attempts. Recycle slots or allow safe execution turnover;
+   never stamp the current UID onto historical rows.
+3. All drain-blocking and retained-artifact candidates are accounted for across
+   every page, including unpinned inventory and old failed registrations.
+   Distinguish waiting work from permanent incompatibility. Fresh complete
+   inventories and healthy telemetry are required; an empty queue is not proof.
+4. Legacy target-only uploads finish under compatibility, or receive an explicit
+   recovery decision. A confirmed new execution followed by capture can create
+   new compliant state; ordinary wake may reuse an execution and is not proof.
+5. The worker optimization that reuses an exact Ready backup is deployed, so
+   older restored artifacts do not request unnecessary first registrations.
+
+The grant issuance flag `space-backup-recovery-grants-enabled` defaults false.
+Enable it only after every backup service enforces grants and reports content
+proofs. Disabling issuance does not revoke an existing approval; use revocation.
+
+### Explicit recovery approval
+
+Only a managing-organization administrator can issue a grant through
+`POST /v1/sandboxes/{sandbox_id}/backup-recovery-grants`. This does not enqueue,
+wake, reconstruct files, or select a restore point. The approval records the
+actor and reason in the same transaction as its exact scope:
+
+- One retained full suspend artifact and its original execution generation.
+- The current uploader node ID and Kubernetes UID, independently of unknown
+  historical ownership.
+- Capture time from validated capture evidence, expiry within 24 hours, captured
+  execution metadata, VM resources, template identity and content hash.
+- An exact nonempty VM-file manifest: plaintext memory/state plus rootfs (full or
+  btrfs-send), or the two sealed encrypted containers. Each entry has canonical
+  artifact name, logical size, and SHA-256.
+- A SHA-256 of the stable metadata binding produced by
+  `snapshot_metadata_binding`. It canonicalizes version-2 metadata and excludes
+  only `created_at`, `size_bytes`, and the node-local `rootfs_send_source_id`.
+  All remaining fields, including future fields, are bound. Never publish the
+  sidecar itself in operational logs; it may contain user data.
+
+The sandbox must have no active execution and no active worker placement, have
+an eligible retained lifecycle, and retain the approved artifact pointer (or
+its explicitly observed absence). A higher execution generation, changed
+current-artifact pointer, or newer different captured artifact prevents Ready.
+Capture time is preserved in the attempt catalog; registration liveness is a
+separate timestamp. Approval does not make old bytes newer for restore selectors.
+
+A worker's ordinary exact-artifact enqueue discovers the approval at
+registration. One attempt is active at a time. Only a terminal failed attempt
+can be replaced under the same live grant. Every attempt keeps the grant ID,
+and ordinary prior-registration admission excludes all grant-backed attempts.
+Begin, heartbeat, and finalize check live caller identity and the grant again.
+Expiry or revocation prevents publication even if an already accepted transfer
+finishes. Finalize compares the complete approved file and metadata proofs,
+rechecks supersession, and consumes the grant atomically with Ready. Lost-reply
+replays acknowledge the same Ready proof without re-projecting old state.
+
+`GET` on the approval collection lists the newest 100 approvals and outcomes,
+including after a lost approval response. `POST` to
+`.../backup-recovery-grants/{grant_id}/revoke` requires an admin reason and
+revokes an unconsumed grant. Neither revocation nor a failed attempt deletes
+objects or local bytes. A blocked drain is not authorization to discard state.
+
+### Content proof and validation limits
+
+Volume-manager hashes the exact reads fed into compression and envelope
+encryption. The raw file path first streams into a private temporary upload copy
+while hashing. Proofs become durable atomically with the job's fenced completion,
+and sandbox-manager forwards them after observing every transfer complete. An
+EOF or a successful upload alone is not a completed proof: object verification
+and durable job completion must also succeed. Logical digests differ from
+transport-object checksums. Stable metadata is bounded to 1 MiB; unsupported or
+larger metadata remains unknown and cannot satisfy a grant.
+
+This protects against accidental source drift and regenerated inputs within the
+trusted-worker model. It does not prove honesty of a malicious uploader. A real
+restore through the normal user path, with prior state verified, remains the
+acceptance gate for a recovery. Generated btrfs-send jobs without an immutable
+file proof, incomplete sidecars, unsealed encrypted devices, missing bytes, and
+inconsistent capture evidence must remain blocked. This work does not recover a
+failed encrypted capture or resume arbitrary quarantine publication.
+
+Credential vending remains a separate policy surface: its source/restore
+permissions must be reviewed independently. Rolling back to servers that ignore
+grants or incarnation identity removes those protections. Keep all additive
+schema and audit evidence; do not treat an application downgrade as a safe
+operational undo.

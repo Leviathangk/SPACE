@@ -1037,6 +1037,8 @@ message FinalizeArtifactBackupRequest {
   // Digests of the artifacts this attempt uploaded. Recorded only for READY
   // and write-once: a replay must repeat the same digests.
   repeated SnapshotArtifactDigest artifact_digests = 5;
+  // Stable metadata proof from the exact metadata upload read. Required for recovery grants.
+  optional string metadata_binding_digest = 6;
 }
 
 // Content digest of one artifact file in a backup attempt, reported by the

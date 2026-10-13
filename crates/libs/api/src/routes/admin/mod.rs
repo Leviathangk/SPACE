@@ -36,6 +36,7 @@ use crate::{
 mod api_key_store;
 mod api_keys;
 pub mod audit;
+mod backup_recovery;
 mod docs;
 mod identity;
 mod node_group_store;
@@ -85,6 +86,18 @@ pub fn dedicated_host_router(state: AppState) -> Router<AppState> {
 /// version mount so admin submodules cannot accidentally claim non-admin paths.
 pub fn v1_router(state: AppState) -> Router<AppState> {
     Router::new()
+        .route(
+            "/nodes/{node_id}/backup-admission-shadow",
+            get(backup_recovery::shadow),
+        )
+        .route(
+            "/sandboxes/{sandbox_id}/backup-recovery-grants",
+            get(backup_recovery::list).post(backup_recovery::approve),
+        )
+        .route(
+            "/sandboxes/{sandbox_id}/backup-recovery-grants/{grant_id}/revoke",
+            axum::routing::post(backup_recovery::revoke),
+        )
         .route(
             "/nodes",
             get(nodes::list_admin_nodes).post(node_maintenance::create_node),

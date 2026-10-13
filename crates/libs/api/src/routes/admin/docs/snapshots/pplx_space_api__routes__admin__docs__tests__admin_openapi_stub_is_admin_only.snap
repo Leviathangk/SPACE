@@ -22,6 +22,9 @@ expression: paths_by_method
     "get",
     "patch"
   ],
+  "/nodes/{node_id}/backup-admission-shadow": [
+    "get"
+  ],
   "/nodes/{node_id}/health": [
     "get"
   ],
@@ -96,6 +99,14 @@ expression: paths_by_method
   ],
   "/sandboxes/{sandbox_id}": [
     "patch"
+  ],
+  "/sandboxes/{sandbox_id}/backup-recovery-grants": [
+    "get",
+    "parameters",
+    "post"
+  ],
+  "/sandboxes/{sandbox_id}/backup-recovery-grants/{grant_id}/revoke": [
+    "post"
   ],
   "/sandboxes/{sandbox_id}:force-{action}": [
     "post"

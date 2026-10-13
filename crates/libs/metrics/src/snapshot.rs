@@ -34,6 +34,10 @@
 //! `step.duration_ms`, terminal `completed` / `failed`, and per-artifact
 //! `bytes` records.
 
+//! `snapshot.backup.admission` counts live admission evaluations by `mode`
+//! (`shadow` or `enforce`) and `decision`. It is not a fleet backlog gauge:
+//! artifacts that never request registration require the separate rollout census.
+
 use std::time::Instant;
 
 use crate::emit::{counter, elapsed_ms, gauge, tag, timing_ms};
@@ -450,4 +454,58 @@ pub fn gc_deleted(origin: &str, kind: &str) {
 ///   The artifact stays on disk for the next tick.
 pub fn gc_skipped(reason: &str) {
     counter("snapshot.gc.skipped", 1, &[tag("reason", reason)]);
+}
+
+/// Bounded outcomes shared by backup admission reporting and rollout diagnostics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackupAdmissionDecision {
+    Allowed,
+    PermanentlyRefused,
+    Waiting,
+    InsufficientEvidence,
+}
+
+impl BackupAdmissionDecision {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::PermanentlyRefused => "permanently_refused",
+            Self::Waiting => "waiting",
+            Self::InsufficientEvidence => "insufficient_evidence",
+        }
+    }
+}
+
+impl std::fmt::Display for BackupAdmissionDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("unknown backup admission decision")]
+pub struct InvalidBackupAdmissionDecision;
+
+impl std::str::FromStr for BackupAdmissionDecision {
+    type Err = InvalidBackupAdmissionDecision;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "allowed" => Ok(Self::Allowed),
+            "permanently_refused" => Ok(Self::PermanentlyRefused),
+            "waiting" => Ok(Self::Waiting),
+            "insufficient_evidence" => Ok(Self::InsufficientEvidence),
+            _ => Err(InvalidBackupAdmissionDecision),
+        }
+    }
+}
+
+pub fn backup_admission(decision: BackupAdmissionDecision, enforcing: bool) {
+    counter(
+        "snapshot.backup.admission",
+        1,
+        &[
+            tag("decision", decision.as_str()),
+            tag("mode", if enforcing { "enforce" } else { "shadow" }),
+        ],
+    );
 }

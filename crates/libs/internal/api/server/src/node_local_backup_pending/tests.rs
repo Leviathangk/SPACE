@@ -39,6 +39,14 @@ async fn mirror_with_max_connections(max_connections: u32) -> TestResult<Option<
     };
     let node_id = NodeId::new();
     insert_ready_worker_node(&db.pool, node_id).await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid)
+         VALUES ($1, $2, 'original-worker-uid')"
+    ))
+    .bind(node_id)
+    .bind(format!("worker-{node_id}"))
+    .execute(&db.pool)
+    .await?;
     let service = ClusterApiService::new(db.pool.clone());
     Ok(Some(Mirror {
         db,
@@ -102,10 +110,10 @@ impl Mirror {
         sqlx::query(sql!(
             "INSERT INTO snapshots (
                  id, sandbox_id, type, state, source_node_id, org_id,
-                 local_artifact_id, artifact_kind, artifact_origin, timestamp
+                 local_artifact_id, artifact_kind, artifact_origin, timestamp, source_node_uid
              )
              VALUES ($1, $2, $3, $4, $5, $6, $7, $3, 'suspend',
-                     NOW() - make_interval(secs => $8))"
+                     NOW() - make_interval(secs => $8), 'original-worker-uid')"
         ))
         .bind(snapshot_id)
         .bind(sandbox_id)
@@ -1680,6 +1688,7 @@ async fn finalize(
     state: crate::proto::SuspendSnapshotTerminalState,
 ) -> Result<(), tonic::Status> {
     let mut request = Request::new(crate::proto::FinalizeArtifactBackupRequest {
+        metadata_binding_digest: None,
         backup_attempt_id: snapshot_id.to_string(),
         target_state: state as i32,
         bytes_uploaded: 1,

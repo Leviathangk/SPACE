@@ -79,17 +79,13 @@
 //!
 //! ## What `snapshots.timestamp` actually is
 //!
-//! `snapshots.timestamp` is the row's immutable **creation** time: set to
-//! `NOW()` when `BeginArtifactBackup` inserts the row in `state='creating'`
-//! and never updated thereafter (the terminal `FinalizeArtifactBackup`
-//! transitions `state` and `size_bytes` but deliberately leaves `timestamp`
-//! alone). Every suspend attempt allocates a fresh row id and S3 prefix, so
-//! a late-finalizing stale upload produces its own row with its own
-//! creation timestamp — earlier than the wake that bumped
-//! `placement_changed_at`, which classifies it correctly as stale. The
-//! `wake → modify → re-suspend` race and the residual late-register race
-//! that earlier versions of this module documented are both closed by the
-//! immutable-row design.
+//! `snapshots.timestamp` is immutable registration evidence. First registration
+//! uses `NOW()`; a fresh attempt authorized by an earlier exact registration
+//! inherits that registration's timestamp. Finalization never refreshes it.
+//! Attempt IDs and object prefixes remain fresh, while a retry after relocation
+//! cannot make older bytes pass the new placement's freshness gate. Historical
+//! attempts and other deferred registration paths still have insert-time
+//! timestamps, so artifact-identity proofs remain necessary for source release.
 
 use pplx_space_common_core::types::{ArtifactOrigin, SandboxLifecycle};
 
@@ -428,8 +424,9 @@ pub fn sandbox_attached_anywhere(sandbox_alias: &str) -> String {
 /// ## Why no timestamp, and why not the full source-release predicate
 ///
 /// The obvious spellings are both unsound, for one reason:
-/// `snapshots.timestamp` is `DEFAULT NOW()` and no writer binds it, so it is
-/// the row's **insert** time, written by `BeginArtifactBackup`. A deferred or retried backup of an
+/// Historical rows use the **insert** time of `BeginArtifactBackup`. Verified
+/// retries now preserve their earlier registration timestamp, but that does not
+/// repair historical or deferred first registrations. A deferred backup of an
 /// **older** artifact therefore inserts a row stamped later than a **newer**
 /// artifact's, so any "newer than X" test can read older bytes as superseding
 /// newer ones and delete the queue row for the only copy of the newer state.
