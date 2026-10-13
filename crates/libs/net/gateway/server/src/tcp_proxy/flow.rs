@@ -32,6 +32,7 @@ pub(super) enum Phase {
     TlsHandshake,
     HttpExchange,
     HttpIdle,
+    Relay,
 }
 
 impl Phase {
@@ -41,6 +42,7 @@ impl Phase {
             Self::TlsHandshake => "tls_handshake",
             Self::HttpExchange => "http_exchange",
             Self::HttpIdle => "http_idle",
+            Self::Relay => "relay",
         }
     }
 }
@@ -78,6 +80,7 @@ pub(super) struct Failure {
 struct State {
     requests: Requests,
     failure: Option<Failure>,
+    closed: Option<(Phase, Side)>,
 }
 
 impl State {
@@ -141,6 +144,30 @@ impl Flow {
             },
             codes: Codes::io(error),
         });
+    }
+
+    pub(super) fn io_failed(&self, error: &std::io::Error, phase: Phase, side: Side) {
+        let mut state = self.0.lock();
+        let requests = state.requests;
+        state.observe(Failure {
+            phase,
+            side,
+            requests,
+            codes: Codes::io(error),
+            outcome: if phase == Phase::TcpConnect {
+                "connect"
+            } else {
+                "transfer"
+            },
+        });
+    }
+
+    pub(super) fn closed(&self, phase: Phase, side: Side) {
+        self.0.lock().closed.get_or_insert((phase, side));
+    }
+
+    pub(super) fn closed_by(&self) -> Option<(Phase, Side)> {
+        self.0.lock().closed
     }
 
     pub(super) fn request(&self, protocol: super::tls::HttpProtocol) -> Request {

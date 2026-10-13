@@ -548,7 +548,7 @@ impl TcpProxy {
                     pplx_space_net_common::TlsInterception::On => "plaintext",
                 };
                 inspection.finish(accounting::Outcome::Skipped, reason);
-                self.relay(client, admitted).await
+                self.relay(client, admitted, flow).await
             }
             crate::tls_interception::InterceptionAction::Terminate(lease) => {
                 inspection.finish(accounting::Outcome::Success, "admitted");
@@ -589,9 +589,14 @@ impl TcpProxy {
         }
     }
 
-    async fn relay(&self, client: TcpStream, admitted: AdmittedTcp) -> FlowOutcome {
+    async fn relay(
+        &self,
+        client: TcpStream,
+        admitted: AdmittedTcp,
+        flow: &flow::Flow,
+    ) -> FlowOutcome {
         match admitted {
-            AdmittedTcp::Tunnel(destination) => self.pass_through(client, destination).await,
+            AdmittedTcp::Tunnel(destination) => self.pass_through(client, destination, flow).await,
             AdmittedTcp::HostBoundHttp(destination) => {
                 self.host_bound_http(client, destination, relay::connect)
                     .await
@@ -599,8 +604,13 @@ impl TcpProxy {
         }
     }
 
-    async fn pass_through(&self, client: TcpStream, dst: SocketAddr) -> FlowOutcome {
-        match relay::run(client, dst).await {
+    async fn pass_through(
+        &self,
+        client: TcpStream,
+        dst: SocketAddr,
+        flow: &flow::Flow,
+    ) -> FlowOutcome {
+        match relay::run(client, dst, flow).await {
             Ok((wire_tx, wire_rx)) => FlowOutcome::Relayed(Relay::Tunnelled { wire_tx, wire_rx }),
             Err(relay::Failure::Connect(error)) => {
                 FlowOutcome::RelayFailed(RelayFailure::Connect(error))
@@ -658,6 +668,7 @@ impl TcpProxy {
     ) -> bool {
         let (status, detail) = outcome.metric_tags();
         let failure = flow.failure();
+        let closed = flow.closed_by();
         let codes = failure.map(|failure| failure.codes);
         let h2_error_code = codes.and_then(|codes| codes.h2_error_code());
         let errno = codes
@@ -665,9 +676,15 @@ impl TcpProxy {
             .map(|errno| format!("{errno:?}"));
         let error_type = codes.map(|codes| codes.error_type());
         let termination = pplx_space_metrics::gateway::Termination {
-            phase: failure.map(|failure| failure.phase.as_str()),
-            side: failure.map(|failure| failure.side.as_str()),
-            close: codes.map(|codes| codes.close().as_str()),
+            phase: failure
+                .map(|failure| failure.phase.as_str())
+                .or(closed.map(|(phase, _)| phase.as_str())),
+            side: failure
+                .map(|failure| failure.side.as_str())
+                .or(closed.map(|(_, side)| side.as_str())),
+            close: codes
+                .map(|codes| codes.close().as_str())
+                .or(closed.map(|_| "normal")),
             tls_alert: codes.and_then(|codes| codes.alert_name()),
             tls_alert_dir: codes
                 .and_then(|codes| codes.tls_alert)
