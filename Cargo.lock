@@ -5757,9 +5757,12 @@ name = "pplx-space-execution-common"
 version = "0.8.0"
 dependencies = [
  "anyhow",
+ "aws-lc-rs",
  "pplx-space-common-core",
  "pplx-space-common-proto-build",
  "prost",
+ "serde",
+ "serde_json",
  "thiserror 2.0.20",
  "tonic",
  "tonic-prost-build",
