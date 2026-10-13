@@ -78,6 +78,7 @@ impl TcpProxy {
                     tls::connect(origin, &upstream_lease, &interception, offer)
                         .await
                         .map(|(io, alpn)| (io, alpn.into()))
+                        .map_err(Into::into)
                 };
                 tls_http::serve(downstream, binding, lease.clone(), connect).await
             };

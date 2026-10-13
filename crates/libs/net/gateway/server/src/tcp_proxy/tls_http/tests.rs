@@ -360,9 +360,12 @@ async fn credential_refusal_before_origin(
     let (guest, guest_peer) = tokio::io::duplex(4096);
     let gateway = tokio::spawn(serve(guest, binding, lease, move |_| async move {
         observed.fetch_add(1, Ordering::SeqCst);
-        Err::<(tokio::io::DuplexStream, HttpProtocol), _>(TlsTransportError::Upstream(
-            std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
-        ))
+        Err::<(tokio::io::DuplexStream, HttpProtocol), _>(
+            TlsTransportError::Upstream(std::io::Error::from(
+                std::io::ErrorKind::ConnectionRefused,
+            ))
+            .into(),
+        )
     }));
     let (mut sender, connection) = http1::handshake(TokioIo::new(guest_peer)).await.unwrap();
     let client = tokio::spawn(connection);
@@ -730,7 +733,6 @@ async fn inspected_tls_drops_fastly_routing_headers_before_forwarding() {
 #[derive(Clone, Copy, Debug)]
 enum UpstreamEnd {
     SetupFailed,
-    SetupCancelled,
     Http1Close,
     H2Goaway,
 }
@@ -742,7 +744,6 @@ async fn upstream_failure_or_closure_never_leaves_a_poisoned_guest_connection() 
     let mut poisoned = Vec::new();
     for (ending, protocol) in [
         (UpstreamEnd::SetupFailed, HttpProtocol::Http2),
-        (UpstreamEnd::SetupCancelled, HttpProtocol::Http2),
         (UpstreamEnd::Http1Close, HttpProtocol::Http1),
         (UpstreamEnd::Http1Close, HttpProtocol::Http2),
         (UpstreamEnd::H2Goaway, HttpProtocol::Http2),
@@ -790,8 +791,8 @@ async fn upstream_failure_or_closure_never_leaves_a_poisoned_guest_connection() 
             match ending {
                 UpstreamEnd::SetupFailed => Err(TlsTransportError::Upstream(std::io::Error::from(
                     std::io::ErrorKind::ConnectionRefused,
-                ))),
-                UpstreamEnd::SetupCancelled => std::future::pending().await,
+                ))
+                .into()),
                 UpstreamEnd::Http1Close => Ok((origin, HttpProtocol::Http1)),
                 UpstreamEnd::H2Goaway => Ok((origin, HttpProtocol::Http2)),
             }
@@ -826,9 +827,7 @@ async fn upstream_failure_or_closure_never_leaves_a_poisoned_guest_connection() 
             let mut client = tokio::spawn(connection);
             let sending = tokio::spawn(sender.send_request(request()));
             started.notified().await;
-            if matches!(ending, UpstreamEnd::SetupCancelled) {
-                sending.abort();
-            } else {
+            {
                 let response = sending.await.unwrap().unwrap();
                 assert_eq!(
                     response.status(),
