@@ -9,8 +9,6 @@ pub(in crate::tcp_proxy) enum HttpError {
     Protocol(#[from] hyper::Error),
     #[error("HTTP server failed")]
     Server(#[from] Box<dyn std::error::Error + Send + Sync>),
-    #[error("HTTP session ended")]
-    Cancelled,
 }
 
 impl HttpError {
@@ -18,7 +16,6 @@ impl HttpError {
         match self {
             Self::Transport(error) => error.as_str(),
             Self::Protocol(_) | Self::Server(_) => "http_connection_error",
-            Self::Cancelled => "session_ended",
         }
     }
     pub(in crate::tcp_proxy) fn record(&self, stage: &'static str) {
@@ -29,7 +26,7 @@ impl HttpError {
                 http_reason = http_reason(error),
                 "HTTP operation failed"
             ),
-            Self::Server(_) | Self::Cancelled => {
+            Self::Server(_) => {
                 tracing::info!(stage, reason = self.as_str(), "HTTP connection ended")
             }
         }

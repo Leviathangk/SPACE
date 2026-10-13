@@ -41,6 +41,7 @@ mod routing_headers;
 pub(crate) mod tls;
 mod tls_http;
 mod transport;
+mod upstream;
 
 use crate::egress::DnsAttributedTcpTracker;
 use crate::egress::{AdmittedTcp, TcpAdmissionDenial};
@@ -214,12 +215,7 @@ impl FlowOutcome {
             Self::InspectedTls => ("relayed", "inspected_tls"),
             Self::RelayFailed(RelayFailure::Inspected(_)) => ("relay_failed", "inspected_http"),
             Self::RelayFailed(RelayFailure::Connect(_)) => ("relay_failed", "connect"),
-            Self::RelayFailed(RelayFailure::PlaintextUpstreamHttp) => {
-                ("relay_failed", "plaintext_upstream_http")
-            }
-            Self::RelayFailed(RelayFailure::PlaintextGuestHttp) => {
-                ("relay_failed", "plaintext_guest_http")
-            }
+            Self::RelayFailed(RelayFailure::Plaintext(error)) => ("relay_failed", error.reason()),
             Self::RelayFailed(RelayFailure::Transfer(_)) => ("relay_failed", "transfer"),
         }
     }
@@ -253,10 +249,7 @@ enum Rejection {
 /// Where relaying failed, named for the phase.
 enum RelayFailure {
     Connect(transport::Error),
-    /// Plaintext upstream accepted TCP but did not speak HTTP/1.1.
-    PlaintextUpstreamHttp,
-    /// A DNS-authorized plaintext guest flow did not speak HTTP/1.1.
-    PlaintextGuestHttp,
+    Plaintext(http_host::Failure),
     /// Connected, then the byte stream failed (e.g. reset, broken pipe).
     Transfer(io::Error),
     Inspected(tls_http::HttpError),
@@ -641,15 +634,7 @@ impl TcpProxy {
                 wire_tx: served.wire_tx,
                 wire_rx: served.wire_rx,
             }),
-            Err(http_host::Failure::Connect(error)) => {
-                FlowOutcome::RelayFailed(RelayFailure::Connect(error))
-            }
-            Err(http_host::Failure::UpstreamHttp(_)) => {
-                FlowOutcome::RelayFailed(RelayFailure::PlaintextUpstreamHttp)
-            }
-            Err(http_host::Failure::GuestHttp) => {
-                FlowOutcome::RelayFailed(RelayFailure::PlaintextGuestHttp)
-            }
+            Err(error) => FlowOutcome::RelayFailed(RelayFailure::Plaintext(error)),
         }
     }
 
@@ -693,22 +678,22 @@ impl TcpProxy {
                     "handled policy-gated TCP DNS connection"
                 );
             }
-            FlowOutcome::RelayFailed(RelayFailure::PlaintextUpstreamHttp) => {
-                pplx_space_metrics::gateway::domain_binding(
+            FlowOutcome::RelayFailed(RelayFailure::Plaintext(error)) => match error {
+                http_host::Failure::Setup(error)
+                    if matches!(error.as_ref(), upstream::Error::Connect(_)) => {}
+                http_host::Failure::Setup(_) => pplx_space_metrics::gateway::domain_binding(
                     "tcp",
                     "http_host",
                     "upstream_http_failed",
                     None,
-                );
-            }
-            FlowOutcome::RelayFailed(RelayFailure::PlaintextGuestHttp) => {
-                pplx_space_metrics::gateway::domain_binding(
+                ),
+                http_host::Failure::GuestHttp(_) => pplx_space_metrics::gateway::domain_binding(
                     "tcp",
                     "http_host",
                     "guest_http_failed",
                     None,
-                );
-            }
+                ),
+            },
             FlowOutcome::Rejected(Rejection::PolicyMissing(reason)) => {
                 debug!(
                     sandbox_id = self.sandbox_id,

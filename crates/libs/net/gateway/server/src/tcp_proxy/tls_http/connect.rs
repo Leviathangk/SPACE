@@ -77,7 +77,7 @@ fn target<B>(request: &SanitizedRequest<B>) -> Result<Target, ()> {
 impl<F, Fut, U> Session<F>
 where
     F: FnOnce(HttpProtocol) -> Fut + Send + 'static,
-    Fut: Future<Output = Result<(U, HttpProtocol), TlsTransportError>> + Send,
+    Fut: Future<Output = Result<(U, HttpProtocol), upstream::Error>> + Send + 'static,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     pub(super) async fn connect_request(
@@ -107,35 +107,40 @@ where
         request.set_host(authority.parse().expect("validated CONNECT target"));
         let guest = request.on_upgrade();
         let mut forwarding = Attempt::forwarding(protocol.as_str(), "request");
-        let sender = match self.sender(protocol).await {
-            Ok(Sender::Http1(sender)) => sender,
-            Ok(Sender::Http2(_)) => {
-                forwarding.finish(Outcome::Denied, "invalid_connect");
-                return self.refuse(protocol, "invalid_connect", StatusCode::FORBIDDEN);
-            }
+        let sender = match self.upstream.sender(protocol).await {
+            Ok(sender) => sender,
             Err(error) => {
                 forwarding.finish(Outcome::Error, "origin_setup");
                 error.record("connect_proxy_setup");
                 return self.refuse(protocol, error.as_str(), StatusCode::BAD_GATEWAY);
             }
         };
-        let mut sender = sender.lock().await;
+        let ready = match sender.ready().await {
+            Ok(ready) if ready.is_http1() => ready,
+            Ok(_) => return self.refuse(protocol, "invalid_connect", StatusCode::FORBIDDEN),
+            Err(error) => {
+                HttpError::Protocol(error).record("connect_proxy_ready");
+                return self.refuse(protocol, "upstream_http_error", StatusCode::BAD_GATEWAY);
+            }
+        };
         if !self.lease.is_usable() {
             forwarding.finish(Outcome::Cancelled, "lease_invalidated");
             return self.refuse(protocol, "lease_invalidated", StatusCode::FORBIDDEN);
         }
-        let mut response = match request
-            .map(|body| Either::Left(Self::forwarding_body(protocol, body, "request_body")))
-            .send_http1(&mut sender)
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                forwarding.finish(Outcome::Error, "upstream_http");
-                HttpError::Protocol(error).record("connect_proxy_request");
-                return self.refuse(protocol, "upstream_http_error", StatusCode::BAD_GATEWAY);
-            }
-        };
+        let mut response =
+            match ready
+                .send(request.map(|body| {
+                    Either::Left(Self::forwarding_body(protocol, body, "request_body"))
+                }))
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    forwarding.finish(Outcome::Error, "upstream_http");
+                    HttpError::Protocol(error).record("connect_proxy_request");
+                    return self.refuse(protocol, "upstream_http_error", StatusCode::BAD_GATEWAY);
+                }
+            };
         if response.status() == StatusCode::SWITCHING_PROTOCOLS {
             forwarding.finish(Outcome::Error, "unexpected_upgrade");
             return self.refuse(protocol, "unexpected_upgrade", StatusCode::BAD_GATEWAY);

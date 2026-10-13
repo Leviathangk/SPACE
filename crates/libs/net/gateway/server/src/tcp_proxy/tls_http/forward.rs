@@ -10,7 +10,7 @@ use crate::certificates::NetworkCredentialAccessError;
 impl<F, Fut, U> Session<F>
 where
     F: FnOnce(HttpProtocol) -> Fut + Send + 'static,
-    Fut: Future<Output = Result<(U, HttpProtocol), TlsTransportError>> + Send,
+    Fut: Future<Output = Result<(U, HttpProtocol), upstream::Error>> + Send + 'static,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     pub(super) async fn forward(&self, mut request: SanitizedRequest<Incoming>) -> Response<Body> {
@@ -57,7 +57,7 @@ where
         }
         let upgrade = handshake.map(|handshake| (handshake, request.on_upgrade()));
         let mut forwarding = Attempt::forwarding(protocol.as_str(), "request");
-        let sender = match self.sender(protocol).await {
+        let sender = match self.upstream.sender(protocol).await {
             Ok(sender) => sender,
             Err(error) => {
                 forwarding.finish(Outcome::Error, "origin_setup");
