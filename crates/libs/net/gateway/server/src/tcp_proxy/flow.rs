@@ -6,6 +6,9 @@ use parking_lot::Mutex;
 
 use super::tls::TlsTransportError;
 
+pub(super) mod codes;
+use codes::Codes;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Side {
     Downstream,
@@ -66,6 +69,7 @@ pub(super) struct Failure {
     pub(super) side: Side,
     pub(super) requests: Requests,
     pub(super) outcome: &'static str,
+    pub(super) codes: Codes,
 }
 
 #[derive(Default)]
@@ -73,6 +77,22 @@ struct State {
     requests: Requests,
     interrupted: Option<Requests>,
     failure: Option<Failure>,
+}
+
+impl State {
+    fn observe(&mut self, failure: Failure) {
+        match &mut self.failure {
+            Some(first)
+                if first.side == failure.side
+                    && !first.codes.has_protocol_code()
+                    && failure.codes.has_protocol_code() =>
+            {
+                first.codes = failure.codes;
+            }
+            None => self.failure = Some(failure),
+            _ => {}
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -86,29 +106,31 @@ impl Flow {
     pub(super) fn failed(&self, error: &TlsTransportError, phase: Phase, side: Side) {
         let mut state = self.0.lock();
         let requests = state.interrupted.unwrap_or(state.requests);
-        state.failure.get_or_insert(Failure {
+        state.observe(Failure {
             phase,
             side,
             requests,
             outcome: error.as_str(),
+            codes: Codes::transport(error),
         });
     }
 
     pub(super) fn http_failed(&self, error: &TlsTransportError, side: Side) {
         let mut state = self.0.lock();
         let requests = state.interrupted.unwrap_or(state.requests);
-        state.failure.get_or_insert(Failure {
+        state.observe(Failure {
             phase: requests.phase(),
             side,
             requests,
             outcome: error.as_str(),
+            codes: Codes::transport(error),
         });
     }
 
-    pub(super) fn http_io_failed(&self, _error: &std::io::Error, side: Side) {
+    pub(super) fn http_io_failed(&self, error: &std::io::Error, side: Side) {
         let mut state = self.0.lock();
         let requests = state.requests;
-        state.failure.get_or_insert(Failure {
+        state.observe(Failure {
             phase: requests.phase(),
             side,
             requests,
@@ -116,6 +138,7 @@ impl Flow {
                 Side::Downstream => "tls_downstream_error",
                 Side::Upstream => "tls_upstream_error",
             },
+            codes: Codes::io(error),
         });
     }
 

@@ -208,7 +208,7 @@ impl HttpFailure {
 }
 
 /// First error of type `T` in `error`'s source chain, including `error` itself.
-fn cause<'a, T: std::error::Error + 'static>(
+pub(super) fn cause<'a, T: std::error::Error + 'static>(
     error: &'a (dyn std::error::Error + 'static),
 ) -> Option<&'a T> {
     let mut current = Some(error);
@@ -216,7 +216,12 @@ fn cause<'a, T: std::error::Error + 'static>(
         if let Some(found) = error.downcast_ref::<T>() {
             return Some(found);
         }
-        current = error.source();
+        current = if let Some(io) = error.downcast_ref::<io::Error>() {
+            io.get_ref()
+                .map(|inner| inner as &(dyn std::error::Error + 'static))
+        } else {
+            error.source()
+        };
     }
     None
 }
@@ -245,7 +250,6 @@ const fn h2_reason(reason: h2::Reason) -> &'static str {
 struct TlsFailure {
     reason: &'static str,
     alert: Option<&'static str>,
-    /// Bounded alert class for metrics. The full `alert` name stays in logs.
     alert_class: &'static str,
     certificate: Option<&'static str>,
 }
@@ -261,22 +265,6 @@ impl TlsFailure {
     }
 }
 
-/// A peer's alert is the only signal that separates a guest refusing the
-/// interception CA from every other handshake failure, so the classes that
-/// name a trust decision have to reach metrics rather than logs alone.
-const fn alert_class(alert: rustls::AlertDescription) -> &'static str {
-    match alert {
-        rustls::AlertDescription::UnknownCA => "unknown_ca",
-        rustls::AlertDescription::BadCertificate => "bad_certificate",
-        rustls::AlertDescription::CertificateUnknown => "certificate_unknown",
-        rustls::AlertDescription::CertificateExpired => "certificate_expired",
-        rustls::AlertDescription::CertificateRevoked => "certificate_revoked",
-        rustls::AlertDescription::HandshakeFailure => "handshake_failure",
-        rustls::AlertDescription::ProtocolVersion => "protocol_version",
-        _ => "other",
-    }
-}
-
 fn tls_failure_from_io(error: &io::Error) -> Option<TlsFailure> {
     error
         .get_ref()?
@@ -289,7 +277,7 @@ fn tls_failure_from_rustls(error: &rustls::Error) -> TlsFailure {
         rustls::Error::AlertReceived(alert) => TlsFailure {
             reason: "peer_alert",
             alert: alert.as_str().or(Some("unknown")),
-            alert_class: alert_class(*alert),
+            alert_class: alert.as_str().unwrap_or("_OTHER"),
             certificate: None,
         },
         rustls::Error::InvalidCertificate(certificate) => TlsFailure {

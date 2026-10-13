@@ -1234,7 +1234,7 @@ async fn guest_reset_preserves_response_progress() {
 }
 
 #[tokio::test]
-async fn untrusted_guest_ca_ends_during_the_tls_handshake() {
+async fn untrusted_ca_preserves_the_alert_on_each_tls_leg() {
     use super::super::flow::{Phase, Side};
     let (_, provider) = credential_provider(false).await;
     let lease = provider
@@ -1272,4 +1272,48 @@ async fn untrusted_guest_ca_ends_during_the_tls_handshake() {
     assert_eq!(failure.phase, Phase::TlsHandshake);
     assert_eq!(failure.side, Side::Downstream);
     assert_eq!(failure.requests.in_flight, 0);
+    assert_eq!(failure.codes.alert_name(), Some("UnknownCA"));
+    assert_eq!(failure.codes.tls_alert.unwrap().1.as_str(), "received");
+
+    let origin_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(
+        lease.certified_key().unwrap(),
+    )));
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(origin_config));
+    let flow = Flow::default();
+    let (gateway, origin) = tokio::io::duplex(16384);
+    let (origin_result, gateway_result) = tokio::join!(
+        acceptor.accept(origin),
+        super::super::tls::connect(
+            std::future::ready(Ok(gateway)),
+            &lease,
+            &interception,
+            crate::tls_sni::ClientAlpnOffer::Http1,
+            &flow
+        ),
+    );
+    let error = origin_result.unwrap_err();
+    assert!(matches!(
+        error
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<rustls::Error>()),
+        Some(rustls::Error::AlertReceived(
+            rustls::AlertDescription::UnknownCA
+        ))
+    ));
+    assert!(matches!(
+        gateway_result,
+        Err(TlsTransportError::Upstream(_))
+    ));
+    let failure = flow.failure().unwrap();
+    assert_eq!(failure.phase, Phase::TlsHandshake);
+    assert_eq!(failure.side, Side::Upstream);
+    assert_eq!(failure.codes.alert_name(), Some("UnknownCA"));
+    assert_eq!(failure.codes.tls_alert.unwrap().1.as_str(), "sent");
+    assert_eq!(failure.codes.tls_cert_error, Some("UnknownIssuer"));
 }

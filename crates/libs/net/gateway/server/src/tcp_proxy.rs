@@ -667,6 +667,15 @@ impl TcpProxy {
                 in_flight = failure.requests.in_flight,
                 completed = failure.requests.completed,
                 outcome = failure.outcome,
+                close = failure.codes.close().as_str(),
+                tls_alert = failure.codes.alert_name(),
+                tls_alert_dir = failure.codes.tls_alert.map(|(_, direction)| direction.as_str()),
+                tls_cert_error = failure.codes.tls_cert_error,
+                h2_error_code = failure.codes.h2_error_code(),
+                h2_origin = failure.codes.http.and_then(|http| http.h2_origin),
+                errno = failure.codes.errno.map(|errno| format!("{errno:?}")),
+                http_lib_reason = failure.codes.http_lib_reason(),
+                error.type = %failure.codes.error_type(),
                 "TCP flow ended"
             );
         }
