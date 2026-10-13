@@ -128,6 +128,7 @@ pub(super) struct StreamPushAttempt<'a> {
     pub options: StreamingUploadOptions,
     pub original_size: u64,
     pub cancellation: CancellationToken,
+    pub digest: Option<DigestSink>,
 }
 
 impl TransferExecutor {
@@ -145,6 +146,7 @@ impl TransferExecutor {
             options,
             original_size,
             cancellation,
+            digest,
         } = attempt;
         let cancellation = cancellation.child_token();
         let _cancel_on_drop = cancellation.clone().drop_guard();
@@ -176,7 +178,7 @@ impl TransferExecutor {
             .into_std()
             .await;
         let source = compression_source(
-            file,
+            DigestReader::new(file, digest),
             original_size,
             ProducerAdmission {
                 executor: self.clone(),
@@ -244,7 +246,7 @@ struct ProducerAdmission {
 }
 
 fn compression_source(
-    file: std::fs::File,
+    file: DigestReader<std::fs::File>,
     size: u64,
     admission: ProducerAdmission,
     cancellation: CancellationToken,
@@ -290,7 +292,7 @@ fn compression_source(
         if result.is_ok() {
             // Preserve the file-backed compressor's final source-cache hint.
             page_cache::advise_dontneed(
-                &input.file,
+                input.file.inner(),
                 Path::new("staged snapshot"),
                 "stream upload input",
             );
@@ -314,7 +316,7 @@ fn compression_source(
 }
 
 struct SourceReader {
-    file: std::fs::File,
+    file: DigestReader<std::fs::File>,
     cancellation: CancellationToken,
     consumed: u64,
     advised_through: u64,
@@ -334,7 +336,7 @@ impl Read for SourceReader {
         let through = self.consumed / ADVICE_WINDOW * ADVICE_WINDOW;
         if through > self.advised_through {
             if let Err(error) = page_cache::advise_range_dontneed(
-                &self.file,
+                self.file.inner(),
                 self.advised_through,
                 through - self.advised_through,
             ) {
