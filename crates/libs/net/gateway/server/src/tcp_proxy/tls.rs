@@ -14,10 +14,10 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::Instrument;
 
 use super::accounting::{Attempt, Outcome};
-use super::admission::AdmittedTcp;
 use super::http_host::{HostBinding, MeteredIo};
 use super::{TcpProxy, relay, tls_http};
 use crate::certificates::{CertificateError, CertificateLease};
+use crate::egress::AdmittedTcp;
 use crate::stats::ProxyStats;
 use crate::tls_interception::{
     Admission, HandshakePermit, Refused, TlsHandshakeLeg, TlsInterception, TlsInterceptionError,

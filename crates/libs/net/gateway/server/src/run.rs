@@ -32,19 +32,19 @@ use crate::certificates::{CertificateContext, CertificateProvider, GatewayAuthor
 use crate::control::NetGatewayControlService;
 use crate::debug::GatewayDebugState;
 use crate::dns::DnsAllowCache;
+use crate::egress::DnsAttributedTcpTracker;
 use crate::ingress::{
     ServicePortIngressState, route_identity_from_proto, status_for_route_identity_parse,
 };
 use crate::known_egress::KnownEgressState;
 use crate::proto::net_gateway_control_server::NetGatewayControlServer;
-use crate::reserved_dns::{BuildReservedDnsCoreError, ReservedDnsCancellation, ReservedDnsCore};
+use crate::reserved_dns::{BuildReservedDnsCoreError, ReservedDnsCore};
 use crate::resource_budget::MAX_CONTROL_CONNECTIONS;
 use crate::state::{
-    GatewayNetworkState, NetworkCredentialSnapshot, NetworkStateReason, PolicyInvalidation,
-    PolicyLoader, PulledNetworkPolicy,
+    GatewayNetworkState, NetworkCredentialSnapshot, NetworkStateReason, PolicyLoader,
+    PulledNetworkPolicy, ReservedDnsCancellation,
 };
 use crate::stats::ProxyStats;
-use crate::tcp_proxy::DnsAttributedTcpTracker;
 use crate::tls_interception::TlsInterception;
 use crate::{TCP_PROXY_PORT, UDP_PROXY_PORT, tcp_proxy, udp_proxy};
 
@@ -441,45 +441,11 @@ pub async fn run(
     let stats = Arc::new(ProxyStats::new());
     let reserved_dns = ReservedDnsCore::new().map_err(RunNetGatewayError::ReservedDns)?;
     let reserved_dns_cancellation = ReservedDnsCancellation::default();
-    // Built before the network state so the install hook can reconcile
+    // Built before the network state so policy installation can reconcile
     // them on every successful policy install (RPC refresh and self-hydration
     // alike), not just when the control-plane RPC drives the refresh.
     let dns_allow_cache = DnsAllowCache::default();
     let dns_attributed_connections = DnsAttributedTcpTracker::default();
-    // Before publishing a successful install, prune DNS allows the new policy
-    // no longer justifies and reconcile established TCP flows against it.
-    let install_hook = {
-        let cache = dns_allow_cache.clone();
-        let dns_attributed_connections = dns_attributed_connections.clone();
-        let reserved_dns_cancellation = reserved_dns_cancellation.clone();
-        std::sync::Arc::new(move |policy: &pplx_space_net_common::NetworkPolicyV1| {
-            reserved_dns_cancellation.cancel_in_flight();
-            cache.retain_relevant_to_policy(policy);
-            let dns_attributed_cancelled = dns_attributed_connections.cancel_denied(policy, &cache);
-            if dns_attributed_cancelled > 0 {
-                tracing::info!(
-                    dns_attributed_cancelled_tcp_connections = dns_attributed_cancelled,
-                    "reconciled TCP connections for installed network policy"
-                );
-            }
-        })
-    };
-    let policy_invalidation_hook = {
-        let reserved_dns_cancellation = reserved_dns_cancellation.clone();
-        let dns_attributed_connections = dns_attributed_connections.clone();
-        std::sync::Arc::new(move |invalidation| match invalidation {
-            PolicyInvalidation::ReadyState => reserved_dns_cancellation.cancel_in_flight(),
-            PolicyInvalidation::InstalledPolicy => {
-                let dns_attributed_cancelled = dns_attributed_connections.cancel_all();
-                if dns_attributed_cancelled > 0 {
-                    tracing::info!(
-                        dns_attributed_cancelled_tcp_connections = dns_attributed_cancelled,
-                        "cancelled TCP connections after network policy invalidation"
-                    );
-                }
-            }
-        })
-    };
     let network_state = if config.no_identity {
         emit_sandbox_event(
             sandbox_id,
@@ -497,8 +463,11 @@ pub async fn run(
     } else {
         GatewayNetworkState::pending_policy()
     }
-    .with_install_hook(install_hook)
-    .with_policy_invalidation_hook(policy_invalidation_hook)
+    .with_egress(
+        dns_allow_cache.clone(),
+        dns_attributed_connections.clone(),
+        reserved_dns_cancellation.clone(),
+    )
     .with_readiness_metrics();
     let policy_loader = make_policy_loader(config.sandbox_id.clone(), stats.clone());
     let trusted_sandbox_id =

@@ -31,7 +31,7 @@ where
             authorization.finish(Outcome::Denied, reason.as_str());
             return self.refuse(protocol, reason.as_str(), StatusCode::FORBIDDEN);
         }
-        if let Err(reason) = self.binding.authorize(&request).await {
+        if let Err(reason) = self.binding.authorize(self.lease.host()).await {
             authorization.finish(Outcome::Denied, reason.as_str());
             return self.refuse(protocol, reason.as_str(), reason.refusal_status());
         }

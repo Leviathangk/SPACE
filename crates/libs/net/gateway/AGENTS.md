@@ -19,9 +19,9 @@
 - New policy input travels in sbx-mgr's host-control `GetNetworkPolicy`
   response, which the gateway pulls; `RefreshNetworkPolicy` only triggers
   another pull.
-- New state changes go through `GatewayNetworkState`'s writer lock. `run`
-  gives it a hook that prunes DNS caches and cancels DNS-attributed TCP
-  connections the new policy denies; an install path adds no reconcile.
+- New state changes go through `GatewayNetworkState`'s writer lock. State
+  reconciles DNS work, attribution caches, and established TCP connections
+  before publishing a policy. Egress decision rules belong in `egress`.
 - A new control RPC authorizes its peer first, with `ALLOW_NET_SERVICE`
   unless read-only (`ALLOW_NET_OBSERVER`) (`server/src/control.rs`).
 

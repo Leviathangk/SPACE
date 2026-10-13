@@ -28,7 +28,7 @@ use tokio::sync::Mutex;
 
 use super::routing_headers::{SanitizedBody, SanitizedRequest};
 use crate::dns::DnsAllowCache;
-use crate::egress::{dns_allow_required, evaluate_egress_unmetered};
+use crate::egress::{HostBindingError, authorize_host};
 use crate::state::{GatewayNetworkState, TrafficPolicy};
 
 #[derive(Clone)]
@@ -54,41 +54,19 @@ impl HostBinding {
         }
     }
 
-    pub(super) async fn authorize<B>(
-        &self,
-        request: &SanitizedRequest<B>,
-    ) -> Result<Authority, BindingOutcome> {
-        let (host, canonical_authority) =
-            validated_request_authority(request).map_err(|()| BindingOutcome::InvalidHost)?;
-        // Established HTTP flows get the same bounded PendingPolicy grace and
-        // telemetry as a new TCP admission instead of synthesizing a transient
-        // 502 during policy hydration.
+    pub(super) async fn authorize(&self, host: &DomainName) -> Result<(), BindingOutcome> {
+        // Established requests retain the bounded PendingPolicy grace.
         let policy = match self.network_state.wait_for_tcp_policy().await {
             TrafficPolicy::Ready(policy) => policy,
             TrafficPolicy::NotReady(_) => return Err(BindingOutcome::PolicyUnavailable),
         };
-        if dns_allow_required(self.destination, &policy).is_none() {
-            return Ok(canonical_authority);
-        }
-        if !policy.explicitly_allows_domain_name(&host) {
-            return Err(BindingOutcome::HostNotAllowed);
-        }
-        if !self
-            .dns_allow_cache
-            .contains_host_binding(self.destination.ip(), host.as_str())
-        {
-            return Err(BindingOutcome::HostUnattributed);
-        }
-
-        let dns_allowed = self
-            .dns_allow_cache
-            .allows_ip(self.destination.ip(), &policy);
-        let decision = evaluate_egress_unmetered(self.destination, dns_allowed, &policy);
-        if decision.is_allowed() {
-            Ok(canonical_authority)
-        } else {
-            Err(BindingOutcome::PolicyDenied)
-        }
+        authorize_host(&policy, self.destination, host, &self.dns_allow_cache).map_err(|error| {
+            match error {
+                HostBindingError::HostNotAllowed => BindingOutcome::HostNotAllowed,
+                HostBindingError::HostUnattributed => BindingOutcome::HostUnattributed,
+                HostBindingError::PolicyDenied(_) => BindingOutcome::PolicyDenied,
+            }
+        })
     }
 }
 
@@ -247,7 +225,14 @@ where
     Fut: Future<Output = io::Result<U>> + Send + 'static,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let authority = match binding.authorize(&request).await {
+    let authorization: Result<Authority, BindingOutcome> = async {
+        let (host, authority) =
+            validated_request_authority(&request).map_err(|()| BindingOutcome::InvalidHost)?;
+        binding.authorize(&host).await?;
+        Ok(authority)
+    }
+    .await;
+    let authority = match authorization {
         Ok(authority) => authority,
         Err(outcome) => {
             pplx_space_metrics::gateway::domain_binding("tcp", "http_host", outcome.as_str(), None);

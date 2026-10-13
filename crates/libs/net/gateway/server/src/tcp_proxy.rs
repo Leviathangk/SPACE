@@ -24,10 +24,10 @@ use crate::debug::GatewayDebugState;
 use crate::dns::DnsAllowCache;
 use crate::egress::{EgressPhase, EgressProtocol};
 use crate::known_egress::KnownEgressState;
-use crate::reserved_dns::{ReservedDnsCancellation, ReservedDnsCore};
+use crate::reserved_dns::ReservedDnsCore;
 use crate::resource_budget::MAX_ACTIVE_TCP_CONNECTIONS;
 use crate::sniff;
-use crate::state::{GatewayNetworkState, PolicyNotReady, TrafficPolicy};
+use crate::state::{GatewayNetworkState, PolicyNotReady, ReservedDnsCancellation, TrafficPolicy};
 use crate::stats::ProxyStats;
 use crate::tls_interception::{TlsInterception, TlsInterceptionError};
 
@@ -39,11 +39,10 @@ mod reserved_dns;
 mod routing_headers;
 pub(crate) mod tls;
 mod tls_http;
-mod tracker;
 
-use admission::{AdmittedTcp, TcpAdmissionDenial};
+use crate::egress::DnsAttributedTcpTracker;
+use crate::egress::{AdmittedTcp, TcpAdmissionDenial};
 pub use pplx_space_net_gateway_client::TcpDomainAuthorizationMode;
-pub use tracker::DnsAttributedTcpTracker;
 
 pub struct TcpProxyConfig {
     pub sandbox_id: &'static str,

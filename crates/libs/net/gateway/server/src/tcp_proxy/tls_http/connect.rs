@@ -100,16 +100,7 @@ where
             authorization.finish(Outcome::Cancelled, "lease_invalidated");
             return self.refuse(protocol, "lease_invalidated", StatusCode::FORBIDDEN);
         }
-        let proxy = Request::builder()
-            .uri("/")
-            .header(
-                header::HOST,
-                format!("{}:{}", self.lease.host(), self.lease.port()),
-            )
-            .body(())
-            .expect("validated proxy origin");
-        let proxy = SanitizedRequest::try_from(proxy).expect("proxy request has only Host");
-        if let Err(reason) = self.binding.authorize(&proxy).await {
+        if let Err(reason) = self.binding.authorize(self.lease.host()).await {
             authorization.finish(Outcome::Denied, reason.as_str());
             return self.refuse(protocol, reason.as_str(), reason.refusal_status());
         }

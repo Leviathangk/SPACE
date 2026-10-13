@@ -92,13 +92,8 @@ async fn authorization_waits_through_a_transient_policy_refresh() {
         &policy,
     );
     let binding = HostBinding::new("test", DESTINATION.parse().unwrap(), state.clone(), cache);
-    let request = Request::builder()
-        .uri("/simple/")
-        .header(header::HOST, ALLOWED_HOST)
-        .body(Empty::<hyper::body::Bytes>::new())
-        .unwrap();
     let authorizing =
-        tokio::spawn(async move { binding.authorize(&request.try_into().unwrap()).await });
+        tokio::spawn(async move { binding.authorize(&ALLOWED_HOST.parse().unwrap()).await });
     tokio::task::yield_now().await;
     assert!(
         !authorizing.is_finished(),
@@ -113,8 +108,7 @@ async fn authorization_waits_through_a_transient_policy_refresh() {
         )
         .await;
     assert_eq!(snapshot.mode, NetworkState::Ready);
-    let authority = authorizing.await.unwrap().unwrap();
-    assert_eq!(authority.host(), ALLOWED_HOST);
+    authorizing.await.unwrap().unwrap();
 }
 
 async fn assert_request_refused_before_connect(
@@ -244,20 +238,10 @@ async fn independent_ip_allow_applies_to_an_existing_host_bound_flow() {
         ready_state(direct_policy).await,
         DnsAllowCache::default(),
     );
-    let request = Request::builder()
-        .uri("/simple/")
-        .header(header::HOST, ALLOWED_HOST)
-        .body(Empty::<hyper::body::Bytes>::new())
+    binding
+        .authorize(&ALLOWED_HOST.parse().unwrap())
+        .await
         .unwrap();
-
-    assert_eq!(
-        binding
-            .authorize(&request.try_into().unwrap())
-            .await
-            .unwrap()
-            .host(),
-        ALLOWED_HOST
-    );
 }
 
 async fn send_request(

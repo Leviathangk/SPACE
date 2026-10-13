@@ -32,54 +32,19 @@ use tracing::{debug, info, warn};
 use crate::UDP_MAPPING_TIMEOUT_SECS;
 use crate::dns::DnsAllowCache;
 use crate::egress::{
-    EgressContext, EgressPhase, EgressProtocol, dns_allow_required, evaluate_egress,
-    evaluate_egress_with_post_policy,
+    EgressContext, EgressPhase, EgressProtocol, admit_udp as evaluate_udp_egress, evaluate_egress,
 };
 use crate::known_egress::KnownEgressState;
 use crate::orig_dst;
-use crate::reserved_dns::{
-    ReservedDnsCancellation, ReservedDnsCore, ReservedResolver, ResolveOutcome,
-};
+use crate::reserved_dns::{ReservedDnsCore, ReservedResolver, ResolveOutcome};
 use crate::resource_budget::{MAX_ACTIVE_RESERVED_DNS_DATAGRAMS, MAX_ACTIVE_UDP_SESSIONS};
-use crate::state::{GatewayNetworkState, PolicyNotReady, TrafficPolicy};
+use crate::state::{GatewayNetworkState, PolicyNotReady, ReservedDnsCancellation, TrafficPolicy};
 use crate::stats::ProxyStats;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct FlowKey {
     guest_src: SocketAddr,
     orig_dst: SocketAddr,
-}
-
-fn evaluate_udp_egress(
-    dns_allow_cache: &DnsAllowCache,
-    destination: SocketAddr,
-    policy: &NetworkPolicyV1,
-) -> EgressDecision {
-    let dns_allowed = dns_allow_cache.allows_ip(destination.ip(), policy);
-    evaluate_egress_with_post_policy(
-        EgressContext::Admission(EgressProtocol::Udp),
-        destination,
-        dns_allowed,
-        policy,
-        |decision| {
-            if !decision.is_allowed() {
-                return decision;
-            }
-            let Some(reason) = dns_allow_required(destination, policy) else {
-                return decision;
-            };
-            // QUIC and other UDP payloads do not expose a destination hostname
-            // through the gateway's current parser. An IP shared by CDN
-            // tenants therefore cannot safely inherit a domain permission.
-            pplx_space_metrics::gateway::domain_binding(
-                "udp",
-                "unavailable",
-                "host_unavailable",
-                None,
-            );
-            EgressDecision::Deny { reason }
-        },
-    )
 }
 
 fn evaluate_reserved_dns_egress(

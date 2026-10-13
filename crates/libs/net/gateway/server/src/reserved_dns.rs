@@ -17,7 +17,6 @@ use hickory_resolver::proto::op::{Header, Message, MessageType, OpCode, Query, R
 use hickory_resolver::proto::rr::rdata::CNAME;
 use hickory_resolver::proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use hickory_resolver::proto::serialize::binary::{BinDecodable, BinDecoder};
-use parking_lot::Mutex;
 use pplx_space_net_common::{DomainName, EgressAddressMatch, NetworkPolicyV1};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::sync::Semaphore;
@@ -27,6 +26,7 @@ mod metrics;
 mod recovery;
 mod upstream;
 
+use crate::egress::allows_dns_query as domain_is_allowed;
 use recovery::RecoveringResolver;
 
 pub(crate) const MAX_DNS_MESSAGE_BYTES: usize = 4 * 1024;
@@ -77,37 +77,6 @@ impl ReservedResolver {
 pub enum ResolveOutcome {
     Reply(Vec<u8>),
     Cancelled,
-}
-
-/// Cancels reserved-DNS work that began before a network-policy install.
-///
-/// Adapters take a child token before reading the admitted policy. The policy
-/// install hook cancels that token before publishing the replacement policy,
-/// so the guest retries the transaction against the new policy instead of
-/// receiving a response authorized by the old one.
-#[derive(Clone, Debug)]
-pub struct ReservedDnsCancellation {
-    current: Arc<Mutex<CancellationToken>>,
-}
-
-impl Default for ReservedDnsCancellation {
-    fn default() -> Self {
-        Self {
-            current: Arc::new(Mutex::new(CancellationToken::new())),
-        }
-    }
-}
-
-impl ReservedDnsCancellation {
-    pub fn operation_token(&self) -> CancellationToken {
-        self.current.lock().child_token()
-    }
-
-    pub fn cancel_in_flight(&self) {
-        let mut current = self.current.lock();
-        current.cancel();
-        *current = CancellationToken::new();
-    }
 }
 
 /// The transport-neutral DNS policy and Hickory resolution core.
@@ -236,16 +205,6 @@ impl ReservedDnsCore {
             Err(ResolutionFailure::Lookup(ResolverFailure::Cancelled)) => ResolveOutcome::Cancelled,
             Err(failure) => ResolveOutcome::Reply(local_error(&request, failure.response_code())),
         }
-    }
-}
-
-fn domain_is_allowed(policy: &NetworkPolicyV1, domain: &DomainName) -> bool {
-    if policy.denies_domain(domain) {
-        false
-    } else if policy.matches_domain_allow_rule(domain) {
-        true
-    } else {
-        policy.default_action().allows_egress()
     }
 }
 

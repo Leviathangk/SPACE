@@ -15,13 +15,14 @@ use pplx_space_net_common::{
 };
 use pplx_space_net_gateway::debug::GatewayDebugState;
 use pplx_space_net_gateway::dns::DnsAllowCache;
+use pplx_space_net_gateway::egress::DnsAttributedTcpTracker;
 use pplx_space_net_gateway::known_egress::KnownEgressState;
-use pplx_space_net_gateway::reserved_dns::{ReservedDnsCancellation, ReservedDnsCore};
+use pplx_space_net_gateway::reserved_dns::ReservedDnsCore;
 use pplx_space_net_gateway::state::{
     GatewayNetworkState, NetworkStateReason, PolicyLoader, PulledNetworkPolicy,
+    ReservedDnsCancellation,
 };
 use pplx_space_net_gateway::stats::ProxyStats;
-use pplx_space_net_gateway::tcp_proxy::DnsAttributedTcpTracker;
 use pplx_space_net_gateway::{tcp_proxy, udp_proxy};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;

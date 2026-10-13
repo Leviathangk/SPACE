@@ -1,6 +1,6 @@
 use super::*;
 use crate::dns::test_fixtures::a_response as dns_a_response;
-use crate::tcp_proxy::admission::interception_mode;
+use crate::egress::tcp::dns_attributed_host;
 
 fn v1_allow_all() -> NetworkPolicyV1 {
     NetworkPolicyV1::allow_all()
@@ -362,7 +362,10 @@ fn exempt_tls_survives_dns_expiry_but_rechecks_current_policy() {
             );
             assert!(!token.is_cancelled());
             assert_eq!(
-                interception_mode(&policy, destination, &scan, &cache),
+                policy.tls_interception_for(
+                    destination.ip(),
+                    dns_attributed_host(destination, &scan, &cache)
+                ),
                 TlsInterception::On,
                 "a new connection cannot reuse the established flow's DNS evidence"
             );

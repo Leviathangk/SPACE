@@ -13,13 +13,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::debug::GatewayDebugState;
 use crate::dns::DnsAllowCache;
-use crate::reserved_dns::ReservedDnsCancellation;
+use crate::egress::DnsAttributedTcpTracker;
 use crate::reserved_dns::test_support::RecordedResolver;
-use crate::state::{
-    GatewayNetworkState, NetworkStateReason, PolicyInvalidation, PolicyLoader, PulledNetworkPolicy,
-};
+use crate::state::ReservedDnsCancellation;
+use crate::state::{GatewayNetworkState, NetworkStateReason, PolicyLoader, PulledNetworkPolicy};
 use crate::stats::ProxyStats;
-use crate::tcp_proxy::tracker::DnsAttributedTcpTracker;
 
 use super::super::{FlowOutcome, TcpAdmissionDenial, TcpProxy};
 
@@ -180,14 +178,11 @@ async fn ready_invalidation_cancels_open_reserved_tcp_connections() {
     ] {
         let resolver = RecordedResolver::new(Ipv4Addr::new(192, 0, 2, 10));
         let policy_cancellation = ReservedDnsCancellation::default();
-        let invalidation_cancellation = policy_cancellation.clone();
-        let state = GatewayNetworkState::pending_policy().with_policy_invalidation_hook(Arc::new(
-            move |invalidation| {
-                if invalidation == PolicyInvalidation::ReadyState {
-                    invalidation_cancellation.cancel_in_flight();
-                }
-            },
-        ));
+        let state = GatewayNetworkState::pending_policy().with_egress(
+            DnsAllowCache::default(),
+            crate::egress::DnsAttributedTcpTracker::default(),
+            policy_cancellation.clone(),
+        );
         let state = install_ready(
             state,
             policy(&[
