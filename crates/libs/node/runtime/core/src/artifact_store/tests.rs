@@ -31,11 +31,14 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let node = dir.path().join("node");
+        // Keep checked ancestors inside the fixture even when the system
+        // temporary directory belongs to a different account.
+        let root = dir.path().join("space");
+        let node = root.join("node");
         let releases = node.join("firecracker");
         let kernels = node.join("kernels");
         let staging = dir.path().join("staging");
-        for path in [&node, &releases, &kernels, &staging] {
+        for path in [&root, &node, &releases, &kernels, &staging] {
             std::fs::create_dir_all(path).unwrap();
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
@@ -69,9 +72,16 @@ impl Fixture {
         self.staging.join("firecracker/releases")
     }
 
+    fn release_path(&self, version: &str, fill: u8) -> PathBuf {
+        self.releases.join(managed_release_directory(
+            &firecracker(version),
+            pin(version, fill).digest(),
+        ))
+    }
+
     /// Put a verified release copy in the managed store.
     fn place_release(&self, version: &str, fill: u8) {
-        let bin = self.releases.join(format!("v{version}/bin"));
+        let bin = self.release_path(version, fill).join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         for (name, fill) in [("firecracker", fill), ("jailer", fill.wrapping_add(1))] {
             std::fs::write(bin.join(name), binary(fill)).unwrap();
@@ -139,9 +149,9 @@ fn a_pinned_release_is_published_as_the_stores_own_copy() {
         .publish_release(&pin("1.16.2", 7), &staged("job-1"))
         .unwrap();
     assert_eq!(published.outcome, PublishOutcome::Published);
-    assert_eq!(published.path, fixture.releases.join("v1.16.2"));
+    assert_eq!(published.path, fixture.release_path("1.16.2", 7));
     assert_eq!(published.digest, pin("1.16.2", 7).digest());
-    let firecracker = fixture.releases.join("v1.16.2/bin/firecracker");
+    let firecracker = fixture.release_path("1.16.2", 7).join("bin/firecracker");
     assert_eq!(std::fs::read(&firecracker).unwrap(), binary(7));
     assert_eq!(
         std::fs::metadata(&firecracker)
@@ -152,7 +162,7 @@ fn a_pinned_release_is_published_as_the_stores_own_copy() {
         0o755
     );
     assert_eq!(
-        std::fs::metadata(fixture.releases.join("v1.16.2"))
+        std::fs::metadata(fixture.release_path("1.16.2", 7))
             .unwrap()
             .permissions()
             .mode()
@@ -191,7 +201,7 @@ fn a_publication_that_does_not_check_out_leaves_nothing() {
         .unwrap_err();
     assert!(matches!(error, PublishError::Mismatch { .. }), "{error}");
     assert!(!error.is_transient());
-    assert!(!fixture.releases.join("v1.16.2").exists());
+    assert!(!fixture.release_path("1.16.2", 7).exists());
     assert!(no_leftovers(&fixture.releases));
 
     // A staged binary that is a link, and a staged directory that is one.
@@ -250,7 +260,12 @@ fn a_publication_that_does_not_check_out_leaves_nothing() {
     // The target already holds other bytes.
     let fixture = Fixture::new();
     fixture.stage_release("job-1", "1.16.2", 7);
-    fixture.place_release("1.16.2", 3);
+    fixture.place_release("1.16.2", 7);
+    std::fs::write(
+        fixture.release_path("1.16.2", 7).join("bin/firecracker"),
+        binary(3),
+    )
+    .unwrap();
     let error = fixture
         .store
         .publish_release(&pin("1.16.2", 7), &staged("job-1"))
@@ -260,7 +275,7 @@ fn a_publication_that_does_not_check_out_leaves_nothing() {
         "{error}"
     );
     assert_eq!(
-        std::fs::read(fixture.releases.join("v1.16.2/bin/firecracker")).unwrap(),
+        std::fs::read(fixture.release_path("1.16.2", 7).join("bin/firecracker")).unwrap(),
         binary(3),
         "left in place"
     );
@@ -287,7 +302,7 @@ fn every_managed_release_can_be_removed_without_changing_execution() {
                 expected
             );
         }
-        assert!(!fixture.releases.join(format!("v{version}")).exists());
+        assert!(!fixture.release_path(version, fill).exists());
         assert!(no_leftovers(&fixture.releases));
         assert_eq!(
             std::fs::read(execution.join("firecracker")).unwrap(),
@@ -324,7 +339,7 @@ fn a_managed_copy_of_the_image_kernel_is_verified_and_removable() {
         .publish_kernel(&kernel("6.1.155", 8192), &staged("job-1"))
         .unwrap();
     assert_eq!(published.digest, sha256(&image));
-    let installed = fixture.kernels.join("6.1.155/vmlinux.bin");
+    let installed = published.path.join("vmlinux.bin");
     assert_eq!(std::fs::read(&installed).unwrap(), image);
     assert_eq!(
         std::fs::metadata(&installed).unwrap().permissions().mode() & 0o777,
@@ -336,7 +351,7 @@ fn a_managed_copy_of_the_image_kernel_is_verified_and_removable() {
         fixture
             .store
             .remove_kernel(&version, Digest::sha256([0; 32])),
-        Err(RemoveError::IdentityChanged { .. })
+        Ok(RemoveOutcome::Absent)
     ));
     assert_eq!(std::fs::read(&installed).unwrap(), image);
     assert_eq!(
@@ -346,23 +361,33 @@ fn a_managed_copy_of_the_image_kernel_is_verified_and_removable() {
             .unwrap(),
         RemoveOutcome::Removed
     );
-    assert!(!fixture.kernels.join("6.1.155").exists());
+    assert!(!published.path.exists());
 }
 
 #[test]
 fn interrupted_work_is_cleared() {
     let fixture = Fixture::new();
-    fixture.place_release("1.16.2", 5);
+    fixture.place_release("1.16.2", 7);
     for leftover in [".incoming-v1.16.1-job-1", ".removing-v1.16.0"] {
         std::fs::create_dir_all(fixture.releases.join(leftover).join("bin")).unwrap();
     }
     std::fs::create_dir_all(fixture.kernels.join(".incoming-6.1.158-job-2")).unwrap();
 
     assert_eq!(fixture.store.clear_leftovers().unwrap(), 3);
-    assert!(fixture.releases.join("v1.15.1/bin/firecracker").exists());
+    assert!(
+        fixture
+            .release_path("1.15.1", 1)
+            .join("bin/firecracker")
+            .exists()
+    );
     assert!(no_leftovers(&fixture.releases));
     assert!(no_leftovers(&fixture.kernels));
-    assert!(fixture.releases.join("v1.16.2/bin/firecracker").exists());
+    assert!(
+        fixture
+            .release_path("1.16.2", 7)
+            .join("bin/firecracker")
+            .exists()
+    );
 }
 
 #[test]
@@ -389,7 +414,7 @@ fn a_publication_never_uses_another_ones_work_directory() {
         .unwrap();
     assert_eq!(published.outcome, PublishOutcome::Published);
     assert_eq!(
-        std::fs::read(fixture.releases.join("v1.16.2/bin/firecracker")).unwrap(),
+        std::fs::read(fixture.release_path("1.16.2", 7).join("bin/firecracker")).unwrap(),
         binary(7)
     );
     assert_eq!(std::fs::read(stale.join("firecracker")).unwrap(), binary(9));
@@ -428,7 +453,7 @@ fn concurrent_publications_of_one_release_publish_the_pinned_bytes() {
         "{outcomes:?}"
     );
     assert_eq!(
-        std::fs::read(fixture.releases.join("v1.16.2/bin/firecracker")).unwrap(),
+        std::fs::read(fixture.release_path("1.16.2", 7).join("bin/firecracker")).unwrap(),
         binary(7)
     );
     assert!(no_leftovers(&fixture.releases));
@@ -453,7 +478,7 @@ fn the_staging_root_is_created_private_and_anything_else_there_replaced() {
     assert!(fixture.staging.join("staging").exists());
 
     // A link at the path is removed, never followed.
-    let elsewhere = fixture.releases.join("v1.15.1");
+    let elsewhere = fixture.release_path("1.15.1", 1);
     std::fs::remove_dir_all(&fixture.staging).unwrap();
     std::os::unix::fs::symlink(&elsewhere, &fixture.staging).unwrap();
     assert!(fixture.store.ensure_staging_root(uid, gid).unwrap());
@@ -496,7 +521,7 @@ fn an_empty_managed_store_is_additive_and_can_return_to_empty() {
         fixture
             .store
             .remove_release(&firecracker("1.16.2"), Digest::sha256([0; 32])),
-        Err(RemoveError::IdentityChanged { .. })
+        Ok(RemoveOutcome::Absent)
     ));
     fixture
         .store
@@ -533,13 +558,17 @@ fn reserved_kernel_names_are_refused_before_touching_the_store() {
 #[test]
 fn missing_managed_files_require_repair_not_a_retry() {
     let fixture = Fixture::new();
-    std::fs::remove_file(fixture.releases.join("v1.15.1/bin/jailer")).unwrap();
+    std::fs::remove_file(fixture.release_path("1.15.1", 1).join("bin/jailer")).unwrap();
     let error = fixture
         .store
         .remove_release(&firecracker("1.15.1"), pin("1.15.1", 1).digest())
         .unwrap_err();
     assert!(!error.is_transient(), "{error:?}");
-    std::fs::create_dir(fixture.kernels.join("6.1.155")).unwrap();
+    std::fs::create_dir(fixture.kernels.join(managed_kernel_directory(
+        &"6.1.155".parse().unwrap(),
+        sha256(b"missing"),
+    )))
+    .unwrap();
     let error = fixture
         .store
         .remove_kernel(&"6.1.155".parse().unwrap(), sha256(b"missing"))
@@ -569,4 +598,462 @@ fn cleanup_skips_a_busy_root_and_clears_the_other_root() {
     );
     assert!(busy.exists());
     assert!(!idle.exists());
+}
+
+#[test]
+fn distinct_release_builds_with_the_same_version_coexist() {
+    let fixture = Fixture::new();
+    fixture.stage_release("first", "1.16.2", 7);
+    fixture.stage_release("second", "1.16.2", 9);
+    let first = fixture
+        .store
+        .publish_release(&pin("1.16.2", 7), &staged("first"))
+        .unwrap();
+    let second = fixture
+        .store
+        .publish_release(&pin("1.16.2", 9), &staged("second"))
+        .unwrap();
+    assert_ne!(first.path, second.path);
+    fixture
+        .store
+        .remove_release(&firecracker("1.16.2"), first.digest)
+        .unwrap();
+    assert!(!first.path.exists());
+    assert_eq!(
+        std::fs::read(second.path.join("bin/firecracker")).unwrap(),
+        binary(9)
+    );
+}
+
+/// Exercise the production publication -> verified staging -> resolution path
+/// with synthetic pinned bytes; no VM or host filesystem is involved.
+#[test]
+fn managed_e0_survives_cache_loss_without_selecting_other_installs() {
+    use crate::runtime_inventory::{ExecutionSelectionMode, RuntimeFileRole, RuntimeInventory};
+    let fixture = Fixture::new();
+    std::fs::remove_dir_all(fixture.release_path("1.15.1", 1)).unwrap();
+    let initial = synthetic_initial_environment();
+    let vendor = fixture._dir.path().join("external/firecracker");
+    let cache = fixture._dir.path().join("cache/firecracker");
+    std::fs::create_dir_all(&cache).unwrap();
+    let discover = || {
+        RuntimeInventory::discover_with_store(
+            &fixture.store,
+            &initial,
+            &vendor,
+            &cache.join("assets"),
+            &cache.join("kernels"),
+        )
+    };
+    let resolve = |inventory: &RuntimeInventory| {
+        inventory.resolve(
+            None,
+            RuntimeKind::Firecracker,
+            ExecutionSelectionMode::NewColdBoot,
+        )
+    };
+    let empty = discover().unwrap();
+    assert!(empty.to_proto().runtimes.is_empty());
+    assert!(empty.to_proto().components.is_empty());
+    resolve(&empty).unwrap_err();
+
+    fixture.stage_release("runtime", "1.15.1", 1);
+    fixture
+        .store
+        .publish_release(&initial.release, &staged("runtime"))
+        .unwrap();
+    assert!(
+        resolve(&discover().unwrap()).is_err(),
+        "a release alone is not a usable environment"
+    );
+    let source = fixture
+        .staging
+        .join("firecracker/kernels/kernel/6.1.155/vmlinux.bin");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, binary(42)).unwrap();
+    let kernel = fixture
+        .store
+        .publish_kernel(&initial.kernel, &staged("kernel"))
+        .unwrap();
+
+    let inventory = discover().unwrap();
+    let selected = resolve(&inventory).unwrap();
+    assert_eq!(selected.execution.runtime(), &initial.release.release);
+    let staged_kernel = &selected.components[0].path;
+    assert_eq!(
+        selected.components[0].metadata.digest,
+        Some(initial.kernel.sha256)
+    );
+    assert!(
+        !std::fs::symlink_metadata(staged_kernel)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_ne!(
+        std::fs::metadata(staged_kernel).unwrap().ino(),
+        std::fs::metadata(kernel.path.join(KERNEL_IMAGE))
+            .unwrap()
+            .ino()
+    );
+    let jail = cache.join("jail-kernel");
+    std::fs::hard_link(staged_kernel, &jail).unwrap();
+    assert!(
+        inventory.files_unchanged(),
+        "linking a kernel into a jail must not invalidate the verified inventory"
+    );
+
+    // Coexisting baked bytes remain external. Both sources resolve the same
+    // identity, with the managed copy preferred whenever it exists.
+    let baked = vendor.join("v1.15.1/bin");
+    std::fs::create_dir_all(&baked).unwrap();
+    for name in ["firecracker", "jailer"] {
+        std::fs::copy(
+            fixture.release_path("1.15.1", 1).join("bin").join(name),
+            baked.join(name),
+        )
+        .unwrap();
+    }
+    fixture
+        .store
+        .remove_release(&initial.release.release, initial.release.digest())
+        .unwrap();
+    let baked_kernel = cache.join("kernels/6.1.155/vmlinux.bin");
+    std::fs::create_dir_all(baked_kernel.parent().unwrap()).unwrap();
+    std::fs::copy(kernel.path.join(KERNEL_IMAGE), &baked_kernel).unwrap();
+    fixture
+        .store
+        .remove_kernel(&initial.kernel.version, initial.kernel.sha256)
+        .unwrap();
+    let from_baked = resolve(&discover().unwrap()).unwrap();
+    assert_eq!(from_baked.execution, selected.execution);
+    assert_eq!(from_baked.components[0].path, baked_kernel);
+    assert_eq!(
+        from_baked
+            .runtime_files
+            .path(RuntimeFileRole::FirecrackerBinary)
+            .unwrap(),
+        baked.join("firecracker")
+    );
+    fixture
+        .store
+        .publish_release(&initial.release, &staged("runtime"))
+        .unwrap();
+    fixture
+        .store
+        .publish_kernel(&initial.kernel, &staged("kernel"))
+        .unwrap();
+    assert_eq!(
+        resolve(&discover().unwrap()).unwrap().runtime_files,
+        selected.runtime_files
+    );
+
+    // A malformed/unselected candidate cannot enter the execution inventory.
+    fixture.stage_release("candidate", "1.17.0", 7);
+    let candidate = fixture
+        .store
+        .publish_release(&pin("1.17.0", 7), &staged("candidate"))
+        .unwrap();
+    std::fs::write(candidate.path.join("bin/firecracker"), b"damaged candidate").unwrap();
+    std::os::unix::fs::symlink(&candidate.path, vendor.join("v1.17.0")).unwrap();
+    std::os::unix::fs::symlink("v1.17.0", vendor.join("default")).unwrap();
+    let after_candidate = discover().unwrap();
+    assert_eq!(after_candidate.to_proto().runtimes.len(), 1);
+    assert_eq!(
+        resolve(&after_candidate).unwrap().execution,
+        selected.execution
+    );
+
+    // Explicit historical kernels retain their identity. Ambiguous legacy
+    // defaults must not silently turn an unannotated record into E0.
+    let historical = cache.join("kernels/custom/vmlinux.bin");
+    std::fs::create_dir_all(historical.parent().unwrap()).unwrap();
+    std::fs::write(&historical, binary(99)).unwrap();
+    for alias in ["default", "legacy-default"] {
+        std::os::unix::fs::symlink("custom", cache.join("kernels").join(alias)).unwrap();
+    }
+    let inventory = discover().unwrap();
+    let legacy = pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
+        selected.execution.guest().architecture,
+        Vec::new(),
+    );
+    // A dangling explicit legacy marker must not inherit a stock new default.
+    let new_default = cache.join("kernels/default");
+    std::fs::remove_file(&new_default).unwrap();
+    std::os::unix::fs::symlink("6.1.155", &new_default).unwrap();
+    for (target, allowed) in [("custom", false), ("missing", false), ("6.1.155", true)] {
+        let marker = cache.join("kernels/legacy-default");
+        std::fs::remove_file(&marker).unwrap();
+        std::os::unix::fs::symlink(target, &marker).unwrap();
+        let binding = discover().unwrap();
+        for mode in [
+            ExecutionSelectionMode::ExistingColdBoot,
+            ExecutionSelectionMode::PersistedStateRestore,
+        ] {
+            assert_eq!(
+                binding
+                    .resolve(Some(&legacy), RuntimeKind::Firecracker, mode)
+                    .is_ok(),
+                allowed,
+                "legacy marker {target} must not silently change kernels"
+            );
+        }
+    }
+    let mut component = selected.components[0].metadata.clone();
+    component.version = Some("custom".parse().unwrap());
+    component.digest = Some(sha256(&binary(99)));
+    let explicit = pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
+        selected.execution.guest().architecture,
+        vec![component],
+    );
+    let restored = inventory
+        .resolve(
+            Some(&explicit),
+            RuntimeKind::Firecracker,
+            ExecutionSelectionMode::ExistingColdBoot,
+        )
+        .unwrap();
+    assert_eq!(restored.components[0].path, historical);
+
+    // Reboot recovery needs only the durable store, not the download staging.
+    std::fs::remove_dir_all(&fixture.staging).unwrap();
+    std::fs::remove_dir_all(cache.join("managed")).unwrap();
+    assert!(!inventory.files_unchanged());
+    let recovered = discover().unwrap();
+    assert!(recovered.files_unchanged());
+    assert_eq!(resolve(&recovered).unwrap().execution, selected.execution);
+    assert_eq!(std::fs::read(&jail).unwrap(), binary(42));
+
+    // Partial cache loss is recoverable too, without touching existing jails.
+    std::fs::remove_file(&resolve(&recovered).unwrap().components[0].path).unwrap();
+    let recovered = discover().unwrap();
+    assert_eq!(
+        std::fs::read(&resolve(&recovered).unwrap().components[0].path).unwrap(),
+        binary(42)
+    );
+
+    // Cache corruption is not repaired by overwriting a file used by a jail.
+    std::fs::write(&resolve(&recovered).unwrap().components[0].path, b"bad").unwrap();
+    assert!(!recovered.files_unchanged());
+    resolve(&discover().unwrap()).unwrap_err();
+    assert_eq!(std::fs::read(&jail).unwrap(), binary(42));
+    assert_eq!(
+        selected
+            .runtime_files
+            .path(RuntimeFileRole::FirecrackerBinary)
+            .unwrap(),
+        fixture.release_path("1.15.1", 1).join("bin/firecracker")
+    );
+}
+
+fn synthetic_initial_environment() -> crate::catalog::InitialEnvironment {
+    use crate::catalog::InitialEnvironment;
+    InitialEnvironment {
+        release: pin("1.15.1", 1),
+        kernel: PinnedKernel {
+            version: "6.1.155".parse().unwrap(),
+            runtime: RuntimeKind::Firecracker,
+            runtime_line: "1.15".parse().unwrap(),
+            architecture: Arch::X86_64,
+            size: 4096,
+            sha256: sha256(&binary(42)),
+        },
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn e0_failures_preserve_unrelated_external_execution() {
+    use crate::runtime_inventory::{
+        ExecutionSelectionMode, RuntimeInstallationRoot, RuntimeInventory,
+    };
+    for failure in [
+        "binary",
+        "kernel_mode",
+        "directory_mode",
+        "managed_cache",
+        "cache_io",
+    ] {
+        let fixture = Fixture::new();
+        let initial = synthetic_initial_environment();
+        let vendor = fixture._dir.path().join("external/firecracker");
+        let cache = fixture._dir.path().join("cache/firecracker");
+        let kernels = cache.join("kernels");
+        let baked = vendor.join("v1.15.1/bin");
+        let other = vendor.join("v1.17.0/bin");
+        for directory in [
+            &baked,
+            &other,
+            &kernels.join("6.1.155"),
+            &kernels.join("custom"),
+        ] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        for name in ["firecracker", "jailer"] {
+            let source = fixture.release_path("1.15.1", 1).join("bin").join(name);
+            std::fs::copy(&source, baked.join(name)).unwrap();
+            std::fs::copy(&source, other.join(name)).unwrap();
+        }
+        std::fs::remove_dir_all(fixture.release_path("1.15.1", 1)).unwrap();
+        let image = kernels.join("6.1.155/vmlinux.bin");
+        std::fs::write(&image, binary(42)).unwrap();
+        std::fs::write(kernels.join("custom/vmlinux.bin"), binary(99)).unwrap();
+        std::os::unix::fs::symlink("v1.17.0", vendor.join("default")).unwrap();
+        std::os::unix::fs::symlink("custom", kernels.join("default")).unwrap();
+        std::os::unix::fs::symlink("6.1.155", kernels.join("legacy-default")).unwrap();
+        let external = RuntimeInventory::discover(
+            [RuntimeInstallationRoot::new(
+                RuntimeKind::Firecracker,
+                &vendor,
+            )],
+            cache.join("assets"),
+            &kernels,
+        )
+        .unwrap();
+        let explicit = external
+            .resolve(
+                None,
+                RuntimeKind::Firecracker,
+                ExecutionSelectionMode::NewColdBoot,
+            )
+            .unwrap()
+            .execution;
+        match failure {
+            "binary" => std::fs::write(baked.join("firecracker"), binary(88)).unwrap(),
+            "kernel_mode" => {
+                std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o664)).unwrap()
+            }
+            "directory_mode" => std::fs::set_permissions(
+                image.parent().unwrap(),
+                std::fs::Permissions::from_mode(0o775),
+            )
+            .unwrap(),
+            "managed_cache" | "cache_io" => {
+                let source = fixture
+                    .staging
+                    .join("firecracker/kernels/kernel/6.1.155/vmlinux.bin");
+                std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+                std::fs::write(&source, binary(42)).unwrap();
+                fixture
+                    .store
+                    .publish_kernel(&initial.kernel, &staged("kernel"))
+                    .unwrap();
+                if failure == "managed_cache" {
+                    std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o2775))
+                        .unwrap();
+                } else {
+                    let target = cache.join("managed/kernels").join(managed_kernel_directory(
+                        &initial.kernel.version,
+                        initial.kernel.sha256,
+                    ));
+                    std::fs::create_dir_all(&target).unwrap();
+                    std::fs::write(
+                        target.join("obstruction"),
+                        b"cache reconstruction I/O failure",
+                    )
+                    .unwrap();
+                }
+            }
+            _ => unreachable!(),
+        }
+        let discover = || {
+            RuntimeInventory::discover_with_store(
+                &fixture.store,
+                &initial,
+                &vendor,
+                &cache.join("assets"),
+                &kernels,
+            )
+        };
+        let inventory = discover().expect(failure);
+        let error = inventory
+            .resolve(
+                None,
+                RuntimeKind::Firecracker,
+                ExecutionSelectionMode::NewColdBoot,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.is_transient(),
+            failure == "cache_io",
+            "{failure}: {error}"
+        );
+        assert!(
+            inventory.files_unchanged(),
+            "unchanged failures must not cause repeated hashing"
+        );
+        if failure == "cache_io" {
+            tokio::time::advance(std::time::Duration::from_secs(11)).await;
+            assert!(
+                !inventory.files_unchanged(),
+                "transient I/O must retry without a filesystem change"
+            );
+            let blocker = cache
+                .join("managed/kernels")
+                .join(managed_kernel_directory(
+                    &initial.kernel.version,
+                    initial.kernel.sha256,
+                ))
+                .join("obstruction");
+            std::fs::remove_file(blocker).unwrap();
+        }
+        for mode in [
+            ExecutionSelectionMode::ExistingColdBoot,
+            ExecutionSelectionMode::PersistedStateRestore,
+        ] {
+            let resolved = inventory
+                .resolve(Some(&explicit), RuntimeKind::Firecracker, mode)
+                .expect(failure);
+            assert_eq!(resolved.execution, explicit, "{failure}");
+        }
+        // Repair only the failed input: unrelated writes must not be needed
+        // to invalidate a cached negative observation.
+        match failure {
+            "binary" => std::fs::write(baked.join("firecracker"), binary(1)).unwrap(),
+            "kernel_mode" => {
+                std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o644)).unwrap()
+            }
+            "directory_mode" => std::fs::set_permissions(
+                image.parent().unwrap(),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap(),
+            "managed_cache" => {
+                std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o3775)).unwrap()
+            }
+            "cache_io" => {}
+            _ => unreachable!(),
+        }
+        assert!(!inventory.files_unchanged(), "{failure}");
+        discover()
+            .unwrap()
+            .resolve(
+                None,
+                RuntimeKind::Firecracker,
+                ExecutionSelectionMode::NewColdBoot,
+            )
+            .expect(failure);
+    }
+}
+
+#[test]
+fn sticky_permissions_are_limited_to_execution_cache_parents() {
+    let fixture = Fixture::new();
+    let parent = fixture.releases.parent().unwrap();
+    fixture.store.verify_release(&pin("1.15.1", 1)).unwrap();
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o3775)).unwrap();
+    assert!(matches!(
+        fixture.store.verify_release(&pin("1.15.1", 1)),
+        Err(PublishError::UnsafeRoot { path, .. }) if path == parent
+    ));
+    assert!(matches!(
+        fixture
+            .store
+            .remove_release(&firecracker("1.15.1"), pin("1.15.1", 1).digest()),
+        Err(RemoveError::UnsafeRoot { path, .. }) if path == parent
+    ));
+    let cache = fixture.store.prepare_execution_cache(parent).unwrap();
+    assert_eq!(
+        std::fs::metadata(cache).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
 }

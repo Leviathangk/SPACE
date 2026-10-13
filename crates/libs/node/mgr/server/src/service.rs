@@ -8,9 +8,7 @@ use arc_swap::ArcSwapOption;
 use pplx_space_common_core::types::SandboxId;
 use pplx_space_common_svc::core::host::linux::identities::{gids, group_names, user_names};
 use pplx_space_common_svc::{LocalRole, UdsPeerAccount, UdsPeerAuthorizer, UdsPeerPrincipal};
-use pplx_space_node_runtime_core::runtime_inventory::{
-    RuntimeInstallationRoot, RuntimeInventory, RuntimeInventoryError,
-};
+use pplx_space_node_runtime_core::runtime_inventory::{RuntimeInventory, RuntimeInventoryError};
 use tonic::{Request, Response, Status};
 
 use crate::disk_admission::DiskAdmission;
@@ -405,40 +403,42 @@ impl NodeManagerService {
 
     async fn runtime_inventory(&self) -> Result<std::sync::Arc<RuntimeInventory>, Status> {
         if let Some(inventory) = self.runtime_inventory.load_full() {
-            return Ok(inventory);
+            let candidate = inventory.clone();
+            // Read-only validation needs no sandbox mutation ownership. Keep
+            // it off Tokio workers and tracked through waiter cancellation.
+            let valid = self
+                .device_op_tasks
+                .spawn_blocking(move || candidate.files_unchanged())
+                .await
+                .map_err(|error| {
+                    Status::internal(format!("validate execution inventory: {error}"))
+                })?;
+            if valid {
+                return Ok(inventory);
+            }
         }
-        self.refresh_runtime_inventory().await
-    }
-
-    async fn refresh_runtime_inventory(&self) -> Result<std::sync::Arc<RuntimeInventory>, Status> {
-        let _guard = self.runtime_inventory_refresh_lock.lock().await;
-        if let Some(inventory) = self.runtime_inventory.load_full() {
-            return Ok(inventory);
-        }
-        let crate::config::RuntimePaths {
-            vendor: root,
-            assets: asset_root,
-            kernels: kernel_root,
-            store: _,
-        } = self.runtime_paths.clone();
-        // Prepare and Launch also require this cache; diagnostic pressure must
-        // not reject cold discovery before lifecycle admission.
-        let inventory = self
-            .off_runtime("discover runtime inventory", move || {
-                RuntimeInventory::discover(
-                    [RuntimeInstallationRoot::new(
-                        pplx_space_common_core::types::RuntimeKind::Firecracker,
-                        root,
-                    )],
-                    asset_root,
-                    kernel_root,
-                )
-                .map_err(RuntimeInventoryError::into_status)
-            })
-            .await
-            .map(std::sync::Arc::new)?;
-        self.runtime_inventory.store(Some(inventory.clone()));
-        Ok(inventory)
+        // Metadata checks and discovery are blocking. The owned lock stays in
+        // the tracked closure even if the RPC waiter is cancelled.
+        let guard = self
+            .runtime_inventory_refresh_lock
+            .clone()
+            .lock_owned()
+            .await;
+        let snapshot = self.runtime_inventory.clone();
+        let paths = self.runtime_paths.clone();
+        self.off_runtime("discover runtime inventory", move || {
+            let _guard = guard;
+            if let Some(inventory) = snapshot.load_full()
+                && inventory.files_unchanged()
+            {
+                return Ok(inventory);
+            }
+            snapshot.store(None);
+            let inventory = std::sync::Arc::new(node_artifacts::execution_inventory(&paths)?);
+            snapshot.store(Some(inventory.clone()));
+            Ok(inventory)
+        })
+        .await
     }
 
     fn launch_cgroup_limits(

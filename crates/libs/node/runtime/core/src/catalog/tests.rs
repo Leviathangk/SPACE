@@ -67,6 +67,14 @@ fn every_known_release_is_pinned_for_both_architectures() {
         kernel.sha256.to_string(),
         "sha256:e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2"
     );
+    // E0 is a durable legacy binding, not an alias to the current catalog tip.
+    let initial = InitialEnvironment::for_architecture(Arch::X86_64).unwrap();
+    assert_eq!(initial.release.release.version.as_str(), "1.15.1");
+    assert_eq!(
+        initial.release.digest().to_string(),
+        "sha256:7225701e6d651bb351c6858e3587994fb75a9932fb16d744dfec30fb8bfdd027"
+    );
+    assert_eq!(initial.kernel, *kernel);
 }
 
 #[test]
