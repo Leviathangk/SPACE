@@ -53,7 +53,11 @@ datadog:
   # Host directory for log tailing positions.
   logsPositionsDir: /var/lib/datadog-agent/logs
   nodeSelector: {kubernetes.io/os: linux}
-  tolerations: []
+  # The Agent must run on every node with SPACE producers, including tainted
+  # worker and builder nodes: producers send to the Agent on their own node.
+  # The default tolerates every taint; narrow it to your nodes' taints if
+  # needed.
+  tolerations: [{operator: Exists}]
   # Extra NetworkPolicy peers, beyond spaceNamespaces, allowed to send to
   # DogStatsD and APM, for host-network producers the CNI does not exempt
   # (kindnet exempts root processes only). Node addresses here admit anything
@@ -65,9 +69,12 @@ datadog:
     limits: {memory: 512Mi}
 
 # --- otlp mode --------------------------------------------------------------
-# The single gateway Collector every OTLP producer (or node-local Collector)
-# sends to: collector.<release-namespace>.svc:4317. It converts delta metrics
-# to cumulative for Prometheus, so it runs exactly one replica. Every component
+# The single gateway Collector behind the node-local Collector:
+# collector.<release-namespace>.svc:4317. SPACE producers do not send to it
+# directly; they send to http://<node IP>:<otlp.nodeLocalPort>. It converts
+# delta metrics to cumulative for Prometheus (the Rust services already export
+# cumulative in otlp mode; the containerd shim exports delta), so it runs
+# exactly one replica. Every component
 # in otlp mode gets a NetworkPolicy; rendering a policy does not prove the CNI
 # enforces it, so verify an allowed and a denied producer before relying on it.
 gateway:

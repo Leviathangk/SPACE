@@ -38,11 +38,18 @@ helm upgrade --install space-observability "$charts/space-observability" \
   --wait --timeout 10m
 ```
 
-`global.observability.cluster` is required: it labels every log stream. SPACE
-producers send OTLP/gRPC to the gateway at
-`collector.<release-namespace>.svc:4317`. Host-network producers and the
-worker shim reach it through the node-local Collector when one is installed;
-until then they need a route to the Service themselves.
+`global.observability.cluster` is required: it labels every log stream.
+
+SPACE producers do not send to the gateway Service. In otlp mode every
+producer (pods, host-network services, the runtime supervisor and the worker
+shim) sends OTLP/gRPC to the node it runs on, `http://$(NODE_IP):<nodeLocalPort>`
+(default 4317, `NODE_IP` from the pod's `status.hostIP`), and a node-local
+Collector there forwards to the gateway at
+`collector.<release-namespace>.svc:4317`. **otlp mode therefore requires the
+node-local Collector.** This chart does not install it yet: nothing listens on
+the node port, and producers switched to otlp fail to export until the
+node-local Collector DaemonSet is added to this chart. Install the two
+together.
 
 What you get, and what to change:
 
@@ -113,7 +120,10 @@ collected from `spaceNamespaces` only. A SPACE container whose output
 must not be collected opts out with an `ad.datadoghq.com/<container>.logs_exclude`
 annotation, which outranks the namespace inclusion. Local clusters whose
 kubelet certificate does not cover the node IP (Kind) need
-`datadog.kubeletTLSVerify=false`.
+`datadog.kubeletTLSVerify=false`. The Agent tolerates every taint by default
+(`datadog.tolerations: [{operator: Exists}]`) because producers on tainted
+worker and builder nodes send to the Agent on their own node; narrow it to
+your nodes' taints if needed.
 
 ## Switching modes
 

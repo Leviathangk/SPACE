@@ -124,6 +124,10 @@ def test_datadog_renders_only_the_agent() -> None:
     (rule,) = policy["ingress"]
     assert rule["ports"] == [{"protocol": "UDP", "port": 8125}, {"protocol": "TCP", "port": 8126}]
     assert rule["from"][0]["namespaceSelector"]["matchExpressions"][0]["values"] == ["space"]
+    # Producers on tainted worker and builder nodes need the Agent there too.
+    assert docs[("DaemonSet", "datadog-agent")]["spec"]["template"]["spec"]["tolerations"] == [
+        {"operator": "Exists"}
+    ]
 
 
 def test_datadog_ports_follow_the_shared_values() -> None:
@@ -258,3 +262,73 @@ def test_signal_charts_render_nothing_outside_otlp_mode(mode: str) -> None:
         "--set", f"global.observability.mode={mode}", chart=CHARTS / "metrics", namespace="obs-metrics"
     )
     assert docs == []
+
+
+KUBE_DNS_EGRESS = {
+    "to": [
+        {
+            "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
+            "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}},
+        }
+    ],
+    "ports": [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}],
+}
+
+
+def dns_rules(docs: list[dict]) -> dict[str, list[dict]]:
+    """Each NetworkPolicy with egress, mapped to its DNS (port 53/5353) rules."""
+    out = {}
+    for doc in docs:
+        if doc["kind"] != "NetworkPolicy" or "Egress" not in doc["spec"].get("policyTypes", []):
+            continue
+        out[doc["metadata"]["name"]] = [
+            rule for rule in doc["spec"].get("egress") or []
+            if any(port.get("port") in (53, 5353) for port in rule.get("ports") or [])
+        ]
+    return out
+
+
+def test_dns_egress_defaults_to_kube_dns() -> None:
+    rules = dns_rules(documents(*OTLP))
+    assert rules, "no egress NetworkPolicies rendered"
+    for name, found in rules.items():
+        assert found == [KUBE_DNS_EGRESS], name
+
+
+def test_dns_egress_peers_and_ports_are_configurable(tmp_path: Path) -> None:
+    # OpenShift: the DNS operator's pods, on 5353 behind the Service's 53.
+    custom = {
+        "to": [
+            {
+                "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "openshift-dns"}},
+                "podSelector": {"matchLabels": {"dns.operator.openshift.io/daemonset-dns": "default"}},
+            },
+            {"ipBlock": {"cidr": "169.254.20.10/32"}},
+        ],
+        "ports": [{"protocol": "UDP", "port": 5353}, {"protocol": "TCP", "port": 5353}],
+    }
+    values = tmp_path / "dns.yaml"
+    values.write_text(yaml.safe_dump({"global": {"networkPolicy": {"dns": {"peers": custom["to"], "ports": custom["ports"]}}}}))
+    rules = dns_rules(documents(*OTLP, "-f", str(values)))
+    assert rules
+    for name, found in rules.items():
+        assert found == [custom], name
+    # A standalone signal chart reads the same global key.
+    standalone = dns_rules(documents("-f", str(CHARTS / "traces/profiles/shared.example.yaml"),
+                                     "--set", "storage.ephemeral=true", "-f", str(values),
+                                     chart=CHARTS / "traces"))
+    assert standalone and all(found == [custom] for found in standalone.values())
+
+
+def test_dns_egress_empty_lists_keep_the_default(tmp_path: Path) -> None:
+    # An empty `to` would allow egress anywhere; empty lists fall back instead.
+    values = tmp_path / "dns.yaml"
+    values.write_text("global: {networkPolicy: {dns: {peers: [], ports: []}}}\n")
+    for name, found in dns_rules(documents(*OTLP, "-f", str(values))).items():
+        assert found == [KUBE_DNS_EGRESS], name
+
+
+def test_dns_egress_rejects_a_non_list() -> None:
+    result = render(*OTLP, "--set", "global.networkPolicy.dns.peers=kube-dns")
+    assert result.returncode != 0
+    assert "global.networkPolicy.dns.peers must be a list" in result.stderr

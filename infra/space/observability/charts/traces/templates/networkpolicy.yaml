@@ -37,7 +37,7 @@ spec:
         - podSelector: {matchLabels: {app: tempo}}
       ports: [{protocol: TCP, port: 4317}]
     {{- end }}
-{{- include "common.dnsEgress" . | nindent 4 }}
+{{- include "common.dnsEgress" $ | nindent 4 }}
 {{- with $.Values.networkPolicy.additionalEgress }}
 {{ toYaml . | indent 4 }}
 {{- end }}

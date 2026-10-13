@@ -90,9 +90,10 @@ limits, bounded queues, and readiness probes are in each chart. Read its
            matchLabels: {observability-canary: "true"}
    ```
 
-   Internal component traffic and kube-system CoreDNS (`k8s-app=kube-dns`,
-   TCP/UDP 53) are allowed. NodeLocal DNS or different DNS labels require a
-   reviewed `networkPolicy.additionalEgress` rule. Producer egress policies also
+   Internal component traffic and cluster DNS are allowed: by default
+   kube-system CoreDNS (`k8s-app=kube-dns`, TCP/UDP 53); NodeLocal DNSCache,
+   OpenShift or other DNS labels are set with `global.networkPolicy.dns` (see
+   "DNS egress" below). Producer egress policies also
    need to allow the destination. Do not open the receiver to the entire VPC.
    SPACE node-api uses host networking: peer matching for host-networked pods
    varies by CNI. Begin with an ordinary pod canary; separately prove host-path
@@ -421,3 +422,41 @@ References: [Kubernetes NetworkPolicy](https://kubernetes.io/docs/concepts/servi
 [Loki retention](https://grafana.com/docs/loki/latest/operations/storage/retention/),
 [Tempo configuration](https://grafana.com/docs/tempo/latest/configuration/),
 [Tempo query API](https://grafana.com/docs/tempo/latest/api_docs/).
+
+## DNS egress
+
+Every NetworkPolicy these charts render allows DNS to the peers and ports in
+`global.networkPolicy.dns` (`charts/common/templates/_netpol.tpl`). Unset, that
+is kube-system pods labelled `k8s-app=kube-dns` on UDP/TCP 53. Set it once in
+the values file; the umbrella chart passes `global` to every signal chart.
+
+NodeLocal DNSCache (pods resolve through the node-local cache's link-local
+address, which forwards to CoreDNS on a miss):
+
+```yaml
+global:
+  networkPolicy:
+    dns:
+      peers:
+        - ipBlock: {cidr: 169.254.20.10/32}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+```
+
+OpenShift (the DNS operator's pods in `openshift-dns`, which listen on 5353
+behind the DNS Service's port 53):
+
+```yaml
+global:
+  networkPolicy:
+    dns:
+      peers:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: openshift-dns}}
+          podSelector: {matchLabels: {dns.operator.openshift.io/daemonset-dns: default}}
+      ports:
+        - {protocol: UDP, port: 5353}
+        - {protocol: TCP, port: 5353}
+```
+
+Check the labels and ports on your cluster (`kubectl get pods -A -l ...`)
+before relying on either, and confirm resolution from a pod under the policy.
