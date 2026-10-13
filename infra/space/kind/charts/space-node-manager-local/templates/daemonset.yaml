@@ -186,6 +186,10 @@ spec:
           env:
             {{- include "space-node-service.env.identity" . | nindent 12 }}
             {{- include "space-node-service.env.diskAdmission" . | nindent 12 }}
+            # The node image stages a protected copy of the developer-owned
+            # vendor downloads on this hostPath before kubelet starts.
+            - name: SPACE_FIRECRACKER_VENDOR_DIR
+              value: /space/bin/runtime/firecracker
             # Sandbox volume DEKs come straight from the authority, which
             # admits GetOrIssueSandboxVolumeDek only from node-manager, never
             # through the node agent
@@ -231,8 +235,7 @@ spec:
             # children (crates/libs/node/runtime/core/src/cgroup.rs).
             - name: cgroup
               mountPath: /sys/fs/cgroup
-            # The runtime inventory resolves /space/bin/{firecracker,jailer}
-            # and the vendor releases they link to.
+            # Includes the root-owned runtime tree used by the host supervisor.
             - name: space-bin
               mountPath: /space/bin
               readOnly: true

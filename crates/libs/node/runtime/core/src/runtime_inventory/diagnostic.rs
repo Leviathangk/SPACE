@@ -32,6 +32,8 @@ use pplx_space_common_core::types::{
 };
 use sha2::{Digest as _, Sha256};
 
+use crate::catalog::ManagedDirectoryName;
+
 use super::kernel_release::KernelReleaseScanner;
 use super::{
     FirecrackerDriver, RuntimeInstallationRoot, boot_component_role, kernel_candidate_version,
@@ -650,9 +652,13 @@ pub fn scan(
     }
     if kinds.kernels {
         for root in vendor_kernel_roots(roots) {
-            scanner.scan_versioned_kernels(ArtifactOrigin::VENDOR_KERNEL, root);
+            scanner.scan_versioned_kernels(
+                ArtifactOrigin::VENDOR_KERNEL,
+                root,
+                roots.managed_kernels.as_deref() == Some(root),
+            );
         }
-        scanner.scan_versioned_kernels(ArtifactOrigin::CACHE_KERNEL, &roots.cache_kernels);
+        scanner.scan_versioned_kernels(ArtifactOrigin::CACHE_KERNEL, &roots.cache_kernels, false);
         scanner.scan_legacy_assets(&roots.cache_legacy_assets);
     }
 
@@ -843,9 +849,16 @@ impl Scanner<'_> {
                     continue;
                 }
             }
+            let directory = managed
+                .then(|| display_name.parse::<ManagedDirectoryName>().ok())
+                .flatten();
             if kinds.runtimes {
-                let mut artifact =
-                    inspect_runtime_release(runtime, display_name.clone(), path.clone());
+                let mut artifact = inspect_runtime_release(
+                    runtime,
+                    display_name.clone(),
+                    path.clone(),
+                    directory.as_ref(),
+                );
                 // Uninstall identifies installed bytes, even if their catalog
                 // pin has since been removed. Execution roots stay probe-only.
                 if managed
@@ -878,6 +891,9 @@ impl Scanner<'_> {
                         artifact.digest = Some(crate::catalog::release_digest(binaries));
                     }
                 }
+                if let Some(directory) = &directory {
+                    check_directory_digest(&mut artifact, directory);
+                }
                 self.scan.artifacts.push(artifact);
             }
             if kinds.kernels {
@@ -885,16 +901,20 @@ impl Scanner<'_> {
                 match std::fs::symlink_metadata(&image) {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     _ => {
-                        let release = version_from_dir(&path).map(|version| RuntimeIdentity {
-                            kind: runtime,
-                            version,
-                        });
+                        let release =
+                            diagnostic_runtime_version(&path, directory.as_ref()).map(|version| {
+                                RuntimeIdentity {
+                                    kind: runtime,
+                                    version,
+                                }
+                            });
                         self.inspect_kernel(
                             ArtifactOrigin::RELEASE_BUNDLED_KERNEL,
                             display_name,
                             None,
                             release,
                             image,
+                            None,
                         );
                     }
                 }
@@ -902,7 +922,7 @@ impl Scanner<'_> {
         }
     }
 
-    fn scan_versioned_kernels(&mut self, origin: ArtifactOrigin, root: &Path) {
+    fn scan_versioned_kernels(&mut self, origin: ArtifactOrigin, root: &Path, managed: bool) {
         let Some(names) = self.list_root(origin, root) else {
             return;
         };
@@ -927,7 +947,13 @@ impl Scanner<'_> {
                 }
             }
             let image = path.join(KERNEL_IMAGE);
-            let Some(version) = kernel_candidate_version(&name) else {
+            let directory = managed
+                .then(|| display_name.parse::<ManagedDirectoryName>().ok())
+                .flatten();
+            let version_name = directory.as_ref().map_or(name.as_os_str(), |directory| {
+                std::ffi::OsStr::new(directory.label())
+            });
+            let Some(version) = kernel_candidate_version(version_name) else {
                 self.scan.artifacts.push(ScannedArtifact {
                     status: ArtifactStatus::Unrecognized,
                     detail: Some("directory name is not a kernel version".to_string()),
@@ -935,7 +961,14 @@ impl Scanner<'_> {
                 });
                 continue;
             };
-            self.inspect_kernel(origin, display_name, Some(version), None, image);
+            self.inspect_kernel(
+                origin,
+                display_name,
+                Some(version),
+                None,
+                image,
+                directory.as_ref(),
+            );
         }
     }
 
@@ -990,6 +1023,7 @@ impl Scanner<'_> {
                 None,
                 None,
                 image,
+                None,
             ),
         }
     }
@@ -1018,6 +1052,7 @@ impl Scanner<'_> {
         version: Option<ArtifactVersion>,
         for_runtime: Option<RuntimeIdentity>,
         image: PathBuf,
+        directory: Option<&ManagedDirectoryName>,
     ) {
         let mut artifact = empty_artifact(origin, name, image.clone());
         artifact.for_runtime = for_runtime;
@@ -1093,6 +1128,10 @@ impl Scanner<'_> {
                 artifact.version = Some(ScannedVersion::Component(release));
                 artifact.version_source = Some(VersionSource::ImageBanner);
             }
+        }
+
+        if let Some(directory) = directory {
+            check_directory_digest(&mut artifact, directory);
         }
 
         // Jail setup hard-links the cache kernel into each chroot, and a
@@ -1315,9 +1354,14 @@ fn firecracker_state_format(version: &RuntimeVersion) -> Result<StateFormatIdent
     })
 }
 
-fn inspect_runtime_release(runtime: RuntimeKind, name: String, root: PathBuf) -> ScannedArtifact {
+fn inspect_runtime_release(
+    runtime: RuntimeKind,
+    name: String,
+    root: PathBuf,
+    directory: Option<&ManagedDirectoryName>,
+) -> ScannedArtifact {
     let mut artifact = empty_artifact(ArtifactOrigin::runtime_release(runtime), name, root.clone());
-    let Some(version) = version_from_dir(&root) else {
+    let Some(version) = diagnostic_runtime_version(&root, directory) else {
         artifact.status = ArtifactStatus::Unrecognized;
         artifact.detail = Some("directory name is not a runtime version".to_string());
         return artifact;
@@ -1504,3 +1548,22 @@ fn parse_elf_machine(header: &[u8]) -> Option<u16> {
 
 #[cfg(test)]
 mod tests;
+
+fn diagnostic_runtime_version(
+    root: &Path,
+    directory: Option<&ManagedDirectoryName>,
+) -> Option<RuntimeVersion> {
+    version_from_dir(directory.map_or(root, |directory| Path::new(directory.label())))
+}
+
+fn check_directory_digest(artifact: &mut ScannedArtifact, directory: &ManagedDirectoryName) {
+    if let Some(found) = artifact.digest
+        && found != directory.digest()
+    {
+        artifact.status = ArtifactStatus::Invalid;
+        artifact.detail = Some(format!(
+            "managed directory claims {}, but installed bytes have {found}",
+            directory.digest()
+        ));
+    }
+}

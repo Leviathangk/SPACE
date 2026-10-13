@@ -475,7 +475,7 @@ impl RuntimeManager for RuntimeManagerService {
                         presence: presence(
                             &releases
                                 .root
-                                .join(crate::installs::release_directory(&pin.release)),
+                                .join(pplx_space_node_runtime_core::artifact_store::managed_release_directory(&pin.release, pin.digest())),
                         ) as i32,
                         compatible_runtimes: Vec::new(),
                     });
@@ -511,7 +511,7 @@ impl RuntimeManager for RuntimeManagerService {
                     presence: kernels_root
                         .as_ref()
                         .map_or(ArtifactPresence::Unspecified, |root| {
-                            presence(&root.join(kernel.version.as_str()))
+                            presence(&root.join(pplx_space_node_runtime_core::artifact_store::managed_kernel_directory(&pin.version, pin.sha256)))
                         }) as i32,
                     compatible_runtimes: catalog
                         .releases(runtime, architecture)
