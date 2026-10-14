@@ -30,6 +30,44 @@ fn configuration_precedence_and_owned_sections() {
     toml::from_str::<NodeConfig>("[network_pool]\ntarget = 1\ntarget_ready_slots = 2").unwrap_err();
 }
 
+#[test]
+fn custom_disk_capacity_reaches_startup_policy_without_a_cloud_profile() {
+    if !pplx_space_test_env::enter_test_process(&[
+        ("SPACE_NODEMGR_DISK_IO_RESERVATION_ENABLED", Some("true".as_ref())),
+        ("SPACE_NODEMGR_DISK_IO_SANDBOX_CAPACITY_PERCENT", Some("40".as_ref())),
+        ("SPACE_NODEMGR_DISK_IO_READ_WEIGHT_PERCENT", Some("60".as_ref())),
+        ("SPACE_NODEMGR_DISK_IO_WRITE_WEIGHT_PERCENT", Some("40".as_ref())),
+        ("SPACE_NODEMGR_DISK_IO_CAPACITY_PROFILE", None),
+        ("SPACE_NODEMGR_DISK_IO_CUSTOM_CAPACITY", Some(r#"{"expected_device_count":1,"read_iops":12000,"write_iops":8000,"read_bandwidth_mib_per_sec":120,"write_bandwidth_mib_per_sec":80}"#.as_ref())),
+    ]) {
+        return;
+    }
+    let config: NodeConfig = toml::from_str(
+        r#"
+        [disk_io_reservation]
+        enabled = true
+        [disk_io_reservation.custom_capacity]
+        expected_device_count = 2
+        read_iops = 100000
+        write_iops = 60000
+        read_bandwidth_mib_per_sec = 1000
+        write_bandwidth_mib_per_sec = 600
+        "#,
+    )
+    .unwrap();
+    let resolved = resolve_disk_io_reservation_config(config.disk_io_reservation).unwrap();
+    assert!(resolved.capacity_profile.is_none());
+    let capacity = resolved
+        .custom_capacity
+        .expect("startup must retain the measured capacity");
+    assert_eq!(resolved.enabled, Some(true));
+    assert_eq!(resolved.sandbox_capacity_percent, Some(40));
+    assert_eq!(resolved.read_weight_percent, Some(60));
+    assert_eq!(resolved.write_weight_percent, Some(40));
+    assert_eq!(capacity.expected_device_count.get(), 1);
+    assert_eq!(capacity.read_iops, 12000);
+}
+
 // Invoked in a separate test process by the handoff test; ordinary suite
 // runs have no probe path and do nothing. Uses the real flock boundary.
 #[test]
