@@ -50,6 +50,13 @@ impl RelayFault {
         self.side
     }
 
+    pub(in crate::tcp_proxy) const fn peer(self) -> &'static str {
+        match self.side {
+            Side::Guest => "downstream",
+            Side::Origin => "upstream",
+        }
+    }
+
     pub(in crate::tcp_proxy) const fn as_str(self) -> &'static str {
         match (self.side, self.operation) {
             (Side::Guest, Operation::Read) => "guest_read",

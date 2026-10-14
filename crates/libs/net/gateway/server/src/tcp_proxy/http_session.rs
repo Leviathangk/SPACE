@@ -17,6 +17,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
+use pplx_space_metrics::gateway::HttpResponseSource;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -276,6 +277,7 @@ where
         request: Request<Incoming>,
     ) -> Result<Response<Body>, Infallible> {
         let protocol = HttpProtocol::of(request.version());
+        pplx_space_metrics::gateway::http_request(protocol.as_str());
         tracing::Span::current().record("protocol", protocol.as_str());
         let result = match SanitizedRequest::try_from(request) {
             Ok(request) => self.forward(request).await,
@@ -306,7 +308,7 @@ where
                 }
                 let reason = error.reason(self.mode.is_inspected());
                 let status = error.status();
-                self.record(protocol, reason, status);
+                self.record(protocol, reason, status, HttpResponseSource::Gateway);
                 let mut response = Response::new(Either::Right(Empty::new()));
                 *response.status_mut() = status;
                 if protocol == HttpProtocol::Http1 {
@@ -328,18 +330,28 @@ where
         ForwardingBody::new(body, protocol.as_str(), operation, self.mode.is_inspected())
     }
 
-    fn record(&self, protocol: HttpProtocol, outcome: &'static str, status: StatusCode) {
+    fn record(
+        &self,
+        protocol: HttpProtocol,
+        outcome: &'static str,
+        status: StatusCode,
+        source: HttpResponseSource,
+    ) {
         let binding = if self.mode.is_inspected() {
             "tls_http"
         } else {
             "http_host"
         };
         pplx_space_metrics::gateway::domain_binding("tcp", binding, outcome, None);
+        pplx_space_metrics::gateway::http_response(protocol.as_str(), status.as_u16(), source);
         tracing::debug!(
+            telemetry_type = "gateway_http_response",
             protocol = protocol.as_str(),
             outcome,
-            status = status.as_u16(),
-            "HTTP request forwarding result"
+            http.response.status_code = status.as_u16(),
+            status_source = source.as_str(),
+            injected = source.injected(),
+            "HTTP response selected"
         );
         if self.mode.is_inspected()
             && !matches!(outcome, "allowed" | "websocket" | "connect_forwarded")

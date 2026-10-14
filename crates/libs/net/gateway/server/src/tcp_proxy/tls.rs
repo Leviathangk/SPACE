@@ -241,7 +241,7 @@ where
         .await
         {
             Ok(result) => result,
-            Err(_) => Err(TlsTransportError::Timeout),
+            Err(_) => Err(TlsTransportError::Connect(transport::Error::Timeout)),
         };
         // The dial and the handshake share one deadline, so without separate
         // timers a `timeout` cannot be attributed to either phase.

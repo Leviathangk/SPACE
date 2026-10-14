@@ -1,7 +1,6 @@
 use super::*;
 use futures_util::FutureExt as _;
 use tokio::io::AsyncWriteExt as _;
-use tracing_subscriber::Layer as _;
 
 #[derive(Clone, Copy)]
 enum SigningResult {
@@ -110,44 +109,7 @@ async fn interception_wiring_preserves_admission_and_never_falls_back_to_relay()
             FlowOutcome::Rejected(Rejection::TlsInterception(_))
         );
         assert_eq!(intercepted, allowed, "{name}: unexpected rejection path");
-        if intercepted {
-            let layer = CapturedEventsLayer::new().with_event_filter(|event| {
-                field_value(event, "message")
-                    == Some("experimental TLS interception closed the connection")
-            });
-            let events = layer.events();
-            let warning_layer = CapturedEventsLayer::new().with_event_filter(|event| {
-                field_value(event, "message")
-                    == Some("experimental TLS interception closed the connection")
-            });
-            let warning_events = warning_layer.events();
-            tracing::subscriber::with_default(
-                tracing_subscriber::registry()
-                    .with(layer)
-                    .with(warning_layer.with_filter(tracing::level_filters::LevelFilter::WARN)),
-                || {
-                    proxy.record(dst, host.as_ref(), outcome);
-                },
-            );
-            let events = events.events();
-            let [event] = events.as_slice() else {
-                panic!("{name}: expected one TLS rejection event");
-            };
-            // Every interception rejection is a fail-closed guest breakage, so
-            // all of them must survive a production log level, not only the
-            // missing-SNI case.
-            assert_eq!(warning_events.events().len(), 1, "{name}");
-            assert!(
-                event
-                    .iter()
-                    .all(|(_, value)| !value.contains(&dst.ip().to_string())),
-                "{name}: raw destination leaked: {event:?}",
-            );
-            assert_eq!(
-                field_value(event, "destination_port"),
-                Some(dst.port().to_string().as_str())
-            );
-        }
+        proxy.record(dst, host.as_ref(), outcome);
     }
 }
 

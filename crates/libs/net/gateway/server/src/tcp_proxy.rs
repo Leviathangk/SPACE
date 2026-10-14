@@ -41,6 +41,7 @@ mod inspected;
 mod relay;
 mod reserved_dns;
 mod routing_headers;
+mod telemetry;
 pub(crate) mod tls;
 mod transport;
 mod upstream;
@@ -218,7 +219,7 @@ impl FlowOutcome {
             Self::RelayFailed(RelayFailure::Inspected(_)) => ("relay_failed", "inspected_http"),
             Self::RelayFailed(RelayFailure::Connect(_)) => ("relay_failed", "connect"),
             Self::RelayFailed(RelayFailure::Plaintext(error)) => ("relay_failed", error.reason()),
-            Self::RelayFailed(RelayFailure::Transfer(_)) => ("relay_failed", "transfer"),
+            Self::RelayFailed(RelayFailure::Transfer { .. }) => ("relay_failed", "transfer"),
         }
     }
 
@@ -227,7 +228,7 @@ impl FlowOutcome {
             Self::RelayFailed(RelayFailure::Connect(error)) => {
                 Some(format!("upstream_connect: {error}").into())
             }
-            Self::RelayFailed(RelayFailure::Transfer(error)) => {
+            Self::RelayFailed(RelayFailure::Transfer { error, .. }) => {
                 Some(format!("transfer: {:?}: {error}", error.kind()).into())
             }
             Self::Rejected(_) | Self::RelayFailed(_) => Some(self.metric_tags().1.into()),
@@ -253,7 +254,10 @@ enum RelayFailure {
     Connect(transport::Error),
     Plaintext(http_host::Failure),
     /// Connected, then the byte stream failed (e.g. reset, broken pipe).
-    Transfer(io::Error),
+    Transfer {
+        error: io::Error,
+        fault: Option<relay::RelayFault>,
+    },
     Inspected(http_session::HttpError),
 }
 
@@ -621,7 +625,10 @@ impl TcpProxy {
                 wire_tx: report.written.0,
                 wire_rx: report.written.1,
             }),
-            Err(relay::Error::Io(error)) => FlowOutcome::RelayFailed(RelayFailure::Transfer(error)),
+            Err(relay::Error::Io(error)) => FlowOutcome::RelayFailed(RelayFailure::Transfer {
+                error,
+                fault: report.fault,
+            }),
             Err(relay::Error::Cancelled | relay::Error::Idle) => FlowOutcome::Cancelled,
         }
     }
@@ -657,8 +664,7 @@ impl TcpProxy {
     }
 
     fn record(&self, dst: SocketAddr, host: Option<&DomainName>, outcome: FlowOutcome) -> bool {
-        let (status, detail) = outcome.metric_tags();
-        pplx_space_metrics::gateway::tcp_connection(status, detail);
+        telemetry::record(self, dst, host, &outcome);
         let reported = if let (Some(host), Some(reason)) = (host, outcome.failure_reason()) {
             self.known_egress_state
                 .report_tcp_failure(self.sandbox_id, dst, host, reason.as_ref())
@@ -671,7 +677,8 @@ impl TcpProxy {
             // terminal connection metric emitted above.
             FlowOutcome::Cancelled
             | FlowOutcome::InspectedTls
-            | FlowOutcome::RelayFailed(RelayFailure::Connect(_) | RelayFailure::Transfer(_)) => {}
+            | FlowOutcome::RelayFailed(RelayFailure::Connect(_) | RelayFailure::Transfer { .. }) => {
+            }
             FlowOutcome::RelayFailed(RelayFailure::Inspected(error)) => {
                 pplx_space_metrics::gateway::domain_binding(
                     "tcp",
@@ -713,12 +720,6 @@ impl TcpProxy {
                 ),
             },
             FlowOutcome::Rejected(Rejection::PolicyMissing(reason)) => {
-                debug!(
-                    sandbox_id = self.sandbox_id,
-                    %dst,
-                    reason = reason.as_str(),
-                    "denied TCP egress while network policy is not ready"
-                );
                 // `evaluate_egress` meters every other verdict, but it cannot
                 // run without a policy. No policy also means no version to tag.
                 pplx_space_metrics::gateway::policy_decision(
@@ -731,13 +732,7 @@ impl TcpProxy {
                 );
                 self.stats.tcp_denied.fetch_add(1, Ordering::Relaxed);
             }
-            FlowOutcome::Rejected(Rejection::Admission(reason)) => {
-                debug!(
-                    sandbox_id = self.sandbox_id,
-                    %dst,
-                    reason = reason.label(),
-                    "denied TCP egress"
-                );
+            FlowOutcome::Rejected(Rejection::Admission(_)) => {
                 self.stats.tcp_denied.fetch_add(1, Ordering::Relaxed);
             }
             FlowOutcome::Rejected(Rejection::TlsInterception(error)) => {
@@ -748,30 +743,6 @@ impl TcpProxy {
                     error.as_str(),
                     detail,
                 );
-                // Every arm here is a fail-closed guest breakage, so the cause
-                // has to survive a production log level. Certificate refusals
-                // previously carried their gRPC code only in the message.
-                let (warn_now, suppressed) = self.refusal_warnings.sample(error.as_str(), detail);
-                if warn_now {
-                    warn!(
-                        sandbox_id = self.sandbox_id,
-                        destination_port = dst.port(),
-                        outcome = error.as_str(),
-                        detail,
-                        suppressed,
-                        %error,
-                        "experimental TLS interception closed the connection"
-                    );
-                } else {
-                    debug!(
-                        sandbox_id = self.sandbox_id,
-                        destination_port = dst.port(),
-                        outcome = error.as_str(),
-                        detail,
-                        %error,
-                        "experimental TLS interception closed the connection"
-                    );
-                }
                 self.stats.tcp_denied.fetch_add(1, Ordering::Relaxed);
             }
             FlowOutcome::Relayed(Relay::Tunnelled { wire_tx, wire_rx }) => {

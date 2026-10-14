@@ -1,3 +1,14 @@
+//! Gateway metrics use bounded operation and protocol labels. Addresses, SNI,
+//! sandbox IDs and connection IDs are log fields only.
+//!
+//! `gateway.tcp.connection` counts every handled connection once, retaining
+//! `status`/`detail` and adding only facts exposed by its terminal result.
+//! Unavailable fields are omitted. `gateway.http.request` counts parsed request
+//! starts; `gateway.http.response` counts selected response headers, including
+//! upstream statuses and gateway-generated responses. These are not completed
+//! request counts: a body or downstream write can fail after headers are selected.
+//! Opaque tunnels contribute connection measurements, never HTTP measurements.
+
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -544,12 +555,81 @@ pub fn tcp_in_flight(active: usize) {
 
 /// Emitted exactly once for every TCP connection that reaches the proxy's
 /// per-connection handler. `detail` is the bounded detail within `status`.
-pub fn tcp_connection(status: &str, detail: &str) {
-    counter(
-        "gateway.tcp.connection",
-        1,
-        &[tag("status", status), tag("detail", detail)],
-    );
+pub fn tcp_connection(status: &str, detail: &str, labels: &TcpConnectionLabels<'_>) {
+    let mut tags = vec![tag("status", status), tag("detail", detail)];
+    for (name, value) in [
+        ("phase", labels.phase),
+        ("side", labels.side),
+        ("close", labels.close),
+        ("errno", labels.errno),
+        ("http_lib_reason", labels.http_lib_reason),
+        ("error.type", labels.error_type),
+        ("guardrail_id", labels.guardrail_id),
+    ] {
+        if let Some(value) = value {
+            tags.push(tag(name, value));
+        }
+    }
+    counter("gateway.tcp.connection", 1, &tags);
+}
+
+/// Optional, bounded facts observed at the terminating operation. Missing means
+/// unavailable, not a successful close. Identifiers and request occupancy belong
+/// in logs; these labels never contain addresses, hostnames, or sandbox IDs.
+#[derive(Default)]
+pub struct TcpConnectionLabels<'a> {
+    pub phase: Option<&'a str>,
+    pub side: Option<&'a str>,
+    pub close: Option<&'a str>,
+    pub errno: Option<&'a str>,
+    pub http_lib_reason: Option<&'a str>,
+    pub error_type: Option<&'a str>,
+    pub guardrail_id: Option<&'a str>,
+}
+
+/// One parsed HTTP request accepted by the gateway's HTTP service. This counts
+/// requests before authority checks and origin setup, including later cancellation.
+pub fn http_request(protocol: &str) {
+    counter("gateway.http.request", 1, &[tag("protocol", protocol)]);
+}
+
+/// Who supplied the response selected for the downstream HTTP codec.
+#[derive(Clone, Copy)]
+pub enum HttpResponseSource {
+    Gateway,
+    Upstream { injected: bool },
+}
+
+impl HttpResponseSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Gateway => "gateway",
+            Self::Upstream { .. } => "upstream",
+        }
+    }
+
+    pub const fn injected(self) -> Option<bool> {
+        match self {
+            Self::Gateway => None,
+            Self::Upstream { injected } => Some(injected),
+        }
+    }
+}
+
+/// One selected HTTP response, including origin statuses and gateway refusals.
+/// This is a response-header observation, not downstream delivery or request
+/// completion. `injected` describes the request that produced an origin response;
+/// gateway responses do not assert that an upstream request was submitted.
+pub fn http_response(protocol: &str, status: u16, source: HttpResponseSource) {
+    let mut tags = vec![
+        tag("protocol", protocol),
+        tag("http.response.status_code", status),
+        tag("status_source", source.as_str()),
+    ];
+    if let Some(injected) = source.injected() {
+        tags.push(tag("injected", injected));
+    }
+    counter("gateway.http.response", 1, &tags);
 }
 
 /// One terminal inspection-admission outcome per accepted non-DNS TCP flow.

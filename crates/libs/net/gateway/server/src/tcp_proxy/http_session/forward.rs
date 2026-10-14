@@ -93,18 +93,25 @@ where
                 return Err(RequestError::Cancelled);
             }
             // No request headers are submitted before the final authorization check.
-            match &self.mode {
-                Mode::Plaintext => self.binding.reauthorize(&host, &policy).await?,
+            let injected = match &self.mode {
+                Mode::Plaintext => {
+                    self.binding.reauthorize(&host, &policy).await?;
+                    false
+                }
                 Mode::Inspected(lease) => {
                     if !lease.is_usable() {
                         return Err(RequestError::Cancelled);
                     }
                     if !matches!(kind, Kind::Connect) {
                         let headers = credential_headers(lease, &request)?;
+                        let injected = !headers.is_empty();
                         inject(&mut request, headers);
+                        injected
+                    } else {
+                        false
                     }
                 }
-            }
+            };
             if self.shutdown.is_cancelled() {
                 return Err(RequestError::Cancelled);
             }
@@ -153,7 +160,12 @@ where
                     )
                     .in_current_span(),
                 );
-                self.record(protocol, outcome, response.status());
+                self.record(
+                    protocol,
+                    outcome,
+                    response.status(),
+                    HttpResponseSource::Upstream { injected },
+                );
                 return Ok(response.map(|_| Either::Right(Empty::new())));
             }
             if response.status() == StatusCode::SWITCHING_PROTOCOLS {
@@ -164,7 +176,12 @@ where
             } else {
                 "allowed"
             };
-            self.record(protocol, outcome, response.status());
+            self.record(
+                protocol,
+                outcome,
+                response.status(),
+                HttpResponseSource::Upstream { injected },
+            );
             Ok(response
                 .map(|body| Either::Left(self.forwarding_body(protocol, body, "response_body"))))
         }
