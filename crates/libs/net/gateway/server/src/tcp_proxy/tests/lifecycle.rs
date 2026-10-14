@@ -8,17 +8,14 @@ async fn shutdown_releases_owned_connections() {
         let address = listener.local_addr().unwrap();
         let shutdown = CancellationToken::new();
         let stats = Arc::new(ProxyStats::new());
-        let network_state = GatewayNetworkState::pending_policy();
+        let network_state = TestNetwork::pending_policy();
         let proxy = tokio::spawn(run(TcpProxyConfig {
             sandbox_id: "connection-lifetime-test",
             listener,
             stats: stats.clone(),
-            network_state: network_state.clone(),
-            dns_allow_cache: DnsAllowCache::default(),
-            dns_attributed_connections: DnsAttributedTcpTracker::default(),
+            egress: network_state.egress(),
             tls_interception: Default::default(),
             reserved_dns: crate::reserved_dns::test_support::test_core(),
-            reserved_dns_cancellation: ReservedDnsCancellation::default(),
             known_egress_state: KnownEgressState::default(),
             debug_state: GatewayDebugState::default(),
             shutdown_token: shutdown.clone(),

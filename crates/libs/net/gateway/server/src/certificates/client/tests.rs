@@ -1,6 +1,6 @@
 use super::super::authority::tests::local_provider;
 use super::*;
-use crate::state::NetworkStateReason;
+use crate::egress::NetworkStateReason;
 
 #[tokio::test]
 async fn cache_refreshes_short_lived_leaves_without_revoking_existing_connections() {
@@ -59,7 +59,8 @@ async fn cache_refreshes_short_lived_leaves_without_revoking_existing_connection
 
 #[tokio::test]
 async fn local_cache_shares_exact_targets_and_bounds_retention() {
-    let (_, _, provider) = local_provider().await;
+    let network = crate::egress::test_support::TestNetwork::pending_policy();
+    let (_, _, provider) = crate::certificates::local_provider_with_state(network.clone()).await;
     let host: DomainName = "shared.test".parse().unwrap();
     let (first, second) = tokio::join!(
         provider.get(host.clone(), 443),
@@ -133,10 +134,7 @@ async fn local_cache_shares_exact_targets_and_bounds_retention() {
         drop(permits);
     }
 
-    provider
-        .inner
-        .context
-        .network
+    network
         .set_no_identity(NetworkStateReason::NoIdentity)
         .await;
     first.invalidated().await;

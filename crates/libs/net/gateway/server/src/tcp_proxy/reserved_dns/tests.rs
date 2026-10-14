@@ -1,3 +1,4 @@
+use crate::egress::test_support::TestNetwork;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
@@ -12,14 +13,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::debug::GatewayDebugState;
-use crate::dns::DnsAllowCache;
-use crate::egress::DnsAttributedTcpTracker;
+use crate::egress::{NetworkStateReason, PolicyLoader, PulledNetworkPolicy};
 use crate::reserved_dns::test_support::RecordedResolver;
-use crate::state::ReservedDnsCancellation;
-use crate::state::{GatewayNetworkState, NetworkStateReason, PolicyLoader, PulledNetworkPolicy};
 use crate::stats::ProxyStats;
 
-use super::super::{FlowOutcome, TcpAdmissionDenial, TcpProxy};
+use super::super::{FlowOutcome, TcpProxy};
 
 #[tokio::test]
 async fn reserved_destination_requires_ordinary_address_admission() {
@@ -28,13 +26,13 @@ async fn reserved_destination_requires_ordinary_address_admission() {
         "allowed.example".parse().unwrap(),
     )]))
     .await;
-    let policy = state.snapshot().await.policy.unwrap();
-    let shutdown = CancellationToken::new();
-    let proxy = proxy(state, &resolver, shutdown.clone());
-
+    let operation = state.egress().dns_tcp().await.unwrap();
     assert!(matches!(
-        proxy.admit_reserved_dns_destination("1.1.1.1:53".parse().unwrap(), policy.as_ref()),
-        Err(TcpAdmissionDenial::DnsAttribution(_))
+        operation.admit_destination(
+            "1.1.1.1:53".parse().unwrap(),
+            crate::egress::EgressProtocol::Tcp
+        ),
+        pplx_space_net_common::EgressDecision::Deny { .. }
     ));
     assert!(resolver.requests().is_empty());
 }
@@ -47,7 +45,7 @@ async fn every_reserved_tcp_frame_is_authorized_independently() {
         EgressDestinationV1::Domain("allowed.example".parse().unwrap()),
     ]))
     .await;
-    let policy = state.snapshot().await.policy.unwrap();
+    let operation = state.egress().dns_tcp().await.unwrap();
     let (mut guest, accepted) = tcp_pair();
     let shutdown = CancellationToken::new();
     let proxy = proxy(state, &resolver, shutdown.clone());
@@ -58,8 +56,7 @@ async fn every_reserved_tcp_frame_is_authorized_independently() {
             &serving_proxy,
             accepted,
             crate::reserved_dns::ReservedResolver::Google,
-            policy.as_ref(),
-            &shutdown,
+            &operation,
         )
         .await
     });
@@ -105,7 +102,7 @@ async fn oversized_opaque_tcp_is_closed_without_generic_relay() {
         "1.1.1.1".parse().unwrap(),
     )]))
     .await;
-    let policy = state.snapshot().await.policy.unwrap();
+    let operation = state.egress().dns_tcp().await.unwrap();
     let (mut guest, accepted) = tcp_pair();
     let shutdown = CancellationToken::new();
     let proxy = proxy(state, &resolver, shutdown.clone());
@@ -114,8 +111,7 @@ async fn oversized_opaque_tcp_is_closed_without_generic_relay() {
             &proxy,
             accepted,
             crate::reserved_dns::ReservedResolver::Cloudflare,
-            policy.as_ref(),
-            &shutdown,
+            &operation,
         )
         .await
     });
@@ -140,25 +136,27 @@ async fn policy_install_cancels_an_incomplete_tcp_message() {
         EgressDestinationV1::Domain("allowed.example".parse().unwrap()),
     ]))
     .await;
-    let policy = state.snapshot().await.policy.unwrap();
+    let operation = state.egress().dns_tcp().await.unwrap();
     let (mut guest, accepted) = tcp_pair();
     let gateway_shutdown = CancellationToken::new();
-    let proxy = proxy(state, &resolver, gateway_shutdown);
-    let policy_cancellation = ReservedDnsCancellation::default();
-    let operation = policy_cancellation.operation_token();
+    let proxy = proxy(state.clone(), &resolver, gateway_shutdown);
     let outcome = tokio::spawn(async move {
         super::serve(
             &proxy,
             accepted,
             crate::reserved_dns::ReservedResolver::Cloudflare,
-            policy.as_ref(),
             &operation,
         )
         .await
     });
 
     guest.write_all(&[0]).await.unwrap();
-    policy_cancellation.cancel_in_flight();
+    install_ready(
+        state,
+        NetworkPolicyV1::deny_all(),
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    )
+    .await;
 
     assert!(matches!(outcome.await.unwrap(), FlowOutcome::Cancelled));
     assert!(resolver.requests().is_empty());
@@ -177,30 +175,19 @@ async fn ready_invalidation_cancels_open_reserved_tcp_connections() {
         ReadyInvalidation::FailedRefresh,
     ] {
         let resolver = RecordedResolver::new(Ipv4Addr::new(192, 0, 2, 10));
-        let policy_cancellation = ReservedDnsCancellation::default();
-        let state = GatewayNetworkState::pending_policy().with_egress(
-            DnsAllowCache::default(),
-            crate::egress::DnsAttributedTcpTracker::default(),
-            policy_cancellation.clone(),
-        );
-        let state = install_ready(
-            state,
-            policy(&[
-                EgressDestinationV1::Ip("1.1.1.1".parse().unwrap()),
-                EgressDestinationV1::Domain("allowed.example".parse().unwrap()),
-            ]),
-        )
+        let state = ready_state(policy(&[
+            EgressDestinationV1::Ip("1.1.1.1".parse().unwrap()),
+            EgressDestinationV1::Domain("allowed.example".parse().unwrap()),
+        ]))
         .await;
-        let policy = state.snapshot().await.policy.unwrap();
+        let operation = state.egress().dns_tcp().await.unwrap();
         let (mut guest, accepted) = tcp_pair();
         let proxy = proxy(state.clone(), &resolver, CancellationToken::new());
-        let operation = policy_cancellation.operation_token();
         let outcome = tokio::spawn(async move {
             super::serve(
                 &proxy,
                 accepted,
                 crate::reserved_dns::ReservedResolver::Cloudflare,
-                policy.as_ref(),
                 &operation,
             )
             .await
@@ -228,7 +215,7 @@ async fn ready_invalidation_cancels_open_reserved_tcp_connections() {
                 .unwrap();
                 let loader: PolicyLoader = Arc::new(|| {
                     Box::pin(async {
-                        Err(crate::state::HydrateNetworkStateError::GetNetworkPolicy {
+                        Err(crate::egress::HydrateNetworkStateError::GetNetworkPolicy {
                             sandbox_id: "sandbox-1".to_owned(),
                             source: tonic::Status::unavailable("unavailable"),
                         })
@@ -258,14 +245,18 @@ fn policy(allow: &[EgressDestinationV1]) -> NetworkPolicyV1 {
     }
 }
 
-async fn ready_state(policy: NetworkPolicyV1) -> GatewayNetworkState {
-    install_ready(GatewayNetworkState::pending_policy(), policy).await
+async fn ready_state(policy: NetworkPolicyV1) -> TestNetwork {
+    install_ready(
+        TestNetwork::pending_policy(),
+        policy,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    )
+    .await
 }
 
-async fn install_ready(state: GatewayNetworkState, policy: NetworkPolicyV1) -> GatewayNetworkState {
-    const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+async fn install_ready(state: TestNetwork, policy: NetworkPolicyV1, sha: &str) -> TestNetwork {
     let policy_ref =
-        EffectiveNetworkPolicyRef::local(EffectiveNetworkPolicyRefScope::Sandbox, "sandbox-1", SHA)
+        EffectiveNetworkPolicyRef::local(EffectiveNetworkPolicyRefScope::Sandbox, "sandbox-1", sha)
             .unwrap();
     let installed_ref = policy_ref.clone();
     let loader: PolicyLoader = Arc::new(move || {
@@ -279,27 +270,26 @@ async fn install_ready(state: GatewayNetworkState, policy: NetworkPolicyV1) -> G
             })
         })
     });
+    let expected_ref = policy_ref.to_string();
     let snapshot = state
         .refresh(loader, Some(policy_ref), NetworkStateReason::ControlRefresh)
         .await;
     assert_eq!(snapshot.mode, crate::proto::NetworkState::Ready);
+    assert_eq!(snapshot.installed_policy_ref, expected_ref);
     state
 }
 
 fn proxy(
-    network_state: GatewayNetworkState,
+    network_state: TestNetwork,
     resolver: &RecordedResolver,
     shutdown_token: CancellationToken,
 ) -> TcpProxy {
     TcpProxy {
         sandbox_id: "test",
         stats: Arc::new(ProxyStats::new()),
-        network_state,
-        dns_allow_cache: DnsAllowCache::default(),
-        dns_attributed_connections: DnsAttributedTcpTracker::default(),
+        egress: network_state.egress(),
         tls_interception: Default::default(),
         reserved_dns: resolver.core(),
-        reserved_dns_cancellation: ReservedDnsCancellation::default(),
         known_egress_state: crate::known_egress::KnownEgressState::default(),
         debug_state: GatewayDebugState::default(),
         shutdown_token,

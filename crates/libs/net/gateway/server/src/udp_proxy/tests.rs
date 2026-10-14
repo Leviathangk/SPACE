@@ -1,3 +1,9 @@
+use crate::egress::EgressContext;
+use crate::egress::test_support::TestNetwork;
+use crate::egress::test_support::{
+    DnsAllowCache, admit_udp as evaluate_udp_egress, evaluate_egress,
+};
+use pplx_space_net_common::EgressDecision;
 use std::net::IpAddr;
 
 use pplx_space_net_common::{
@@ -254,19 +260,15 @@ async fn reserved_udp_datagrams_are_independent_and_replies_preserve_the_destina
     let response_addr = response_socket.local_addr().unwrap();
     let dns_tasks = TaskTracker::new();
     let shutdown = CancellationToken::new();
-    let dns_allow_cache = DnsAllowCache::default();
-    let reserved_dns_cancellation = ReservedDnsCancellation::default();
     let stats = Arc::new(ProxyStats::new());
     let mut proxy = UdpProxy::new(
         UdpProxyConfig {
             sandbox_id: "test",
             listener,
             stats: Arc::clone(&stats),
-            network_state,
-            dns_allow_cache,
+            egress: network_state.egress(),
             known_egress_state: crate::known_egress::KnownEgressState::default(),
             reserved_dns: resolver.core(),
-            reserved_dns_cancellation: reserved_dns_cancellation.clone(),
             shutdown_token: shutdown,
         },
         dns_tasks.clone(),
@@ -283,8 +285,7 @@ async fn reserved_udp_datagrams_are_independent_and_replies_preserve_the_destina
             flow,
             ReservedResolver::Cloudflare,
             &denied_wire,
-            Arc::clone(&policy),
-            reserved_dns_cancellation.operation_token(),
+            proxy.egress.udp().await.unwrap().into_dns(),
             |addr| {
                 assert_eq!(addr, response_addr);
                 Ok(response_socket)
@@ -309,8 +310,7 @@ async fn reserved_udp_datagrams_are_independent_and_replies_preserve_the_destina
             flow,
             ReservedResolver::Cloudflare,
             &allowed_wire,
-            Arc::clone(&policy),
-            reserved_dns_cancellation.operation_token(),
+            proxy.egress.udp().await.unwrap().into_dns(),
             |addr| {
                 assert_eq!(addr, response_addr);
                 Ok(response_socket)
@@ -326,12 +326,14 @@ async fn reserved_udp_datagrams_are_independent_and_replies_preserve_the_destina
     assert_eq!(resolver.requests().len(), 1);
     assert!(
         proxy
-            .dns_allow_cache
+            .egress
+            .test_cache()
             .contains_host_binding("192.0.2.10".parse().unwrap(), "allowed.example",)
     );
     assert!(
         proxy
-            .dns_allow_cache
+            .egress
+            .test_cache()
             .allows_ip("192.0.2.10".parse().unwrap(), policy.as_ref())
     );
     assert!(proxy.sessions.is_empty());
@@ -339,23 +341,23 @@ async fn reserved_udp_datagrams_are_independent_and_replies_preserve_the_destina
     dns_tasks.wait().await;
 }
 
-async fn ready_network_state(policy: NetworkPolicyV1) -> GatewayNetworkState {
-    let state = GatewayNetworkState::pending_policy();
+async fn ready_network_state(policy: NetworkPolicyV1) -> TestNetwork {
+    let state = TestNetwork::pending_policy();
     install_test_policy(&state, policy).await;
     state
 }
 
-async fn install_test_policy(state: &GatewayNetworkState, policy: NetworkPolicyV1) {
+async fn install_test_policy(state: &TestNetwork, policy: NetworkPolicyV1) {
     const SHA: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     let policy_ref =
         EffectiveNetworkPolicyRef::local(EffectiveNetworkPolicyRefScope::Sandbox, "sandbox-1", SHA)
             .unwrap();
     let installed_ref = policy_ref.clone();
-    let loader: crate::state::PolicyLoader = Arc::new(move || {
+    let loader: crate::egress::PolicyLoader = Arc::new(move || {
         let policy = policy.clone();
         let installed_ref = installed_ref.clone();
         Box::pin(async move {
-            Ok(crate::state::PulledNetworkPolicy {
+            Ok(crate::egress::PulledNetworkPolicy {
                 policy,
                 policy_ref: installed_ref,
                 network_credentials: Default::default(),
@@ -366,7 +368,7 @@ async fn install_test_policy(state: &GatewayNetworkState, policy: NetworkPolicyV
         .refresh(
             loader,
             Some(policy_ref),
-            crate::state::NetworkStateReason::ControlRefresh,
+            crate::egress::NetworkStateReason::ControlRefresh,
         )
         .await;
     assert_eq!(snapshot.mode, crate::proto::NetworkState::Ready);
@@ -379,7 +381,7 @@ async fn pending_replay_rechecks_ca_readiness_before_each_datagram() {
     for permitted_replays in [0, 1, 2] {
         let remaining = Arc::new(AtomicUsize::new(usize::MAX));
         let gate = remaining.clone();
-        let state = GatewayNetworkState::pending_policy().with_traffic_gate(Arc::new(move || {
+        let state = TestNetwork::with_gate(Arc::new(move || {
             gate.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok()
         }));
@@ -390,11 +392,9 @@ async fn pending_replay_rechecks_ca_readiness_before_each_datagram() {
                 sandbox_id: "test",
                 listener,
                 stats: Arc::new(ProxyStats::new()),
-                network_state: state.clone(),
-                dns_allow_cache: DnsAllowCache::default(),
+                egress: state.clone().egress(),
                 known_egress_state: KnownEgressState::default(),
                 reserved_dns: crate::reserved_dns::test_support::test_core(),
-                reserved_dns_cancellation: ReservedDnsCancellation::default(),
                 shutdown_token: CancellationToken::new(),
             },
             TaskTracker::new(),
@@ -767,11 +767,11 @@ fn pending_datagram_survives_full_pending_policy_grace() {
     // a hydration cycle so that regression can't return.
     assert_eq!(
         UDP_PENDING_MAX_AGE,
-        crate::state::TCP_PENDING_TIMEOUT,
+        crate::egress::TCP_PENDING_TIMEOUT,
         "TCP and UDP pending-policy windows must stay aligned"
     );
     assert!(
-        UDP_PENDING_MAX_AGE >= crate::state::HYDRATION_DEADLINE,
+        UDP_PENDING_MAX_AGE >= crate::egress::HYDRATION_DEADLINE,
         "pending traffic must cover a full policy-hydration cycle"
     );
 
@@ -787,7 +787,7 @@ fn pending_datagram_survives_full_pending_policy_grace() {
     // awaiting a Ready policy to replay it. (Under the former 1s grace it
     // would already have been evicted here.)
     queue.evict_expired(
-        t0 + crate::state::HYDRATION_DEADLINE,
+        t0 + crate::egress::HYDRATION_DEADLINE,
         "test-sandbox",
         &stats,
     );
@@ -861,4 +861,16 @@ async fn dead_event_does_not_remove_newer_session() {
     assert_eq!(sessions.len(), 1);
     assert_eq!(response_sockets.len(), 1);
     assert_eq!(stats.udp_active(), 1);
+}
+
+fn evaluate_reserved_dns_egress(
+    destination: SocketAddr,
+    policy: &NetworkPolicyV1,
+) -> EgressDecision {
+    evaluate_egress(
+        EgressContext::Admission(EgressProtocol::Udp),
+        destination,
+        false,
+        policy,
+    )
 }

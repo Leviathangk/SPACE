@@ -1,6 +1,6 @@
 use super::*;
-use crate::dns::test_fixtures::a_response as dns_a_response;
-use crate::egress::DnsAttributedTcpTracker;
+use crate::egress::test_support::DnsAttributedTcpTracker;
+use crate::egress::test_support::test_fixtures::a_response as dns_a_response;
 use tokio_util::sync::CancellationToken;
 
 fn cancel_denied(
@@ -315,7 +315,7 @@ fn policy_resweep_closes_unclassified_off_relays_when_interception_turns_on() {
 
 #[test]
 fn exempt_tls_survives_dns_expiry_but_rechecks_current_policy() {
-    use crate::dns::test_fixtures::expire_cache;
+    use crate::egress::test_support::test_fixtures::expire_cache;
     use pplx_space_net_common::{EgressDefaultAction, EgressDestinationV1};
 
     let destination: SocketAddr = "192.0.2.10:443".parse().unwrap();

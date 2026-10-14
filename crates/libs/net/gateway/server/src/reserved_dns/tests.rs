@@ -1,4 +1,3 @@
-use crate::state::ReservedDnsCancellation;
 use std::sync::Arc;
 
 use hickory_resolver::proto::rr::rdata::A;
@@ -47,17 +46,6 @@ fn classifier_uses_only_reserved_ip() {
         Some(ReservedResolver::Google)
     );
     assert!(core.resolver_for("9.9.9.9".parse().unwrap()).is_none());
-}
-
-#[test]
-fn policy_install_cancels_only_operations_from_the_previous_policy() {
-    let cancellation = ReservedDnsCancellation::default();
-    let previous = cancellation.operation_token();
-
-    cancellation.cancel_in_flight();
-
-    assert!(previous.is_cancelled());
-    assert!(!cancellation.operation_token().is_cancelled());
 }
 
 #[tokio::test]

@@ -23,9 +23,23 @@ use tokio_util::sync::CancellationToken;
 use tonic::Status;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
+use crate::egress::{PolicyView, ReadinessObserver};
 use crate::execution::ExecutionIdentity;
-use crate::state::{GatewayNetworkState, ReadinessObserver};
 use pplx_space_metrics::gateway::readiness::{self as metrics, Outcome};
+
+/// Live lease usability without retaining the authority worker or its observer.
+#[derive(Clone)]
+pub struct AuthorityReadiness {
+    current: Arc<ArcSwapOption<AuthorityLease>>,
+}
+
+impl AuthorityReadiness {
+    pub fn is_ready(&self) -> bool {
+        self.current
+            .load_full()
+            .is_some_and(|lease| lease.is_usable())
+    }
+}
 
 const MAX_CERTIFICATE_BYTES: usize = 16 * 1024;
 const LEAF_LIFETIME_SECS: i64 = 86_400;
@@ -74,7 +88,7 @@ struct AuthorityOwner {
     channel: LazyClient<tonic::transport::Channel>,
     identity: ExecutionIdentity,
     shutdown: CancellationToken,
-    current: ArcSwapOption<AuthorityLease>,
+    current: Arc<ArcSwapOption<AuthorityLease>>,
     readiness_observer: Option<ReadinessObserver>,
     timing: AuthorityTiming,
 }
@@ -380,7 +394,7 @@ impl GatewayAuthority {
                 identity,
                 shutdown,
                 channel: LazyClient::new(),
-                current: ArcSwapOption::empty(),
+                current: Arc::new(ArcSwapOption::empty()),
                 readiness_observer: None,
                 timing: AuthorityTiming::default(),
             }),
@@ -389,6 +403,12 @@ impl GatewayAuthority {
 
     pub fn is_ready(&self) -> bool {
         self.current().is_ok()
+    }
+
+    pub fn readiness(&self) -> AuthorityReadiness {
+        AuthorityReadiness {
+            current: self.inner.current.clone(),
+        }
     }
 
     #[must_use]
@@ -437,7 +457,7 @@ impl GatewayAuthority {
     /// A single supervised owner handles startup and renewal after an installed
     /// policy requests interception. No guest request invokes this operation.
     /// Each RPC, including connection, is bounded to 45s.
-    pub fn spawn(&self, network: GatewayNetworkState) -> tokio::task::JoinHandle<()> {
+    pub fn spawn(&self, network: PolicyView) -> tokio::task::JoinHandle<()> {
         let owner = self.clone();
         tokio::spawn(async move {
             if network

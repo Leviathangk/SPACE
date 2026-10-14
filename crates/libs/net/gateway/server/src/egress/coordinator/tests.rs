@@ -1,4 +1,5 @@
 use super::*;
+use crate::proto::NetworkState;
 use pplx_space_common_core::types::CredentialReferenceId;
 use pplx_space_net_common::EffectiveNetworkPolicyRefScope;
 use std::future::Future;
@@ -28,9 +29,7 @@ fn tls_on_loader(pulls: Arc<AtomicU64>) -> PolicyLoader {
 async fn interception_dependency_gate_blocks_traffic_without_blocking_policy_hydration() {
     let open = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let gate = open.clone();
-    let state = GatewayNetworkState::pending_policy()
-        .with_readiness_metrics()
-        .with_traffic_gate(Arc::new(move || gate.load(Ordering::SeqCst)));
+    let state = pending_policy(Some(Arc::new(move || gate.load(Ordering::SeqCst))));
     let observe_dependencies = state.interception_readiness_observer();
     assert!(matches!(
         state.udp_policy().await,
@@ -128,7 +127,7 @@ async fn interception_dependency_gate_blocks_traffic_without_blocking_policy_hyd
 /// not hold or deny anything, and readiness reports `NotRequired`.
 #[tokio::test]
 async fn tls_off_policy_ignores_closed_interception_gate() {
-    let state = GatewayNetworkState::pending_policy().with_traffic_gate(Arc::new(|| false));
+    let state = pending_policy(Some(Arc::new(|| false)));
     let snapshot = state
         .refresh(
             immediate_success_loader(test_policy_ref()),
@@ -162,7 +161,7 @@ fn test_policy_ref() -> EffectiveNetworkPolicyRef {
 
 #[tokio::test]
 async fn changed_tls_policy_applies_to_subsequent_admissions() {
-    let state = GatewayNetworkState::pending_policy().with_traffic_gate(Arc::new(|| true));
+    let state = pending_policy(Some(Arc::new(|| true)));
     let off_ref = test_policy_ref();
     state
         .refresh(
@@ -241,7 +240,7 @@ async fn network_credentials_are_bound_to_the_exact_installed_policy_generation(
     let mut policy = pplx_space_net_common::NetworkPolicyV1::allow_all();
     policy.tls_interception = TlsInterception::On;
     policy.network_credential_rules = vec![rule];
-    let state = GatewayNetworkState::pending_policy().with_traffic_gate(Arc::new(|| true));
+    let state = pending_policy(Some(Arc::new(|| true)));
     let first_ref = test_policy_ref();
     let loader: PolicyLoader = Arc::new(move || {
         let policy = policy.clone();
@@ -338,7 +337,7 @@ fn v1_domain_allow_loader(policy_ref: EffectiveNetworkPolicyRef) -> PolicyLoader
 #[tokio::test]
 async fn domain_policy_installs_ready() {
     let policy_ref = test_policy_ref();
-    let state = GatewayNetworkState::pending_policy();
+    let state = pending_policy(None);
     let snapshot = state
         .refresh(
             v1_domain_allow_loader(policy_ref.clone()),
@@ -352,11 +351,12 @@ async fn domain_policy_installs_ready() {
 
 #[tokio::test]
 async fn policy_install_reconciles_dns_and_connections_on_self_hydration() {
-    let state = GatewayNetworkState::pending_policy();
+    let network = GatewayNetwork::new(InitialPolicyState::PendingPolicy, None);
+    let state = network.coordinator.clone();
     let cancellation = state.reserved_dns_cancellation.operation_token();
     let shutdown = CancellationToken::new();
     let _connection = state.tcp_connections.register(
-        crate::egress::admit_tcp(
+        crate::egress::test_support::admit_tcp(
             "192.0.2.10:443".parse().unwrap(),
             &crate::tls_sni::ClientHelloScan::NotTls,
             &NetworkPolicyV1::allow_all(),
@@ -379,7 +379,7 @@ async fn policy_install_reconciles_dns_and_connections_on_self_hydration() {
         shutdown.is_cancelled(),
         "the installed policy must close the old IP-only connection"
     );
-    let next_operation = state.reserved_dns_cancellation.operation_token();
+    let next_operation = network.egress().dns_tcp().await.unwrap();
     state
         .refresh(
             v1_domain_allow_loader(policy_ref.clone()),
@@ -388,8 +388,41 @@ async fn policy_install_reconciles_dns_and_connections_on_self_hydration() {
         )
         .await;
     assert!(
-        !next_operation.is_cancelled(),
+        !next_operation.cancellation().is_cancelled(),
         "an unchanged policy must not cancel current DNS work"
+    );
+    let packet =
+        super::super::attribution::test_fixtures::a_response("example.com", [93, 184, 216, 34], 60);
+    assert!(next_operation.observe_response(&packet));
+    let replacement_ref = EffectiveNetworkPolicyRef::local(
+        EffectiveNetworkPolicyRefScope::Sandbox,
+        "sandbox-1",
+        "2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    )
+    .unwrap();
+    state
+        .refresh(
+            v1_domain_allow_loader(replacement_ref.clone()),
+            Some(replacement_ref),
+            NetworkStateReason::ControlRefresh,
+        )
+        .await;
+    assert!(next_operation.cancellation().is_cancelled());
+    let late_packet =
+        super::super::attribution::test_fixtures::a_response("example.com", [93, 184, 216, 35], 60);
+    assert!(
+        !next_operation.observe_response(&late_packet),
+        "a retired operation cannot add attribution after install pruning"
+    );
+    assert!(
+        !state
+            .dns_allow_cache
+            .contains_host_binding("93.184.216.35".parse().unwrap(), "example.com")
+    );
+    let current = network.egress().udp().await.unwrap().into_dns();
+    assert!(
+        current.observe_response(&late_packet),
+        "the current operation can add the same permitted answer"
     );
 }
 
@@ -400,7 +433,7 @@ async fn policy_install_reconciles_dns_and_connections_on_self_hydration() {
 #[tokio::test]
 async fn refresh_out_of_no_identity_is_the_adoption_path() {
     let policy_ref = test_policy_ref();
-    let state = GatewayNetworkState::no_identity();
+    let state = Arc::new(Coordinator::new(InitialPolicyState::NoIdentity, None));
 
     let snapshot = state
         .refresh(
@@ -417,7 +450,7 @@ async fn refresh_out_of_no_identity_is_the_adoption_path() {
 /// matching re-refresh short-circuits, and a ref mismatch fails closed.
 #[tokio::test]
 async fn policy_hydrates_ready_with_stable_ref_and_fails_closed_on_mismatch() {
-    let state = GatewayNetworkState::pending_policy();
+    let state = pending_policy(None);
     let policy_ref = test_policy_ref();
     let loader = immediate_success_loader(policy_ref.clone());
 
@@ -493,7 +526,7 @@ async fn typed_load_failures_clear_policy_and_preserve_diagnostics() {
         ),
     ];
     for (failure, message) in failures {
-        let state = GatewayNetworkState::pending_policy();
+        let state = pending_policy(None);
         let installed_ref = test_policy_ref();
         state
             .refresh(
@@ -551,7 +584,7 @@ fn counting_success_loader(
 
 #[tokio::test(start_paused = true)]
 async fn hydration_timeout_and_retry_exhaustion_preserve_policy_history() {
-    let state = GatewayNetworkState::pending_policy();
+    let state = pending_policy(None);
     let previous_ref = test_policy_ref();
     state
         .refresh(
@@ -614,7 +647,7 @@ async fn hydration_timeout_and_retry_exhaustion_preserve_policy_history() {
 async fn refresh_short_circuits_when_ready_with_matching_ref() {
     use std::sync::atomic::Ordering::SeqCst;
 
-    let state = GatewayNetworkState::pending_policy();
+    let state = pending_policy(None);
     let policy_ref = test_policy_ref();
     let (loader, calls) = counting_success_loader(policy_ref.clone());
 
@@ -695,7 +728,8 @@ async fn matching_policy_ref_reloads_the_complete_network_credential_snapshot() 
             })
         }
     });
-    let state = GatewayNetworkState::pending_policy().with_traffic_gate(Arc::new(|| true));
+    let network = GatewayNetwork::new(InitialPolicyState::PendingPolicy, Some(Arc::new(|| true)));
+    let state = &network.coordinator;
     let policy_ref = test_policy_ref();
     state
         .refresh(
@@ -715,11 +749,24 @@ async fn matching_policy_ref_reloads_the_complete_network_credential_snapshot() 
             .unwrap(),
         b"Bearer generation-1"
     );
+    let authorization = network
+        .egress()
+        .authorize_host(
+            "192.0.2.10:443".parse().unwrap(),
+            &"api.example.com".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+    authorization.recheck().unwrap();
 
     state
         .refresh(loader, Some(policy_ref), NetworkStateReason::ControlRefresh)
         .await;
     assert_eq!(calls.load(SeqCst), 2);
+    assert!(matches!(
+        authorization.recheck(),
+        Err(crate::egress::HostBindingError::PolicyUnavailable)
+    ));
     assert!(
         state
             .with_network_credentials(&first_policy, |_| ())
@@ -782,7 +829,7 @@ fn controlled_success_loader(
 
 async fn assert_stale_refresh_success_cannot_overwrite(terminal_mode: NetworkState) {
     for had_policy in [false, true] {
-        let state = GatewayNetworkState::pending_policy();
+        let state = pending_policy(None);
         let previous_ref = test_policy_ref();
         let previous = if had_policy {
             state
@@ -859,7 +906,7 @@ async fn assert_stale_refresh_success_cannot_overwrite(terminal_mode: NetworkSta
     }
 }
 
-async fn wait_for_pending_tcp_count(state: &GatewayNetworkState, expected: u64) {
+async fn wait_for_pending_tcp_count(state: &Arc<Coordinator>, expected: u64) {
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             if state.snapshot().await.pending_tcp_connections == expected {
@@ -874,7 +921,7 @@ async fn wait_for_pending_tcp_count(state: &GatewayNetworkState, expected: u64) 
 
 #[tokio::test]
 async fn state_change_wait_ignores_existing_watch_version() {
-    let state = GatewayNetworkState::pending_policy();
+    let state = pending_policy(None);
     let policy_ref = test_policy_ref();
     let snapshot = state
         .refresh(
@@ -904,7 +951,7 @@ async fn state_change_wait_ignores_existing_watch_version() {
 
 #[tokio::test]
 async fn state_change_wait_observes_future_watch_version() {
-    let state = GatewayNetworkState::pending_policy();
+    let state = pending_policy(None);
     let shutdown = CancellationToken::new();
     let wait_state = state.clone();
     let wait_shutdown = shutdown.clone();
@@ -927,7 +974,7 @@ async fn state_change_wait_observes_future_watch_version() {
 
 #[tokio::test]
 async fn cancelled_tcp_policy_wait_releases_pending_counter() {
-    let state = GatewayNetworkState::pending_policy();
+    let state = pending_policy(None);
     let wait_state = state.clone();
     let wait_task = tokio::spawn(async move { wait_state.wait_for_tcp_policy().await });
 
@@ -954,7 +1001,7 @@ async fn stale_refresh_success_cannot_overwrite_no_identity() {
 
 #[tokio::test]
 async fn explicit_refresh_from_no_identity_can_install_policy() {
-    let state = GatewayNetworkState::no_identity();
+    let state = Arc::new(Coordinator::new(InitialPolicyState::NoIdentity, None));
     let policy_ref = test_policy_ref();
 
     let snapshot = state
@@ -986,7 +1033,7 @@ fn external_pool_adoption_rollback_reason_is_preserved() {
 
 #[tokio::test]
 async fn terminal_non_error_states_report_empty_last_error() {
-    let state = GatewayNetworkState::pending_policy();
+    let state = pending_policy(None);
     let error_snapshot = state
         .refresh(
             immediate_error_loader("loader failed"),
@@ -1002,7 +1049,7 @@ async fn terminal_non_error_states_report_empty_last_error() {
     assert!(no_identity.last_error.is_empty());
     assert_eq!(no_identity.last_error_kind, NetworkPolicyErrorKind::None);
 
-    let state = GatewayNetworkState::pending_policy();
+    let state = pending_policy(None);
     state
         .refresh(
             immediate_error_loader("loader failed"),
@@ -1016,7 +1063,7 @@ async fn terminal_non_error_states_report_empty_last_error() {
     assert!(draining.last_error.is_empty());
     assert_eq!(draining.last_error_kind, NetworkPolicyErrorKind::None);
 
-    let state = GatewayNetworkState::pending_policy();
+    let state = pending_policy(None);
     state
         .refresh(
             immediate_error_loader("loader failed"),
@@ -1044,4 +1091,38 @@ async fn terminal_non_error_states_report_empty_last_error() {
         refresh_after_stopped.last_error_kind,
         NetworkPolicyErrorKind::None
     );
+}
+
+fn pending_policy(gate: Option<TrafficGate>) -> Arc<Coordinator> {
+    Arc::new(Coordinator::new(InitialPolicyState::PendingPolicy, gate))
+}
+
+#[test]
+fn policy_install_cancels_only_operations_from_the_previous_policy() {
+    let cancellation = ReservedDnsCancellation::default();
+    let previous = cancellation.operation_token();
+
+    cancellation.cancel_in_flight();
+
+    assert!(previous.is_cancelled());
+    assert!(!cancellation.operation_token().is_cancelled());
+}
+
+#[test]
+fn policy_view_does_not_retain_the_coordinator_or_traffic_gate() {
+    let marker = Arc::new(());
+    let gate_lifetime = Arc::downgrade(&marker);
+    let network = GatewayNetwork::new(
+        InitialPolicyState::PendingPolicy,
+        Some(Arc::new(move || {
+            let _retained = &marker;
+            true
+        })),
+    );
+    let policies = network.policies();
+    let observer = network.control().interception_readiness_observer();
+    drop(network);
+    assert!(gate_lifetime.upgrade().is_none());
+    assert!(!policies.is_ready());
+    observer(false);
 }

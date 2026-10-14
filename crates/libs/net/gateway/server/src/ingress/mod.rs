@@ -18,7 +18,7 @@ use pplx_space_common_svc::space_api_route_ed25519::{
 use pplx_space_metrics::gateway::{ServicePortIngressCloseReason, ServicePortIngressOpenResult};
 use pplx_space_net_gateway_client::SERVICE_PORT_INGRESS_START_TIMEOUT;
 use pplx_space_net_gateway_client::proto::{
-    NetworkState, ServicePortIngressFrame, ServicePortIngressStart, service_port_ingress_frame,
+    ServicePortIngressFrame, ServicePortIngressStart, service_port_ingress_frame,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -31,6 +31,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::{Status, metadata::MetadataMap};
 use tracing::Instrument;
 
+use crate::egress::PolicyView;
 use crate::execution::ExecutionIdentity;
 pub use crate::execution::{
     RouteIdentityParseError, RouteIdentityUpdate, RouteIdentityUpdateError,
@@ -39,7 +40,6 @@ pub use crate::execution::{
 };
 use crate::resource_budget::MAX_ACTIVE_SERVICE_PORT_INGRESS_STREAMS;
 use crate::route_verification::RouteVerificationState;
-use crate::state::GatewayNetworkState;
 
 const INGRESS_BUFFER_BYTES: usize = 16 * 1024;
 const INGRESS_CHANNEL_CAPACITY: usize = 32;
@@ -154,7 +154,7 @@ impl Default for ServicePortIngressState {
 
 pub async fn open_service_port_ingress(
     state: ServicePortIngressState,
-    network_state: GatewayNetworkState,
+    network_state: PolicyView,
     metadata: MetadataMap,
     mut inbound: tonic::Streaming<ServicePortIngressFrame>,
     shutdown_token: CancellationToken,
@@ -241,17 +241,16 @@ pub async fn open_service_port_ingress(
 
 async fn authorize_service_port_ingress(
     state: &ServicePortIngressState,
-    network_state: &GatewayNetworkState,
+    network_state: &PolicyView,
     metadata: &MetadataMap,
     start: &ServicePortIngressStart,
 ) -> Result<(GuestPort, CancellationToken, SandboxTraceContext), Status> {
-    let network_snapshot = network_state.snapshot().await;
     // Policy installation only. Interception readiness is deliberately not a
     // condition here: the CA exists to inspect guest egress, and this path
     // relays inbound connections to a guest port without consulting it. An
     // earlier gateway refused ingress whenever the CA was missing, but only
     // because a closed traffic gate demoted this mode to PendingPolicy.
-    if network_snapshot.mode != NetworkState::Ready {
+    if !network_state.is_ready() {
         pplx_space_metrics::gateway::service_port_ingress_open(
             ServicePortIngressOpenResult::PolicyNotReady,
         );

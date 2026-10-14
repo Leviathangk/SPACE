@@ -11,7 +11,7 @@ use super::evidence::TcpAdmissionEvidence;
 
 /// Established-flow registry shared by admission and policy resweeps.
 #[derive(Clone, Debug, Default)]
-pub struct DnsAttributedTcpTracker {
+pub(crate) struct DnsAttributedTcpTracker {
     inner: Arc<DnsAttributedInner>,
 }
 

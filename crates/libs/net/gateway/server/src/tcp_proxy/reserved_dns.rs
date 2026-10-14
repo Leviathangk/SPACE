@@ -1,13 +1,12 @@
 use std::io;
 use std::time::Duration;
 
+use crate::egress::DnsOperation;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use pplx_space_metrics::gateway::DnsAttributionCacheObservationSource;
-use pplx_space_net_common::NetworkPolicyV1;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::LengthDelimitedCodec;
-use tokio_util::sync::CancellationToken;
 
 use crate::reserved_dns::{MAX_DNS_MESSAGE_BYTES, ReservedResolver, ResolveOutcome};
 
@@ -21,12 +20,12 @@ pub(super) async fn serve<T>(
     proxy: &TcpProxy,
     client: T,
     resolver: ReservedResolver,
-    admitted_policy: &NetworkPolicyV1,
-    shutdown: &CancellationToken,
+    operation: &DnsOperation,
 ) -> FlowOutcome
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
+    let shutdown = operation.cancellation();
     let mut framed = LengthDelimitedCodec::builder()
         .length_field_type::<u16>()
         .max_frame_length(MAX_DNS_MESSAGE_BYTES)
@@ -65,7 +64,7 @@ where
                 proxy.sandbox_id,
                 resolver,
                 wire.as_ref(),
-                admitted_policy,
+                operation.policy(),
                 shutdown,
             )
             .await
@@ -81,9 +80,7 @@ where
         if shutdown.is_cancelled() {
             return FlowOutcome::Cancelled;
         }
-        let accepted = proxy
-            .dns_allow_cache
-            .observe_response(&reply, admitted_policy);
+        let accepted = operation.observe_response(&reply);
         pplx_space_metrics::gateway::dns_attribution_cache_observation(
             DnsAttributionCacheObservationSource::ReservedDns,
             accepted,

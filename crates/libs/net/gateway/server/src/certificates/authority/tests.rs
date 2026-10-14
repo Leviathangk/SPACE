@@ -1,6 +1,7 @@
 use super::super::{CertificateContext, CertificateProvider};
 use super::*;
-use crate::state::{GatewayNetworkState, NetworkStateReason, PulledNetworkPolicy};
+use crate::egress::test_support::TestNetwork;
+use crate::egress::{NetworkStateReason, PulledNetworkPolicy};
 use pplx_space_common_svc::core::types::{
     ExecutionGeneration, RouteGeneration, SandboxId, SpaceApiRouteIdentity,
 };
@@ -83,7 +84,7 @@ fn identity() -> SpaceApiRouteIdentity {
 
 pub(crate) async fn local_provider() -> (rcgen::Certificate, GatewayAuthority, CertificateProvider)
 {
-    local_provider_with_state(GatewayNetworkState::pending_policy()).await
+    local_provider_with_state(TestNetwork::pending_policy()).await
 }
 
 pub(crate) fn advance_route(owner: &GatewayAuthority) {
@@ -126,7 +127,7 @@ pub(crate) fn leaf_with_lifetime(
 }
 
 pub(crate) async fn local_provider_with_state(
-    network: GatewayNetworkState,
+    network: TestNetwork,
 ) -> (rcgen::Certificate, GatewayAuthority, CertificateProvider) {
     local_provider_with_policy(
         network,
@@ -137,9 +138,9 @@ pub(crate) async fn local_provider_with_state(
 }
 
 pub(crate) async fn local_provider_with_policy(
-    network: GatewayNetworkState,
+    network: TestNetwork,
     policy: pplx_space_net_common::NetworkPolicyV1,
-    network_credentials: crate::state::NetworkCredentialSnapshot,
+    network_credentials: crate::egress::NetworkCredentialSnapshot,
 ) -> (rcgen::Certificate, GatewayAuthority, CertificateProvider) {
     let (root_certificate, root) = root();
     let identity = ExecutionIdentity::new(Some(identity()));
@@ -156,7 +157,7 @@ pub(crate) async fn local_provider_with_policy(
     );
     owner.inner.current.store(Some(Arc::new(ca)));
     let pulled = Arc::new(std::sync::Mutex::new(Some((policy, network_credentials))));
-    let loader: crate::state::PolicyLoader = Arc::new(move || {
+    let loader: crate::egress::PolicyLoader = Arc::new(move || {
         let (policy, network_credentials) = pulled
             .lock()
             .unwrap()
@@ -179,8 +180,10 @@ pub(crate) async fn local_provider_with_policy(
     network
         .refresh(loader, None, NetworkStateReason::Startup)
         .await;
-    let provider =
-        CertificateProvider::new(owner.clone(), CertificateContext::new(network, shutdown));
+    let provider = CertificateProvider::new(
+        owner.clone(),
+        CertificateContext::new(network.egress(), shutdown),
+    );
     (root_certificate, owner, provider)
 }
 
@@ -524,7 +527,6 @@ async fn owner_issues_over_host_control_after_assignment_and_stops_on_shutdown()
     });
     let assigned = identity();
     let identities = ExecutionIdentity::new(Some(assigned));
-    let network = GatewayNetworkState::pending_policy().with_readiness_metrics();
     let authority_cleared = Arc::new(tokio::sync::Notify::new());
     // The owner drives a real tonic UDS server here, so the loop's scheduling
     // pauses cannot run on a paused clock. Shrink the intervals instead: the
@@ -538,26 +540,24 @@ async fn owner_issues_over_host_control_after_assignment_and_stops_on_shutdown()
         max_backoff: Duration::from_secs(3),
         candidate_backoff: Duration::from_millis(500),
     };
-    let mut owner = GatewayAuthority::new(socket, identities.clone(), shutdown.clone())
-        .with_timing(timing)
-        .with_readiness_observer({
-            let observe = network.interception_readiness_observer();
-            let authority_cleared = authority_cleared.clone();
-            Arc::new(move |ready| {
-                observe(ready);
-                if !ready {
-                    authority_cleared.notify_one();
-                }
-            })
-        });
+    let owner =
+        GatewayAuthority::new(socket, identities.clone(), shutdown.clone()).with_timing(timing);
+    let readiness = owner.readiness();
+    let network = TestNetwork::with_gate(Arc::new(move || readiness.is_ready()));
+    let mut owner = owner.with_readiness_observer({
+        let observe = network.interception_readiness_observer();
+        let authority_cleared = authority_cleared.clone();
+        Arc::new(move |ready| {
+            observe(ready);
+            if !ready {
+                authority_cleared.notify_one();
+            }
+        })
+    });
     Arc::get_mut(&mut owner.inner).unwrap().launch_capability =
         Ok(zeroize::Zeroizing::new(vec![b'a'; 64]));
     let owner_lifetime = Arc::downgrade(&owner.inner);
-    let network = network.with_traffic_gate({
-        let owner = owner.clone();
-        Arc::new(move || owner.is_ready())
-    });
-    let loader: crate::state::PolicyLoader = Arc::new(|| {
+    let loader: crate::egress::PolicyLoader = Arc::new(|| {
         Box::pin(async {
             let mut policy = pplx_space_net_common::NetworkPolicyV1::allow_all();
             policy.tls_interception = pplx_space_net_common::TlsInterception::On;
@@ -573,7 +573,7 @@ async fn owner_issues_over_host_control_after_assignment_and_stops_on_shutdown()
             })
         })
     });
-    let worker = owner.spawn(network.clone());
+    let worker = owner.spawn(network.policies());
     // A complete launch identity is not proof that its PID has been registered.
     tokio::time::timeout(Duration::from_millis(300), received.recv())
         .await
@@ -587,7 +587,7 @@ async fn owner_issues_over_host_control_after_assignment_and_stops_on_shutdown()
     assert_eq!(hydrated.mode, crate::proto::NetworkState::Ready);
     assert_eq!(
         hydrated.interception_readiness,
-        crate::state::InterceptionReadiness::DependenciesNotReady
+        crate::egress::InterceptionReadiness::DependenciesNotReady
     );
     let request = tokio::time::timeout(Duration::from_secs(5), received.recv())
         .await
@@ -652,7 +652,7 @@ async fn owner_issues_over_host_control_after_assignment_and_stops_on_shutdown()
     assert_eq!(installed.mode, crate::proto::NetworkState::Ready);
     assert_eq!(
         installed.interception_readiness,
-        crate::state::InterceptionReadiness::Ready
+        crate::egress::InterceptionReadiness::Ready
     );
 
     // Move only the renewal schedule, not certificate validity or the clock.
@@ -745,7 +745,7 @@ async fn owner_issues_over_host_control_after_assignment_and_stops_on_shutdown()
             assert_eq!(retired.mode, crate::proto::NetworkState::Ready);
             assert_eq!(
                 retired.interception_readiness,
-                crate::state::InterceptionReadiness::DependenciesNotReady
+                crate::egress::InterceptionReadiness::DependenciesNotReady
             );
             assert!(
                 !old.is_usable(),
@@ -786,14 +786,16 @@ async fn owner_issues_over_host_control_after_assignment_and_stops_on_shutdown()
     assert_eq!(stopped.mode, crate::proto::NetworkState::Ready);
     assert_eq!(
         stopped.interception_readiness,
-        crate::state::InterceptionReadiness::DependenciesNotReady
+        crate::egress::InterceptionReadiness::DependenciesNotReady
     );
-    drop(network);
+    let policies = network.policies();
     drop(owner);
     assert!(
         owner_lifetime.upgrade().is_none(),
-        "readiness observation must not retain the CA owner or its key material"
+        "the network's readiness gate must not retain the CA owner"
     );
+    assert!(policies.is_ready());
+    drop(network);
 }
 
 #[tokio::test(start_paused = true)]
@@ -804,7 +806,8 @@ async fn owner_shutdown_does_not_wait_for_policy_registration() {
         ExecutionIdentity::new(Some(identity())),
         shutdown.clone(),
     );
-    let worker = owner.spawn(GatewayNetworkState::pending_policy());
+    let network = TestNetwork::pending_policy();
+    let worker = owner.spawn(network.policies());
     tokio::task::yield_now().await;
     shutdown.cancel();
     tokio::time::timeout(Duration::from_secs(1), worker)

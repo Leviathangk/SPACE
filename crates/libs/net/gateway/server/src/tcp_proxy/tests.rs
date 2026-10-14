@@ -1,8 +1,9 @@
+use crate::egress::test_support::TestNetwork;
 use std::sync::Arc;
 use std::time::Duration;
 
 use super::*;
-use crate::dns::test_fixtures::a_response as dns_a_response;
+use crate::egress::test_support::test_fixtures::a_response as dns_a_response;
 use crate::tls_sni::ClientHelloScan;
 use pplx_space_net_common::{
     DenyReason, EffectiveNetworkPolicyRef, EffectiveNetworkPolicyRefScope, EgressDefaultAction,
@@ -23,8 +24,8 @@ fn v1_allow_all() -> NetworkPolicyV1 {
     NetworkPolicyV1::allow_all()
 }
 
-async fn ready_policy(policy: NetworkPolicyV1) -> (GatewayNetworkState, Arc<NetworkPolicyV1>) {
-    let state = GatewayNetworkState::pending_policy();
+async fn ready_policy(policy: NetworkPolicyV1) -> (TestNetwork, Arc<NetworkPolicyV1>) {
+    let state = TestNetwork::pending_policy();
     let policy = install_policy(
         &state,
         policy,
@@ -35,7 +36,7 @@ async fn ready_policy(policy: NetworkPolicyV1) -> (GatewayNetworkState, Arc<Netw
 }
 
 async fn install_policy(
-    state: &GatewayNetworkState,
+    state: &TestNetwork,
     policy: NetworkPolicyV1,
     content_hash: &str,
 ) -> Arc<NetworkPolicyV1> {
@@ -46,11 +47,11 @@ async fn install_policy(
     )
     .unwrap();
     let policy_ref = expected_policy_ref.clone();
-    let loader: crate::state::PolicyLoader = Arc::new(move || {
+    let loader: crate::egress::PolicyLoader = Arc::new(move || {
         let policy = policy.clone();
         let policy_ref = policy_ref.clone();
         Box::pin(async move {
-            Ok(crate::state::PulledNetworkPolicy {
+            Ok(crate::egress::PulledNetworkPolicy {
                 policy,
                 policy_ref,
                 network_credentials: Default::default(),
@@ -61,7 +62,7 @@ async fn install_policy(
         .refresh(
             loader,
             Some(expected_policy_ref),
-            crate::state::NetworkStateReason::Startup,
+            crate::egress::NetworkStateReason::Startup,
         )
         .await;
     let TrafficPolicy::Ready(policy) = state.wait_for_tcp_policy().await else {
@@ -95,7 +96,7 @@ async fn failed_plaintext_connect() -> FailedPlaintextConnect {
         .unwrap(),
     };
     let (network_state, policy) = ready_policy(policy).await;
-    let dns_allow_cache = DnsAllowCache::default();
+    let dns_allow_cache = network_state.cache();
     dns_allow_cache.observe_response(
         &dns_a_response(ALLOWED_HOST, [93, 184, 216, 34], 60),
         policy.as_ref(),
@@ -103,12 +104,9 @@ async fn failed_plaintext_connect() -> FailedPlaintextConnect {
     let proxy = TcpProxy {
         sandbox_id: "test",
         stats: Arc::new(ProxyStats::new()),
-        network_state,
-        dns_allow_cache,
-        dns_attributed_connections: DnsAttributedTcpTracker::default(),
+        egress: network_state.egress(),
         tls_interception: Default::default(),
         reserved_dns: crate::reserved_dns::test_support::test_core(),
-        reserved_dns_cancellation: crate::state::ReservedDnsCancellation::default(),
         known_egress_state: crate::known_egress::KnownEgressState::default(),
         debug_state: GatewayDebugState::default(),
         shutdown_token: CancellationToken::new(),
@@ -187,7 +185,7 @@ async fn dns_attributed_pypi_proxy() -> (TcpProxy, Arc<NetworkPolicyV1>) {
         .unwrap(),
     };
     let (network_state, policy) = ready_policy(policy).await;
-    let dns_allow_cache = DnsAllowCache::default();
+    let dns_allow_cache = network_state.cache();
     dns_allow_cache.observe_response(
         &dns_a_response("pypi.org", [93, 184, 216, 34], 60),
         policy.as_ref(),
@@ -195,12 +193,9 @@ async fn dns_attributed_pypi_proxy() -> (TcpProxy, Arc<NetworkPolicyV1>) {
     let proxy = TcpProxy {
         sandbox_id: "test",
         stats: Arc::new(ProxyStats::new()),
-        network_state,
-        dns_allow_cache,
-        dns_attributed_connections: DnsAttributedTcpTracker::default(),
+        egress: network_state.egress(),
         tls_interception: Default::default(),
         reserved_dns: crate::reserved_dns::test_support::test_core(),
-        reserved_dns_cancellation: crate::state::ReservedDnsCancellation::default(),
         known_egress_state: crate::known_egress::KnownEgressState::default(),
         debug_state: GatewayDebugState::default(),
         shutdown_token: CancellationToken::new(),
@@ -217,17 +212,17 @@ async fn only_a_dns_attributed_fail_closed_destination_waits_for_a_late_client_h
     let unattributed: SocketAddr = "203.0.113.9:443".parse().unwrap();
 
     assert_eq!(
-        proxy.missing_client_hello(attributed, &ready),
+        proxy.egress.missing_client_hello(attributed, &ready),
         crate::tls_sni::MissingClientHello::Denied,
         "a resolved allowed domain's address is decided by its ClientHello"
     );
     assert_eq!(
-        proxy.missing_client_hello(unattributed, &ready),
+        proxy.egress.missing_client_hello(unattributed, &ready),
         crate::tls_sni::MissingClientHello::Proceeds,
         "an address with no DNS evidence is refused whatever the ClientHello says"
     );
     assert_eq!(
-        proxy.missing_client_hello(
+        proxy.egress.missing_client_hello(
             attributed,
             &TrafficPolicy::NotReady(PolicyNotReady::PendingPolicyTimeout)
         ),
@@ -256,17 +251,18 @@ async fn an_address_refused_before_its_client_hello_is_read_does_not_wait_for_on
     };
     let (network_state, policy) = ready_policy(policy).await;
     let (mut proxy, _) = dns_attributed_pypi_proxy().await;
-    proxy.network_state = network_state;
+    proxy.egress = network_state.egress();
     for address in [[93, 184, 216, 34], [169, 254, 169, 254]] {
         proxy
-            .dns_allow_cache
+            .egress
+            .test_cache()
             .observe_response(&dns_a_response("pypi.org", address, 60), policy.as_ref());
     }
     let ready = TrafficPolicy::Ready(policy);
 
     for destination in [denied, guardrailed] {
         assert_eq!(
-            proxy.missing_client_hello(destination, &ready),
+            proxy.egress.missing_client_hello(destination, &ready),
             crate::tls_sni::MissingClientHello::Proceeds,
             "{destination} is refused whatever its ClientHello says"
         );
@@ -286,7 +282,7 @@ async fn tls_interception_waits_for_a_late_client_hello_on_an_allowed_destinatio
     };
 
     assert_eq!(
-        proxy.missing_client_hello(
+        proxy.egress.missing_client_hello(
             destination,
             &with_interception(pplx_space_net_common::TlsInterception::On)
         ),
@@ -294,7 +290,7 @@ async fn tls_interception_waits_for_a_late_client_hello_on_an_allowed_destinatio
         "interception refuses a flow without SNI, so it must wait out a retransmit"
     );
     assert_eq!(
-        proxy.missing_client_hello(
+        proxy.egress.missing_client_hello(
             destination,
             &with_interception(pplx_space_net_common::TlsInterception::Off)
         ),
@@ -315,7 +311,7 @@ async fn tls_interception_waits_for_a_late_client_hello_on_an_allowed_destinatio
         .unwrap(),
     };
     assert_eq!(
-        proxy.missing_client_hello(
+        proxy.egress.missing_client_hello(
             destination,
             &TrafficPolicy::Ready(Arc::new(explicit_deny.clone()))
         ),
@@ -324,7 +320,9 @@ async fn tls_interception_waits_for_a_late_client_hello_on_an_allowed_destinatio
     );
     explicit_deny.tls_interception = pplx_space_net_common::TlsInterception::Off;
     assert_eq!(
-        proxy.missing_client_hello(destination, &TrafficPolicy::Ready(Arc::new(explicit_deny))),
+        proxy
+            .egress
+            .missing_client_hello(destination, &TrafficPolicy::Ready(Arc::new(explicit_deny))),
         crate::tls_sni::MissingClientHello::Proceeds,
     );
 }
@@ -401,36 +399,27 @@ async fn lazy_plaintext_connect_failure_log_omits_raw_destination() {
 
 #[tokio::test]
 async fn failed_policy_refresh_cancels_established_tcp_connections() {
-    let dns_allow_cache = DnsAllowCache::default();
-    let dns_attributed_connections = DnsAttributedTcpTracker::default();
-    let state = GatewayNetworkState::pending_policy().with_egress(
-        dns_allow_cache.clone(),
-        dns_attributed_connections.clone(),
-        crate::state::ReservedDnsCancellation::default(),
-    );
-    install_policy(
+    let state = TestNetwork::pending_policy();
+    let policy = install_policy(
         &state,
         NetworkPolicyV1::allow_all(),
         "2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     )
     .await;
-
-    // `TcpProxy::serve` watches each tracked token for the full relay lifetime.
-    // Leaving one uncancelled leaves that established tunnel open.
+    // The registered token is watched for the full relay lifetime.
     let dns_attributed_shutdown = CancellationToken::new();
-    let _dns_attributed_connection = dns_attributed_connections.register(
-        crate::egress::admit_tcp(
+    let _dns_attributed_connection = state
+        .egress()
+        .tcp(
             "192.0.2.44:443".parse().unwrap(),
             &ClientHelloScan::NoServerName,
-            &NetworkPolicyV1::allow_all(),
-            &DnsAllowCache::default(),
+            policy,
+            dns_attributed_shutdown.clone(),
         )
-        .unwrap(),
-        dns_attributed_shutdown.clone(),
-    );
-    let failed_loader: crate::state::PolicyLoader = Arc::new(|| {
+        .unwrap();
+    let failed_loader: crate::egress::PolicyLoader = Arc::new(|| {
         Box::pin(async {
-            Err(crate::state::HydrateNetworkStateError::GetNetworkPolicy {
+            Err(crate::egress::HydrateNetworkStateError::GetNetworkPolicy {
                 sandbox_id: "tcp-enforcement-test".to_owned(),
                 source: tonic::Status::unavailable("forced policy refresh failure"),
             })
@@ -447,7 +436,7 @@ async fn failed_policy_refresh_cancels_established_tcp_connections() {
         .refresh(
             failed_loader,
             Some(expected_policy_ref),
-            crate::state::NetworkStateReason::ControlRefresh,
+            crate::egress::NetworkStateReason::ControlRefresh,
         )
         .await;
 
@@ -523,7 +512,8 @@ async fn tcp_admission_returns_the_authorized_route_or_deny() {
         .unwrap(),
     };
     let default_deny_policy = NetworkPolicyV1::deny_all();
-    let cache = DnsAllowCache::default();
+    let network_state = TestNetwork::pending_policy();
+    let cache = network_state.cache();
     cache.observe_response(
         &dns_a_response(ALLOWED_HOST, [93, 184, 216, 34], 60),
         &domain_policy,
@@ -535,12 +525,9 @@ async fn tcp_admission_returns_the_authorized_route_or_deny() {
     let proxy = TcpProxy {
         sandbox_id: "test",
         stats: Arc::new(ProxyStats::new()),
-        network_state: GatewayNetworkState::pending_policy(),
-        dns_allow_cache: cache,
-        dns_attributed_connections: DnsAttributedTcpTracker::default(),
+        egress: network_state.egress(),
         tls_interception: Default::default(),
         reserved_dns: crate::reserved_dns::test_support::test_core(),
-        reserved_dns_cancellation: crate::state::ReservedDnsCancellation::default(),
         known_egress_state: crate::known_egress::KnownEgressState::default(),
         debug_state: GatewayDebugState::default(),
         shutdown_token: CancellationToken::new(),
@@ -637,39 +624,46 @@ async fn tcp_admission_returns_the_authorized_route_or_deny() {
 
     for case in cases {
         assert_eq!(
-            proxy
-                .admit(destination, &case.scan, case.policy)
-                .map(|admission| admission.route()),
+            crate::egress::test_support::admit_tcp(
+                destination,
+                &case.scan,
+                case.policy,
+                proxy.egress.test_cache()
+            )
+            .map(|admission| admission.route()),
             case.expected,
             "{}",
             case.name,
         );
     }
-    proxy.dns_allow_cache.observe_response(
+    proxy.egress.test_cache().observe_response(
         &dns_a_response(OTHER_ALLOWED_HOST, [93, 184, 216, 34], 60),
         &domain_deny_policy,
     );
     assert!(
         proxy
-            .dns_allow_cache
+            .egress
+            .test_cache()
             .allows_ip(destination.ip(), &domain_deny_policy),
         "the other allowed hostname must keep the shared IP eligible",
     );
     assert_eq!(
-        proxy.admit(
+        crate::egress::test_support::admit_tcp(
             destination,
             &ClientHelloScan::ServerName(ALLOWED_HOST.parse().unwrap()),
             &domain_deny_policy,
+            proxy.egress.test_cache()
         ),
         Err(dns_attribution_denied(DenyReason::Rule)),
         "the explicit SNI deny must still win on a shared IP",
     );
     let uncached: SocketAddr = "192.0.2.44:443".parse().unwrap();
     assert_eq!(
-        proxy.admit(
+        crate::egress::test_support::admit_tcp(
             uncached,
             &ClientHelloScan::ServerName(ALLOWED_HOST.parse().unwrap()),
-            &domain_policy
+            &domain_policy,
+            proxy.egress.test_cache()
         ),
         Err(dns_attribution_denied(DenyReason::Default)),
         "an allowed SNI cannot authorize an uncached destination",
@@ -680,9 +674,13 @@ async fn tcp_admission_returns_the_authorized_route_or_deny() {
         ClientHelloScan::NoServerName,
     ] {
         assert_eq!(
-            proxy
-                .admit(uncached, &scan, &NetworkPolicyV1::allow_all())
-                .map(|admission| admission.route()),
+            crate::egress::test_support::admit_tcp(
+                uncached,
+                &scan,
+                &NetworkPolicyV1::allow_all(),
+                proxy.egress.test_cache()
+            )
+            .map(|admission| admission.route()),
             Ok(AdmittedTcp::Tunnel(uncached)),
             "independent default permission preserves raw and server-first protocols",
         );
@@ -695,12 +693,9 @@ async fn tcp_handoff_allows_current_and_rejects_replaced_policy() {
     let proxy = TcpProxy {
         sandbox_id: "test",
         stats: Arc::new(ProxyStats::new()),
-        network_state,
-        dns_allow_cache: DnsAllowCache::default(),
-        dns_attributed_connections: DnsAttributedTcpTracker::default(),
+        egress: network_state.egress(),
         tls_interception: Default::default(),
         reserved_dns: crate::reserved_dns::test_support::test_core(),
-        reserved_dns_cancellation: crate::state::ReservedDnsCancellation::default(),
         known_egress_state: crate::known_egress::KnownEgressState::default(),
         debug_state: GatewayDebugState::default(),
         shutdown_token: CancellationToken::new(),
@@ -708,27 +703,33 @@ async fn tcp_handoff_allows_current_and_rejects_replaced_policy() {
     };
     let destination = "192.0.2.44:443".parse().unwrap();
     let admission = proxy
-        .admit(destination, &ClientHelloScan::NotTls, &current_policy)
+        .egress
+        .tcp(
+            destination,
+            &ClientHelloScan::NotTls,
+            current_policy.clone(),
+            CancellationToken::new(),
+        )
         .unwrap();
-    let connection = proxy
-        .dns_attributed_connections
-        .register(admission.clone(), CancellationToken::new());
-    assert_eq!(proxy.validate_admission_policy(&current_policy), Ok(()));
-    drop(connection);
-
+    assert_eq!(admission.recheck(), Ok(()));
+    drop(admission);
     install_policy(
-        &proxy.network_state,
+        &network_state,
         NetworkPolicyV1::deny_all(),
         "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     )
     .await;
-    let _connection = proxy
-        .dns_attributed_connections
-        .register(admission, CancellationToken::new());
-    assert_eq!(
-        proxy.validate_admission_policy(&current_policy),
-        Err(TcpAdmissionDenial::PolicyChanged)
-    );
+    // Registration after a resweep still fails the final generation fence.
+    let admission = proxy
+        .egress
+        .tcp(
+            destination,
+            &ClientHelloScan::NotTls,
+            current_policy,
+            CancellationToken::new(),
+        )
+        .unwrap();
+    assert_eq!(admission.recheck(), Err(TcpAdmissionDenial::PolicyChanged));
 }
 
 #[tokio::test]
@@ -740,12 +741,9 @@ async fn record_emits_one_connection_metric_and_reports_every_failure_outcome() 
     let proxy = TcpProxy {
         sandbox_id: "test",
         stats: Arc::new(ProxyStats::new()),
-        network_state: GatewayNetworkState::no_identity(),
-        dns_allow_cache: DnsAllowCache::default(),
-        dns_attributed_connections: DnsAttributedTcpTracker::default(),
+        egress: TestNetwork::no_identity().egress(),
         tls_interception: Default::default(),
         reserved_dns: crate::reserved_dns::test_support::test_core(),
-        reserved_dns_cancellation: crate::state::ReservedDnsCancellation::default(),
         known_egress_state: crate::known_egress::KnownEgressState::new(vec![host.clone()]),
         debug_state: GatewayDebugState::default(),
         shutdown_token: CancellationToken::new(),
@@ -894,13 +892,13 @@ async fn devbox_full_proxy_run_extracts_sni_from_real_client() {
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     )
     .unwrap();
-    let state = GatewayNetworkState::pending_policy();
-    let loader: crate::state::PolicyLoader = {
+    let state = TestNetwork::pending_policy();
+    let loader: crate::egress::PolicyLoader = {
         let policy_ref = policy_ref.clone();
         Arc::new(move || {
             let policy_ref = policy_ref.clone();
             Box::pin(async move {
-                Ok(crate::state::PulledNetworkPolicy {
+                Ok(crate::egress::PulledNetworkPolicy {
                     policy: v1_allow_all(),
                     policy_ref,
                     network_credentials: Default::default(),
@@ -909,7 +907,7 @@ async fn devbox_full_proxy_run_extracts_sni_from_real_client() {
         })
     };
     let snapshot = state
-        .refresh(loader, None, crate::state::NetworkStateReason::Startup)
+        .refresh(loader, None, crate::egress::NetworkStateReason::Startup)
         .await;
     assert_eq!(snapshot.mode, crate::proto::NetworkState::Ready);
 
@@ -927,12 +925,9 @@ async fn devbox_full_proxy_run_extracts_sni_from_real_client() {
         sandbox_id: "devbox-validation",
         listener,
         stats: Arc::new(ProxyStats::new()),
-        network_state: state,
-        dns_allow_cache: DnsAllowCache::default(),
-        dns_attributed_connections: DnsAttributedTcpTracker::default(),
+        egress: state.egress(),
         tls_interception: Default::default(),
         reserved_dns: crate::reserved_dns::test_support::test_core(),
-        reserved_dns_cancellation: crate::state::ReservedDnsCancellation::default(),
         known_egress_state: crate::known_egress::KnownEgressState::default(),
         debug_state: debug_state.clone(),
         shutdown_token: shutdown.clone(),

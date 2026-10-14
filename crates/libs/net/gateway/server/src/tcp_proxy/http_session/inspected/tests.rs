@@ -2,6 +2,7 @@ use super::credentials::{credential_headers, inject};
 use super::forward::authorize_authority;
 use super::*;
 use crate::certificates::NetworkCredentialAccessError;
+use crate::egress::test_support::TestNetwork;
 use http::HeaderMap;
 use pplx_space_common_core::types::CredentialReferenceId;
 
@@ -101,20 +102,14 @@ const NETWORK_SECRET: &str = "Bearer network-secret-test-value";
 
 async fn credential_provider(
     include_material: bool,
-) -> (
-    crate::state::GatewayNetworkState,
-    crate::certificates::CertificateProvider,
-) {
+) -> (TestNetwork, crate::certificates::CertificateProvider) {
     credential_provider_for_header(include_material, "authorization").await
 }
 
 async fn credential_provider_for_header(
     include_material: bool,
     header_name: &str,
-) -> (
-    crate::state::GatewayNetworkState,
-    crate::certificates::CertificateProvider,
-) {
+) -> (TestNetwork, crate::certificates::CertificateProvider) {
     let bindings = [(header_name, NETWORK_REFERENCE_ID)];
     let material = include_material
         .then_some((NETWORK_REFERENCE_ID, NETWORK_SECRET))
@@ -126,10 +121,7 @@ async fn credential_provider_for_header(
 async fn credential_provider_with_material(
     bindings: &[(&str, &str)],
     material: &[(&str, &str)],
-) -> (
-    crate::state::GatewayNetworkState,
-    crate::certificates::CertificateProvider,
-) {
+) -> (TestNetwork, crate::certificates::CertificateProvider) {
     use pplx_space_credential_injection_core::proto::ResolvedNetworkCredential;
     use pplx_space_net_common::{
         CredentialHeaderBindingV1, NetworkCredentialDestinationV1, NetworkCredentialHttpMethodV1,
@@ -169,8 +161,8 @@ async fn credential_provider_with_material(
         })
         .collect();
     let snapshot =
-        crate::state::NetworkCredentialSnapshot::from_wire(credentials, &policy).unwrap();
-    let state = crate::state::GatewayNetworkState::pending_policy();
+        crate::egress::NetworkCredentialSnapshot::from_wire(credentials, &policy).unwrap();
+    let state = TestNetwork::pending_policy();
     let (_, _, provider) =
         crate::certificates::local_provider_with_policy(state.clone(), policy, snapshot).await;
     (state, provider)
@@ -293,7 +285,7 @@ async fn matching_policy_reports_service_unavailable_during_policy_refresh() {
         "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     )
     .unwrap();
-    let loader: crate::state::PolicyLoader = Arc::new(|| Box::pin(std::future::pending()));
+    let loader: crate::egress::PolicyLoader = Arc::new(|| Box::pin(std::future::pending()));
     let refreshing = tokio::spawn({
         let state = state.clone();
         async move {
@@ -301,7 +293,7 @@ async fn matching_policy_reports_service_unavailable_during_policy_refresh() {
                 .refresh(
                     loader,
                     Some(expected),
-                    crate::state::NetworkStateReason::ControlRefresh,
+                    crate::egress::NetworkStateReason::ControlRefresh,
                 )
                 .await
         }
@@ -349,12 +341,7 @@ async fn credential_refusal_before_origin(
         .get("allowed.test".parse().unwrap(), 443)
         .await
         .unwrap();
-    let binding = HostBinding::new(
-        "test",
-        "93.184.216.34:443".parse().unwrap(),
-        state,
-        Default::default(),
-    );
+    let binding = HostBinding::new("test", "93.184.216.34:443".parse().unwrap(), state.egress());
     let origin_connects = Arc::new(AtomicUsize::new(0));
     let observed = origin_connects.clone();
     let (guest, guest_peer) = tokio::io::duplex(4096);
@@ -398,12 +385,7 @@ async fn concurrent_http2_streams_keep_credential_decisions_request_local() {
         .get("allowed.test".parse().unwrap(), 443)
         .await
         .unwrap();
-    let binding = HostBinding::new(
-        "test",
-        "93.184.216.34:443".parse().unwrap(),
-        state,
-        Default::default(),
-    );
+    let binding = HostBinding::new("test", "93.184.216.34:443".parse().unwrap(), state.egress());
     let (origin, origin_peer) = tokio::io::duplex(4096);
     let (observed_tx, mut observed_rx) = tokio::sync::mpsc::channel(2);
     let origin_server = tokio::spawn(
@@ -482,12 +464,7 @@ async fn policy_change_during_origin_setup_never_forwards_buffered_credentials()
         .get("allowed.test".parse().unwrap(), 443)
         .await
         .unwrap();
-    let binding = HostBinding::new(
-        "test",
-        "93.184.216.34:443".parse().unwrap(),
-        state.clone(),
-        Default::default(),
-    );
+    let binding = HostBinding::new("test", "93.184.216.34:443".parse().unwrap(), state.egress());
     let (origin, mut origin_peer) = tokio::io::duplex(4096);
     let (connect_started_tx, connect_started_rx) = tokio::sync::oneshot::channel();
     let (connect_release_tx, connect_release_rx) = tokio::sync::oneshot::channel();
@@ -504,7 +481,7 @@ async fn policy_change_during_origin_setup_never_forwards_buffered_credentials()
 
     connect_started_rx.await.unwrap();
     state
-        .set_no_identity(crate::state::NetworkStateReason::NoIdentity)
+        .set_no_identity(crate::egress::NetworkStateReason::NoIdentity)
         .await;
     connect_release_tx.send(()).unwrap();
 
@@ -528,18 +505,13 @@ async fn fixture() -> (
     Arc<CertificateLease>,
     crate::tls_interception::TlsInterception,
 ) {
-    let state = crate::state::GatewayNetworkState::pending_policy();
+    let state = TestNetwork::pending_policy();
     let (root, _, provider) = crate::certificates::local_provider_with_state(state.clone()).await;
     let lease = provider
         .get("allowed.test".parse().unwrap(), 443)
         .await
         .unwrap();
-    let binding = HostBinding::new(
-        "test",
-        "93.184.216.34:443".parse().unwrap(),
-        state,
-        Default::default(),
-    );
+    let binding = HostBinding::new("test", "93.184.216.34:443".parse().unwrap(), state.egress());
     let mut roots = rustls::RootCertStore::empty();
     roots.add(root.der().clone()).unwrap();
     let tls = crate::tls_interception::TlsInterception::default().with_upstream_roots(roots);

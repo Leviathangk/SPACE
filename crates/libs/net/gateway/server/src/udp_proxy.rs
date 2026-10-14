@@ -19,7 +19,6 @@ use std::time::{Duration, Instant};
 
 use lru::LruCache;
 use pplx_space_metrics::gateway::{DnsAttributionCacheObservationSource, UdpDatagramRoute};
-use pplx_space_net_common::{EgressDecision, NetworkPolicyV1};
 use pplx_space_net_gateway_client::OUTBOUND_MARK;
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
@@ -30,33 +29,18 @@ use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
 
 use crate::UDP_MAPPING_TIMEOUT_SECS;
-use crate::dns::DnsAllowCache;
-use crate::egress::{
-    EgressContext, EgressPhase, EgressProtocol, admit_udp as evaluate_udp_egress, evaluate_egress,
-};
+use crate::egress::{DnsOperation, Egress, PolicyNotReady, UdpPolicy};
+use crate::egress::{EgressPhase, EgressProtocol};
 use crate::known_egress::KnownEgressState;
 use crate::orig_dst;
 use crate::reserved_dns::{ReservedDnsCore, ReservedResolver, ResolveOutcome};
 use crate::resource_budget::{MAX_ACTIVE_RESERVED_DNS_DATAGRAMS, MAX_ACTIVE_UDP_SESSIONS};
-use crate::state::{GatewayNetworkState, PolicyNotReady, ReservedDnsCancellation, TrafficPolicy};
 use crate::stats::ProxyStats;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct FlowKey {
     guest_src: SocketAddr,
     orig_dst: SocketAddr,
-}
-
-fn evaluate_reserved_dns_egress(
-    destination: SocketAddr,
-    policy: &NetworkPolicyV1,
-) -> EgressDecision {
-    evaluate_egress(
-        EgressContext::Admission(EgressProtocol::Udp),
-        destination,
-        false,
-        policy,
-    )
 }
 
 fn udp_datagram_route(destination: SocketAddr, is_reserved_dns: bool) -> UdpDatagramRoute {
@@ -81,7 +65,7 @@ const UDP_PENDING_MAX_BYTES: usize = 1024 * 1024;
 /// across the refresh and replayed within this window still gets its answer,
 /// whereas a shorter grace dropped it silently mid-refresh and surfaced as a
 /// resolver timeout (gaierror) in the guest.
-const UDP_PENDING_MAX_AGE: Duration = crate::state::TCP_PENDING_TIMEOUT;
+const UDP_PENDING_MAX_AGE: Duration = crate::egress::TCP_PENDING_TIMEOUT;
 const UDP_PENDING_REPLAY_INTERVAL: Duration = Duration::from_millis(25);
 const UDP_PENDING_REPLAY_BATCH_DATAGRAMS: usize = 16;
 /// A response task emits at most one terminal event, so a queue sized to the
@@ -363,11 +347,9 @@ pub struct UdpProxyConfig {
     pub sandbox_id: &'static str,
     pub listener: std::net::UdpSocket,
     pub stats: Arc<ProxyStats>,
-    pub network_state: GatewayNetworkState,
-    pub dns_allow_cache: DnsAllowCache,
+    pub egress: Egress,
     pub known_egress_state: KnownEgressState,
     pub reserved_dns: ReservedDnsCore,
-    pub reserved_dns_cancellation: ReservedDnsCancellation,
     pub shutdown_token: CancellationToken,
 }
 
@@ -388,11 +370,9 @@ struct UdpProxy {
     sandbox_id: &'static str,
     started_at: Instant,
     stats: Arc<ProxyStats>,
-    network_state: GatewayNetworkState,
-    dns_allow_cache: DnsAllowCache,
+    egress: Egress,
     known_egress_state: KnownEgressState,
     reserved_dns: ReservedDnsCore,
-    reserved_dns_cancellation: ReservedDnsCancellation,
     shutdown_token: CancellationToken,
     reserved_dns_tasks: TaskTracker,
     reserved_dns_task_slots: Arc<Semaphore>,
@@ -416,11 +396,9 @@ impl UdpProxy {
             sandbox_id,
             listener,
             stats,
-            network_state,
-            dns_allow_cache,
+            egress,
             known_egress_state,
             reserved_dns,
-            reserved_dns_cancellation,
             shutdown_token,
         } = config;
         let (session_event_tx, session_event_rx) =
@@ -437,11 +415,9 @@ impl UdpProxy {
             sandbox_id,
             started_at: Instant::now(),
             stats,
-            network_state,
-            dns_allow_cache,
+            egress,
             known_egress_state,
             reserved_dns,
-            reserved_dns_cancellation,
             shutdown_token,
             reserved_dns_tasks,
             reserved_dns_task_slots: Arc::new(Semaphore::new(MAX_ACTIVE_RESERVED_DNS_DATAGRAMS)),
@@ -543,14 +519,11 @@ impl UdpProxy {
             guest_src: src_addr,
             orig_dst,
         };
-        let reserved = self
-            .reserved_dns
-            .resolver_for(flow.orig_dst.ip())
-            .map(|resolver| (resolver, self.reserved_dns_cancellation.operation_token()));
+        let reserved = self.reserved_dns.resolver_for(flow.orig_dst.ip());
 
-        let policy = match self.network_state.udp_policy().await {
-            TrafficPolicy::Ready(policy) => policy,
-            TrafficPolicy::NotReady(reason) => {
+        let policy = match self.egress.udp().await {
+            Ok(policy) => policy,
+            Err(reason) => {
                 if reason == PolicyNotReady::PendingPolicy {
                     self.pending_udp.push(
                         flow,
@@ -590,7 +563,7 @@ impl UdpProxy {
                     // No policy installed yet, so no version.
                     "unknown",
                     reason.as_str(),
-                    crate::tcp_proxy::interception_for_not_ready(reason),
+                    reason.interception_label(),
                 );
                 return;
             }
@@ -611,11 +584,10 @@ impl UdpProxy {
             // reserved-DNS work. Recheck the interception dependency gate for
             // each buffered send; a dependency can become unavailable between
             // two iterations of the same batch.
-            let reserved_policy_cancellation = self.reserved_dns_cancellation.operation_token();
-            let policy = match self.network_state.udp_policy().await {
-                TrafficPolicy::Ready(policy) => policy,
-                TrafficPolicy::NotReady(PolicyNotReady::PendingPolicy) => break,
-                TrafficPolicy::NotReady(_) => {
+            let policy = match self.egress.udp().await {
+                Ok(policy) => policy,
+                Err(PolicyNotReady::PendingPolicy) => break,
+                Err(_) => {
                     self.pending_udp.clear_dropped(
                         PendingUdpClearReason::NonReadyPolicy,
                         self.sandbox_id,
@@ -630,24 +602,15 @@ impl UdpProxy {
             replayed = true;
             pplx_space_metrics::gateway::udp_pending_buffer("replayed");
             pplx_space_metrics::gateway::pending_udp_datagram("replayed");
-            self.forward_udp_datagram(datagram, policy, &reserved_policy_cancellation)
-                .await;
+            self.forward_udp_datagram(datagram, policy).await;
         }
         if replayed {
             self.pending_udp.update_stats(&self.stats);
         }
     }
 
-    async fn forward_udp_datagram(
-        &mut self,
-        datagram: PendingUdpDatagram,
-        policy: Arc<NetworkPolicyV1>,
-        reserved_policy_cancellation: &CancellationToken,
-    ) {
-        let reserved = self
-            .reserved_dns
-            .resolver_for(datagram.flow.orig_dst.ip())
-            .map(|resolver| (resolver, reserved_policy_cancellation.child_token()));
+    async fn forward_udp_datagram(&mut self, datagram: PendingUdpDatagram, policy: UdpPolicy) {
+        let reserved = self.reserved_dns.resolver_for(datagram.flow.orig_dst.ip());
         self.forward_udp_bytes(datagram.flow, datagram.bytes.as_slice(), policy, reserved)
             .await;
     }
@@ -656,14 +619,14 @@ impl UdpProxy {
         &mut self,
         flow: FlowKey,
         bytes: &[u8],
-        policy: Arc<NetworkPolicyV1>,
-        reserved: Option<(ReservedResolver, CancellationToken)>,
+        policy: UdpPolicy,
+        reserved: Option<ReservedResolver>,
     ) {
         let route = udp_datagram_route(flow.orig_dst, reserved.is_some());
         let decision = if reserved.is_some() {
-            evaluate_reserved_dns_egress(flow.orig_dst, policy.as_ref())
+            policy.admit_dns(flow.orig_dst)
         } else {
-            evaluate_udp_egress(&self.dns_allow_cache, flow.orig_dst, policy.as_ref())
+            policy.admit(flow.orig_dst)
         };
         pplx_space_metrics::gateway::udp_datagram(route, decision.is_allowed());
         if !decision.is_allowed() {
@@ -683,14 +646,13 @@ impl UdpProxy {
             return;
         }
 
-        if let Some((resolver, policy_cancellation)) = reserved {
+        if let Some(resolver) = reserved {
             self.stats.add_network_tx_bytes(bytes.len() as u64);
             self.forward_reserved_dns_datagram(
                 flow,
                 resolver,
                 bytes,
-                policy,
-                policy_cancellation,
+                policy.into_dns(),
                 create_response_socket,
             )
             .await;
@@ -740,8 +702,7 @@ impl UdpProxy {
         flow: FlowKey,
         resolver: ReservedResolver,
         wire: &[u8],
-        policy: Arc<NetworkPolicyV1>,
-        policy_cancellation: CancellationToken,
+        operation: DnsOperation,
         response_socket_factory: impl FnOnce(SocketAddr) -> std::io::Result<UdpSocket>,
     ) {
         let permit = Arc::clone(&self.reserved_dns_task_slots).try_acquire_owned();
@@ -778,7 +739,6 @@ impl UdpProxy {
 
         let wire = wire.to_vec();
         let reserved_dns = self.reserved_dns.clone();
-        let dns_allow_cache = self.dns_allow_cache.clone();
         let stats = Arc::clone(&self.stats);
         let gateway_shutdown = self.shutdown_token.clone();
         let sandbox_id = self.sandbox_id;
@@ -791,17 +751,17 @@ impl UdpProxy {
                     sandbox_id,
                     resolver,
                     &wire,
-                    policy.as_ref(),
-                    &policy_cancellation,
+                    operation.policy(),
+                    operation.cancellation(),
                 ) => outcome,
             };
             let ResolveOutcome::Reply(reply) = outcome else {
                 return;
             };
-            if reply.is_empty() || policy_cancellation.is_cancelled() {
+            if reply.is_empty() || operation.cancellation().is_cancelled() {
                 return;
             }
-            let accepted = dns_allow_cache.observe_response(&reply, policy.as_ref());
+            let accepted = operation.observe_response(&reply);
             pplx_space_metrics::gateway::dns_attribution_cache_observation(
                 DnsAttributionCacheObservationSource::ReservedDns,
                 accepted,
@@ -809,7 +769,7 @@ impl UdpProxy {
             tokio::select! {
                 biased;
                 () = gateway_shutdown.cancelled() => {}
-                () = policy_cancellation.cancelled() => {}
+                () = operation.cancellation().cancelled() => {}
                 result = tokio::time::timeout(
                     Duration::from_secs(1),
                     response_socket.send_to(&reply, flow.guest_src),

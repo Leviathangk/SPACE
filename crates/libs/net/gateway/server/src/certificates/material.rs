@@ -10,7 +10,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::sign::CertifiedKey;
 use tokio_util::sync::CancellationToken;
 
-use crate::state::{GatewayNetworkState, NetworkCredentialSnapshotError};
+use crate::egress::{Egress, NetworkCredentialSnapshotError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CertificateError {
@@ -32,7 +32,7 @@ pub(crate) enum NetworkCredentialAccessError {
 
 #[derive(Clone)]
 pub(super) struct Fence {
-    pub state: GatewayNetworkState,
+    pub state: Egress,
     pub policy: Arc<NetworkPolicyV1>,
     pub identity: CancellationToken,
     pub shutdown: CancellationToken,

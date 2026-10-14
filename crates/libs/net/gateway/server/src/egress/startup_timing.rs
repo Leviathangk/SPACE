@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use pplx_space_metrics::gateway::readiness::{self as metrics, Outcome};
 use pplx_space_net_common::TlsInterception;
 
-use super::{NetworkStateInner, lifecycle::PolicyLifecycle};
+use super::policy::{NetworkStateInner, PolicyLifecycle};
 
 pub(super) struct StartupTiming {
     startup: Mutex<Startup>,

@@ -15,6 +15,7 @@ use tonic::{Request, Response, Status, metadata::MetadataValue};
 use tracing::info;
 
 use crate::debug::GatewayDebugState;
+use crate::egress::{InterceptionReadiness, NetworkStateReason, PolicyControl, PolicyLoader};
 use crate::execution::{
     route_identity_from_proto, status_for_route_identity_parse, status_for_route_identity_update,
 };
@@ -32,7 +33,6 @@ use crate::proto::{
     SetRouteVerificationKeysRequest, SetRouteVerificationKeysResponse,
 };
 use crate::route_verification::{RouteVerificationUpdateError, verification_key_from_wire};
-use crate::state::{GatewayNetworkState, InterceptionReadiness, NetworkStateReason, PolicyLoader};
 use crate::stats::ProxyStats;
 use pplx_space_net_common::proto::TlsInterception as ProtoTlsInterception;
 use pplx_space_net_gateway_client::IDENTITY_PROFILE_VERSION;
@@ -50,7 +50,7 @@ const ALLOW_NET_SERVICE: &[UdsPeerPrincipal] = &[
 
 pub struct NetGatewayControlService {
     stats: Arc<ProxyStats>,
-    network_state: GatewayNetworkState,
+    network_state: PolicyControl,
     policy_loader: PolicyLoader,
     /// Verbose debug-logging toggle, shared with the proxy hot paths.
     /// `EnableDebug` flips this on for a sandbox-scoped, self-expiring window.
@@ -63,7 +63,7 @@ pub struct NetGatewayControlService {
 impl NetGatewayControlService {
     pub fn new(
         stats: Arc<ProxyStats>,
-        network_state: GatewayNetworkState,
+        network_state: PolicyControl,
         policy_loader: PolicyLoader,
         debug_state: GatewayDebugState,
         service_port_ingress: ServicePortIngressState,
@@ -220,7 +220,7 @@ impl NetGatewayControl for NetGatewayControlService {
         let inbound = request.into_inner();
         open_service_port_ingress(
             self.service_port_ingress.clone(),
-            self.network_state.clone(),
+            self.network_state.policies(),
             metadata,
             inbound,
             self.shutdown_token.child_token(),

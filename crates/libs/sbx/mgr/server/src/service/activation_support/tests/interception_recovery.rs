@@ -16,12 +16,12 @@ use pplx_space_net_gateway::certificates::{
 };
 use pplx_space_net_gateway::control::NetGatewayControlService;
 use pplx_space_net_gateway::debug::GatewayDebugState;
-use pplx_space_net_gateway::ingress::ServicePortIngressState;
-use pplx_space_net_gateway::proto::net_gateway_control_server::NetGatewayControl;
-use pplx_space_net_gateway::state::{
-    GatewayNetworkState, NetworkCredentialSnapshot, PolicyLoader, PolicyNotReady,
+use pplx_space_net_gateway::egress::{
+    GatewayNetwork, InitialPolicyState, NetworkCredentialSnapshot, PolicyLoader, PolicyNotReady,
     PulledNetworkPolicy, TrafficPolicy,
 };
+use pplx_space_net_gateway::ingress::ServicePortIngressState;
+use pplx_space_net_gateway::proto::net_gateway_control_server::NetGatewayControl;
 use pplx_space_spaced_common::proto::host_control::host_control_server::HostControlServer;
 
 use rcgen::{
@@ -231,12 +231,12 @@ async fn exercise_recovery(restore: bool) {
             shutdown.clone(),
         )
     };
-    let network = GatewayNetworkState::pending_policy();
-    let network = network.with_traffic_gate({
-        let authority = authority.clone();
-        Arc::new(move || authority.is_ready())
-    });
-    let gateway_task = AbortOnDropHandle::new(authority.spawn(network.clone()));
+    let readiness = authority.readiness();
+    let network = GatewayNetwork::new(
+        InitialPolicyState::PendingPolicy,
+        Some(Arc::new(move || readiness.is_ready())),
+    );
+    let gateway_task = AbortOnDropHandle::new(authority.spawn(network.policies()));
     let policy_ref = EffectiveNetworkPolicyRef::local(
         EffectiveNetworkPolicyRefScope::Sandbox,
         &id,
@@ -257,7 +257,7 @@ async fn exercise_recovery(restore: bool) {
     });
     let control = Arc::new(NetGatewayControlService::new(
         Arc::default(),
-        network.clone(),
+        network.control(),
         loader,
         GatewayDebugState::default(),
         ingress,
@@ -340,18 +340,17 @@ async fn exercise_recovery(restore: bool) {
         ),
         "successful startup must disarm cleanup"
     );
-    for policy in [
-        network.wait_for_tcp_policy().await,
-        network.udp_policy().await,
-    ] {
-        assert!(matches!(
-            policy,
-            TrafficPolicy::NotReady(PolicyNotReady::InterceptionNotReady)
-        ));
-    }
+    assert!(matches!(
+        network.egress().wait_for_tcp_policy().await,
+        TrafficPolicy::NotReady(PolicyNotReady::InterceptionNotReady)
+    ));
+    assert!(matches!(
+        network.egress().udp().await,
+        Err(PolicyNotReady::InterceptionNotReady)
+    ));
     let provider = CertificateProvider::new(
         authority.clone(),
-        CertificateContext::new(network.clone(), shutdown.clone()),
+        CertificateContext::new(network.egress(), shutdown.clone()),
     );
     provider
         .get("recovery.example".parse().unwrap(), 443)
@@ -383,7 +382,7 @@ async fn exercise_recovery(restore: bool) {
     );
     assert_same_execution(&service, &id, &identity, gateway_pid);
     assert!(matches!(
-        network.wait_for_tcp_policy().await,
+        network.egress().wait_for_tcp_policy().await,
         TrafficPolicy::Ready(_)
     ));
     let certificate = provider

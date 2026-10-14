@@ -1,4 +1,6 @@
 use super::*;
+use crate::egress::test_support::TestNetwork;
+use crate::proto::NetworkState;
 
 #[tokio::test]
 async fn ingress_stream_holds_admission_until_stream_drop() {
@@ -41,18 +43,18 @@ use pplx_space_common_svc::space_api_route_ed25519::{
 use pplx_space_net_common::{EffectiveNetworkPolicyRef, EffectiveNetworkPolicyRefScope};
 use tonic::metadata::MetadataMap;
 
-async fn ready_network_state() -> GatewayNetworkState {
-    let state = GatewayNetworkState::pending_policy();
+async fn ready_network_state() -> PolicyView {
+    let state = TestNetwork::pending_policy();
     let policy_ref = EffectiveNetworkPolicyRef::local(
         EffectiveNetworkPolicyRefScope::Sandbox,
         "sandbox",
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     )
     .expect("policy ref parses");
-    let loader: crate::state::PolicyLoader = Arc::new(move || {
+    let loader: crate::egress::PolicyLoader = Arc::new(move || {
         let policy_ref = policy_ref.clone();
         Box::pin(async move {
-            Ok(crate::state::PulledNetworkPolicy {
+            Ok(crate::egress::PulledNetworkPolicy {
                 policy: pplx_space_net_common::NetworkPolicyV1::allow_all(),
                 policy_ref,
                 network_credentials: Default::default(),
@@ -60,10 +62,10 @@ async fn ready_network_state() -> GatewayNetworkState {
         })
     });
     let snapshot = state
-        .refresh(loader, None, crate::state::NetworkStateReason::Startup)
+        .refresh(loader, None, crate::egress::NetworkStateReason::Startup)
         .await;
     assert_eq!(snapshot.mode, NetworkState::Ready);
-    state
+    state.policies()
 }
 
 fn test_activation_attempt_id() -> SandboxActivationAttemptId {

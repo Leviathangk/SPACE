@@ -5,7 +5,7 @@ mod client;
 mod material;
 mod timing;
 
-pub use authority::GatewayAuthority;
+pub use authority::{AuthorityReadiness, GatewayAuthority};
 pub use client::{CertificateContext, CertificateProvider};
 pub(crate) use material::NetworkCredentialAccessError;
 pub use material::{CertificateError, CertificateLease};

@@ -7,11 +7,12 @@ use pplx_space_net_common::{
     DenyReason, DomainName, EgressDecision, NetworkPolicyV1, TlsInterception,
 };
 
-use super::{
-    AdmittedTcp, EgressContext, EgressProtocol, TcpAdmissionEvidence, authorize_domain,
-    dns_allow_required, record_decision, record_latency,
+use super::admission::{
+    EgressContext, EgressProtocol, authorize_domain, dns_allow_required, record_decision,
+    record_latency,
 };
-use crate::dns::DnsAllowCache;
+use super::attribution::DnsAllowCache;
+use super::evidence::{AdmittedTcp, TcpAdmissionEvidence};
 use crate::tls_sni::{ClientHelloScan, MissingClientHello};
 
 pub(crate) fn dns_attributed_host<'a>(

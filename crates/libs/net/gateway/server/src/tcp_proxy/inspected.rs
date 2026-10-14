@@ -39,7 +39,7 @@ impl TcpProxy {
         async {
             tracing::Span::current().record(
                 "policy_ref",
-                &self.network_state.snapshot().await.installed_policy_ref,
+                &self.egress.snapshot().await.installed_policy_ref,
             );
             let destination = admitted.destination();
             if destination.port() != lease.port() {
@@ -53,12 +53,7 @@ impl TcpProxy {
                 let (downstream, negotiated) =
                     tls::accept(client, &lease, &self.tls_interception).await?;
                 tracing::Span::current().record("negotiated", negotiated.as_str());
-                let binding = HostBinding::new(
-                    self.sandbox_id,
-                    destination,
-                    self.network_state.clone(),
-                    self.dns_allow_cache.clone(),
-                );
+                let binding = HostBinding::new(self.sandbox_id, destination, self.egress.clone());
                 let interception = self.tls_interception.clone();
                 let upstream_lease = lease.clone();
                 let wire_read = accounting.read.clone();

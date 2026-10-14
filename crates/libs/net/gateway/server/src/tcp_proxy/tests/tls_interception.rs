@@ -62,12 +62,9 @@ async fn interception_wiring_preserves_admission_and_never_falls_back_to_relay()
         let proxy = TcpProxy {
             sandbox_id: "test",
             stats: Arc::new(ProxyStats::new()),
-            network_state,
-            dns_allow_cache: DnsAllowCache::default(),
-            dns_attributed_connections: DnsAttributedTcpTracker::default(),
+            egress: network_state.egress(),
             tls_interception,
             reserved_dns: crate::reserved_dns::test_support::test_core(),
-            reserved_dns_cancellation: ReservedDnsCancellation::default(),
             known_egress_state: KnownEgressState::default(),
             debug_state: GatewayDebugState::default(),
             shutdown_token: CancellationToken::new(),
@@ -318,7 +315,7 @@ async fn interception_exemptions_relay_original_tls_only_after_admission() {
             ));
         }
         let (network_state, installed) = ready_policy(policy).await;
-        let dns_allow_cache = DnsAllowCache::default();
+        let dns_allow_cache = network_state.cache();
         if matches!(
             name,
             "exempt host" | "DNS-bound host" | "bound host with IP allow"
@@ -345,15 +342,12 @@ async fn interception_exemptions_relay_original_tls_only_after_admission() {
         let proxy = TcpProxy {
             sandbox_id: "test",
             stats: Arc::new(ProxyStats::new()),
-            network_state,
-            dns_allow_cache,
-            dns_attributed_connections: DnsAttributedTcpTracker::default(),
+            egress: network_state.egress(),
             tls_interception: TlsInterception::new(Arc::new(move |_, _| {
                 recorded.fetch_add(1, Ordering::Relaxed);
                 Box::pin(async { Err(tonic::Status::unavailable("synthetic signer")) })
             })),
             reserved_dns: crate::reserved_dns::test_support::test_core(),
-            reserved_dns_cancellation: ReservedDnsCancellation::default(),
             known_egress_state: KnownEgressState::default(),
             debug_state: GatewayDebugState::default(),
             shutdown_token: CancellationToken::new(),

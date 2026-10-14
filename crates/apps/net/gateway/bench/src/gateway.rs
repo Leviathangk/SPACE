@@ -14,14 +14,12 @@ use pplx_space_net_common::{
     EffectiveNetworkPolicyRef, EffectiveNetworkPolicyRefScope, NetworkPolicyV1,
 };
 use pplx_space_net_gateway::debug::GatewayDebugState;
-use pplx_space_net_gateway::dns::DnsAllowCache;
-use pplx_space_net_gateway::egress::DnsAttributedTcpTracker;
+use pplx_space_net_gateway::egress::{
+    GatewayNetwork, InitialPolicyState, NetworkStateReason, PolicyControl, PolicyLoader,
+    PulledNetworkPolicy,
+};
 use pplx_space_net_gateway::known_egress::KnownEgressState;
 use pplx_space_net_gateway::reserved_dns::ReservedDnsCore;
-use pplx_space_net_gateway::state::{
-    GatewayNetworkState, NetworkStateReason, PolicyLoader, PulledNetworkPolicy,
-    ReservedDnsCancellation,
-};
 use pplx_space_net_gateway::stats::ProxyStats;
 use pplx_space_net_gateway::{tcp_proxy, udp_proxy};
 use tokio::net::TcpListener;
@@ -84,10 +82,9 @@ pub async fn serve(args: GatewayArgs) -> anyhow::Result<()> {
         .with_context(|| format!("failed to bind transparent UDP socket on {}", args.udp_port))?;
 
     let stats = Arc::new(ProxyStats::new());
-    let dns_allow_cache = DnsAllowCache::default();
-    let network_state = GatewayNetworkState::pending_policy();
+    let network = GatewayNetwork::new(InitialPolicyState::PendingPolicy, None);
     let known_egress_state = KnownEgressState::default();
-    let installed_policy_ref = install_policy(&network_state, args.policy).await?;
+    let installed_policy_ref = install_policy(&network.control(), args.policy).await?;
     let reserved_dns =
         ReservedDnsCore::new().context("failed to initialize reserved-DNS resolution")?;
 
@@ -96,12 +93,9 @@ pub async fn serve(args: GatewayArgs) -> anyhow::Result<()> {
         sandbox_id,
         listener: tcp_listener,
         stats: stats.clone(),
-        network_state: network_state.clone(),
-        dns_allow_cache: dns_allow_cache.clone(),
-        dns_attributed_connections: DnsAttributedTcpTracker::default(),
+        egress: network.egress(),
         tls_interception: Default::default(),
         reserved_dns: reserved_dns.clone(),
-        reserved_dns_cancellation: ReservedDnsCancellation::default(),
         known_egress_state: known_egress_state.clone(),
         debug_state: GatewayDebugState::default(),
         shutdown_token: shutdown.child_token(),
@@ -110,11 +104,9 @@ pub async fn serve(args: GatewayArgs) -> anyhow::Result<()> {
         sandbox_id,
         listener: udp_socket,
         stats,
-        network_state,
-        dns_allow_cache,
+        egress: network.egress(),
         known_egress_state,
         reserved_dns,
-        reserved_dns_cancellation: ReservedDnsCancellation::default(),
         shutdown_token: shutdown.child_token(),
     })));
 
@@ -147,7 +139,7 @@ pub async fn serve(args: GatewayArgs) -> anyhow::Result<()> {
 /// Drive the state machine to `Ready` through the same `refresh` the control RPC
 /// uses, with a loader that returns a fixed policy instead of calling
 /// host-control. `Pending` skips the refresh so the proxy sees no policy.
-async fn install_policy(state: &GatewayNetworkState, kind: PolicyKind) -> anyhow::Result<String> {
+async fn install_policy(state: &PolicyControl, kind: PolicyKind) -> anyhow::Result<String> {
     let Some(policy) = kind.policy() else {
         return Ok(String::new());
     };

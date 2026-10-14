@@ -8,7 +8,7 @@ use super::source::{HydrateNetworkStateError, PulledNetworkPolicy};
 use crate::proto::{NetworkPolicyErrorKind, NetworkState};
 
 #[derive(Clone, Debug)]
-pub(super) enum PolicyLifecycle {
+pub(in crate::egress) enum PolicyLifecycle {
     NoIdentity,
     Pending {
         previous: Option<Arc<InstalledPolicy>>,
@@ -22,7 +22,7 @@ pub(super) enum PolicyLifecycle {
 }
 
 impl PolicyLifecycle {
-    pub(super) fn installed(&self) -> Option<&Arc<InstalledPolicy>> {
+    pub(in crate::egress) fn installed(&self) -> Option<&Arc<InstalledPolicy>> {
         match self {
             Self::Ready(installed) => Some(installed),
             Self::Pending { previous } | Self::Draining { previous } => previous.as_ref(),
@@ -30,21 +30,21 @@ impl PolicyLifecycle {
         }
     }
 
-    pub(super) fn ready(&self) -> Option<&Arc<InstalledPolicy>> {
+    pub(in crate::egress) fn ready(&self) -> Option<&Arc<InstalledPolicy>> {
         match self {
             Self::Ready(installed) => Some(installed),
             _ => None,
         }
     }
 
-    pub(super) fn failure(&self) -> Option<&HydrationFailure> {
+    pub(in crate::egress) fn failure(&self) -> Option<&HydrationFailure> {
         match self {
             Self::PolicyError(failure) => Some(failure),
             _ => None,
         }
     }
 
-    pub(super) fn mode(&self) -> NetworkState {
+    pub(in crate::egress) fn mode(&self) -> NetworkState {
         match self {
             Self::NoIdentity => NetworkState::NoIdentity,
             Self::Pending { .. } => NetworkState::PendingPolicy,
@@ -55,19 +55,19 @@ impl PolicyLifecycle {
         }
     }
 
-    pub(super) fn error_kind(&self) -> NetworkPolicyErrorKind {
+    pub(in crate::egress) fn error_kind(&self) -> NetworkPolicyErrorKind {
         self.failure()
             .map_or(NetworkPolicyErrorKind::None, HydrationFailure::kind)
     }
 }
 
 #[derive(Debug)]
-pub(super) struct InstalledPolicy {
+pub(in crate::egress) struct InstalledPolicy {
     // Each install allocates this Arc once. Existing traffic leases use its
     // identity to fence the complete bundle, including same-reference reloads.
-    pub(super) policy: Arc<NetworkPolicyV1>,
-    pub(super) credentials: NetworkCredentialSnapshot,
-    pub(super) reference: EffectiveNetworkPolicyRef,
+    pub(in crate::egress) policy: Arc<NetworkPolicyV1>,
+    pub(in crate::egress) credentials: NetworkCredentialSnapshot,
+    pub(in crate::egress) reference: EffectiveNetworkPolicyRef,
 }
 
 impl From<PulledNetworkPolicy> for InstalledPolicy {
@@ -81,7 +81,7 @@ impl From<PulledNetworkPolicy> for InstalledPolicy {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(super) enum HydrationFailure {
+pub(in crate::egress) enum HydrationFailure {
     #[error("policy ref mismatch: expected {expected}, got {actual}")]
     ReferenceMismatch {
         expected: EffectiveNetworkPolicyRef,

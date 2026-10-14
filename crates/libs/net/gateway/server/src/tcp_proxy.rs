@@ -22,18 +22,16 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::debug::GatewayDebugState;
-use crate::dns::DnsAllowCache;
+use crate::egress::{DnsPolicyError, Egress, PolicyNotReady, TrafficPolicy};
 use crate::egress::{EgressPhase, EgressProtocol};
 use crate::known_egress::KnownEgressState;
 use crate::reserved_dns::ReservedDnsCore;
 use crate::resource_budget::MAX_ACTIVE_TCP_CONNECTIONS;
 use crate::sniff;
-use crate::state::{GatewayNetworkState, PolicyNotReady, ReservedDnsCancellation, TrafficPolicy};
 use crate::stats::ProxyStats;
 use crate::tls_interception::{TlsInterception, TlsInterceptionError};
 
 mod accounting;
-mod admission;
 mod http_session;
 mod inspected;
 mod relay;
@@ -41,7 +39,6 @@ mod reserved_dns;
 pub(crate) mod tls;
 mod transport;
 
-use crate::egress::DnsAttributedTcpTracker;
 use crate::egress::{AdmittedTcp, TcpAdmissionDenial};
 pub use pplx_space_net_gateway_client::TcpDomainAuthorizationMode;
 
@@ -49,12 +46,9 @@ pub struct TcpProxyConfig {
     pub sandbox_id: &'static str,
     pub listener: TcpListener,
     pub stats: Arc<ProxyStats>,
-    pub network_state: GatewayNetworkState,
-    pub dns_allow_cache: DnsAllowCache,
-    pub dns_attributed_connections: DnsAttributedTcpTracker,
+    pub egress: Egress,
     pub tls_interception: TlsInterception,
     pub reserved_dns: ReservedDnsCore,
-    pub reserved_dns_cancellation: ReservedDnsCancellation,
     pub known_egress_state: KnownEgressState,
     /// Verbose debug-logging toggle. When enabled (via `EnableDebug`), the proxy
     /// emits a structured per-flow log of each TLS ClientHello SNI scan. Gated so
@@ -77,12 +71,9 @@ pub async fn run(config: TcpProxyConfig) -> io::Result<()> {
         sandbox_id,
         listener,
         stats,
-        network_state,
-        dns_allow_cache,
-        dns_attributed_connections,
+        egress,
         tls_interception,
         reserved_dns,
-        reserved_dns_cancellation,
         known_egress_state,
         debug_state,
         shutdown_token,
@@ -93,12 +84,9 @@ pub async fn run(config: TcpProxyConfig) -> io::Result<()> {
     TcpProxy {
         sandbox_id,
         stats,
-        network_state,
-        dns_allow_cache,
-        dns_attributed_connections,
+        egress,
         tls_interception,
         reserved_dns,
-        reserved_dns_cancellation,
         known_egress_state,
         debug_state,
         shutdown_token: proxy_shutdown_token,
@@ -118,12 +106,9 @@ const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 struct TcpProxy {
     sandbox_id: &'static str,
     stats: Arc<ProxyStats>,
-    network_state: GatewayNetworkState,
-    dns_allow_cache: DnsAllowCache,
-    dns_attributed_connections: DnsAttributedTcpTracker,
+    egress: Egress,
     tls_interception: TlsInterception,
     reserved_dns: ReservedDnsCore,
-    reserved_dns_cancellation: ReservedDnsCancellation,
     known_egress_state: KnownEgressState,
     debug_state: GatewayDebugState,
     shutdown_token: CancellationToken,
@@ -448,50 +433,39 @@ impl TcpProxy {
     ) -> (Option<DomainName>, FlowOutcome) {
         abort_on_close(&client);
         if let Some(resolver) = self.reserved_dns.resolver_for(dst.ip()) {
-            // Take the cancellation token before reading policy. A concurrent
-            // install therefore either cancels this connection or precedes
-            // the policy snapshot used below.
-            let policy_cancellation = self.reserved_dns_cancellation.operation_token();
-            let policy = tokio::select! {
-                biased;
-                () = policy_cancellation.cancelled() => return (None, FlowOutcome::Cancelled),
-                policy = self.network_state.wait_for_tcp_policy() => policy,
-            };
-            let policy = match policy {
-                TrafficPolicy::Ready(policy) => policy,
-                TrafficPolicy::NotReady(reason) => {
+            let operation = match self.egress.dns_tcp().await {
+                Ok(operation) => operation,
+                Err(DnsPolicyError::Cancelled) => return (None, FlowOutcome::Cancelled),
+                Err(DnsPolicyError::NotReady(reason)) => {
                     return (
                         None,
                         FlowOutcome::Rejected(Rejection::PolicyMissing(reason)),
                     );
                 }
             };
-            let _admitted = match self.admit_reserved_dns_destination(dst, policy.as_ref()) {
-                Ok(admitted) => admitted,
-                Err(reason) => {
-                    return (None, FlowOutcome::Rejected(Rejection::Admission(reason)));
-                }
-            };
+            if let pplx_space_net_common::EgressDecision::Deny { reason } =
+                operation.admit_destination(dst, EgressProtocol::Tcp)
+            {
+                return (
+                    None,
+                    FlowOutcome::Rejected(Rejection::Admission(
+                        TcpAdmissionDenial::DnsAttribution(reason),
+                    )),
+                );
+            }
             close_gracefully(&client);
             return (
                 None,
-                reserved_dns::serve(
-                    self,
-                    client,
-                    resolver,
-                    policy.as_ref(),
-                    &policy_cancellation,
-                )
-                .await,
+                reserved_dns::serve(self, client, resolver, &operation).await,
             );
         }
 
         let mut inspection = accounting::Attempt::inspection_admission();
-        let policy = self.network_state.wait_for_tcp_policy().await;
+        let policy = self.egress.wait_for_tcp_policy().await;
         // Policy readiness remains first on the success path. A failed wait
         // still gets one bounded, non-consuming peek so its diagnostic can
         // identify a configured TLS destination.
-        let missing_client_hello = self.missing_client_hello(dst, &policy);
+        let missing_client_hello = self.egress.missing_client_hello(dst, &policy);
         let observation = sniff::client_hello_with_detail(&client, missing_client_hello).await;
         let peek_elapsed = observation.elapsed;
         let scan = observation.scan;
@@ -527,7 +501,10 @@ impl TcpProxy {
             }
         };
 
-        let admission = match self.admit(dst, &scan, &policy) {
+        let admission = match self
+            .egress
+            .tcp(dst, &scan, policy.clone(), shutdown.clone())
+        {
             Ok(admitted) => admitted,
             Err(reason) => {
                 inspection.finish(
@@ -544,12 +521,7 @@ impl TcpProxy {
         };
         let admitted = admission.route();
         let interception_mode = admission.interception_mode();
-        // Register before the final current-policy check so a concurrent
-        // update either rejects this handoff or sees the flow in its resweep.
-        let connection = self
-            .dns_attributed_connections
-            .register(admission, shutdown.clone());
-        if let Err(reason) = self.validate_admission_policy(&policy) {
+        if let Err(reason) = admission.recheck() {
             inspection.finish(accounting::Outcome::Cancelled, reason.label());
             return (host, FlowOutcome::Rejected(Rejection::Admission(reason)));
         }
@@ -570,7 +542,7 @@ impl TcpProxy {
                 );
             }
         };
-        if let Err(reason) = self.validate_admission_policy(&policy) {
+        if let Err(reason) = admission.recheck() {
             inspection.finish(accounting::Outcome::Cancelled, reason.label());
             return (host, FlowOutcome::Rejected(Rejection::Admission(reason)));
         }
@@ -598,7 +570,7 @@ impl TcpProxy {
                 }
             }
         };
-        drop(connection);
+        drop(admission);
         (host, outcome)
     }
 
@@ -663,12 +635,7 @@ impl TcpProxy {
         Fut: Future<Output = Result<U, transport::Error>> + Send + 'static,
         U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let binding = http_session::HostBinding::new(
-            self.sandbox_id,
-            dst,
-            self.network_state.clone(),
-            self.dns_allow_cache.clone(),
-        );
+        let binding = http_session::HostBinding::new(self.sandbox_id, dst, self.egress.clone());
         match http_session::serve_plaintext(client, binding, connect).await {
             Ok(served) => FlowOutcome::Relayed(Relay::HostBoundHttp {
                 requests: served.requests,
@@ -738,7 +705,7 @@ impl TcpProxy {
                     EgressPhase::Admission.as_str(),
                     "unknown",
                     reason.as_str(),
-                    interception_for_not_ready(reason),
+                    reason.interception_label(),
                 );
                 self.stats.tcp_denied.fetch_add(1, Ordering::Relaxed);
             }
@@ -884,24 +851,6 @@ fn inspection_admission_reason(
             .unwrap_or_else(|| denial.label()),
         crate::tls_sni::ClientHelloScan::ServerName(_)
         | crate::tls_sni::ClientHelloScan::NotTls => denial.label(),
-    }
-}
-
-/// Bounded detail for an interception refusal. Certificate refusals share one
-/// `certificate_error` outcome, so the gRPC code is the only thing separating a
-/// CA outage from a local capacity or lifetime refusal.
-/// The interception choice to report for a flow refused before policy was
-/// evaluated. `InterceptionNotReady` is only reachable with a policy installed
-/// and interception enabled, because the readiness gate it fails is skipped
-/// outright when interception is off; reporting `unknown` for it would drop
-/// those denials out of the enabled-rollout rate. Every other reason genuinely
-/// has no installed policy to read a choice from.
-pub(crate) fn interception_for_not_ready(reason: crate::state::PolicyNotReady) -> &'static str {
-    match reason {
-        crate::state::PolicyNotReady::InterceptionNotReady => {
-            pplx_space_net_common::TlsInterception::On.as_str()
-        }
-        _ => "unknown",
     }
 }
 

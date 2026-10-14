@@ -1,8 +1,6 @@
 //! Policy and DNS attribution for the authority of an established HTTP connection.
 
-use crate::dns::DnsAllowCache;
-use crate::egress::{HostBindingError, authorize_host};
-use crate::state::{GatewayNetworkState, TrafficPolicy};
+use crate::egress::{Egress, HostAuthorization, HostBindingError};
 use http::StatusCode;
 use pplx_space_net_common::DomainName;
 use std::net::SocketAddr;
@@ -11,22 +9,19 @@ use std::net::SocketAddr;
 pub(in crate::tcp_proxy) struct HostBinding {
     sandbox_id: &'static str,
     destination: SocketAddr,
-    network_state: GatewayNetworkState,
-    dns_allow_cache: DnsAllowCache,
+    egress: Egress,
 }
 
 impl HostBinding {
     pub(in crate::tcp_proxy) fn new(
         sandbox_id: &'static str,
         destination: SocketAddr,
-        network_state: GatewayNetworkState,
-        dns_allow_cache: DnsAllowCache,
+        egress: Egress,
     ) -> Self {
         Self {
             sandbox_id,
             destination,
-            network_state,
-            dns_allow_cache,
+            egress,
         }
     }
 
@@ -38,19 +33,15 @@ impl HostBinding {
         self.destination
     }
 
-    pub(super) async fn authorize(&self, host: &DomainName) -> Result<(), BindingOutcome> {
+    pub(super) async fn authorize(
+        &self,
+        host: &DomainName,
+    ) -> Result<HostAuthorization, BindingOutcome> {
         // Established requests retain the bounded PendingPolicy grace.
-        let policy = match self.network_state.wait_for_tcp_policy().await {
-            TrafficPolicy::Ready(policy) => policy,
-            TrafficPolicy::NotReady(_) => return Err(BindingOutcome::PolicyUnavailable),
-        };
-        authorize_host(&policy, self.destination, host, &self.dns_allow_cache).map_err(|error| {
-            match error {
-                HostBindingError::HostNotAllowed => BindingOutcome::HostNotAllowed,
-                HostBindingError::HostUnattributed => BindingOutcome::HostUnattributed,
-                HostBindingError::PolicyDenied(_) => BindingOutcome::PolicyDenied,
-            }
-        })
+        self.egress
+            .authorize_host(self.destination, host)
+            .await
+            .map_err(BindingOutcome::from)
     }
 }
 
@@ -92,6 +83,17 @@ impl BindingOutcome {
             | Self::HostUnattributed
             | Self::PolicyDenied
             | Self::UpgradeUnsupported => StatusCode::FORBIDDEN,
+        }
+    }
+}
+
+impl From<HostBindingError> for BindingOutcome {
+    fn from(error: HostBindingError) -> Self {
+        match error {
+            HostBindingError::PolicyUnavailable => Self::PolicyUnavailable,
+            HostBindingError::HostNotAllowed => Self::HostNotAllowed,
+            HostBindingError::HostUnattributed => Self::HostUnattributed,
+            HostBindingError::PolicyDenied(_) => Self::PolicyDenied,
         }
     }
 }

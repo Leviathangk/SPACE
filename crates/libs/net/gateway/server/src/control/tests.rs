@@ -1,3 +1,4 @@
+use crate::egress::test_support::TestNetwork;
 // Both existing readiness replies use these tags. A peer that only understands
 // this pre-TLS contract must still distinguish ready from pending.
 #[derive(Clone, PartialEq, prost::Message)]
@@ -23,7 +24,7 @@ fn root_request<T>(message: T) -> tonic::Request<T> {
 #[tokio::test]
 async fn control_rpcs_preserve_readiness_and_report_installed_tls_policy() {
     use super::*;
-    use crate::state::PulledNetworkPolicy;
+    use crate::egress::PulledNetworkPolicy;
     use pplx_space_net_common::{EffectiveNetworkPolicyRefScope, NetworkPolicyV1, TlsInterception};
     use prost::Message;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,12 +37,10 @@ async fn control_rpcs_preserve_readiness_and_report_installed_tls_policy() {
     .unwrap();
     for mode in [TlsInterception::Off, TlsInterception::On] {
         let ca_ready = Arc::new(AtomicBool::new(false));
-        let state = GatewayNetworkState::pending_policy()
-            .with_traffic_gate({
-                let ca_ready = ca_ready.clone();
-                Arc::new(move || ca_ready.load(Ordering::SeqCst))
-            })
-            .with_readiness_metrics();
+        let state = TestNetwork::with_gate({
+            let ca_ready = ca_ready.clone();
+            Arc::new(move || ca_ready.load(Ordering::SeqCst))
+        });
         let loader: PolicyLoader = Arc::new({
             let policy_ref = policy_ref.clone();
             move || {
@@ -59,7 +58,7 @@ async fn control_rpcs_preserve_readiness_and_report_installed_tls_policy() {
         });
         let service = NetGatewayControlService::new(
             Arc::default(),
-            state,
+            state.control(),
             loader,
             GatewayDebugState::default(),
             ServicePortIngressState::default(),

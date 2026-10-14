@@ -1,179 +1,34 @@
+use pplx_space_net_common::{
+    EffectiveNetworkPolicyRef, NetworkPolicyV1, TlsInterception,
+    effective_network_policy_ref_authority_label,
+};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-use pplx_space_net_common::{
-    EffectiveNetworkPolicyRef, NetworkPolicyV1, TlsInterception,
-    effective_network_policy_ref_authority_label,
-};
 use tokio::sync::{Mutex, watch};
-// Pending-hold deadlines share tokio's clock with the timers that enforce
-// them, so paused-time tests observe the same timeout production does.
+// Use the same clock as the pending-hold timers, including paused-time tests.
+use super::attribution::DnsAllowCache;
+use super::policy::*;
+use super::startup_timing::StartupTiming;
+use super::tracker::DnsAttributedTcpTracker;
+use crate::proto::NetworkPolicyErrorKind;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::dns::DnsAllowCache;
-use crate::egress::DnsAttributedTcpTracker;
-
-use crate::proto::{NetworkPolicyErrorKind, NetworkState};
-
-mod credentials;
-pub use credentials::{InvalidNetworkCredentialSnapshot, NetworkCredentialSnapshot};
-mod source;
-pub(crate) use source::host_control_policy_loader;
-pub use source::{
-    HydrateNetworkStateError, NetworkPolicyFromHostControlError, PolicyLoader, PulledNetworkPolicy,
-};
-mod egress;
-pub use egress::ReservedDnsCancellation;
-mod lifecycle;
-use lifecycle::{HydrationFailure, InstalledPolicy, PolicyLifecycle};
-mod startup_timing;
-use startup_timing::StartupTiming;
-
-pub type ReadinessObserver = Arc<dyn Fn(bool) + Send + Sync>;
-
-// Credential-bearing policy hydration includes the node-agent and authority
-// provider budgets. The state stays fail-closed while this deadline runs.
-pub const HYDRATION_DEADLINE: Duration = Duration::from_secs(30);
-pub const TCP_PENDING_TIMEOUT: Duration = HYDRATION_DEADLINE.saturating_add(Duration::from_secs(1));
-pub const TCP_PENDING_WARN_AFTER: Duration = Duration::from_millis(500);
-pub(crate) const INITIAL_HYDRATION_RETRY_INTERVAL: Duration = Duration::from_millis(250);
-pub(crate) const READY_HYDRATION_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
-const POLICY_REF_MISMATCH_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
-pub(crate) const MAX_HYDRATION_RETRY_BACKOFF: Duration = Duration::from_secs(5);
-pub(crate) const MAX_SELF_HYDRATION_RETRIES: u64 = 12;
-
-#[derive(Clone, Debug)]
-pub struct NetworkStateSnapshot {
-    /// Policy lifecycle only. `Ready` means a policy is installed; it says
-    /// nothing about TLS-interception dependencies (see
-    /// [`Self::interception_readiness`]), so a missing CA never demotes a
-    /// Ready gateway to `PendingPolicy` for its control-plane peers.
-    pub mode: NetworkState,
-    pub policy: Option<Arc<NetworkPolicyV1>>,
-    pub installed_policy_ref: String,
-    pub last_error: String,
-    pub last_error_kind: NetworkPolicyErrorKind,
-    pub last_hydration_latency_ms: u64,
-    pub last_transition_unix_ms: u64,
-    pub pending_tcp_connections: u64,
-    pub current_retry_backoff_ms: u64,
-    pub consecutive_hydration_failures: u64,
-    /// Whether guest traffic under the installed policy can currently be
-    /// admitted with respect to TLS-interception dependencies. Reported
-    /// separately from `mode` so sandbox start never depends on it.
-    pub interception_readiness: InterceptionReadiness,
-}
-
-/// Readiness of the gateway CA relative to the installed policy. Orthogonal to [`NetworkState`]:
-/// a gateway is `Ready` with `DependenciesNotReady` while it denies traffic
-/// until the CA is available.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum InterceptionReadiness {
-    /// No policy is installed, or the installed policy has TLS interception
-    /// off. Nothing beyond policy hydration gates admission.
-    NotRequired,
-    /// The installed policy has TLS interception on and every dependency
-    /// behind the traffic gate is usable.
-    Ready,
-    /// The installed policy has TLS interception on and the gateway CA is not
-    /// usable yet. New TCP and UDP traffic is denied.
-    DependenciesNotReady,
-}
-
-impl InterceptionReadiness {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::NotRequired => "not_required",
-            Self::Ready => "ready",
-            Self::DependenciesNotReady => "dependencies_not_ready",
-        }
-    }
-
-    /// Whether admission is currently blocked on interception dependencies.
-    pub const fn blocks_admission(self) -> bool {
-        matches!(self, Self::DependenciesNotReady)
-    }
-}
-
-impl std::fmt::Display for InterceptionReadiness {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str((*self).as_str())
-    }
-}
-
-#[derive(Clone, Debug)]
-pub enum TrafficPolicy {
-    Ready(Arc<NetworkPolicyV1>),
-    NotReady(PolicyNotReady),
-}
-
-/// Why no policy was available to evaluate a flow against. Doubles as the
-/// `decision` tag on `gateway.policy.decision` for flows denied this way.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PolicyNotReady {
-    InterceptionNotReady,
-    PendingPolicyTimeout,
-    NoIdentity,
-    PolicyError,
-    Draining,
-    Stopped,
-    /// Reached only by the UDP path, which buffers rather than drops here.
-    PendingPolicy,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum NetworkCredentialSnapshotError {
-    TemporarilyUnavailable,
-    Stale,
-}
-
-impl PolicyNotReady {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::InterceptionNotReady => "interception_not_ready",
-            Self::PendingPolicyTimeout => "pending_policy_timeout",
-            Self::NoIdentity => "no_identity",
-            Self::PolicyError => "policy_error",
-            Self::Draining => "draining",
-            Self::Stopped => "stopped",
-            Self::PendingPolicy => "pending_policy",
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct GatewayNetworkState {
+pub(super) struct Coordinator {
     state_tx: watch::Sender<Arc<NetworkStateInner>>,
     state_rx: watch::Receiver<Arc<NetworkStateInner>>,
-    writer_lock: Arc<Mutex<()>>,
-    refresh_lock: Arc<Mutex<()>>,
+    writer_lock: Mutex<()>,
+    refresh_lock: Mutex<()>,
     pending_tcp_connections: Arc<AtomicU64>,
-    dns_allow_cache: DnsAllowCache,
-    tcp_connections: DnsAttributedTcpTracker,
-    reserved_dns_cancellation: ReservedDnsCancellation,
+    pub(super) dns_allow_cache: DnsAllowCache,
+    pub(super) tcp_connections: DnsAttributedTcpTracker,
+    pub(super) reserved_dns_cancellation: ReservedDnsCancellation,
     traffic_gate: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
-    readiness_observer: Option<Arc<StartupTiming>>,
-}
-
-#[derive(Clone, Debug)]
-struct NetworkStateInner {
-    lifecycle: PolicyLifecycle,
-    diagnostics: HydrationDiagnostics,
-}
-
-#[derive(Clone, Debug, Default)]
-struct HydrationDiagnostics {
-    // Retained after policy removal for control-plane diagnostics only.
-    installed_policy_ref: Option<EffectiveNetworkPolicyRef>,
-    last_hydration_latency_ms: u64,
-    last_transition_unix_ms: u64,
-    current_retry_backoff_ms: u64,
-    consecutive_hydration_failures: u64,
+    readiness_observer: Arc<StartupTiming>,
 }
 
 struct TcpPendingWaiterGuard {
@@ -201,92 +56,34 @@ impl Drop for TcpPendingWaiterGuard {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum NetworkStateReason {
-    Startup,
-    SelfRetry,
-    ControlRefresh,
-    PoolAdoption,
-    PoolAdoptionRollback,
-    Reconcile,
-    SnapshotRestore,
-    Start,
-    NoIdentity,
-    Shutdown,
-}
-
-impl NetworkStateReason {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Startup => "startup",
-            Self::SelfRetry => "self_retry",
-            Self::ControlRefresh => "control_refresh",
-            Self::PoolAdoption => "pool_adoption",
-            Self::PoolAdoptionRollback => "pool_adoption_rollback",
-            Self::Reconcile => "reconcile",
-            Self::SnapshotRestore => "snapshot_restore",
-            Self::Start => "start",
-            Self::NoIdentity => "no_identity",
-            Self::Shutdown => "shutdown",
-        }
-    }
-
-    pub fn from_external(value: &str) -> Self {
-        match value {
-            "pool-adoption" | "pool_adoption" => Self::PoolAdoption,
-            "pool-adoption-rollback"
-            | "pool_adoption_rollback"
-            | "pool-rollback"
-            | "pool_rollback" => Self::PoolAdoptionRollback,
-            "reconcile" => Self::Reconcile,
-            "snapshot-restore" | "snapshot_restore" => Self::SnapshotRestore,
-            "start" => Self::Start,
-            "no_identity" | "no-identity" => Self::NoIdentity,
-            "shutdown" => Self::Shutdown,
-            "startup" => Self::Startup,
-            "self_retry" | "self-retry" => Self::SelfRetry,
-            _ => Self::ControlRefresh,
-        }
-    }
-}
-
-impl std::fmt::Display for NetworkStateReason {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str((*self).as_str())
-    }
-}
-
-impl GatewayNetworkState {
-    pub fn pending_policy() -> Self {
-        Self::new(NetworkStateInner {
-            lifecycle: PolicyLifecycle::Pending { previous: None },
+impl Coordinator {
+    fn new(initial: InitialPolicyState, traffic_gate: Option<TrafficGate>) -> Self {
+        let (lifecycle, installed_policy_ref) = match initial {
+            InitialPolicyState::NoIdentity => (
+                PolicyLifecycle::NoIdentity,
+                Some(EffectiveNetworkPolicyRef::no_identity()),
+            ),
+            InitialPolicyState::PendingPolicy => {
+                (PolicyLifecycle::Pending { previous: None }, None)
+            }
+        };
+        let inner = Arc::new(NetworkStateInner {
+            lifecycle,
             diagnostics: HydrationDiagnostics {
+                installed_policy_ref,
                 last_transition_unix_ms: unix_time_ms(),
                 ..Default::default()
             },
-        })
-    }
-
-    pub fn no_identity() -> Self {
-        Self::new(NetworkStateInner {
-            lifecycle: PolicyLifecycle::NoIdentity,
-            diagnostics: HydrationDiagnostics {
-                installed_policy_ref: Some(EffectiveNetworkPolicyRef::no_identity()),
-                last_transition_unix_ms: unix_time_ms(),
-                ..Default::default()
-            },
-        })
-    }
-
-    fn new(inner: NetworkStateInner) -> Self {
-        let (state_tx, state_rx) = watch::channel(Arc::new(inner));
+        });
+        let readiness_observer = Arc::new(StartupTiming::new(inner.clone()));
+        let (state_tx, state_rx) = watch::channel(inner);
         Self {
-            traffic_gate: None,
-            readiness_observer: None,
+            traffic_gate,
+            readiness_observer,
             state_tx,
             state_rx,
-            writer_lock: Arc::new(Mutex::new(())),
-            refresh_lock: Arc::new(Mutex::new(())),
+            writer_lock: Mutex::new(()),
+            refresh_lock: Mutex::new(()),
             pending_tcp_connections: Arc::new(AtomicU64::new(0)),
             dns_allow_cache: DnsAllowCache::default(),
             tcp_connections: DnsAttributedTcpTracker::default(),
@@ -299,16 +96,6 @@ impl GatewayNetworkState {
         self.snapshot_from_inner(inner.as_ref())
     }
 
-    /// Attach once, before hydration or CA acquisition. Pool residency is not a
-    /// readiness wait; timing begins when the policy leaves NoIdentity and
-    /// stops at this process's first Ready.
-    #[must_use]
-    pub fn with_readiness_metrics(mut self) -> Self {
-        self.readiness_observer =
-            Some(Arc::new(StartupTiming::new(self.state_rx.borrow().clone())));
-        self
-    }
-
     /// Observer for the interception dependency (gateway CA).
     /// Feeds startup timing independently of policy readiness.
     pub fn interception_readiness_observer(&self) -> ReadinessObserver {
@@ -317,9 +104,7 @@ impl GatewayNetworkState {
         let state = self.state_rx.clone();
         let observer = self.readiness_observer.clone();
         Arc::new(move |ready| {
-            if let Some(observer) = &observer {
-                observer.observe(|| (state.borrow().clone(), ready));
-            }
+            observer.observe(|| (state.borrow().clone(), ready));
         })
     }
 
@@ -339,28 +124,6 @@ impl GatewayNetworkState {
             }
             _ => InterceptionReadiness::NotRequired,
         }
-    }
-
-    /// Wait until the installed policy requires interception. Gateway CA
-    /// preparation stays dormant for the default-off policy.
-    pub(crate) async fn wait_for_interception_policy(&self, shutdown: &CancellationToken) -> bool {
-        let mut state = self.state_rx.clone();
-        tokio::select! {
-            biased;
-            () = shutdown.cancelled() => false,
-            installed = state.wait_for(|inner| {
-                inner.lifecycle.ready().is_some_and(|installed| {
-                    installed.policy.tls_interception == TlsInterception::On
-                })
-            }) => installed.is_ok(),
-        }
-    }
-
-    /// Additional admission requirement, separate from policy hydration so the
-    /// control plane can initialize both without a circular readiness wait.
-    pub fn with_traffic_gate(mut self, gate: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
-        self.traffic_gate = Some(gate);
-        self
     }
 
     fn traffic_gate_open(&self) -> bool {
@@ -405,8 +168,8 @@ impl GatewayNetworkState {
         }
     }
 
-    pub fn spawn_hydration(
-        &self,
+    fn spawn_hydration(
+        self: &Arc<Self>,
         loader: PolicyLoader,
         shutdown_token: CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
@@ -416,7 +179,11 @@ impl GatewayNetworkState {
         })
     }
 
-    async fn run_hydration_loop(self, loader: PolicyLoader, shutdown_token: CancellationToken) {
+    async fn run_hydration_loop(
+        self: Arc<Self>,
+        loader: PolicyLoader,
+        shutdown_token: CancellationToken,
+    ) {
         let mut retry_delay = INITIAL_HYDRATION_RETRY_INTERVAL;
         let mut attempts = 0_u64;
 
@@ -480,7 +247,7 @@ impl GatewayNetworkState {
                 continue;
             }
 
-            warn!(
+            warn!(target: "pplx_space_net_gateway::state",
                 error_kind = snapshot.last_error_kind.as_str(),
                 consecutive_hydration_failures = snapshot.consecutive_hydration_failures,
                 current_retry_backoff_ms =
@@ -525,16 +292,15 @@ impl GatewayNetworkState {
             current.lifecycle.installed().is_some() && inner.lifecycle.installed().is_none();
         let inner = Arc::new(inner);
         self.state_tx.send_replace(inner.clone());
-        if let Some(observer) = &self.readiness_observer {
-            observer.observe(|| (self.state_rx.borrow().clone(), self.traffic_gate_open()));
-        }
+        self.readiness_observer
+            .observe(|| (self.state_rx.borrow().clone(), self.traffic_gate_open()));
         // Publish unavailability before sweeping. An old-policy admission racing
         // the transition then either fails its final generation check or was
         // already registered and is cancelled below.
         if policy_removed {
             let cancelled = self.tcp_connections.cancel_all();
             if cancelled > 0 {
-                info!(
+                info!(target: "pplx_space_net_gateway::state",
                     dns_attributed_cancelled_tcp_connections = cancelled,
                     "cancelled TCP connections after network policy invalidation"
                 );
@@ -580,7 +346,7 @@ impl GatewayNetworkState {
         let inner = self
             .update_inner(|inner| {
                 if let Some(installed) = inner.lifecycle.installed() {
-                    info!(
+                    info!(target: "pplx_space_net_gateway::state",
                         cleared_policy_ref = %installed.reference,
                         reason = reason.as_str(),
                         "net-gateway policy cleared"
@@ -692,7 +458,7 @@ impl GatewayNetworkState {
                             installed.reference.authority_label(),
                             inner.lifecycle.mode().as_str(),
                         );
-                        info!(
+                        info!(target: "pplx_space_net_gateway::state",
                             installed_policy_ref = %installed.reference,
                             latency_ms,
                             policy_version = "v1",
@@ -738,7 +504,7 @@ impl GatewayNetworkState {
                                     actual.authority_label(),
                                     inner.lifecycle.mode().as_str(),
                                 );
-                                warn!(
+                                warn!(target: "pplx_space_net_gateway::state",
                                     expected_policy_ref = %expected,
                                     installed_policy_ref = %actual,
                                     reason = reason.as_str(),
@@ -755,7 +521,7 @@ impl GatewayNetworkState {
                                     "error",
                                     latency_ms as f64,
                                 );
-                                warn!(
+                                warn!(target: "pplx_space_net_gateway::state",
                                     last_error = %failure,
                                     latency_ms,
                                     reason = reason.as_str(),
@@ -768,7 +534,7 @@ impl GatewayNetworkState {
                                     "error",
                                     latency_ms as f64,
                                 );
-                                warn!(
+                                warn!(target: "pplx_space_net_gateway::state",
                                     last_error = %failure,
                                     latency_ms,
                                     reason = reason.as_str(),
@@ -781,7 +547,7 @@ impl GatewayNetworkState {
                                     "timeout",
                                     latency_ms as f64,
                                 );
-                                warn!(
+                                warn!(target: "pplx_space_net_gateway::state",
                                     latency_ms,
                                     reason = reason.as_str(),
                                     "net-gateway policy hydration timed out"
@@ -909,7 +675,7 @@ impl GatewayNetworkState {
             PolicyLifecycle::Draining { .. } => PolicyNotReady::Draining,
             PolicyLifecycle::Stopped => PolicyNotReady::Stopped,
         };
-        debug!(state = ?snapshot.mode, "UDP dropped while network policy is not ready");
+        debug!(target: "pplx_space_net_gateway::state", state = ?snapshot.mode, "UDP dropped while network policy is not ready");
         record_not_ready_denial("udp", reason);
         TrafficPolicy::NotReady(reason)
     }
@@ -926,7 +692,7 @@ impl GatewayNetworkState {
     pub async fn set_stopped(&self, reason: NetworkStateReason) {
         self.update_inner(|inner| {
             if let Some(installed) = inner.lifecycle.installed() {
-                info!(
+                info!(target: "pplx_space_net_gateway::state",
                     cleared_policy_ref = %installed.reference,
                     reason = reason.as_str(),
                     "net-gateway policy cleared"
@@ -1066,7 +832,7 @@ fn record_pending_tcp_slow_wait(snapshot: &NetworkStateSnapshot, started_at: Ins
     // dependencies deny the connection instead of holding it. Carry the
     // readiness anyway so a responder is not sent hunting for a CA problem
     // that this wait is not evidence of.
-    warn!(
+    warn!(target: "pplx_space_net_gateway::state",
         wait_ms,
         state = snapshot.mode.as_str(),
         interception_readiness = snapshot.interception_readiness.as_str(),
@@ -1086,3 +852,151 @@ fn record_not_ready_denial(protocol: &str, reason: PolicyNotReady) {
 
 #[cfg(test)]
 mod tests;
+
+/// Cancels reserved-DNS work that began before a network-policy install.
+///
+/// Adapters take a child token before reading the admitted policy. The policy
+/// installation cancels that token before publishing the replacement policy,
+/// so the guest retries the transaction against the new policy instead of
+/// receiving a response authorized by the old one.
+#[derive(Debug)]
+pub(super) struct ReservedDnsCancellation {
+    current: parking_lot::Mutex<CancellationToken>,
+}
+
+impl Default for ReservedDnsCancellation {
+    fn default() -> Self {
+        Self {
+            current: parking_lot::Mutex::new(CancellationToken::new()),
+        }
+    }
+}
+
+impl ReservedDnsCancellation {
+    pub(super) fn operation_token(&self) -> CancellationToken {
+        self.current.lock().child_token()
+    }
+
+    fn cancel_in_flight(&self) {
+        let mut current = self.current.lock();
+        current.cancel();
+        *current = CancellationToken::new();
+    }
+}
+
+impl Coordinator {
+    fn reconcile_policy(&self, policy: &NetworkPolicyV1) {
+        self.reserved_dns_cancellation.cancel_in_flight();
+        self.dns_allow_cache.retain_relevant_to_policy(policy);
+        let cancelled = self.tcp_connections.cancel_where(|admission| {
+            !super::tcp::revalidate_tcp(admission, policy, &self.dns_allow_cache)
+        });
+        if cancelled > 0 {
+            info!(target: "pplx_space_net_gateway::state::egress",
+                dns_attributed_cancelled_tcp_connections = cancelled,
+                "reconciled TCP connections for installed network policy"
+            );
+        }
+    }
+}
+
+/// Initial lifecycle selected by the gateway's validated configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InitialPolicyState {
+    NoIdentity,
+    PendingPolicy,
+}
+
+pub type TrafficGate = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// Constructs one policy, attribution cache, connection registry and DNS epoch.
+#[derive(Clone)]
+pub struct GatewayNetwork {
+    pub(super) coordinator: Arc<Coordinator>,
+}
+
+impl GatewayNetwork {
+    pub fn new(initial: InitialPolicyState, readiness: Option<TrafficGate>) -> Self {
+        Self {
+            coordinator: Arc::new(Coordinator::new(initial, readiness)),
+        }
+    }
+
+    pub fn egress(&self) -> Egress {
+        Egress {
+            coordinator: self.coordinator.clone(),
+        }
+    }
+
+    pub fn control(&self) -> PolicyControl {
+        PolicyControl {
+            coordinator: self.coordinator.clone(),
+        }
+    }
+
+    pub fn policies(&self) -> PolicyView {
+        self.coordinator.policies()
+    }
+}
+
+#[derive(Clone)]
+pub struct Egress {
+    pub(super) coordinator: Arc<Coordinator>,
+}
+
+/// Mutations and diagnostics for the gateway's installed policy.
+#[derive(Clone)]
+pub struct PolicyControl {
+    pub(super) coordinator: Arc<Coordinator>,
+}
+
+impl PolicyControl {
+    pub fn policies(&self) -> PolicyView {
+        self.coordinator.policies()
+    }
+
+    pub async fn snapshot(&self) -> NetworkStateSnapshot {
+        self.coordinator.snapshot().await
+    }
+
+    pub fn interception_readiness_observer(&self) -> ReadinessObserver {
+        self.coordinator.interception_readiness_observer()
+    }
+
+    pub fn spawn_hydration(
+        &self,
+        loader: PolicyLoader,
+        shutdown: CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        self.coordinator.spawn_hydration(loader, shutdown)
+    }
+
+    pub async fn refresh(
+        &self,
+        loader: PolicyLoader,
+        expected: Option<EffectiveNetworkPolicyRef>,
+        reason: NetworkStateReason,
+    ) -> NetworkStateSnapshot {
+        self.coordinator.refresh(loader, expected, reason).await
+    }
+
+    pub async fn set_no_identity(&self, reason: NetworkStateReason) -> NetworkStateSnapshot {
+        self.coordinator.set_no_identity(reason).await
+    }
+
+    pub async fn set_draining(&self, reason: NetworkStateReason) {
+        self.coordinator.set_draining(reason).await;
+    }
+
+    pub async fn set_stopped(&self, reason: NetworkStateReason) {
+        self.coordinator.set_stopped(reason).await;
+    }
+}
+
+impl Coordinator {
+    fn policies(&self) -> PolicyView {
+        PolicyView {
+            state_rx: self.state_rx.clone(),
+        }
+    }
+}
