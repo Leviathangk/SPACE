@@ -237,82 +237,91 @@ fn upsert_test_build_with_execution(conn: &Connection, name: &str, content_hash:
 
 #[test]
 fn upsert_build_projects_execution_metadata_and_unspecified_role() {
-    let conn = test_conn();
-    let execution = ExecutionMetadata::initial_firecracker(
-        Arch::Aarch64,
-        vec![ArtifactComponentMetadata {
-            kind: ArtifactComponentKind::Kernel,
-            role: None,
-            version: Some(ArtifactVersion::parse("6.10.14").unwrap()),
-            digest: Some(
-                format!("sha256:{}", "a".repeat(64))
-                    .parse::<Digest>()
-                    .unwrap(),
-            ),
-            format: Some(ArtifactFormat::parse("vmlinux").unwrap()),
-        }],
-    );
-    let mut manifest = TemplateManifest {
-        runtime: "fc".to_string(),
-        arch: "aarch64".to_string(),
-        ..Default::default()
-    };
-    manifest.set_execution_metadata(execution.clone());
-    let manifest_json = serde_json::to_string(&manifest).unwrap();
+    for bound in [false, true] {
+        let conn = test_conn();
+        let execution = ExecutionMetadata::initial_firecracker(
+            Arch::Aarch64,
+            vec![ArtifactComponentMetadata {
+                kind: ArtifactComponentKind::Kernel,
+                role: None,
+                version: Some(ArtifactVersion::parse("6.10.14").unwrap()),
+                digest: Some(
+                    format!("sha256:{}", "a".repeat(64))
+                        .parse::<Digest>()
+                        .unwrap(),
+                ),
+                format: Some(ArtifactFormat::parse("vmlinux").unwrap()),
+            }],
+        );
+        let execution = if bound {
+            execution.with_environment(pplx_space_common_core::types::EnvironmentReference::new(
+                Digest::sha256([1; 32]),
+            ))
+        } else {
+            execution
+        };
+        let mut manifest = TemplateManifest {
+            runtime: "fc".to_string(),
+            arch: "aarch64".to_string(),
+            ..Default::default()
+        };
+        manifest.set_execution_metadata(execution.clone());
+        let manifest_json = serde_json::to_string(&manifest).unwrap();
 
-    upsert_build(
-        &conn,
-        &BuildUpsert {
-            name: "seed",
-            content_hash: "sha256:build",
-            build_date: "2026-06-12T00:00:00Z",
-            manifest_json: &manifest_json,
-            runtime: "fc",
-            arch: "aarch64",
-            artifact_size_bytes: 1,
-            state: "ready",
-        },
-    )
-    .unwrap();
+        upsert_build(
+            &conn,
+            &BuildUpsert {
+                name: "seed",
+                content_hash: "sha256:build",
+                build_date: "2026-06-12T00:00:00Z",
+                manifest_json: &manifest_json,
+                runtime: "fc",
+                arch: "aarch64",
+                artifact_size_bytes: 1,
+                state: "ready",
+            },
+        )
+        .unwrap();
 
-    let projected: (String, String, String, String) = conn
-        .query_row(
-            "SELECT runtime_version, guest_os, state_format_name, state_format_version
+        let projected: (String, String, String, String) = conn
+            .query_row(
+                "SELECT runtime_version, guest_os, state_format_name, state_format_version
              FROM template_builds WHERE name = 'seed' AND content_hash = 'sha256:build'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .unwrap();
-    assert_eq!(
-        projected,
-        (
-            "1.15.1".into(),
-            "linux".into(),
-            "firecracker-snapshot".into(),
-            "9.0.0".into()
-        )
-    );
-    let role_key: String = conn
-        .query_row(
-            "SELECT role_key FROM template_build_components
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            projected,
+            (
+                "1.15.1".into(),
+                "linux".into(),
+                "firecracker-snapshot".into(),
+                "9.0.0".into()
+            )
+        );
+        let role_key: String = conn
+            .query_row(
+                "SELECT role_key FROM template_build_components
              WHERE name = 'seed' AND content_hash = 'sha256:build' AND kind = 'kernel'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(role_key, "");
-    let stored_json: String = conn
-        .query_row(
-            "SELECT execution_metadata_json FROM template_builds
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(role_key, "");
+        let stored_json: String = conn
+            .query_row(
+                "SELECT execution_metadata_json FROM template_builds
              WHERE name = 'seed' AND content_hash = 'sha256:build'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        serde_json::from_str::<ExecutionMetadata>(&stored_json).unwrap(),
-        execution
-    );
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<ExecutionMetadata>(&stored_json).unwrap(),
+            execution
+        );
+    }
 }
 
 #[test]

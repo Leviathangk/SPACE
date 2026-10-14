@@ -25,6 +25,97 @@ use crate::proto::{
 
 use super::NodeManagerService;
 
+use pplx_space_node_runtime_core::runtime_inventory::{
+    ExecutionSelectionMode, ResolvedExecutionEnvironment,
+};
+
+impl NodeManagerService {
+    async fn require_verified_environment_layout(&self) -> Result<(), Status> {
+        if !cfg!(target_os = "linux") {
+            return Err(Status::failed_precondition(
+                "the compiled E0 environment requires a Linux host",
+            ));
+        }
+        let paths = self.runtime_paths.clone();
+        self.off_runtime("verify environment layout", move || {
+            separate_store(&paths).map_err(|error| Status::failed_precondition(describe(&error)))
+        })
+        .await
+    }
+
+    pub async fn resolve_execution_environment(
+        &self,
+        request: Request<crate::proto::ResolveExecutionEnvironmentRequest>,
+    ) -> Result<Response<crate::proto::ResolveExecutionEnvironmentResponse>, Status> {
+        self.authorize_peer(
+            &request,
+            "ResolveExecutionEnvironment",
+            super::ALLOW_NODE_STATUS,
+        )?;
+        self.require_verified_environment_layout().await?;
+        let initial = initial_environment()?;
+        let definition = match request.into_inner().reference {
+            Some(reference) => initial.resolve_definition(reference.parse().map_err(
+                |error: pplx_space_common_core::types::DigestParseError| {
+                    Status::invalid_argument(error.to_string())
+                },
+            )?),
+            None => initial.definition().map_err(Into::into),
+        }
+        .map_err(|error| Status::failed_precondition(describe(&error)))?;
+        let inventory = self.runtime_inventory().await?;
+        let resolved = inventory
+            .resolve(
+                None,
+                initial.release().release.kind,
+                ExecutionSelectionMode::NewColdBoot,
+            )
+            .map_err(super::RuntimeInventoryError::into_status)?;
+        let execution = definition
+            .bind_execution(resolved.execution)
+            .map_err(|error| Status::failed_precondition(describe(&error)))?;
+        Ok(Response::new(
+            crate::proto::ResolveExecutionEnvironmentResponse {
+                definition: Some((&definition).into()),
+                execution: Some((&execution).into()),
+            },
+        ))
+    }
+
+    pub(super) async fn resolve_bound_execution(
+        &self,
+        requested: Option<&pplx_space_common_core::types::ExecutionMetadata>,
+        runtime: pplx_space_common_core::types::RuntimeKind,
+        mode: ExecutionSelectionMode,
+    ) -> Result<ResolvedExecutionEnvironment, Status> {
+        let definition =
+            if let Some(reference) = requested.and_then(|metadata| metadata.environment()) {
+                self.require_verified_environment_layout().await?;
+                let definition = initial_environment()?
+                    .resolve_definition(reference)
+                    .map_err(|error| Status::failed_precondition(describe(&error)))?;
+                if let Some(requested) = requested {
+                    definition
+                        .bind_execution(requested.clone())
+                        .map_err(|error| Status::failed_precondition(describe(&error)))?;
+                }
+                Some(definition)
+            } else {
+                None
+            };
+        let inventory = self.runtime_inventory().await?;
+        let mut resolved = inventory
+            .resolve(requested, runtime, mode)
+            .map_err(super::RuntimeInventoryError::into_status)?;
+        if let Some(definition) = definition {
+            resolved.execution = definition
+                .bind_execution(resolved.execution)
+                .map_err(|error| Status::failed_precondition(describe(&error)))?;
+        }
+        Ok(resolved)
+    }
+}
+
 const ALLOW_ROOT_OR_RTMGR: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Service(user_names::SPACE_RTMGR),

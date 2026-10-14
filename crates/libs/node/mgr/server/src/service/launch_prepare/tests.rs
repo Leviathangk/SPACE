@@ -213,6 +213,7 @@ fn runtime_request_rejects_partial_execution_metadata() {
         guest: None,
         state_format: None,
         components: vec![],
+        environment: None,
     };
     let error = parse_runtime_request("firecracker", Some(&wire)).unwrap_err();
 

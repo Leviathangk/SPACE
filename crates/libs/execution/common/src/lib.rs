@@ -274,6 +274,7 @@ impl From<&ExecutionMetadata> for proto::ExecutionMetadata {
             guest: Some(value.guest().into()),
             state_format: value.state_format().map(Into::into),
             components: value.components().iter().map(Into::into).collect(),
+            environment: value.environment().map(|reference| reference.to_string()),
         }
     }
 }
@@ -302,12 +303,11 @@ impl TryFrom<&proto::ExecutionMetadata> for ExecutionMetadata {
             .iter()
             .map(TryInto::try_into)
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(ExecutionMetadata::new(
-            runtime,
-            guest,
-            state_format,
-            components,
-        )?)
+        let metadata = ExecutionMetadata::new(runtime, guest, state_format, components)?;
+        Ok(match value.environment.as_deref() {
+            Some(reference) => metadata.with_environment(reference.parse()?),
+            None => metadata,
+        })
     }
 }
 

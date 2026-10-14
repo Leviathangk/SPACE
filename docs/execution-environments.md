@@ -14,10 +14,11 @@ KVM, Firecracker 1.15.1, Linux/x86_64 guest, kernel 6.1.155, a hardware VM bound
 and Firecracker snapshot format 9.0.0. The runtime digest covers the pinned
 Firecracker and jailer binaries, not their download archive.
 
-The implementation adds domain types, protobuf messages, a versioned JSON codec,
-and a compiled E0 resolver. It does not add a selection RPC, policy tables, change
-execution defaults, or reinterpret existing template/snapshot records. The next
-consumer is explicit seed/build binding; experimental selection follows that.
+The implementation includes domain types, protobuf messages, a versioned JSON
+codec, and explicit E0 seed/build binding. Node-manager resolves only verified
+compiled E0; this does not activate another environment, add policy tables, or
+change execution defaults. Experimental runtime/kernel selection follows this
+binding milestone.
 
 ## Ownership and extension boundaries
 
@@ -98,11 +99,12 @@ stock-image compatibility rules; missing or ambiguous evidence must not become
 an inferred Linux/E0 binding.
 
 New environment consumers require positive evidence that the peer supports both
-the schema and the qualified environment reference. Add that negotiation with
-the first RPC/facet consumer. Until then these messages are data definitions,
-not remotely callable operations. In either deployment order, old launch paths
-continue to use their existing metadata; new required selection semantics must
-never be sent to an old peer and assumed honored.
+the schema and the qualified environment reference. The builder now requires
+`ResolveExecutionEnvironment` to return a checked definition and matching bound
+execution metadata; `Unimplemented`, missing fields, and conflicting evidence
+fail the build. Sandbox-manager requires a bound prepare request to receive the
+same reference before persisting the response or launching. An old node-manager
+that drops the field cannot acknowledge a bound request.
 
 Protobuf readers normally discard unknown fields. Therefore **any new required
 meaning**, including a new field or provider/profile arm, requires a new
@@ -114,8 +116,61 @@ successful protobuf decoding or the old installation projection.
 
 Tests cover frozen legacy metadata wire bytes, E0 wire/document round trips,
 reference mismatches, missing/unknown values, unsupported combinations, and
-catalog rejection of well-formed but unqualified candidates. Runtime adapter and
-cross-process rollout tests belong with the first consumer that changes behavior.
+catalog rejection of well-formed but unqualified candidates. Binding tests also
+cover missing peer acknowledgement, contradictory execution observations,
+manifest publication, SQLite JSON round trips, and PostgreSQL write-once storage. A real Linux/KVM build,
+publish, pull and boot remains the deployment acceptance test.
+
+## Seed/build binding and deployment
+
+`ResolveExecutionEnvironment` is a read-only node-local RPC with the node-status
+peer allowlist. An omitted reference requests compiled E0; an explicit reference
+must resolve to that same approved definition. Node-manager requires Linux and a
+non-overlapping managed-store layout, verifies E0 through the execution inventory,
+and returns the definition with matching execution observations. Prototype layouts
+that retain unverified external execution cannot produce this binding. The RPC
+is an observation, not a reservation or an activation operation; prepare and
+launch resolve again. E0 artifacts remain protected from removal.
+
+The production builder uses this response for both paths:
+
+- Scratch builds receive runtime, state-format and kernel inputs from the
+  resolver. The helper no longer scans for the newest installed runtime or a
+  default kernel alias, and inherited selector variables are overwritten. A
+  recipe kernel pin must match E0. The resulting seed metadata records its
+  verified execution target; constructing a rootfs is not a successful VM boot.
+- Derived builds require readable base execution metadata, resolve its binding
+  (or verify that complete unbound observations match E0), and compare actual
+  sandbox execution metadata after the build. Missing metadata is a failure;
+  it is never replaced with invented legacy defaults. A legacy kernel directory
+  alias may differ in spelling only when its recorded digest matches E0.
+
+New bound `metadata.json` and `manifest.json` use schema 3 and carry
+`execution.environment`. Schema 2 remains the unbound shape. A schema/binding
+mismatch fails validation; the old schema-2 reader rejects schema 3. The
+reference survives normalization, immutable manifest publication, the execution
+JSON stored by template-manager and the control plane, worker preparation, and
+sandbox metadata. No table migration or backfill is required. The reference is
+not a substitute for binary verification or an arbitrary execution permission.
+A same-rootfs registration cannot add, remove or replace the retained manifest's
+binding by refreshing metadata; it fails before changing the existing release.
+
+Deploy the new control-plane, template-manager, sandbox-manager and node-manager
+readers before enabling builds with the new builder. Until readers are upgraded,
+new builds or bound-template consumption may fail closed; existing unbound
+workloads retain their previous execution behavior. This milestone qualifies
+only Linux/x86_64 E0, so an aarch64 builder cannot produce a bound template yet.
+Incomplete legacy bases must be rebuilt from a newly bound seed. Do not strip a
+binding to make a template load on an old reader.
+
+For rollback, stop producing bound releases and use retained schema-2 releases
+with the old services. Keep compatible readers while bound templates or their
+sandbox/snapshot records remain in use: older JSON/protobuf readers outside the
+template schema gate can discard the new field. This change does not claim
+fleet-wide capability placement or snapshot-version negotiation. Experimental
+benchmarks must add their own node admission and isolate pools/caches by
+environment; cluster-wide provisioning can follow separately. Installing 1.17.0
+still does not select it.
 
 ## Bounded audit of existing contracts
 
@@ -131,7 +186,7 @@ of existing data.
 | `RuntimeIdentity`, `RuntimeInstallation`, `NodeExecutionInventory`; PostgreSQL `node_runtime_installations` keyed by `(node_id, runtime, runtime_version)` and its dependent projections | **Keep** release metadata. **Replace with first consumer** its use as sufficient environment capability: observations need complete environment reference plus host/usability evidence. This PR adds the separate definition/reference, not a renamed installation row. | Execution-common owns definitions; node-ctl publication and cluster storage own the later provisioning projection; placement migration follows publication. | Preserve old inventory for old readers during rollout. New admission requires new evidence. Remove the old admission dependency only after every reader migrates; old release diagnostics may remain useful. |
 | `GuestOperatingSystem`, `GuestPlatform`, `ArtifactComponentKind` | **Keep** their current meanings. **Replace now** missing host identity with separate `HostPlatform`; do not infer host OS from guest OS. | Common-core/execution-common, this contract. Template owner adds distribution/release with its first guest-image consumer. | Additive messages preserve old guest fields and enum numbers. There is no guest-field migration/removal in this change. |
 | Runtime-manager `AvailableArtifact.architecture` and `ExecutionArtifact.architecture` | **Keep** legacy architecture evidence; it is not a full target or placement requirement. **Replace now** in new descriptors with explicit host target for runtime bytes and guest platform for the direct-boot kernel. | Execution-common owns descriptor targets now; runtime-manager owns richer diagnostic target fields with the first additional installer/target. | Do not silently change the old strings' meaning. Retire their placement use when consumers use typed targets; keep diagnostic evidence as needed. |
-| `ExecutionMetadata`, node `requested_execution`, string runtime selectors and CLI `--runtime fc` | **Keep** current adapter selection/recorded metadata. **Replace with first consumer** as complete selection authority: explicit environment references and actual resolved execution metadata through seed/build, then benchmark launch. | Template/build and node-manager owners, next binding milestone and early benchmark milestone. | Validate legacy aliases and reject contradictory old/new selectors at the consuming boundary. Unbound legacy paths remain unchanged until stock-image attribution is implemented; removal requires migrated writers/readers and durable records. |
+| `ExecutionMetadata`, node `requested_execution`, string runtime selectors and CLI `--runtime fc` | **Keep** current adapter selection/recorded metadata. **Replace with first consumer** as complete selection authority: explicit environment references and actual resolved execution metadata through seed/build, then benchmark launch. | Template/build and node-manager owners: E0 binding is implemented here; explicit candidate selection belongs to the early benchmark milestone. | Validate legacy aliases and reject contradictory old/new selectors at the consuming boundary. Unbound legacy paths remain unchanged until stock-image attribution is implemented; removal requires migrated writers/readers and durable records. |
 | Runtime-manager SQLite `operation_results`, shared `jobs`, `InstallOperation` JSON and dedupe | **Keep** `install_kernel`, `uninstall_kernel`, `install_release`, `uninstall_release` as accurate existing operations. Environment policy does not change their identity or replay semantics. | Runtime-manager owns the first new operation kind and any versioned payload migration. | Preserve retained-job decode/replay and `(action, artifact identity)` dedupe; policy revision is correlation only. Verify deployed migration level before evolution. The historical prototype reset is not a future migration strategy. |
 | Firecracker paths, sources, local catalog JSON and POSIX protection configuration | **Keep** inside the Linux/Firecracker installer/store adapter. Portable policy references approved environments, not paths or arbitrary hashes. New identity has no ENV selection authority. | Node-manager/runtime-manager own adapter configuration; provisioning/source milestone owns managed-store/bootstrap precedence. | Existing configuration keeps its semantics in this PR. The first replacement must define precedence and remove old knobs only after bootstrap, restart and rollback consumers migrate. |
 

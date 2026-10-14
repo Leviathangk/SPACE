@@ -59,17 +59,21 @@ use std::collections::BTreeMap;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-/// Current template `manifest.json` schema version.
+/// Unbound template `manifest.json` schema version.
 pub const TEMPLATE_MANIFEST_SCHEMA_VERSION: u32 = 2;
+/// Environment-bound documents require readers that preserve the binding.
+pub const BOUND_TEMPLATE_MANIFEST_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum TemplateManifestSchemaError {
     #[error("unsupported template manifest schema version {0}")]
     UnsupportedVersion(u32),
-    #[error("template manifest schema version 2 requires execution metadata")]
+    #[error("versioned template manifest requires execution metadata")]
     MissingExecution,
     #[error("legacy template manifest must not contain versioned execution metadata")]
     LegacyExecution,
+    #[error("template schema and execution environment binding disagree")]
+    EnvironmentBinding,
 }
 
 /// Typed view of `manifest.json` carried with every template build.
@@ -210,7 +214,11 @@ impl TemplateManifestFile {
 
 impl TemplateManifest {
     pub fn set_execution_metadata(&mut self, execution: crate::types::ExecutionMetadata) {
-        self.schema_version = Some(TEMPLATE_MANIFEST_SCHEMA_VERSION);
+        self.schema_version = Some(if execution.environment().is_some() {
+            BOUND_TEMPLATE_MANIFEST_SCHEMA_VERSION
+        } else {
+            TEMPLATE_MANIFEST_SCHEMA_VERSION
+        });
         self.execution = Some(execution);
     }
 
@@ -220,10 +228,21 @@ impl TemplateManifest {
         match (self.schema_version, self.execution.as_ref()) {
             (None, None) => Ok(None),
             (None, Some(_)) => Err(TemplateManifestSchemaError::LegacyExecution),
-            (Some(TEMPLATE_MANIFEST_SCHEMA_VERSION), Some(execution)) => Ok(Some(execution)),
-            (Some(TEMPLATE_MANIFEST_SCHEMA_VERSION), None) => {
-                Err(TemplateManifestSchemaError::MissingExecution)
+            (Some(version), Some(execution))
+                if version == TEMPLATE_MANIFEST_SCHEMA_VERSION
+                    || version == BOUND_TEMPLATE_MANIFEST_SCHEMA_VERSION =>
+            {
+                if execution.environment().is_some()
+                    != (version == BOUND_TEMPLATE_MANIFEST_SCHEMA_VERSION)
+                {
+                    return Err(TemplateManifestSchemaError::EnvironmentBinding);
+                }
+                Ok(Some(execution))
             }
+            (
+                Some(TEMPLATE_MANIFEST_SCHEMA_VERSION | BOUND_TEMPLATE_MANIFEST_SCHEMA_VERSION),
+                None,
+            ) => Err(TemplateManifestSchemaError::MissingExecution),
             (Some(version), _) => Err(TemplateManifestSchemaError::UnsupportedVersion(version)),
         }
     }

@@ -118,6 +118,7 @@ pub use template::{
 };
 #[cfg(feature = "serde")]
 pub use template::{
+    BOUND_TEMPLATE_MANIFEST_SCHEMA_VERSION, BOUND_TEMPLATE_METADATA_SCHEMA_VERSION,
     TEMPLATE_MANIFEST_SCHEMA_VERSION, TEMPLATE_METADATA_SCHEMA_VERSION, TemplateManifest,
     TemplateManifestCompression, TemplateManifestFile, TemplateManifestFilenameError,
     TemplateManifestSchemaError, TemplateMetadata, TemplateMetadataSchemaError, ZSTD_CODEC,
