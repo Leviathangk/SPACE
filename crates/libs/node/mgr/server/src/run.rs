@@ -206,6 +206,7 @@ struct DiskIoReservationFileConfig {
     enabled: Option<bool>,
     target_path: Option<PathBuf>,
     capacity_profile: Option<String>,
+    custom_capacity: Option<crate::disk_io_reservation::CustomDiskIoCapacity>,
     sandbox_capacity_percent: Option<u64>,
     read_weight_percent: Option<u64>,
     write_weight_percent: Option<u64>,
@@ -482,6 +483,7 @@ fn resolve_disk_io_reservation_config(
             file.capacity_profile.map(Some),
             defaults.capacity_profile,
         ),
+        custom_capacity: file.custom_capacity,
         sandbox_capacity_percent: setting(
             "disk_io_reservation.sandbox_capacity_percent",
             None,
