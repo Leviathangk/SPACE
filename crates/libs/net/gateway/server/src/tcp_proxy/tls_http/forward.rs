@@ -13,9 +13,13 @@ where
     Fut: Future<Output = Result<(U, HttpProtocol), upstream::Error>> + Send + 'static,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    pub(super) async fn forward(&self, mut request: SanitizedRequest<Incoming>) -> Response<Body> {
+    pub(super) async fn forward(
+        &self,
+        mut request: SanitizedRequest<Incoming>,
+        injected: &mut bool,
+    ) -> Response<Body> {
         if request.method() == http::Method::CONNECT {
-            return self.connect_request(request).await;
+            return self.connect_request(request, injected).await;
         }
 
         let protocol = HttpProtocol::of(request.version());
@@ -57,7 +61,7 @@ where
         }
         let upgrade = handshake.map(|handshake| (handshake, request.on_upgrade()));
         let mut forwarding = Attempt::forwarding(protocol.as_str(), "request");
-        let response = match self.dispatch(request, &mut forwarding).await {
+        let response = match self.dispatch(request, &mut forwarding, injected).await {
             Ok(response) => response,
             Err(response) => return *response,
         };
@@ -108,6 +112,7 @@ where
         &self,
         mut request: SanitizedRequest<Incoming>,
         forwarding: &mut Attempt,
+        injected: &mut bool,
     ) -> Result<Response<Incoming>, Box<Response<Body>>> {
         let protocol = HttpProtocol::of(request.version());
         let connect = request.method() == http::Method::CONNECT;
@@ -158,6 +163,7 @@ where
                     return Err(refuse(error.as_str(), error.status()));
                 }
             };
+            *injected = !headers.is_empty();
             inject(&mut request, headers);
             if sender.is_http1() {
                 translate_to_http1(&mut request);
@@ -166,7 +172,12 @@ where
         let request =
             request.map(|body| Either::Left(Self::forwarding_body(protocol, body, "request_body")));
         match sender.send(request).await {
-            Ok(response) => Ok(response),
+            Ok(mut response) => {
+                response
+                    .extensions_mut()
+                    .insert(HttpResponseSource::Upstream);
+                Ok(response)
+            }
             Err(error) => {
                 forwarding.finish(Outcome::Error, "upstream_http");
                 if !connect {

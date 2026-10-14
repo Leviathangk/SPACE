@@ -83,6 +83,7 @@ where
     pub(super) async fn connect_request(
         &self,
         mut request: SanitizedRequest<Incoming>,
+        injected: &mut bool,
     ) -> Response<Body> {
         let protocol = HttpProtocol::of(request.version());
         let mut authorization = Attempt::http_authorization(protocol.as_str());
@@ -107,7 +108,7 @@ where
         request.set_host(authority.parse().expect("validated CONNECT target"));
         let guest = request.on_upgrade();
         let mut forwarding = Attempt::forwarding(protocol.as_str(), "request");
-        let mut response = match self.dispatch(request, &mut forwarding).await {
+        let mut response = match self.dispatch(request, &mut forwarding, injected).await {
             Ok(response) => response,
             Err(response) => return *response,
         };

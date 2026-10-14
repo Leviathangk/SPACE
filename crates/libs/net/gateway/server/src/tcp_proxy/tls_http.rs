@@ -16,6 +16,7 @@ use hyper::client::conn::{http1, http2};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
+use pplx_space_metrics::gateway::HttpResponseSource;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -155,10 +156,32 @@ where
         tracing::Span::current().record("protocol", protocol.as_str());
         let request = SanitizedRequest::try_from(request);
         async move {
-            Ok::<_, Infallible>(match request {
-                Ok(request) => session.forward(request).await,
+            let mut injected = false;
+            let response = match request {
+                Ok(request) => session.forward(request, &mut injected).await,
                 Err(_) => session.refuse(protocol, "invalid_headers", StatusCode::BAD_REQUEST),
-            })
+            };
+            // Forwarded responses retain their provenance through body mapping.
+            // Locally generated refusals, including rejected upgrades, have none.
+            let source = response
+                .extensions()
+                .get::<HttpResponseSource>()
+                .copied()
+                .unwrap_or(HttpResponseSource::Gateway);
+            pplx_space_metrics::gateway::http_response(
+                protocol.as_str(),
+                response.status().as_u16(),
+                source,
+                injected,
+            );
+            tracing::debug!(
+                protocol = protocol.as_str(),
+                http.response.status_code = response.status().as_u16(),
+                status_source = source.as_str(),
+                injected,
+                "inspected HTTP response selected"
+            );
+            Ok::<_, Infallible>(response)
         }
     });
     let builder = guest_http_builder();

@@ -574,6 +574,49 @@ pub fn http_authorization(protocol: &str, outcome: &str, reason: &str) {
     );
 }
 
+/// Producer of the HTTP response selected for an inspected request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HttpResponseSource {
+    Gateway,
+    Upstream,
+}
+
+impl HttpResponseSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Gateway => "gateway",
+            Self::Upstream => "upstream",
+        }
+    }
+}
+
+impl fmt::Display for HttpResponseSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One response selected by inspected HTTP, before Hyper sends its headers.
+/// Includes gateway refusals, upstream error statuses, and CONNECT/WebSocket
+/// handshakes. It does not assert delivery or body completion; requests dropped
+/// before a response is selected emit no counter. Opaque tunnel data is excluded.
+/// `injected` means credential headers were added at request submission, even
+/// if the upstream attempt subsequently failed. Tags contain no request or
+/// sandbox identity; `protocol` is `http1`/`http2`, status is an HTTP status code,
+/// source is `gateway`/`upstream`, and injected is `true`/`false`.
+pub fn http_response(protocol: &str, status: u16, source: HttpResponseSource, injected: bool) {
+    counter(
+        "gateway.http.response",
+        1,
+        &[
+            tag("protocol", protocol),
+            tag("status_code", status),
+            tag("status_source", source),
+            tag("injected", injected),
+        ],
+    );
+}
+
 /// One terminal outcome per lazy inspected-origin TCP connection attempt.
 pub fn origin_tcp_connect(outcome: &str, reason: &str) {
     counter(
