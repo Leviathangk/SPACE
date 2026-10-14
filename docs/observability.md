@@ -570,7 +570,9 @@ The `error` values are listed in `crates/libs/metrics/src/sandbox/vm.rs`.
 Firecracker's flow-control counters (`block` `no_avail_buffer`, `net`
 `no_rx_avail_buffer` and `no_tx_avail_buffer`) are not among them: they count
 times the guest had not yet posted a buffer, which the device retries, not
-failures.
+failures. Nor is `signals` `sigpipe`: Firecracker raises SIGPIPE when it writes
+guest vsock data to a host peer that has gone, and `vsock` `tx_write_fails`
+counts that write once.
 
 Firecracker's ERROR log lines are re-logged by sandbox-manager as
 `firecracker error` with `sandbox_id` and the line in `firecracker_message`, at
