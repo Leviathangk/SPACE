@@ -7,8 +7,7 @@ use std::time::{Duration, Instant};
 use pplx_space_metrics::gateway::readiness::{self as metrics, Outcome};
 use pplx_space_net_common::TlsInterception;
 
-use super::NetworkStateInner;
-use crate::proto::NetworkState;
+use super::{NetworkStateInner, lifecycle::PolicyLifecycle};
 
 pub(super) struct StartupTiming {
     startup: Mutex<Startup>,
@@ -67,15 +66,17 @@ impl StartupTiming {
             // policy/dependency observations after a newer startup transition.
             let (inner, interception_dependencies_ready) = snapshot();
             let mode = inner
-                .policy
-                .as_ref()
-                .map_or(TlsInterception::Off, |policy| policy.tls_interception);
-            let outcome = match inner.mode {
-                NetworkState::NoIdentity => Outcome::Invalidated,
-                NetworkState::Draining | NetworkState::Stopped => Outcome::Cancelled,
+                .lifecycle
+                .installed()
+                .map_or(TlsInterception::Off, |installed| {
+                    installed.policy.tls_interception
+                });
+            let outcome = match &inner.lifecycle {
+                PolicyLifecycle::NoIdentity => Outcome::Invalidated,
+                PolicyLifecycle::Draining { .. } | PolicyLifecycle::Stopped => Outcome::Cancelled,
                 _ => {
                     let wait = startup.wait.get_or_insert_with(Wait::new);
-                    let policy_ready = inner.mode == NetworkState::Ready && inner.policy.is_some();
+                    let policy_ready = inner.lifecycle.ready().is_some();
                     let dependencies_ready =
                         mode == TlsInterception::Off || interception_dependencies_ready;
                     if policy_ready && !dependencies_ready {

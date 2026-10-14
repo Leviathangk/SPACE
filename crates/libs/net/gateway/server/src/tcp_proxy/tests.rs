@@ -750,7 +750,6 @@ async fn record_emits_one_connection_metric_and_reports_every_failure_outcome() 
 
     let outcomes = [
         FlowOutcome::Cancelled,
-        FlowOutcome::Rejected(Rejection::PolicyMissing(PolicyNotReady::ReadyWithoutPolicy)),
         FlowOutcome::Rejected(Rejection::PolicyMissing(
             PolicyNotReady::PendingPolicyTimeout,
         )),
@@ -758,7 +757,6 @@ async fn record_emits_one_connection_metric_and_reports_every_failure_outcome() 
         FlowOutcome::Rejected(Rejection::PolicyMissing(PolicyNotReady::PolicyError)),
         FlowOutcome::Rejected(Rejection::PolicyMissing(PolicyNotReady::Draining)),
         FlowOutcome::Rejected(Rejection::PolicyMissing(PolicyNotReady::Stopped)),
-        FlowOutcome::Rejected(Rejection::PolicyMissing(PolicyNotReady::Unspecified)),
         FlowOutcome::Rejected(Rejection::PolicyMissing(PolicyNotReady::PendingPolicy)),
         FlowOutcome::Rejected(Rejection::Admission(TcpAdmissionDenial::DnsAttribution(
             DenyReason::PlatformGuardrail {

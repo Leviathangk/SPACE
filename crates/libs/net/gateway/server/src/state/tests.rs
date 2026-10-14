@@ -546,9 +546,67 @@ fn counting_success_loader(
     (loader, calls)
 }
 
-/// `refresh` must keep short-circuiting when the gateway is already Ready
-/// with the expected v0 ref installed — the Ready short-circuit is what
-/// keeps steady-state reconciles from re-running the loader.
+#[tokio::test(start_paused = true)]
+async fn hydration_timeout_and_retry_exhaustion_preserve_policy_history() {
+    let state = GatewayNetworkState::pending_policy();
+    let previous_ref = test_policy_ref();
+    state
+        .refresh(
+            immediate_success_loader(previous_ref.clone()),
+            None,
+            NetworkStateReason::Startup,
+        )
+        .await;
+    state
+        .set_retry_backoff(INITIAL_HYDRATION_RETRY_INTERVAL)
+        .await;
+    let next_ref = EffectiveNetworkPolicyRef::local(
+        EffectiveNetworkPolicyRefScope::Sandbox,
+        "sandbox-1",
+        "f".repeat(64),
+    )
+    .unwrap();
+    let loader: PolicyLoader = Arc::new(|| Box::pin(std::future::pending()));
+    let timed_out = state
+        .refresh(loader, Some(next_ref), NetworkStateReason::ControlRefresh)
+        .await;
+    assert_eq!(timed_out.mode, NetworkState::PolicyError);
+    assert!(timed_out.policy.is_none());
+    assert_eq!(timed_out.installed_policy_ref, previous_ref.to_string());
+    assert_eq!(timed_out.last_error_kind, NetworkPolicyErrorKind::Timeout);
+    assert_eq!(
+        timed_out.last_error,
+        "policy hydration timed out after 30000 ms"
+    );
+    assert!(timed_out.last_hydration_latency_ms >= 30_000);
+    assert_eq!(timed_out.consecutive_hydration_failures, 1);
+    assert_eq!(timed_out.current_retry_backoff_ms, 250);
+
+    state
+        .spawn_hydration(
+            immediate_error_loader("source unavailable"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let exhausted = state.snapshot().await;
+    assert_eq!(exhausted.mode, NetworkState::PolicyError);
+    assert!(exhausted.policy.is_none());
+    assert_eq!(exhausted.installed_policy_ref, previous_ref.to_string());
+    assert_eq!(
+        exhausted.last_error_kind,
+        NetworkPolicyErrorKind::LoaderError
+    );
+    assert_eq!(
+        exhausted.last_error,
+        "policy hydration exhausted retry budget after 12 attempts"
+    );
+    assert_eq!(exhausted.consecutive_hydration_failures, 14);
+    assert_eq!(exhausted.current_retry_backoff_ms, 0);
+}
+
+/// The Ready short-circuit keeps steady-state reconciles from re-running
+/// the loader when the installed reference already matches.
 #[tokio::test]
 async fn refresh_short_circuits_when_ready_with_matching_ref() {
     use std::sync::atomic::Ordering::SeqCst;
@@ -720,41 +778,82 @@ fn controlled_success_loader(
 }
 
 async fn assert_stale_refresh_success_cannot_overwrite(terminal_mode: NetworkState) {
-    let state = GatewayNetworkState::pending_policy();
-    let policy_ref = test_policy_ref();
-    let (loader, started_rx, release_tx) = controlled_success_loader(policy_ref.clone());
-    let refresh_state = state.clone();
-    let refresh_policy_ref = policy_ref.clone();
-    let refresh_task = tokio::spawn(async move {
-        refresh_state
-            .refresh(
-                loader,
-                Some(refresh_policy_ref),
-                NetworkStateReason::ControlRefresh,
-            )
-            .await
-    });
+    for had_policy in [false, true] {
+        let state = GatewayNetworkState::pending_policy();
+        let previous_ref = test_policy_ref();
+        let previous = if had_policy {
+            state
+                .refresh(
+                    immediate_success_loader(previous_ref.clone()),
+                    None,
+                    NetworkStateReason::Startup,
+                )
+                .await
+                .policy
+        } else {
+            None
+        };
+        let policy_ref = EffectiveNetworkPolicyRef::local(
+            EffectiveNetworkPolicyRefScope::Sandbox,
+            "sandbox-1",
+            "f".repeat(64),
+        )
+        .unwrap();
+        let (loader, started_rx, release_tx) = controlled_success_loader(policy_ref.clone());
+        let refresh_state = state.clone();
+        let refresh_task = tokio::spawn(async move {
+            refresh_state
+                .refresh(loader, Some(policy_ref), NetworkStateReason::ControlRefresh)
+                .await
+        });
 
-    started_rx.await.unwrap();
-    match terminal_mode {
-        NetworkState::NoIdentity => {
-            state.set_no_identity(NetworkStateReason::NoIdentity).await;
+        started_rx.await.unwrap();
+        let pending = state.snapshot().await;
+        assert_eq!(pending.mode, NetworkState::PendingPolicy);
+        if let Some(previous) = &previous {
+            assert!(Arc::ptr_eq(pending.policy.as_ref().unwrap(), previous));
+            assert_eq!(pending.installed_policy_ref, previous_ref.to_string());
+            assert_eq!(
+                state.with_network_credentials(previous, |_| ()),
+                Err(NetworkCredentialSnapshotError::TemporarilyUnavailable)
+            );
+        } else {
+            assert!(pending.policy.is_none());
+            assert!(pending.installed_policy_ref.is_empty());
         }
-        NetworkState::Draining => {
-            state.set_draining(NetworkStateReason::Shutdown).await;
+        match terminal_mode {
+            NetworkState::NoIdentity => {
+                state.set_no_identity(NetworkStateReason::NoIdentity).await;
+            }
+            NetworkState::Draining => {
+                state.set_draining(NetworkStateReason::Shutdown).await;
+            }
+            NetworkState::Stopped => {
+                state.set_stopped(NetworkStateReason::Shutdown).await;
+            }
+            _ => panic!("unsupported terminal mode for stale refresh test"),
         }
-        NetworkState::Stopped => {
-            state.set_stopped(NetworkStateReason::Shutdown).await;
+        release_tx.send(()).unwrap();
+
+        let snapshot = refresh_task.await.unwrap();
+        assert_eq!(snapshot.mode, terminal_mode);
+        if terminal_mode == NetworkState::Draining
+            && let Some(previous) = &previous
+        {
+            assert!(Arc::ptr_eq(snapshot.policy.as_ref().unwrap(), previous));
+            assert_eq!(snapshot.installed_policy_ref, previous_ref.to_string());
+        } else {
+            assert!(snapshot.policy.is_none());
         }
-        _ => panic!("unsupported terminal mode for stale refresh test"),
+        if let Some(previous) = &previous {
+            assert_eq!(
+                state.with_network_credentials(previous, |_| ()),
+                Err(NetworkCredentialSnapshotError::Stale)
+            );
+        }
+        assert!(snapshot.last_error.is_empty());
+        assert_eq!(snapshot.last_error_kind, NetworkPolicyErrorKind::None);
     }
-    release_tx.send(()).unwrap();
-
-    let snapshot = refresh_task.await.unwrap();
-    assert_eq!(snapshot.mode, terminal_mode);
-    assert!(snapshot.policy.is_none());
-    assert!(snapshot.last_error.is_empty());
-    assert_eq!(snapshot.last_error_kind, NetworkPolicyErrorKind::None);
 }
 
 async fn wait_for_pending_tcp_count(state: &GatewayNetworkState, expected: u64) {
