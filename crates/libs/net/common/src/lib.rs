@@ -350,6 +350,15 @@ impl<'de> Deserialize<'de> for NetworkPolicyV1 {
     {
         #[derive(Deserialize)]
         struct Helper {
+            // Operator selection is a separate admission contract, never policy input.
+            #[serde(
+                default,
+                rename = "egress_profiles",
+                alias = "egress_profiles_json",
+                alias = "operator_egress_profiles",
+                deserialize_with = "reject_operator_profiles"
+            )]
+            _operator_profiles: (),
             #[serde(default)]
             version: NetworkPolicyVersion,
             egress: EgressPolicyV1,
@@ -375,6 +384,13 @@ impl<'de> Deserialize<'de> for NetworkPolicyV1 {
             tls_interception_exemptions: value.tls_interception_exemptions,
         })
     }
+}
+
+#[cfg(feature = "serde")]
+fn reject_operator_profiles<'de, D: Deserializer<'de>>(_: D) -> Result<(), D::Error> {
+    Err(de::Error::custom(
+        "operator egress profiles cannot be supplied in a policy",
+    ))
 }
 
 /// The only network-policy document supported by SPACE.

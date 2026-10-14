@@ -1131,6 +1131,7 @@ pub struct SetSandboxTimeoutResponse {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", serde(remote = "Self"))]
 pub struct CreateSandboxRequest {
     #[cfg_attr(
         feature = "schema",
@@ -1204,6 +1205,33 @@ pub struct CreateSandboxRequest {
     pub idle_action: Option<SandboxIdleAction>,
 }
 
+// Keep requests forward-compatible while reserving the operator-only admission
+// fields. Remote derives provide the ordinary field codec without recursively
+// calling these validated Deserialize implementations.
+#[cfg(feature = "serde")]
+macro_rules! tenant_policy_request_serde {
+    ($($request:ty),+ $(,)?) => {$(
+        impl Serialize for $request {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                Self::serialize(self, serializer)
+            }
+        }
+        impl<'de> Deserialize<'de> for $request {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let value = serde_json::Value::deserialize(deserializer)?;
+                if ["egress_profiles", "egress_profiles_json", "operator_egress_profiles"]
+                    .iter().any(|field| value.get(field).is_some()) {
+                    return Err(de::Error::custom("operator egress profiles cannot be supplied in a request body"));
+                }
+                Self::deserialize(value).map_err(de::Error::custom)
+            }
+        }
+    )+};
+}
+
+#[cfg(feature = "serde")]
+tenant_policy_request_serde!(CreateSandboxRequest, UpdateSandboxRequest);
+
 impl CreateSandboxRequest {
     pub fn idle_timeout_secs(&self) -> Result<Option<u64>, PublicApiParseError> {
         if (self.idle_timeout.is_some() || self.idle_action.is_some())
@@ -1248,6 +1276,7 @@ pub struct RollbackSandboxRequest {
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", serde(remote = "Self"))]
 pub struct UpdateSandboxRequest {
     pub metadata: Option<PublicSandboxMetadata>,
     pub resources: Option<SandboxResources>,

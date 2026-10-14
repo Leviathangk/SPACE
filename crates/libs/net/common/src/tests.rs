@@ -564,6 +564,20 @@ fn network_policy_json_ignores_unknown_top_level_fields() {
         r#"{"version":"v1","egress":{"default_action":"deny","future_field":true}}"#,
     )
     .unwrap_err();
+    for field in [
+        "egress_profiles",
+        "egress_profiles_json",
+        "operator_egress_profiles",
+    ] {
+        for value in [serde_json::Value::Null, serde_json::json!({"sensor":{}})] {
+            let mut policy = serde_json::json!({"egress":{"default_action":"deny"}});
+            policy[field] = value;
+            assert!(
+                serde_json::from_value::<NetworkPolicyV1>(policy).is_err(),
+                "{field}"
+            );
+        }
+    }
 }
 
 #[test]

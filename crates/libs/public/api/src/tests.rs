@@ -493,6 +493,26 @@ fn sandbox_mutation_requests_reject_v2_and_accept_domain_denies() {
         }
     });
     serde_json::from_value::<UpdateSandboxRequest>(domain_deny_update).unwrap();
+    for field in [
+        "egress_profiles",
+        "egress_profiles_json",
+        "operator_egress_profiles",
+    ] {
+        for value in [serde_json::Value::Null, serde_json::json!(["sensor"])] {
+            let mut create = serde_json::json!({"template":"seed"});
+            create[field] = value.clone();
+            assert!(
+                serde_json::from_value::<CreateSandboxRequest>(create).is_err(),
+                "{field}"
+            );
+            let mut update = serde_json::json!({});
+            update[field] = value;
+            assert!(
+                serde_json::from_value::<UpdateSandboxRequest>(update).is_err(),
+                "{field}"
+            );
+        }
+    }
 }
 
 #[cfg(feature = "serde")]

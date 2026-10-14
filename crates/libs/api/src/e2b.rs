@@ -579,10 +579,24 @@ where
     type Rejection = errors::E2bApiError;
 
     async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
-        <Json<T> as FromRequest<S>>::from_request(request, state)
+        let Json(value) = <Json<serde_json::Value> as FromRequest<S>>::from_request(request, state)
             .await
-            .map(|Json(value)| Self(value))
-            .map_err(json_rejection_error)
+            .map_err(json_rejection_error)?;
+        if [
+            "egress_profiles",
+            "egress_profiles_json",
+            "operator_egress_profiles",
+        ]
+        .iter()
+        .any(|field| value.get(field).is_some())
+        {
+            return Err(errors::E2bApiError::bad_request(
+                "operator egress profiles cannot be supplied in a request body",
+            ));
+        }
+        serde_json::from_value(value)
+            .map(Self)
+            .map_err(|_| errors::E2bApiError::bad_request("Invalid E2B request body"))
     }
 }
 
