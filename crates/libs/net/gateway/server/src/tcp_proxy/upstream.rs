@@ -1,7 +1,8 @@
 //! One lazy origin connection per downstream connection. Waiters never own setup.
 use super::executor::Executor;
 use super::{
-    http_session::{HttpProtocol, http_reason},
+    http_protocol::HttpProtocol,
+    http_session::http_reason,
     routing_headers::{SanitizedBody, SanitizedRequest},
     tls::TlsTransportError,
     transport,

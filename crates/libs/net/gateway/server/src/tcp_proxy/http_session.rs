@@ -1,44 +1,45 @@
 //! Shared request forwarding and task ownership for plaintext and inspected HTTP.
+//!
+//! `forward` is the one pipeline both entries run: target, policy, mode
+//! admission, origin readiness, final re-check, submission. `mode` owns every
+//! difference between plaintext and inspected HTTP; `binding` owns the
+//! hostname-to-destination policy question both modes ask.
 
 use std::convert::Infallible;
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
 use std::time::Duration;
 
-use http::{Request, Response, StatusCode, Version, header};
+use http::{Request, Response, header};
 use http_body_util::{Either, Empty};
-use hyper::body::{Body as HttpBody, Bytes, Incoming};
-#[cfg(test)]
-use hyper::client::conn::{http1, http2};
+use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
-#[cfg(test)]
-use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::Instrument;
 
-use super::accounting::{Attempt, Outcome};
 use super::executor::Executor;
-use super::http_host::{self, HostBinding, Served};
+use super::http_protocol::HttpProtocol;
 use super::routing_headers::SanitizedRequest;
-#[cfg(test)]
-use super::tls::TlsTransportError;
 use super::upstream::{self, Upstream};
 use crate::certificates::CertificateLease;
-use crate::tls_sni::HttpAlpn;
-pub(super) use error::HttpError;
-use error::RequestError;
-pub(super) use error::http_reason;
+pub(super) use binding::{BindingOutcome, HostBinding};
+use body::ForwardingBody;
+pub(super) use error::{HttpError, http_reason};
+use mode::Mode;
 
+/// Events moved into child modules keep this module's target.
+const LOG_TARGET: &str = module_path!();
+
+mod binding;
+mod body;
 mod connect;
 mod credentials;
 mod error;
 mod forward;
+mod mode;
 mod upgrade;
 
 type Body = Either<ForwardingBody, Empty<Bytes>>;
@@ -65,74 +66,35 @@ const MAX_STREAMS: u32 = 32;
 const GUEST_H2_STREAM_WINDOW: u32 = 128 * 1024;
 const GUEST_H2_CONNECTION_WINDOW: u32 = 4 * 1024 * 1024;
 
-struct ForwardingBody {
-    inner: Incoming,
-    attempt: Option<Attempt>,
+#[derive(Debug, thiserror::Error)]
+pub(super) enum Failure {
+    #[error("HTTP origin setup failed: {0}")]
+    Setup(#[source] Arc<upstream::Error>),
+    #[error("guest HTTP failed")]
+    GuestHttp(#[source] hyper::Error),
 }
 
-impl ForwardingBody {
-    fn new(
-        inner: Incoming,
-        protocol: &'static str,
-        operation: &'static str,
-        inspected: bool,
-    ) -> Self {
-        let mut attempt = inspected.then(|| Attempt::forwarding(protocol, operation));
-        if inner.is_end_stream()
-            && let Some(attempt) = &mut attempt
-        {
-            attempt.finish(Outcome::Success, "body_complete");
-        }
-        Self { inner, attempt }
-    }
-}
-
-impl HttpBody for ForwardingBody {
-    type Data = Bytes;
-    type Error = hyper::Error;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
-        let result = Pin::new(&mut self.inner).poll_frame(context);
-        let finished = match &result {
-            Poll::Ready(Some(Err(_))) => Some((Outcome::Error, "body_error")),
-            Poll::Ready(None) => Some((Outcome::Success, "body_complete")),
-            Poll::Ready(Some(Ok(_))) if self.inner.is_end_stream() => {
-                Some((Outcome::Success, "body_complete"))
-            }
-            _ => None,
-        };
-        if let (Some(attempt), Some((outcome, reason))) = (&mut self.attempt, finished) {
-            attempt.finish(outcome, reason);
-        }
-        result
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> hyper::body::SizeHint {
-        self.inner.size_hint()
-    }
-}
-
-enum Mode {
-    Plaintext,
-    Inspected(Arc<CertificateLease>),
-}
-impl Mode {
-    async fn invalidated(&self) {
+impl Failure {
+    pub(super) fn reason(&self) -> &'static str {
         match self {
-            Self::Plaintext => std::future::pending().await,
-            Self::Inspected(lease) => lease.invalidated().await,
+            Self::Setup(error) if matches!(error.as_ref(), upstream::Error::Connect(_)) => {
+                "connect"
+            }
+            Self::Setup(_) => "plaintext_upstream_http",
+            Self::GuestHttp(_) => "plaintext_guest_http",
         }
     }
-    fn is_inspected(&self) -> bool {
-        matches!(self, Self::Inspected(_))
-    }
+}
+
+/// Per-flow request tally for plaintext HTTP.
+#[derive(Default)]
+pub(super) struct Served {
+    pub requests: u32,
+    pub forwarded: u32,
+    pub refused: u32,
+    pub upstream_failed: u32,
+    pub wire_tx: u64,
+    pub wire_rx: u64,
 }
 
 struct Session<F> {
@@ -172,7 +134,7 @@ impl<F> Session<F> {
             tokio::select! {
                 biased;
                 () = self.shutdown.cancelled() => Err(HttpError::Cancelled),
-                () = self.mode.invalidated() => Err(super::tls::TlsTransportError::Invalidated.into()),
+                error = self.mode.invalidated() => Err(error),
                 result = &mut serving => result,
             }
         };
@@ -184,7 +146,7 @@ impl<F> Session<F> {
         tokio::select! {
             biased;
             () = self.shutdown.cancelled() => {},
-            () = self.mode.invalidated() => { result = Err(super::tls::TlsTransportError::Invalidated.into()); },
+            error = self.mode.invalidated() => { result = Err(error); },
             () = self.upgrades.wait() => {},
         }
         self.shutdown.cancel();
@@ -200,7 +162,7 @@ pub(super) async fn serve_plaintext<C, F, Fut, U>(
     binding: HostBinding,
     connect: F,
     shutdown: CancellationToken,
-) -> Result<Served, http_host::Failure>
+) -> Result<Served, Failure>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     F: FnOnce(HttpProtocol) -> Fut + Send + 'static,
@@ -222,12 +184,12 @@ where
     };
     let result = session.run(serving).await;
     if let Some(error) = session.upstream.failure() {
-        return Err(http_host::Failure::Setup(error));
+        return Err(Failure::Setup(error));
     }
     if let Err(HttpError::Protocol(error)) = result
         && error.is_parse()
     {
-        return Err(http_host::Failure::GuestHttp(error));
+        return Err(Failure::GuestHttp(error));
     }
     Ok(std::mem::take(
         &mut *session.served.lock().expect("HTTP tally lock poisoned"),
@@ -279,34 +241,16 @@ where
         tracing::Span::current().record("protocol", protocol.as_str());
         let result = match SanitizedRequest::try_from(request) {
             Ok(request) => self.forward(request).await,
-            Err(_) => Err(http_host::BindingOutcome::InvalidHeaders.into()),
+            Err(_) => Err(BindingOutcome::InvalidHeaders.into()),
         };
-        if !self.mode.is_inspected() {
-            let mut served = self.served.lock().expect("HTTP tally lock poisoned");
-            served.requests += 1;
-            match &result {
-                Ok(_) => served.forwarded += 1,
-                Err(error) if error.is_upstream() => served.upstream_failed += 1,
-                Err(_) => served.refused += 1,
-            }
-        }
+        self.mode.tally(&self.served, &result);
         Ok(match result {
             Ok(response) => response,
             Err(error) => {
-                match &error {
-                    RequestError::Setup(error) if !self.mode.is_inspected() => {
-                        self.binding.record_setup_failure(error)
-                    }
-                    RequestError::Setup(error) => error.record("upstream_setup"),
-                    RequestError::Upstream(error) => tracing::info!(
-                        http_reason = http_reason(error),
-                        "HTTP request forwarding failed"
-                    ),
-                    _ => {}
-                }
-                let reason = error.reason(self.mode.is_inspected());
+                self.mode.log_failure(&self.binding, &error);
+                let reason = self.mode.reason(&error);
                 let status = error.status();
-                self.record(protocol, reason, status);
+                self.mode.record(protocol, reason, status);
                 let mut response = Response::new(Either::Right(Empty::new()));
                 *response.status_mut() = status;
                 if protocol == HttpProtocol::Http1 {
@@ -325,32 +269,10 @@ where
         body: Incoming,
         operation: &'static str,
     ) -> ForwardingBody {
-        ForwardingBody::new(body, protocol.as_str(), operation, self.mode.is_inspected())
-    }
-
-    fn record(&self, protocol: HttpProtocol, outcome: &'static str, status: StatusCode) {
-        let binding = if self.mode.is_inspected() {
-            "tls_http"
-        } else {
-            "http_host"
-        };
-        pplx_space_metrics::gateway::domain_binding("tcp", binding, outcome, None);
-        tracing::debug!(
-            protocol = protocol.as_str(),
-            outcome,
-            status = status.as_u16(),
-            "HTTP request forwarding result"
-        );
-        if self.mode.is_inspected()
-            && !matches!(outcome, "allowed" | "websocket" | "connect_forwarded")
-        {
-            tracing::info!(
-                protocol = protocol.as_str(),
-                outcome,
-                status = status.as_u16(),
-                "inspected HTTP request refused"
-            );
-        }
+        let attempt = self
+            .mode
+            .attempt(|| super::accounting::Attempt::forwarding(protocol.as_str(), operation));
+        ForwardingBody::new(body, attempt)
     }
 }
 
@@ -376,38 +298,4 @@ fn guest_http_builder(executor: Executor) -> auto::Builder<Executor> {
         .keep_alive_interval(Some(H2_KEEP_ALIVE_INTERVAL))
         .keep_alive_timeout(H2_KEEP_ALIVE_TIMEOUT);
     builder
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum HttpProtocol {
-    Http1,
-    Http2,
-}
-
-impl HttpProtocol {
-    /// The protocol hyper actually parsed a request with. This, not the ALPN
-    /// result, decides how the request is forwarded.
-    pub(super) fn of(version: http::Version) -> Self {
-        if version == http::Version::HTTP_2 {
-            Self::Http2
-        } else {
-            Self::Http1
-        }
-    }
-
-    pub(super) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Http1 => "http1",
-            Self::Http2 => "http2",
-        }
-    }
-}
-
-impl From<HttpAlpn> for HttpProtocol {
-    fn from(protocol: HttpAlpn) -> Self {
-        match protocol {
-            HttpAlpn::Http1 => Self::Http1,
-            HttpAlpn::Http2 => Self::Http2,
-        }
-    }
 }

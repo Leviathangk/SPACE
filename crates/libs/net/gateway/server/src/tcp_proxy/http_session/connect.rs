@@ -2,6 +2,7 @@
 //! the tunnel contents and inner destination remain outside HTTP inspection.
 
 use super::*;
+use http::Version;
 
 /// The authority forwarded in an HTTP/1.1 CONNECT request.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]

@@ -36,6 +36,7 @@ mod accounting;
 mod admission;
 mod executor;
 mod http_host;
+mod http_protocol;
 mod http_session;
 mod inspected;
 mod relay;
@@ -251,7 +252,7 @@ enum Rejection {
 /// Where relaying failed, named for the phase.
 enum RelayFailure {
     Connect(transport::Error),
-    Plaintext(http_host::Failure),
+    Plaintext(http_session::Failure),
     /// Connected, then the byte stream failed (e.g. reset, broken pipe).
     Transfer(io::Error),
     Inspected(http_session::HttpError),
@@ -637,7 +638,7 @@ impl TcpProxy {
         Fut: Future<Output = Result<U, transport::Error>> + Send + 'static,
         U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let binding = http_host::HostBinding::new(
+        let binding = http_session::HostBinding::new(
             self.sandbox_id,
             dst,
             self.network_state.clone(),
@@ -697,15 +698,15 @@ impl TcpProxy {
                 );
             }
             FlowOutcome::RelayFailed(RelayFailure::Plaintext(error)) => match error {
-                http_host::Failure::Setup(error)
+                http_session::Failure::Setup(error)
                     if matches!(error.as_ref(), upstream::Error::Connect(_)) => {}
-                http_host::Failure::Setup(_) => pplx_space_metrics::gateway::domain_binding(
+                http_session::Failure::Setup(_) => pplx_space_metrics::gateway::domain_binding(
                     "tcp",
                     "http_host",
                     "upstream_http_failed",
                     None,
                 ),
-                http_host::Failure::GuestHttp(_) => pplx_space_metrics::gateway::domain_binding(
+                http_session::Failure::GuestHttp(_) => pplx_space_metrics::gateway::domain_binding(
                     "tcp",
                     "http_host",
                     "guest_http_failed",

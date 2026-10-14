@@ -1,7 +1,8 @@
 //! Compose certificate-bound TLS transport with inspected HTTP.
-use super::http_host::{HostBinding, MeteredIo};
-use super::http_session::{HttpError, HttpProtocol};
+use super::http_protocol::HttpProtocol;
+use super::http_session::{HostBinding, HttpError};
 use super::tls::TlsTransportError;
+use super::transport::MeteredIo;
 use super::{TcpProxy, http_session, tls, transport};
 use crate::{
     certificates::CertificateLease,

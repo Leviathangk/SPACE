@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use pplx_space_observability::test_capture::{CapturedEvent, RecordingVisitor};
 use tracing_subscriber::layer::SubscriberExt;
 
-use super::super::{http_session::HttpProtocol, inspected::upstream_alpn_offer};
+use super::super::{http_protocol::HttpProtocol, inspected::upstream_alpn_offer};
 use super::TlsTransportError;
 use crate::tls_sni::{ClientAlpnOffer, HttpAlpn};
 

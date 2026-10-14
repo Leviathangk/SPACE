@@ -1,99 +1,13 @@
 use super::credentials::{credential_headers, inject};
-use super::forward::authorize_authority;
+use http::StatusCode;
+use hyper::client::conn::{http1, http2};
+use hyper_util::rt::TokioExecutor;
+
+use super::super::tls::TlsTransportError;
 use super::*;
 use crate::certificates::NetworkCredentialAccessError;
 use http::HeaderMap;
 use pplx_space_common_core::types::CredentialReferenceId;
-
-#[test]
-fn authority_binds_every_http_routing_field_to_the_tls_origin() {
-    let host = "allowed.test".parse().unwrap();
-    for (uri, headers, version, port, accepted) in [
-        ("/", vec!["allowed.test"], Version::HTTP_11, 443, true),
-        ("/", vec!["ALLOWED.test.:443"], Version::HTTP_11, 443, true),
-        (
-            "https://allowed.test/",
-            vec!["allowed.test"],
-            Version::HTTP_11,
-            443,
-            true,
-        ),
-        ("https://allowed.test/", vec![], Version::HTTP_2, 443, true),
-        (
-            "https://allowed.test:8443/",
-            vec!["allowed.test:8443"],
-            Version::HTTP_2,
-            8443,
-            true,
-        ),
-        ("/", vec!["forbidden.test"], Version::HTTP_11, 443, false),
-        (
-            "https://forbidden.test/",
-            vec!["allowed.test"],
-            Version::HTTP_11,
-            443,
-            false,
-        ),
-        (
-            "https://allowed.test/",
-            vec!["forbidden.test"],
-            Version::HTTP_2,
-            443,
-            false,
-        ),
-        (
-            "http://allowed.test/",
-            vec!["allowed.test"],
-            Version::HTTP_11,
-            443,
-            false,
-        ),
-        (
-            "https://allowed.test:80/",
-            vec![],
-            Version::HTTP_2,
-            443,
-            false,
-        ),
-        ("/", vec!["allowed.test:8443"], Version::HTTP_11, 443, false),
-        (
-            "/",
-            vec!["allowed.test:65536"],
-            Version::HTTP_11,
-            443,
-            false,
-        ),
-        ("/", vec!["allowed.test:"], Version::HTTP_11, 443, false),
-        ("/", vec!["user@allowed.test"], Version::HTTP_11, 443, false),
-        (
-            "/",
-            vec!["allowed.test", "allowed.test"],
-            Version::HTTP_11,
-            443,
-            false,
-        ),
-        ("/", vec![], Version::HTTP_11, 443, false),
-        ("/", vec!["allowed.test"], Version::HTTP_2, 443, false),
-        (
-            "https://allowed.test/",
-            vec![],
-            Version::HTTP_11,
-            443,
-            false,
-        ),
-    ] {
-        let mut request = Request::builder().uri(uri).version(version);
-        for header in &headers {
-            request = request.header(header::HOST, *header);
-        }
-        let request = request.body(()).unwrap();
-        assert_eq!(
-            authorize_authority(&request.try_into().unwrap(), &host, port).is_ok(),
-            accepted,
-            "{version:?} {uri} {headers:?} -> {port}"
-        );
-    }
-}
 
 const NETWORK_REFERENCE_ID: &str = "018f1e9d-7b7a-7d3a-8000-000000000001";
 const SECOND_NETWORK_REFERENCE_ID: &str = "018f1e9d-7b7a-7d3a-8000-000000000002";

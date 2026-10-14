@@ -60,8 +60,10 @@ pub(in crate::tcp_proxy) fn http_reason(error: &hyper::Error) -> &'static str {
     }
 }
 
-use super::super::{http_host::BindingOutcome, upstream};
-use super::{Outcome, forward::AuthorityError};
+use super::super::accounting::Outcome;
+use super::super::upstream;
+use super::binding::BindingOutcome;
+use super::mode::AuthorityError;
 use crate::certificates::NetworkCredentialAccessError;
 use http::StatusCode;
 use std::sync::Arc;

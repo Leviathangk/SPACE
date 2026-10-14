@@ -8,9 +8,20 @@ use pplx_space_net_common::{
 };
 use tokio::io::duplex;
 
+use std::convert::Infallible;
+use std::io;
+
+use http::{Request, Response, StatusCode, header};
+use hyper::client::conn::http1 as client;
+use hyper::server::conn::http1 as server;
+use hyper::service::service_fn;
+use hyper_util::rt::TokioIo;
+
 use super::*;
+use crate::dns::DnsAllowCache;
 use crate::dns::test_fixtures::a_response as dns_a_response;
 use crate::proto::NetworkState;
+use crate::state::GatewayNetworkState;
 use crate::state::{NetworkStateReason, PolicyLoader, PulledNetworkPolicy};
 use hyper::body::Incoming;
 use tokio::sync::Mutex;
@@ -391,62 +402,6 @@ async fn validates_every_host_on_a_keep_alive_connection() {
         seen_fastly_key.load(Ordering::SeqCst),
         1,
         "the guest Fastly-Key credential must survive routing-header stripping"
-    );
-}
-
-#[test]
-fn absolute_form_authority_outranks_an_allowed_host_header() {
-    let request = Request::builder()
-        .uri(format!("http://{CO_TENANT_HOST}/relay"))
-        .header(header::HOST, ALLOWED_HOST)
-        .body(Empty::<hyper::body::Bytes>::new())
-        .unwrap();
-
-    assert_eq!(
-        request_authority(&request.try_into().unwrap())
-            .unwrap()
-            .host(),
-        CO_TENANT_HOST,
-        "proxy-form targets must not be authorized by a conflicting Host header"
-    );
-}
-
-#[test]
-fn duplicate_origin_form_hosts_are_invalid() {
-    let request = Request::builder()
-        .uri("/simple/")
-        .header(header::HOST, ALLOWED_HOST)
-        .header(header::HOST, CO_TENANT_HOST)
-        .body(Empty::<hyper::body::Bytes>::new())
-        .unwrap();
-
-    assert!(
-        request_authority(&request.try_into().unwrap()).is_err(),
-        "authorization must not pick one Host while a CDN routes on another"
-    );
-}
-
-#[test]
-fn canonicalizes_the_validated_authority_and_forwards_origin_form() {
-    let request = Request::builder()
-        .uri("http://PYPI.ORG.:8080/simple/?q=host")
-        .header(header::HOST, CO_TENANT_HOST)
-        .body(Empty::<hyper::body::Bytes>::new())
-        .unwrap();
-    let mut request = SanitizedRequest::try_from(request).unwrap();
-    let (_, authority) = validated_request_authority(&request).unwrap();
-
-    normalize_upstream_routing(&mut request, &authority).unwrap();
-
-    assert_eq!(
-        request.headers().get(header::HOST).unwrap(),
-        "pypi.org:8080",
-        "forward the canonical DomainName plus the validated port"
-    );
-    assert_eq!(
-        request.uri(),
-        "/simple/?q=host",
-        "a direct origin connection must receive origin-form, not an absolute URI"
     );
 }
 

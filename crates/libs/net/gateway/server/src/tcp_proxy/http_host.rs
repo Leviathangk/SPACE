@@ -6,174 +6,20 @@
 //! The upstream socket is created only after the first request passes that
 //! check, so a rejected authority cannot produce network egress.
 
-#[cfg(test)]
-use std::convert::Infallible;
+//! Policy, origin setup and forwarding are shared with inspected HTTP in
+//! `http_session`; this module only meters the origin socket for the flow.
+
 use std::future::Future;
-#[cfg(test)]
-use std::io;
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::task::{Context, Poll};
 
-#[cfg(test)]
-use http::{Request, Response};
-use http::{StatusCode, header, uri::Authority};
-#[cfg(test)]
-use hyper::client::conn::http1 as client;
-#[cfg(test)]
-use hyper::server::conn::http1 as server;
-#[cfg(test)]
-use hyper::service::service_fn;
-#[cfg(test)]
-use hyper_util::rt::TokioIo;
-use pplx_space_net_common::DomainName;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-
-use super::routing_headers::SanitizedRequest;
-use super::{http_session::HttpProtocol, upstream};
-use crate::dns::DnsAllowCache;
-use crate::egress::{HostBindingError, authorize_host};
-use crate::state::{GatewayNetworkState, TrafficPolicy};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
 
-#[derive(Clone)]
-pub(super) struct HostBinding {
-    sandbox_id: &'static str,
-    destination: SocketAddr,
-    network_state: GatewayNetworkState,
-    dns_allow_cache: DnsAllowCache,
-}
-
-impl HostBinding {
-    pub(super) fn new(
-        sandbox_id: &'static str,
-        destination: SocketAddr,
-        network_state: GatewayNetworkState,
-        dns_allow_cache: DnsAllowCache,
-    ) -> Self {
-        Self {
-            sandbox_id,
-            destination,
-            network_state,
-            dns_allow_cache,
-        }
-    }
-
-    pub(super) async fn authorize(
-        &self,
-        host: &DomainName,
-    ) -> Result<Arc<pplx_space_net_common::NetworkPolicyV1>, BindingOutcome> {
-        // Established requests retain the bounded PendingPolicy grace.
-        let policy = match self.network_state.wait_for_tcp_policy().await {
-            TrafficPolicy::Ready(policy) => policy,
-            TrafficPolicy::NotReady(_) => return Err(BindingOutcome::PolicyUnavailable),
-        };
-        authorize_host(&policy, self.destination, host, &self.dns_allow_cache).map_err(
-            |error| match error {
-                HostBindingError::HostNotAllowed => BindingOutcome::HostNotAllowed,
-                HostBindingError::HostUnattributed => BindingOutcome::HostUnattributed,
-                HostBindingError::PolicyDenied(_) => BindingOutcome::PolicyDenied,
-            },
-        )?;
-        Ok(policy)
-    }
-    pub(super) async fn reauthorize(
-        &self,
-        host: &DomainName,
-        policy: &Arc<pplx_space_net_common::NetworkPolicyV1>,
-    ) -> Result<(), BindingOutcome> {
-        if self.network_state.is_current_tcp_policy(policy) {
-            return Ok(());
-        }
-        self.authorize(host).await.map(|_| ())
-    }
-
-    pub(super) fn record_setup_failure(&self, error: &upstream::Error) {
-        let (failure, error_kind) = match error {
-            upstream::Error::Connect(error) => ("connect", error.io_kind()),
-            upstream::Error::Http(_) => ("http_handshake", None),
-            upstream::Error::Tls(_) | upstream::Error::Cancelled => ("setup", None),
-        };
-        tracing::debug!(
-            sandbox_id = self.sandbox_id,
-            dst_port = self.destination.port(),
-            address_family = if self.destination.is_ipv6() {
-                "ipv6"
-            } else {
-                "ipv4"
-            },
-            failure,
-            ?error_kind,
-            "plaintext HTTP upstream connection failed"
-        );
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum BindingOutcome {
-    InvalidHost,
-    InvalidHeaders,
-    HostNotAllowed,
-    HostUnattributed,
-    PolicyDenied,
-    PolicyUnavailable,
-}
-
-impl BindingOutcome {
-    pub(super) const fn as_str(self) -> &'static str {
-        match self {
-            Self::InvalidHost => "invalid_host",
-            Self::InvalidHeaders => "invalid_headers",
-            Self::HostNotAllowed => "host_not_allowed",
-            Self::HostUnattributed => "host_unattributed",
-            Self::PolicyDenied => "policy_denied",
-            Self::PolicyUnavailable => "policy_unavailable",
-        }
-    }
-
-    pub(super) const fn refusal_status(self) -> StatusCode {
-        match self {
-            Self::InvalidHeaders => StatusCode::BAD_REQUEST,
-            Self::PolicyUnavailable => StatusCode::BAD_GATEWAY,
-            Self::InvalidHost
-            | Self::HostNotAllowed
-            | Self::HostUnattributed
-            | Self::PolicyDenied => StatusCode::FORBIDDEN,
-        }
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub(super) enum Failure {
-    #[error("HTTP origin setup failed: {0}")]
-    Setup(#[source] Arc<upstream::Error>),
-    #[error("guest HTTP failed")]
-    GuestHttp(#[source] hyper::Error),
-}
-
-impl Failure {
-    pub(super) fn reason(&self) -> &'static str {
-        match self {
-            Self::Setup(error) if matches!(error.as_ref(), upstream::Error::Connect(_)) => {
-                "connect"
-            }
-            Self::Setup(_) => "plaintext_upstream_http",
-            Self::GuestHttp(_) => "plaintext_guest_http",
-        }
-    }
-}
-
-#[derive(Default)]
-pub(super) struct Served {
-    pub requests: u32,
-    pub forwarded: u32,
-    pub refused: u32,
-    pub upstream_failed: u32,
-    pub wire_tx: u64,
-    pub wire_rx: u64,
-}
+use super::http_protocol::HttpProtocol;
+use super::http_session::{Failure, HostBinding, Served};
+use super::transport::{self, MeteredIo};
 
 pub(super) async fn serve<C, F, Fut, U>(
     guest: C,
@@ -184,12 +30,12 @@ pub(super) async fn serve<C, F, Fut, U>(
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     F: FnOnce(SocketAddr) -> Fut + Send + 'static,
-    Fut: Future<Output = Result<U, super::transport::Error>> + Send + 'static,
+    Fut: Future<Output = Result<U, transport::Error>> + Send + 'static,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let wire_tx = Arc::new(AtomicU64::new(0));
     let wire_rx = Arc::new(AtomicU64::new(0));
-    let destination = binding.destination;
+    let destination = binding.destination();
     let connector = {
         let read = wire_rx.clone();
         let written = wire_tx.clone();
@@ -210,116 +56,6 @@ where
     served.wire_tx = wire_tx.load(Ordering::Relaxed);
     served.wire_rx = wire_rx.load(Ordering::Relaxed);
     Ok(served)
-}
-
-/// Make the bytes forwarded upstream express the same authority that passed
-/// policy. For absolute-form targets RFC 7230 requires a proxy to replace a
-/// conflicting `Host`; leaving the guest's original value in place would let a
-/// CDN route on unchecked metadata. Known provider-routing headers have already
-/// been removed by the sanitized request boundary.
-pub(super) fn normalize_upstream_routing<B>(
-    request: &mut SanitizedRequest<B>,
-    authority: &Authority,
-) -> Result<(), ()> {
-    let value = authority.as_str().parse().map_err(|_| ())?;
-    request.set_host(value);
-    let origin_form = request
-        .uri()
-        .path_and_query()
-        .map(|path| path.as_str())
-        .unwrap_or("/")
-        .parse()
-        .map_err(|_| ())?;
-    *request.uri_mut() = origin_form;
-    Ok(())
-}
-
-fn canonical_authority(host: &DomainName, port: Option<u16>) -> Result<Authority, ()> {
-    match port {
-        Some(port) => format!("{}:{port}", host.as_str()),
-        None => host.as_str().to_string(),
-    }
-    .parse()
-    .map_err(|_| ())
-}
-
-pub(super) fn validated_request_authority<B>(
-    request: &SanitizedRequest<B>,
-) -> Result<(DomainName, Authority), ()> {
-    let authority = request_authority(request)?;
-    let host: DomainName = authority.host().parse().map_err(|_| ())?;
-    let authority = canonical_authority(&host, authority.port_u16())?;
-    Ok((host, authority))
-}
-
-/// Parse the effective HTTP request authority. Absolute-form request-target
-/// authority outranks `Host`; accepting the header first would permit a
-/// proxy-form request to name an allowed host in the header while targeting a
-/// different service. Origin-form requests must carry exactly one `Host`, so
-/// the value authorized here cannot differ from one a CDN chooses upstream.
-fn request_authority<B>(request: &SanitizedRequest<B>) -> Result<Authority, ()> {
-    if let Some(authority) = request.uri().authority() {
-        return Ok(authority.clone());
-    }
-    let mut hosts = request.headers().get_all(header::HOST).iter();
-    let host = hosts.next().ok_or(())?;
-    if hosts.next().is_some() {
-        return Err(());
-    }
-    host.to_str()
-        .ok()
-        .and_then(|value| value.parse::<Authority>().ok())
-        .ok_or(())
-}
-
-pub(super) struct MeteredIo<T> {
-    pub(super) inner: T,
-    pub(super) read: Arc<AtomicU64>,
-    pub(super) written: Arc<AtomicU64>,
-}
-
-impl<T: AsyncRead + Unpin> AsyncRead for MeteredIo<T> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        buffer: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let before = buffer.filled().len();
-        let result = Pin::new(&mut self.inner).poll_read(context, buffer);
-        if matches!(result, Poll::Ready(Ok(()))) {
-            let read = buffer.filled().len().saturating_sub(before) as u64;
-            self.read.fetch_add(read, Ordering::Relaxed);
-        }
-        result
-    }
-}
-
-impl<T: AsyncWrite + Unpin> AsyncWrite for MeteredIo<T> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        buffer: &[u8],
-    ) -> Poll<Result<usize, std::io::Error>> {
-        let result = Pin::new(&mut self.inner).poll_write(context, buffer);
-        if let Poll::Ready(Ok(written)) = result {
-            self.written.fetch_add(written as u64, Ordering::Relaxed);
-        }
-        result
-    }
-
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
-        Pin::new(&mut self.inner).poll_flush(context)
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
-        Pin::new(&mut self.inner).poll_shutdown(context)
-    }
 }
 
 #[cfg(test)]
