@@ -192,3 +192,75 @@ async fn unbound_bases_and_custom_or_arm_scratch_builds_do_not_require_a_resolve
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn derived_vm_requests_keep_unbound_releases_on_the_legacy_protocol() {
+    for version in ["1.15.1", "1.16.0"] {
+        let base = ExecutionMetadata::new(
+            RuntimeIdentity {
+                kind: RuntimeKind::Firecracker,
+                version: version.parse().unwrap(),
+            },
+            GuestPlatform {
+                os: GuestOperatingSystem::Linux,
+                architecture: Arch::X86_64,
+            },
+            None,
+            vec![],
+        )
+        .unwrap();
+        let binding = BuildExecutionBinding::for_base(None, &base).await.unwrap();
+        let request = super::super::build_vm_create_request(
+            "seed".into(),
+            "sha256:legacy-base".into(),
+            None,
+            binding.as_ref().map(BuildExecutionBinding::reference),
+        );
+        assert!(request.environment.is_none(), "unselected {version}");
+        assert_eq!(request.runtime, "fc");
+        assert_eq!(request.template, "seed");
+    }
+
+    let binding = BuildExecutionBinding::from_response(None, fixture()).unwrap();
+    let inherited_e0 = super::super::build_vm_create_request(
+        "seed".into(),
+        "sha256:bound-base".into(),
+        None,
+        binding.create_environment(false),
+    );
+    assert!(
+        inherited_e0.environment.is_none(),
+        "ordinary inherited E0 builds remain rolling-compatible"
+    );
+    assert_eq!(inherited_e0.runtime, "fc");
+    let explicit_e0 = super::super::build_vm_create_request(
+        "seed".into(),
+        "sha256:bound-base".into(),
+        None,
+        binding.create_environment(true),
+    );
+    assert_eq!(
+        explicit_e0.environment.unwrap().reference,
+        binding.reference().to_string()
+    );
+    assert!(explicit_e0.runtime.is_empty());
+    assert!(explicit_e0.template.is_empty());
+    // A different boot kernel is a different binding, even with the same VMM.
+    let mut spec = binding.definition.descriptor().spec().clone();
+    let BootProfile::LinuxDirectV1 { kernel } = &mut spec.boot;
+    kernel.digest = Digest::sha256([7; 32]);
+    let definition = EnvironmentDefinition::new(EnvironmentDescriptor::try_from(spec).unwrap());
+    let requirements = definition.execution_requirements().unwrap();
+    let other = BuildExecutionBinding::from_response(
+        None,
+        ResolveExecutionEnvironmentResponse {
+            definition: Some((&definition).into()),
+            execution: Some((&requirements).into()),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        other.create_environment(false),
+        Some(definition.reference())
+    );
+}

@@ -94,6 +94,10 @@ impl RuntimeInstallationFiles {
         }
     }
 
+    pub fn paths(&self) -> impl Iterator<Item = &Path> {
+        self.files.values().map(PathBuf::as_path)
+    }
+
     pub fn path(&self, role: RuntimeFileRole) -> Option<&Path> {
         self.files.get(&role).map(PathBuf::as_path)
     }
@@ -955,15 +959,21 @@ impl RuntimeInventory {
         Ok(inventory)
     }
 
+    /// Look up the exact installed runtime identity, without default selection
+    /// or compatibility substitution.
+    pub fn runtime_installation(&self, identity: &RuntimeIdentity) -> Option<&RuntimeInstallation> {
+        self.runtimes
+            .iter()
+            .find(|installation| &installation.runtime == identity)
+    }
+
     /// The installed release a runtime's `default` alias names.
     fn default_installation(&self, runtime: RuntimeKind) -> Option<&RuntimeInstallation> {
         let default = self
             .defaults
             .iter()
             .find(|default| default.kind == runtime)?;
-        self.runtimes
-            .iter()
-            .find(|installation| installation.runtime == *default)
+        self.runtime_installation(default)
     }
 
     /// Restore may use the selected loader or another compatible installed
@@ -1060,7 +1070,7 @@ impl RuntimeInventory {
                     return Err(RuntimeInventoryError::NoCompatibleRuntime { runtime });
                 }
                 match mode {
-                    ExecutionSelectionMode::NewColdBoot => {
+                    ExecutionSelectionMode::NewColdBoot if requested.environment().is_none() => {
                         let selected = self
                             .default_installation(runtime)
                             .ok_or(RuntimeInventoryError::NoCompatibleRuntime { runtime })?;
@@ -1069,11 +1079,10 @@ impl RuntimeInventory {
                         }
                         selected
                     }
-                    ExecutionSelectionMode::ExistingColdBoot => {
+                    ExecutionSelectionMode::ExistingColdBoot
+                    | ExecutionSelectionMode::NewColdBoot => {
                         let installation = self
-                            .runtimes
-                            .iter()
-                            .find(|installation| installation.runtime == *requested.runtime())
+                            .runtime_installation(requested.runtime())
                             .ok_or(RuntimeInventoryError::NoCompatibleRuntime { runtime })?;
                         if !driver.can_execute(installation, requested, mode)? {
                             return Err(RuntimeInventoryError::NoCompatibleRuntime { runtime });
@@ -1081,10 +1090,7 @@ impl RuntimeInventory {
                         installation
                     }
                     ExecutionSelectionMode::PersistedStateRestore => {
-                        let exact = self
-                            .runtimes
-                            .iter()
-                            .find(|installation| installation.runtime == *requested.runtime());
+                        let exact = self.runtime_installation(requested.runtime());
                         if let Some(installation) = exact
                             && driver.can_execute(installation, requested, mode)?
                         {

@@ -185,19 +185,25 @@ class SandboxCli:
     runtime: str
     boot_mode: str
     user: str = ""
+    environment: str = ""
+    content_hash: str = ""
 
     def create_cmd(self, *, autostart: bool = True, snapshots: bool = False) -> list[str]:
         cmd = [
             *self.prefix,
             self.sbxmgr,
             "create",
-            "--runtime",
-            self.runtime,
             "--template",
             self.template,
             "--boot-mode",
             self.boot_mode,
         ]
+        if self.environment:
+            cmd += ["--environment", self.environment]
+        else:
+            cmd += ["--runtime", self.runtime]
+        if self.content_hash:
+            cmd += ["--content-hash", self.content_hash]
         if self.user:
             cmd += ["--user", self.user]
         if autostart:

@@ -298,6 +298,7 @@ async fn do_create_from_base(
 
     let create_resp = sbx_client
         .create(pplx_space_sbx_mgr_client::proto::CreateRequest {
+            environment: None,
             template: template.to_string(),
             owner: TEMPLATE_MANAGER_SANDBOX_OWNER.to_string(),
             runtime: pplx_space_common_core::types::RUNTIME_FIRECRACKER_ALIAS.into(),

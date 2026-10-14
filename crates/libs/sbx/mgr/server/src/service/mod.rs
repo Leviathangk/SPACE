@@ -407,6 +407,8 @@ pub struct SandboxManagerService {
     /// See [`SandboxManagerServiceOptions::cleanup_run_dir`].
     #[cfg(test)]
     cleanup_run_dir: Option<PathBuf>,
+    #[cfg(test)]
+    create_cache_dir: Option<PathBuf>,
     gateway_caller_client: pplx_space_node_mgr_client::NodeManagerGrpcClient,
     gateway_authority: gateway_authority::GatewayAuthority,
     /// S3 upload config for suspend snapshots. `None` means uploads are disabled.
@@ -984,6 +986,9 @@ pub struct SandboxManagerServiceOptions {
     /// reads in test builds. `None` reads the fixed sandbox run directory.
     #[cfg(test)]
     pub(crate) cleanup_run_dir: Option<PathBuf>,
+    /// Cache root used by logical Create in tests; other filesystem paths retain their own fixtures.
+    #[cfg(test)]
+    pub(crate) create_cache_dir: Option<PathBuf>,
 }
 
 impl Default for SandboxManagerServiceOptions {
@@ -1006,6 +1011,8 @@ impl Default for SandboxManagerServiceOptions {
             template_resolver: Arc::new(crate::template_resolver::HostTemplateManager),
             #[cfg(test)]
             cleanup_run_dir: None,
+            #[cfg(test)]
+            create_cache_dir: None,
         }
     }
 }
@@ -1756,6 +1763,8 @@ impl SandboxManagerService {
             template_resolver: options.template_resolver,
             #[cfg(test)]
             cleanup_run_dir: options.cleanup_run_dir,
+            #[cfg(test)]
+            create_cache_dir: options.create_cache_dir,
             drain_state,
             feature_flags,
             route_ed25519_verification_bundle: Arc::new(ArcSwapOption::from(

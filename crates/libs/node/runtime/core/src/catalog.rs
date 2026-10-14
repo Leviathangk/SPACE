@@ -28,7 +28,9 @@ use sha2::{Digest as _, Sha256};
 use crate::runtime_inventory::diagnostic::ReleaseLayout;
 
 mod environment;
-pub use environment::{InitialEnvironmentDefinitionError, ResolveEnvironmentError};
+pub use environment::{
+    CompiledEnvironment, CompiledEnvironmentDefinitionError, ResolveEnvironmentError,
+};
 
 /// The catalog file version this build reads.
 pub const CATALOG_SCHEMA: u32 = 1;
@@ -454,6 +456,13 @@ impl InitialEnvironment {
 /// directory or file another account could write is refused, not skipped.
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
+    #[error(transparent)]
+    EnvironmentDefinition(#[from] CompiledEnvironmentDefinitionError),
+    #[error("compiled environment {runtime} / {kernel} is missing its release or kernel pins")]
+    MissingEnvironmentPins {
+        runtime: &'static str,
+        kernel: &'static str,
+    },
     #[error("the initial environment has no pins for host architecture {0}")]
     UnsupportedInitialArchitecture(Arch),
     #[error("compiled catalog entry {entry} is invalid: {field} {value:?}")]

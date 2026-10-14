@@ -53,6 +53,7 @@ pub(super) struct CreateWithIdArgs<'a> {
     pub(super) effective_mode: BootMode,
     pub(super) id: String,
     pub(super) template_dir: &'a str,
+    pub(super) execution: Option<&'a pplx_space_common_core::types::ExecutionMetadata>,
     pub(super) snapshot_dir_resolved: Option<&'a str>,
     pub(super) snapshot_vcpu: Option<pplx_space_common_core::types::VcpuCount>,
     pub(super) content_hash_resolved: Option<&'a str>,
@@ -70,9 +71,6 @@ pub(super) enum SandboxCreateIntent {
 pub(super) fn validate_create_request(
     req: &CreateRequest,
 ) -> Result<(BootMode, Option<Uuid>), Status> {
-    let boot_mode = BootMode::try_from(req.boot_mode).map_err(|_| {
-        Status::invalid_argument(format!("unknown boot_mode value {}", req.boot_mode))
-    })?;
     if req.runtime.is_empty() {
         return Err(Status::invalid_argument("runtime is required"));
     }
@@ -82,6 +80,16 @@ pub(super) fn validate_create_request(
             req.runtime
         )));
     }
+    validate_create_request_fields(req)
+}
+
+/// Validate inputs independent of the runtime resolved from an environment.
+pub(super) fn validate_create_request_fields(
+    req: &CreateRequest,
+) -> Result<(BootMode, Option<Uuid>), Status> {
+    let boot_mode = BootMode::try_from(req.boot_mode).map_err(|_| {
+        Status::invalid_argument(format!("unknown boot_mode value {}", req.boot_mode))
+    })?;
     if let Some(size_mib) = req.rootfs_size_mb {
         pplx_space_common_core::sandbox_storage::validate_rootfs_mib(size_mib)
             .map_err(|error| Status::invalid_argument(format!("rootfs_size_mb: {error}")))?;
@@ -520,6 +528,7 @@ pub(super) fn create_response_for_existing_sandbox(
 ) -> CreateResponse {
     let has_process = existing.pid.is_some();
     CreateResponse {
+        environment: None,
         sandbox_id: existing.id.clone(),
         pid: existing.pid,
         guest_ip: has_process.then(|| GUEST_IP.to_string()),
@@ -831,13 +840,22 @@ pub(super) async fn template_source_for_sandbox_prepare(
     templates: &dyn crate::template_resolver::TemplateResolver,
     sandbox: &crate::db::SandboxRow,
 ) -> Result<SandboxPrepareSource, Status> {
-    if sandbox_rootfs_exists(&sandbox.id) {
-        let execution = super::tail_support::sandbox_execution_metadata(&sandbox.id)
+    template_source_for_sandbox_prepare_in(templates, sandbox, std::path::Path::new(CACHE_DIR))
+        .await
+}
+
+pub(super) async fn template_source_for_sandbox_prepare_in(
+    templates: &dyn crate::template_resolver::TemplateResolver,
+    sandbox: &crate::db::SandboxRow,
+    cache_dir: &std::path::Path,
+) -> Result<SandboxPrepareSource, Status> {
+    if sandbox_rootfs_exists_in(cache_dir, &sandbox.id) {
+        let execution = super::tail_support::sandbox_execution_metadata_in(cache_dir, &sandbox.id)
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
         return Ok(SandboxPrepareSource {
             template: None,
             template_dir: None,
-            execution,
+            execution: bind_saved_execution(sandbox, execution)?,
             existing_artifact: true,
         });
     }
@@ -881,9 +899,63 @@ pub(super) async fn template_source_for_sandbox_prepare(
     Ok(SandboxPrepareSource {
         template: Some(sandbox.template.clone()),
         template_dir: Some(resolved_template.template_dir),
-        execution: resolved_template.execution,
+        execution: bind_saved_execution(sandbox, resolved_template.execution)?,
         existing_artifact: false,
     })
+}
+
+/// Saved selection wins over absent legacy annotations, never over conflicting
+/// artifact evidence. Kernel directory labels do not change byte identity.
+fn bind_saved_execution(
+    sandbox: &crate::db::SandboxRow,
+    observed: pplx_space_common_core::types::ExecutionMetadata,
+) -> Result<pplx_space_common_core::types::ExecutionMetadata, Status> {
+    let Some((saved, reference)) = sandbox
+        .execution_metadata
+        .as_ref()
+        .and_then(|saved| saved.environment().map(|reference| (saved, reference)))
+    else {
+        return Ok(observed);
+    };
+    if observed
+        .environment()
+        .is_some_and(|actual| actual != reference)
+    {
+        return Err(Status::failed_precondition(
+            "artifact environment differs from the sandbox's saved binding",
+        ));
+    }
+    if observed.runtime() != saved.runtime() || observed.guest() != saved.guest() {
+        return Err(Status::failed_precondition(
+            "artifact runtime or guest differs from the sandbox's saved binding",
+        ));
+    }
+    if observed.state_format() != saved.state_format() {
+        return Err(Status::failed_precondition(
+            "artifact state format differs from the sandbox's saved binding",
+        ));
+    }
+    if observed.components().len() != saved.components().len()
+        || !saved.components().iter().all(|expected| {
+            observed.components().iter().any(|actual| {
+                expected.kind == actual.kind
+                    && expected.role == actual.role
+                    && match expected.digest {
+                        Some(digest) => actual.digest == Some(digest),
+                        None => {
+                            actual.digest.is_none()
+                                && actual.version == expected.version
+                                && actual.format == expected.format
+                        }
+                    }
+            })
+        })
+    {
+        return Err(Status::failed_precondition(
+            "artifact components differ from the sandbox's saved binding",
+        ));
+    }
+    Ok(observed.with_environment(reference))
 }
 
 pub(super) fn guest_console_logs_enabled() -> bool {

@@ -3,6 +3,8 @@ use super::*;
 pub(super) async fn handle(command: Commands, client: &mut SandboxClient) {
     match command {
         Commands::Create {
+            content_hash,
+            environment,
             runtime,
             template,
             user,
@@ -17,6 +19,8 @@ pub(super) async fn handle(command: Commands, client: &mut SandboxClient) {
             handle_create(
                 client,
                 CreateCommandInput {
+                    content_hash,
+                    environment,
                     runtime,
                     template,
                     user,
@@ -66,7 +70,9 @@ pub(super) async fn handle(command: Commands, client: &mut SandboxClient) {
 }
 
 struct CreateCommandInput {
-    runtime: String,
+    content_hash: Option<pplx_space_common_core::types::ContentHash>,
+    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    runtime: Option<String>,
     template: String,
     user: Option<String>,
     snapshots: bool,
@@ -90,17 +96,10 @@ async fn handle_create(client: &mut SandboxClient, mut input: CreateCommandInput
     if input.snapshots {
         warn_if_inbound_reconciliation_active(FACET_SANDBOX_DESIRED_STATE).await;
     }
-    let resp = client
-        .create(local_create_request(
-            input,
-            boot_mode,
-            owner,
-            env,
-            auto_lifecycle,
-        ))
+    let request = local_create_request(input, boot_mode, owner, env, auto_lifecycle);
+    let resp = pplx_space_sbx_mgr_client::environment::create(client, request)
         .await
-        .unwrap_or_else(|error| exit_error(error))
-        .into_inner();
+        .unwrap_or_else(|error| exit_error(error));
 
     for line in create_response_lines(&resp) {
         println!("{line}");
@@ -114,10 +113,11 @@ fn local_create_request(
     env: std::collections::BTreeMap<String, String>,
     auto_lifecycle: Option<AutoLifecyclePolicy>,
 ) -> CreateRequest {
-    CreateRequest {
+    let mut request = CreateRequest {
+        environment: None,
         template: input.template,
         owner,
-        runtime: input.runtime,
+        runtime: input.runtime.unwrap_or_default(),
         snapshots_enabled: input.snapshots,
         autostart: input.autostart,
         pool_template: None,
@@ -125,7 +125,7 @@ fn local_create_request(
         boot_mode: boot_mode.into(),
         blocking: input.blocking,
         sandbox_id: None,
-        content_hash: None,
+        content_hash: input.content_hash.map(|value| value.to_string()),
         env: env.into_iter().collect(),
         auto_lifecycle: auto_lifecycle
             .as_ref()
@@ -145,7 +145,11 @@ fn local_create_request(
         route_identity: None,
         disk_io_max_operations_per_sec: None,
         disk_io_max_bandwidth_mib_per_sec: None,
+    };
+    if let Some(reference) = input.environment {
+        pplx_space_sbx_mgr_client::environment::bind(&mut request, reference);
     }
+    request
 }
 
 fn parse_boot_mode(value: &str) -> Result<BootMode, String> {

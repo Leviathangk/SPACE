@@ -406,12 +406,24 @@ impl ArtifactStore {
         )
     }
 
+    /// Expected image path, including when staging failed and discovery must
+    /// observe subsequent repairs. Successful staging returns the actual path.
+    pub fn execution_kernel_path(parent: &Path, pin: &PinnedKernel) -> PathBuf {
+        Self::execution_cache_root(parent)
+            .join(managed_kernel_directory(&pin.version, pin.sha256))
+            .join(KERNEL_IMAGE)
+    }
+
+    fn execution_cache_root(parent: &Path) -> PathBuf {
+        parent.join("managed/kernels")
+    }
+
     /// Create an isolated execution-cache namespace below a protected or
     /// sticky root-owned parent. Never repair ownership of existing paths.
     pub fn prepare_execution_cache(&self, parent: &Path) -> Result<PathBuf, PublishError> {
         RootProtection::ExecutionCacheParent.check(parent, self.owner)?;
         let managed = parent.join("managed");
-        let kernels = managed.join("kernels");
+        let kernels = Self::execution_cache_root(parent);
         for directory in [&managed, &kernels] {
             match std::fs::DirBuilder::new().mode(0o755).create(directory) {
                 Ok(()) => {}

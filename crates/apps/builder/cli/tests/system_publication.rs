@@ -105,6 +105,7 @@ async fn direct_build_obtains_and_forwards_operator_authority()
                             .unwrap()
                             .push(StartBuildRequest::decode(&body[5..]).unwrap());
                         grpc_response(StartBuildResponse {
+                            environment: None,
                             job_id: "018f0000-0000-7000-8000-000000000005".into(),
                         })
                     }

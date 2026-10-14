@@ -140,6 +140,7 @@ fn insert_with_episode(
             },
             None,
             None,
+            None,
         )
     });
     inserted.unwrap();

@@ -28,6 +28,7 @@ fn fresh_pair(
 
 fn test_create_request(sandbox_id: &str) -> sbx::CreateRequest {
     sbx::CreateRequest {
+        environment: None,
         template: "seed".into(),
         owner: "root".into(),
         runtime: "fc".into(),

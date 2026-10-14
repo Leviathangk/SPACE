@@ -782,6 +782,7 @@ impl SandboxManagerService {
         let publish_node_state = !should_skip_node_publish(&request);
         let sandbox_id = &request.get_ref().sandbox_id;
         let sandbox = self.lookup_sandbox(sandbox_id)?;
+        self.ensure_memory_state_supported(&sandbox, "enable snapshots")?;
         self.ensure_not_pool_sandbox_for_snapshots(&sandbox, "enable snapshots")?;
         self.ensure_no_plaintext_pool_cow_for_snapshots(&sandbox, "enable snapshots")?;
         self.ensure_snapshot_restore_supported("enable_snapshots")?;

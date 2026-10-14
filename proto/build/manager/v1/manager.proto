@@ -5,6 +5,9 @@ package build.manager.v1;
 import "build/manager/v1/recipe.proto";
 
 service BuildManager {
+  // Advisory readiness only. The environment input also fails closed on old readers.
+  rpc GetExecutionCapabilities(GetExecutionCapabilitiesRequest) returns (GetExecutionCapabilitiesResponse);
+
   rpc StartBuild(StartBuildRequest) returns (StartBuildResponse);
   rpc GetBuildStatus(GetBuildStatusRequest) returns (GetBuildStatusResponse);
   // Streaming blob upload to back Recipe.Copy.blob_sha256. Daemon stores
@@ -14,7 +17,7 @@ service BuildManager {
 }
 
 message StartBuildRequest {
-  // Required. The recipe to build.
+  // Required for legacy input; absent when environment supplies the recipe.
   Recipe recipe = 1;
   // Required. Template ID to register the build artifact under.
   string template_id = 3;
@@ -28,6 +31,9 @@ message StartBuildRequest {
   // Authorization issued before dispatch for publishing `org_id`'s output,
   // retained through publication. Carried only with `org_id`.
   optional string tenant_publication_grant_id = 9;
+  // Mutually exclusive with recipe. Old readers see no required recipe and reject
+  // before enqueueing work, even if they restart after a capability preflight.
+  EnvironmentBuildInput environment = 10;
 }
 
 message BuildOptions {
@@ -47,6 +53,8 @@ message ClientContext {
 
 message StartBuildResponse {
   string job_id = 1;
+  // Exact binding durably queued. Missing acknowledgement is never success.
+  optional string environment = 2;
 }
 
 message GetBuildStatusRequest {
@@ -86,4 +94,15 @@ enum UploadBlobPhase {
 message UploadBlobResponse {
   string sha256 = 1;
   uint64 size_bytes = 2;
+}
+
+message GetExecutionCapabilitiesRequest {}
+message GetExecutionCapabilitiesResponse {
+  // Protocol support only; each exact environment still requires admission.
+  bool environment_selection = 1;
+}
+
+message EnvironmentBuildInput {
+  string reference = 1;
+  Recipe recipe = 2;
 }

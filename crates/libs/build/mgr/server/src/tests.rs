@@ -102,6 +102,7 @@ pub(super) fn initialize_schema(conn: &mut Connection) {
 struct MockBuildBackend {
     build_results: Mutex<VecDeque<Result<BuildOutcome, BuildError>>>,
     build_calls: Mutex<Vec<String>>,
+    environment_calls: Mutex<Vec<Option<pplx_space_common_core::types::EnvironmentReference>>>,
     cluster_template_results: Mutex<VecDeque<Result<(), PublishError>>>,
     cluster_template_calls: Mutex<Vec<(String, TemplatePublication)>>,
     publish_results: Mutex<VecDeque<Result<(), PublishError>>>,
@@ -189,6 +190,7 @@ impl BuildBackend for MockBuildBackend {
         template_id: &str,
         _job_id: &pplx_space_common_jobs::JobId,
         template_org: Option<TemplateOrg>,
+        environment: Option<pplx_space_common_core::types::EnvironmentReference>,
     ) -> Result<BuildOutcome, BuildError> {
         assert!(
             self.cluster_template_calls
@@ -197,6 +199,7 @@ impl BuildBackend for MockBuildBackend {
                 .iter().any(|(name, publication)| name == template_id && publication.org() == template_org),
             "the persisted caller org must reach both template registration and base materialization"
         );
+        self.environment_calls.lock().unwrap().push(environment);
         self.build_calls
             .lock()
             .unwrap()
@@ -248,6 +251,7 @@ impl BuildBackend for BlockingBuildBackend {
         _template_id: &str,
         _job_id: &pplx_space_common_jobs::JobId,
         _template_org: Option<TemplateOrg>,
+        _environment: Option<pplx_space_common_core::types::EnvironmentReference>,
     ) -> Result<BuildOutcome, BuildError> {
         self.started.fetch_add(1, Ordering::SeqCst);
         while !self.released.load(Ordering::SeqCst) {
@@ -453,6 +457,7 @@ fn start_build_request(
     publish_tags: Vec<String>,
 ) -> StartBuildRequest {
     StartBuildRequest {
+        environment: None,
         system_publication_grant_id: None,
         tenant_publication_grant_id: None,
         recipe,
@@ -1397,5 +1402,71 @@ async fn environment_preflight_precedes_blob_and_publication_effects() -> TestRe
         assert!(backend.build_calls.lock().unwrap().is_empty());
         assert!(backend.publish_calls.lock().unwrap().is_empty());
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn selected_build_survives_queue_and_old_wire_readers_reject_before_enqueue() -> TestResult {
+    // The old decoder knows recipe field 1, but not the additive selected input.
+    #[derive(prost::Message)]
+    struct OldStartBuild {
+        #[prost(message, optional, tag = "1")]
+        recipe: Option<ProtoRecipe>,
+    }
+    let reference =
+        "sha256:959f1181ac69f0dde7125fbc81be6fcd75b64e9e06e7a393f067b96eb6fb2ac4".parse()?;
+    let backend = MockBuildBackend::with_build_result(Ok(BuildOutcome { content_hash: None }));
+    let service = BuildManagerDaemonService::with_backend(1, backend.clone())?;
+    let mut request = start_build_request(Some(test_recipe()), "benchmark-c", vec![]);
+    pplx_space_build_mgr_client::environment::bind(&mut request, reference);
+    let old = OldStartBuild::decode(request.encode_to_vec().as_slice())?;
+    assert!(old.recipe.is_none());
+    let error = service
+        .start_build(authorized_request(start_build_request(
+            old.recipe,
+            "old",
+            vec![],
+        )))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert_eq!(count_active_build_jobs(&service.db.lock().unwrap())?, 0);
+    let mut contradictory = request.clone();
+    contradictory.recipe = Some(test_recipe());
+    assert_eq!(
+        service
+            .start_build(authorized_request(contradictory))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    let response = service
+        .start_build(authorized_request(request))
+        .await?
+        .into_inner();
+    assert_eq!(response.environment, Some(reference.to_string()));
+    wait_for_terminal_status(&service, &response.job_id).await?;
+    assert_eq!(
+        *backend.environment_calls.lock().unwrap(),
+        vec![Some(reference)]
+    );
+    let job = service.worker.get_job(&response.job_id.parse()?)?.unwrap();
+    let (payload, binding) = jobs::decode_payload(&job)?;
+    assert_eq!(binding, Some(reference));
+    assert_eq!(payload.template_id, "benchmark-c");
+    assert!(
+        job.payload_as::<BuildJobPayload>().is_err(),
+        "downgraded worker must not silently execute an unbound build"
+    );
+    let mut unknown = job.clone();
+    unknown.payload = unknown.payload.replace("environment_v1", "environment_v2");
+    jobs::decode_payload(&unknown).unwrap_err();
+    // A future or malformed version cannot fall back to the legacy decoder,
+    // even if it supplies all legacy fields as well.
+    let mut ambiguous = serde_json::to_value(payload)?;
+    ambiguous["schema"] = serde_json::json!("environment_v2");
+    unknown.payload = serde_json::to_string(&ambiguous)?;
+    jobs::decode_payload(&unknown).unwrap_err();
     Ok(())
 }

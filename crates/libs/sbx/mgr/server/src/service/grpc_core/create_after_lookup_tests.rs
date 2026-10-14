@@ -670,3 +670,256 @@ async fn requested_id_create_reuses_only_a_compatible_settled_row() {
         assert_eq!(fixture.row_count(), 1, "{}", case.name);
     }
 }
+
+#[tokio::test]
+async fn explicit_selection_checks_legacy_base_evidence_before_create() {
+    use pplx_space_common_core::types::{EnvironmentDescriptor, RuntimeBinding};
+    use pplx_space_execution_common::environment::EnvironmentDefinition;
+    use pplx_space_node_mgr_client::proto::{
+        ResolveExecutionEnvironmentRequest, ResolveExecutionEnvironmentResponse,
+    };
+    if !enter_isolated_test_process() {
+        return;
+    }
+    let document: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../../../proto/execution/v1/fixtures/e0.json"
+    )))
+    .unwrap();
+    let mut spec: pplx_space_common_core::types::EnvironmentSpec =
+        serde_json::from_value(document["descriptor"].clone()).unwrap();
+    let arch = std::env::consts::ARCH.parse().unwrap();
+    spec.host.architecture = arch;
+    spec.guest.architecture = arch;
+    let RuntimeBinding::ManagedRelease(release) = &mut spec.runtime;
+    release.target.architecture = arch;
+    let definition = EnvironmentDefinition::new(EnvironmentDescriptor::try_from(spec).unwrap());
+    let requirements = definition.execution_requirements().unwrap();
+    let mut legacy_wire =
+        pplx_space_execution_common::proto::ExecutionMetadata::from(&requirements);
+    legacy_wire.environment = None;
+    for matches in [true, false] {
+        let build = TemplateBuild::new();
+        let mut evidence = legacy_wire.clone();
+        if !matches {
+            evidence.components.clear();
+        }
+        let evidence =
+            pplx_space_common_core::types::ExecutionMetadata::try_from(&evidence).unwrap();
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(build.dir.path().join("metadata.json")).unwrap())
+                .unwrap();
+        metadata["schema_version"] = 2.into();
+        metadata["execution"] = serde_json::to_value(&evidence).unwrap();
+        std::fs::write(
+            build.dir.path().join("metadata.json"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        let verified = definition.bind_execution(requirements.clone()).unwrap();
+        let response = ResolveExecutionEnvironmentResponse {
+            definition: Some((&definition).into()),
+            execution: Some((&verified).into()),
+        };
+        let node = FakeNodeManager::default().unary(
+            "ResolveExecutionEnvironment",
+            move |_: ResolveExecutionEnvironmentRequest| Ok(response.clone()),
+        );
+        let fixture = Fixture::new(crate::db::test_conn(), build.resolver(BUILD), node);
+        let mut request = create_request();
+        request.boot_mode = BootMode::Cold as i32;
+        pplx_space_sbx_mgr_client::environment::bind(&mut request, definition.reference());
+        let error = fixture.create(request).await.unwrap_err();
+        if matches {
+            assert_eq!(fenced_row(&error).template, TEMPLATE);
+        } else {
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        }
+        assert_eq!(fixture.row_count(), 0);
+    }
+}
+
+/// Exercise logical Create and the persisted input used by Start, without a VM
+/// or host-owned cache. Artifact identity remains a separate node admission check.
+#[tokio::test]
+async fn selected_create_persists_the_binding_used_by_first_start() {
+    use pplx_space_common_core::types::{EnvironmentDescriptor, RuntimeBinding};
+    use pplx_space_execution_common::environment::EnvironmentDefinition;
+    use pplx_space_node_mgr_client::proto::{
+        ResolveExecutionEnvironmentRequest, ResolveExecutionEnvironmentResponse,
+    };
+    if !enter_isolated_test_process() {
+        return;
+    }
+    for environment in pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
+        pplx_space_common_core::types::Arch::X86_64,
+    )
+    .unwrap()
+    {
+        // The fake node validates protocol plumbing on the test host; it does
+        // not qualify an additional host architecture for execution.
+        let mut spec = environment.definition().descriptor().spec().clone();
+        let arch = std::env::consts::ARCH.parse().unwrap();
+        spec.host.architecture = arch;
+        spec.guest.architecture = arch;
+        let RuntimeBinding::ManagedRelease(runtime) = &mut spec.runtime;
+        runtime.target.architecture = arch;
+        let definition = EnvironmentDefinition::new(EnvironmentDescriptor::try_from(spec).unwrap());
+        let execution = definition.execution_requirements().unwrap();
+        let mut wire = pplx_space_execution_common::proto::ExecutionMetadata::from(&execution);
+        wire.environment = None;
+        let legacy = pplx_space_common_core::types::ExecutionMetadata::try_from(&wire).unwrap();
+        let build = TemplateBuild::new();
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(build.dir.path().join("metadata.json")).unwrap())
+                .unwrap();
+        metadata["schema_version"] = 2.into();
+        metadata["execution"] = serde_json::to_value(&legacy).unwrap();
+        let metadata_bytes = serde_json::to_vec(&metadata).unwrap();
+        std::fs::write(build.dir.path().join("metadata.json"), &metadata_bytes).unwrap();
+        let bound = definition.bind_execution(execution).unwrap();
+        let response = ResolveExecutionEnvironmentResponse {
+            definition: Some((&definition).into()),
+            execution: Some((&bound).into()),
+        };
+        let node = FakeNodeManager::default().unary(
+            "ResolveExecutionEnvironment",
+            move |_: ResolveExecutionEnvironmentRequest| Ok(response.clone()),
+        );
+        let database = tempfile::tempdir().unwrap();
+        let db_path = database.path().join("sandbox.sqlite");
+        crate::db::create_test_schema_on_disk(&db_path);
+        let mut fixture = Fixture::new(
+            rusqlite::Connection::open(&db_path).unwrap(),
+            build.resolver(BUILD),
+            node,
+        );
+        fixture
+            .service
+            .db_conn()
+            .unwrap()
+            .execute_batch("DROP TRIGGER create_after_lookup_insert_fence")
+            .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        fixture.service.create_cache_dir = Some(cache.path().to_owned());
+        let mut request = create_request();
+        request.boot_mode = BootMode::Cold as i32;
+        pplx_space_sbx_mgr_client::environment::bind(&mut request, definition.reference());
+        let created = fixture.create(request).await.unwrap();
+        assert_eq!(
+            created.environment.as_deref(),
+            Some(definition.reference().to_string().as_str())
+        );
+        let reopened = rusqlite::Connection::open(&db_path).unwrap();
+        let row = crate::db::get_sandbox(&reopened, &created.sandbox_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, SandboxState::Created);
+        assert_eq!(row.execution_metadata.as_ref(), Some(&bound));
+        let prepared =
+            template_source_for_sandbox_prepare_in(fixture.templates.as_ref(), &row, cache.path())
+                .await
+                .unwrap();
+        assert!(!prepared.existing_artifact);
+        assert_eq!(prepared.execution, bound);
+        assert_eq!(
+            std::fs::read(build.dir.path().join("metadata.json")).unwrap(),
+            metadata_bytes
+        );
+
+        let mut corrupted_template = metadata.clone();
+        corrupted_template["execution"]["components"][0]["digest"] =
+            format!("sha256:{}", "00".repeat(32)).into();
+        std::fs::write(
+            build.dir.path().join("metadata.json"),
+            serde_json::to_vec(&corrupted_template).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            template_source_for_sandbox_prepare_in(fixture.templates.as_ref(), &row, cache.path())
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition,
+        );
+        std::fs::write(build.dir.path().join("metadata.json"), &metadata_bytes).unwrap();
+
+        // A retained rootfs and its matching legacy evidence also inherit the
+        // saved binding. No annotation may change runtime or kernel bytes.
+        let sandbox_dir = cache.path().join(&created.sandbox_id);
+        std::fs::create_dir_all(sandbox_dir.join("instance")).unwrap();
+        std::fs::write(sandbox_dir.join("instance/rootfs.ext4"), b"test rootfs").unwrap();
+        #[derive(Clone, Copy, Debug)]
+        enum Evidence {
+            Matching,
+            Alias,
+            Runtime,
+            Kernel,
+            Reference,
+            Missing,
+        }
+        for evidence in [
+            Evidence::Matching,
+            Evidence::Alias,
+            Evidence::Runtime,
+            Evidence::Kernel,
+            Evidence::Reference,
+            Evidence::Missing,
+        ] {
+            let mut wire = pplx_space_execution_common::proto::ExecutionMetadata::from(&legacy);
+            match evidence {
+                Evidence::Matching => {}
+                Evidence::Alias => wire.components[0].version = Some("legacy-kernel-label".into()),
+                Evidence::Runtime => wire.runtime.as_mut().unwrap().version = "1.16.0".into(),
+                Evidence::Kernel => {
+                    wire.components[0].digest = Some(format!("sha256:{}", "00".repeat(32)))
+                }
+                Evidence::Reference => {
+                    wire.environment = Some(format!("sha256:{}", "00".repeat(32)))
+                }
+                Evidence::Missing => {}
+            }
+            let observed =
+                pplx_space_common_core::types::ExecutionMetadata::try_from(&wire).unwrap();
+            let path = sandbox_dir.join("metadata.json");
+            if matches!(evidence, Evidence::Missing) {
+                std::fs::remove_file(&path).unwrap();
+            } else {
+                let artifact = pplx_space_common_core::types::SandboxArtifactMetadata::new(
+                    created.sandbox_id.parse().unwrap(),
+                    observed,
+                    TEMPLATE.parse().unwrap(),
+                    None,
+                );
+                std::fs::write(path, serde_json::to_vec(&artifact).unwrap()).unwrap();
+            }
+            let source = template_source_for_sandbox_prepare_in(
+                fixture.templates.as_ref(),
+                &row,
+                cache.path(),
+            )
+            .await;
+            if matches!(evidence, Evidence::Matching | Evidence::Alias) {
+                let source = source.unwrap();
+                assert!(source.existing_artifact);
+                assert_eq!(source.execution.environment(), Some(definition.reference()));
+                assert_eq!(source.execution.runtime(), bound.runtime());
+                assert_eq!(
+                    source.execution.components()[0].digest,
+                    bound.components()[0].digest
+                );
+            } else {
+                assert_eq!(
+                    source.unwrap_err().code(),
+                    tonic::Code::FailedPrecondition,
+                    "{evidence:?}"
+                );
+            }
+        }
+        fixture.service.shutdown_token.cancel();
+        fixture.service.task_tracker.close();
+        tokio::time::timeout(CREATE_WAIT, fixture.service.task_tracker.wait())
+            .await
+            .unwrap();
+    }
+}
