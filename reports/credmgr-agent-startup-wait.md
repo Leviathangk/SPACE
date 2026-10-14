@@ -186,3 +186,50 @@ authority returning, without restarting. The minors are addressed:
 
 Remaining limit: the wait's real-world timing was exercised on Kind only up to the forced 51 s outage. No
 bring-up reproduced the ~50 s developer-default gap.
+
+## Review round 2 (`446137c`): dropped startup future
+
+**Finding:** if the startup future is dropped or aborted while the agent waits (a timeout, an aborted
+task, while the runtime keeps running), the explicit stop-and-join of the early health server never
+ran. `LocalHealthServer` stops only through its token, so liveness kept answering SERVING for an agent
+that was gone.
+
+**Fix (only `run.rs`):** `start_agent` holds `health_shutdown.clone().drop_guard()` from the bind until
+activation. On successful activation the guard is disarmed and the token handed over as before. The explicit
+stop-and-join on every normal exit is unchanged. `LocalHealthServer` is untouched.
+
+**Tests:**
+- `dropping_a_waiting_agent_stops_its_health_server`: the agent waits on an authority that never
+  answers; once liveness answers SERVING, the test aborts the task and requires liveness to stop
+  answering within 2 s.
+- `an_activated_agent_keeps_its_health_server`: liveness still answers after `start_agent` has returned
+  an activation, which proves the disarm.
+- Both passed 300/300 stress runs (406 s).
+
+**Mutations** (all 29 `run::tests`):
+
+| Mutation | Result |
+|---|---|
+| N1 drop guard removed | killed: dropping_a_waiting_agent |
+| N2 guard not disarmed on activation | killed: an_activated_agent_keeps |
+| M8 health bound after the connect (round 1) | killed: withholds_readiness, dropping_a_waiting_agent |
+| M9 readiness published before the connect (round 1) | killed: withholds_readiness |
+| M10 failed wait leaves health serving, guard also removed (round 1) | killed: gives_up_stops_health, dropping_a_waiting_agent |
+| M10b failed wait skips the explicit stop, guard kept | **survives, by design**: the guard alone stops the server when `start_agent` returns; the explicit stop only adds the join before returning, which no test observes deterministically |
+| M11 setup failures reported as window failures (round 1) | killed: unreadable_ca, gives_up_stops_health |
+
+**Validation:**
+- fmt, error policy and workspace clippy (CI flags): clean.
+- nextest `rdeps(pplx-space-credmgr) | rdeps(pplx-space-credmgr-client)`: 5831/5832. The 1 failure is the
+  PRE-EXISTING net-gateway TLS-interception test, which also fails at base.
+- No Kind rerun (owner decision).
+
+| Check | Result |
+|---|---|
+| fmt / error policy / clippy | pass |
+| nextest credmgr crates + dependents | 5831/5832; 1 PRE-EXISTING |
+| new tests × 300 | 300/300 |
+| mutations | 6/7 killed; M10b survives by design (explained above) |
+
+**Verdict:** the finding is fixed by construction. Dropping the startup future before activation now cancels the
+early health server, and activation keeps it.
