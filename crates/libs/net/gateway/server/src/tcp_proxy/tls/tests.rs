@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use pplx_space_observability::test_capture::{CapturedEvent, RecordingVisitor};
 use tracing_subscriber::layer::SubscriberExt;
 
-use super::super::{inspected::upstream_alpn_offer, tls_http::HttpProtocol};
+use super::super::{http_session::HttpProtocol, inspected::upstream_alpn_offer};
 use super::TlsTransportError;
 use crate::tls_sni::{ClientAlpnOffer, HttpAlpn};
 
@@ -117,7 +117,7 @@ fn tls_diagnostics_do_not_export_the_guest_hostname() {
         let outcome = error.as_str();
         assert!(std::error::Error::source(&error).is_some());
         assert!(!error.to_string().contains(hostname));
-        let message = super::super::tls_http::HttpError::from(error).to_string();
+        let message = super::super::http_session::HttpError::from(error).to_string();
         assert!(!message.contains(hostname), "{outcome}: {message}");
     }
 
@@ -142,7 +142,7 @@ mod http_failure {
     use hyper_util::rt::{TokioExecutor, TokioIo};
     use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-    use super::super::super::tls_http::http_reason;
+    use super::super::super::http_session::http_reason;
 
     /// Delivers one request, then fails every write the way a guest reset does.
     struct ResetAfterRequest(&'static [u8]);

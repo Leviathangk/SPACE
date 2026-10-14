@@ -1,8 +1,9 @@
 //! One lazy origin connection per downstream connection. Waiters never own setup.
+use super::executor::Executor;
 use super::{
+    http_session::{HttpProtocol, http_reason},
     routing_headers::{SanitizedBody, SanitizedRequest},
     tls::TlsTransportError,
-    tls_http::{HttpProtocol, http_reason},
     transport,
 };
 use http::Response;
@@ -10,7 +11,7 @@ use hyper::{
     body::{Body as HttpBody, Bytes, Incoming},
     client::conn::{http1, http2},
 };
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::TokioIo;
 use std::{
     future::Future,
     io,
@@ -122,7 +123,7 @@ type SetupResult<B> = Result<Arc<Sender<B>>, Arc<Error>>;
 pub(super) struct Upstream<F, B> {
     connect: StdMutex<Option<F>>,
     result: watch::Sender<Option<SetupResult<B>>>,
-    tasks: TaskTracker,
+    executor: Executor,
     shutdown: CancellationToken,
     draining: CancellationToken,
 }
@@ -136,10 +137,20 @@ impl<F, B> Upstream<F, B> {
         Self {
             connect: StdMutex::new(Some(connect)),
             result: watch::channel(None).0,
-            tasks: TaskTracker::new(),
+            executor: Executor::new(shutdown.clone()),
             shutdown,
             draining,
         }
+    }
+
+    pub(super) fn failure(&self) -> Option<Arc<Error>> {
+        self.result.borrow().as_ref().and_then(|result| {
+            result
+                .as_ref()
+                .err()
+                .filter(|error| !matches!(error.as_ref(), Error::Cancelled))
+                .cloned()
+        })
     }
 
     pub(super) async fn shutdown(&self) {
@@ -156,8 +167,7 @@ impl<F, B> Upstream<F, B> {
             self.result
                 .send_replace(Some(Err(Arc::new(Error::Cancelled))));
         }
-        self.tasks.close();
-        self.tasks.wait().await;
+        self.executor.shutdown().await;
     }
 }
 
@@ -178,10 +188,11 @@ where
             .take()
         {
             let result = self.result.clone();
-            let tasks = self.tasks.clone();
+            let tasks = self.executor.tasks.clone();
+            let executor = self.executor.clone();
             let shutdown = self.shutdown.clone();
             let draining = self.draining.clone();
-            self.tasks.spawn(async move {
+            self.executor.tasks.spawn(async move {
                 let failed = draining.clone().drop_guard();
                 let setup = tokio::select! {
                     biased;
@@ -196,7 +207,7 @@ where
                                 Ok(Sender::Http1(Mutex::new(sender)))
                             }
                             HttpProtocol::Http2 => {
-                                let (sender, connection) = http2::Builder::new(TokioExecutor::new()).max_header_list_size(MAX_HEADER_BYTES).max_send_buf_size(64 * 1024).handshake(io).await?;
+                                let (sender, connection) = http2::Builder::new(executor).max_header_list_size(MAX_HEADER_BYTES).max_send_buf_size(64 * 1024).handshake(io).await?;
                                 drive(&tasks, shutdown.clone(), connection);
                                 Ok(Sender::Http2(sender))
                             }

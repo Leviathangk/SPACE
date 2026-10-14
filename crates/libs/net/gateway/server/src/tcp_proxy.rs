@@ -17,6 +17,7 @@ use pplx_space_net_common::DomainName;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -33,13 +34,14 @@ use crate::tls_interception::{TlsInterception, TlsInterceptionError};
 
 mod accounting;
 mod admission;
+mod executor;
 mod http_host;
+mod http_session;
 mod inspected;
 mod relay;
 mod reserved_dns;
 mod routing_headers;
 pub(crate) mod tls;
-mod tls_http;
 mod transport;
 mod upstream;
 
@@ -252,7 +254,7 @@ enum RelayFailure {
     Plaintext(http_host::Failure),
     /// Connected, then the byte stream failed (e.g. reset, broken pipe).
     Transfer(io::Error),
-    Inspected(tls_http::HttpError),
+    Inspected(http_session::HttpError),
 }
 
 /// How the bytes were carried.
@@ -278,12 +280,27 @@ impl TcpProxy {
         let limit = Arc::new(Semaphore::new(MAX_ACTIVE_TCP_CONNECTIONS));
         let mut accept_errors = AcceptErrors::default();
 
-        while let Some(accepted) = self.accept(&listener, &limit, &mut accept_errors).await? {
-            tokio::spawn(self.clone().serve(accepted));
+        let mut flows = JoinSet::new();
+        let result = loop {
+            tokio::select! {
+                accepted = self.accept(&listener, &limit, &mut accept_errors) => match accepted {
+                    Ok(Some(accepted)) => { flows.spawn(self.clone().serve(accepted)); },
+                    Ok(None) => break Ok(()),
+                    Err(error) => break Err(error),
+                },
+                Some(result) = flows.join_next(), if !flows.is_empty() => {
+                    if let Err(error) = result { warn!(%error, "TCP flow task failed"); }
+                }
+            }
+        };
+        self.shutdown_token.cancel();
+        while let Some(result) = flows.join_next().await {
+            if let Err(error) = result {
+                warn!(%error, "TCP flow task failed during shutdown");
+            }
         }
-
         info!(sandbox_id = self.sandbox_id, "TCP proxy shutting down");
-        Ok(())
+        result
     }
 
     /// The next connection to serve, or `None` once shutting down. Recoverable
@@ -368,7 +385,7 @@ impl TcpProxy {
         }
     }
 
-    async fn serve(self, accepted: Accepted) {
+    async fn serve(mut self, accepted: Accepted) {
         let Accepted {
             client,
             dst,
@@ -378,16 +395,12 @@ impl TcpProxy {
 
         self.stats.tcp_active.fetch_add(1, Ordering::Relaxed);
         let shutdown = self.shutdown_token.child_token();
-        // Biased, with the connection polled first: on shutdown both arms are
-        // ready, and an unbiased select would pick between them at random, so
-        // the same event could report either this generic cancellation or the
-        // specific cause the inspected session names. The inner boundary owns
-        // the cause; this arm only covers a connection that cannot observe
-        // cancellation itself.
-        let (host, outcome) = tokio::select! {
-            biased;
-            outcome = self.handle(client, dst, &shutdown) => outcome,
-            _ = shutdown.cancelled() => (None, FlowOutcome::Cancelled),
+        self.shutdown_token = shutdown.clone();
+        let (host, outcome) = self.handle(client, dst, &shutdown).await;
+        let outcome = if shutdown.is_cancelled() {
+            FlowOutcome::Cancelled
+        } else {
+            outcome
         };
         self.record(dst, host.as_ref(), outcome);
         self.stats.tcp_active.fetch_sub(1, Ordering::Relaxed);
@@ -407,6 +420,7 @@ impl TcpProxy {
             let policy_cancellation = self.reserved_dns_cancellation.operation_token();
             let policy = tokio::select! {
                 biased;
+                () = shutdown.cancelled() => return (None, FlowOutcome::Cancelled),
                 () = policy_cancellation.cancelled() => return (None, FlowOutcome::Cancelled),
                 policy = self.network_state.wait_for_tcp_policy() => policy,
             };
@@ -426,26 +440,25 @@ impl TcpProxy {
                 }
             };
             close_gracefully(&client);
-            return (
-                None,
-                reserved_dns::serve(
-                    self,
-                    client,
-                    resolver,
-                    policy.as_ref(),
-                    &policy_cancellation,
-                )
-                .await,
-            );
+            let outcome = tokio::select! {
+                biased;
+                () = shutdown.cancelled() => FlowOutcome::Cancelled,
+                result = reserved_dns::serve(self, client, resolver, policy.as_ref(), &policy_cancellation) => result,
+            };
+            return (None, outcome);
         }
 
         let mut inspection = accounting::Attempt::inspection_admission();
-        let policy = self.network_state.wait_for_tcp_policy().await;
-        // Policy readiness remains first on the success path. A failed wait
-        // still gets one bounded, non-consuming peek so its diagnostic can
-        // identify a configured TLS destination.
-        let missing_client_hello = self.missing_client_hello(dst, &policy);
-        let observation = sniff::client_hello_with_detail(&client, missing_client_hello).await;
+        let (policy, missing_client_hello, observation) = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return (None, FlowOutcome::Cancelled),
+            prepared = async {
+                let policy = self.network_state.wait_for_tcp_policy().await;
+                let missing = self.missing_client_hello(dst, &policy);
+                let observation = sniff::client_hello_with_detail(&client, missing).await;
+                (policy, missing, observation)
+            } => prepared,
+        };
         let peek_elapsed = observation.elapsed;
         let scan = observation.scan;
         let client_alpn = observation.client_alpn;
@@ -511,11 +524,11 @@ impl TcpProxy {
         }
         self.stats.tcp_total.fetch_add(1, Ordering::Relaxed);
 
-        let action = match self
-            .tls_interception
-            .before_relay(interception_mode, &scan, missing_sni_detail, dst.port())
-            .await
-        {
+        let action = match tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return (host, FlowOutcome::Cancelled),
+            action = self.tls_interception.before_relay(interception_mode, &scan, missing_sni_detail, dst.port()) => action,
+        } {
             Ok(action) => action,
             Err(error) => {
                 let (outcome, reason) = interception_failure(&error);
@@ -593,7 +606,12 @@ impl TcpProxy {
     }
 
     async fn pass_through(&self, client: TcpStream, dst: SocketAddr) -> FlowOutcome {
-        let upstream = match transport::connect(dst).await {
+        let connection = tokio::select! {
+            biased;
+            () = self.shutdown_token.cancelled() => return FlowOutcome::Cancelled,
+            connection = transport::connect(dst) => connection,
+        };
+        let upstream = match connection {
             Ok(upstream) => upstream,
             Err(error) => return FlowOutcome::RelayFailed(RelayFailure::Connect(error)),
         };
@@ -625,7 +643,7 @@ impl TcpProxy {
             self.network_state.clone(),
             self.dns_allow_cache.clone(),
         );
-        match http_host::serve(client, binding, connect).await {
+        match http_host::serve(client, binding, connect, self.shutdown_token.clone()).await {
             Ok(served) => FlowOutcome::Relayed(Relay::HostBoundHttp {
                 requests: served.requests,
                 forwarded: served.forwarded,

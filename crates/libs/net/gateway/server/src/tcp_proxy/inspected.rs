@@ -1,8 +1,8 @@
 //! Compose certificate-bound TLS transport with inspected HTTP.
 use super::http_host::{HostBinding, MeteredIo};
+use super::http_session::{HttpError, HttpProtocol};
 use super::tls::TlsTransportError;
-use super::tls_http::{HttpError, HttpProtocol};
-use super::{TcpProxy, tls, tls_http, transport};
+use super::{TcpProxy, http_session, tls, transport};
 use crate::{
     certificates::CertificateLease,
     egress::AdmittedTcp,
@@ -48,14 +48,13 @@ impl TcpProxy {
                 return Err(TlsTransportError::Target.into());
             }
             let accounting = WireAccounting::new(self.stats.clone());
-            let operation = async {
-                // ALPN is telemetry here. `tls_http::serve` detects the
-                // version from the guest's first bytes and records `protocol`
-                // once the first request arrives.
-                let (downstream, negotiated) =
-                    tls::accept(client, &lease, &self.tls_interception).await?;
-                tracing::Span::current()
-                    .record("negotiated", HttpProtocol::from(negotiated).as_str());
+            let (downstream, negotiated) = tokio::select! {
+                biased;
+                () = self.shutdown_token.cancelled() => return Err(TlsTransportError::Withdrawn.into()),
+                () = lease.invalidated() => return Err(TlsTransportError::Invalidated.into()),
+                result = tls::accept(client, &lease, &self.tls_interception) => result?,
+            };
+            tracing::Span::current().record("negotiated", HttpProtocol::from(negotiated).as_str());
                 let binding = HostBinding::new(
                     self.sandbox_id,
                     destination,
@@ -80,18 +79,7 @@ impl TcpProxy {
                         .map(|(io, alpn)| (io, alpn.into()))
                         .map_err(Into::into)
                 };
-                tls_http::serve(downstream, binding, lease.clone(), connect).await
-            };
-            let result = tokio::select! {
-                biased;
-                // These look identical to a client but have different
-                // operators: shutdown is ours to schedule, while an
-                // invalidated lease is the policy, identity or CA layer
-                // changing underneath a live session.
-                () = self.shutdown_token.cancelled() => Err(TlsTransportError::Withdrawn.into()),
-                () = lease.invalidated() => Err(TlsTransportError::Invalidated.into()),
-                result = operation => result,
-            };
+            let result = http_session::serve_inspected(downstream, binding, lease, connect, self.shutdown_token.clone()).await;
             if result.is_ok() {
                 tracing::Span::current().record("otel.status_code", "OK");
             } else if let Err(error) = &result {

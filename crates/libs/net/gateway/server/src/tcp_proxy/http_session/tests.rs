@@ -1070,7 +1070,7 @@ async fn small_frame_upload(frame: usize, total: usize, stall: Duration) -> bool
         Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(read.to_string()))))
     });
     tokio::spawn(async move {
-        let _ = guest_http_builder()
+        let _ = guest_http_builder(Executor::new(CancellationToken::new()))
             .serve_connection(TokioIo::new(server_io), service)
             .await;
     });
@@ -1117,4 +1117,123 @@ async fn guest_http2_accepts_backpressured_small_frame_uploads() {
 #[tokio::test]
 async fn guest_http2_still_rejects_tiny_frame_floods() {
     assert!(!small_frame_upload(1, 1_000_000, Duration::from_secs(2)).await);
+}
+
+async fn serve<C, F, Fut, U>(
+    guest: C,
+    binding: HostBinding,
+    lease: Arc<CertificateLease>,
+    connect: F,
+) -> Result<(), HttpError>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    F: FnOnce(HttpProtocol) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<(U, HttpProtocol), upstream::Error>> + Send + 'static,
+    U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let shutdown = CancellationToken::new();
+    let result = serve_inspected(guest, binding, lease, connect, shutdown.clone()).await;
+    assert!(
+        !shutdown.is_cancelled(),
+        "HTTP cleanup cancelled its caller"
+    );
+    result
+}
+
+#[tokio::test]
+async fn an_origin_stream_reset_does_not_close_other_http2_requests() {
+    let (binding, lease, _) = fixture().await;
+    let (origin, origin_peer) = tokio::io::duplex(4096);
+    let origin_task = tokio::spawn(async move {
+        let mut connection = h2::server::handshake(origin_peer).await.unwrap();
+        while let Some(request) = connection.accept().await {
+            let (request, mut respond) = request.unwrap();
+            if request.uri().path() == "/reset" {
+                respond.send_reset(h2::Reason::CANCEL);
+            } else {
+                respond.send_response(Response::new(()), true).unwrap();
+            }
+        }
+    });
+    let (guest, guest_peer) = tokio::io::duplex(4096);
+    let shutdown = CancellationToken::new();
+    let gateway = tokio::spawn(serve_inspected(
+        guest,
+        binding,
+        lease,
+        move |_| async move { Ok((origin, HttpProtocol::Http2)) },
+        shutdown.clone(),
+    ));
+    let (mut sender, driver) = http2::handshake(TokioExecutor::new(), TokioIo::new(guest_peer))
+        .await
+        .unwrap();
+    let client = tokio::spawn(driver);
+    for (path, status) in [
+        ("reset", StatusCode::BAD_GATEWAY),
+        ("healthy", StatusCode::OK),
+    ] {
+        let request = Request::get(format!("https://allowed.test/{path}"))
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), sender.send_request(request))
+            .await
+            .unwrap()
+            .expect("the HTTP/2 connection must survive a stream reset");
+        assert_eq!(response.status(), status);
+    }
+    shutdown.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(2), gateway)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(result, Err(HttpError::Cancelled)));
+    client.abort();
+    origin_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn session_shutdown_waits_for_pending_setup_to_drop() {
+    let (binding, lease, _) = fixture().await;
+    let (started, started_rx) = tokio::sync::oneshot::channel();
+    let (dropped, mut dropped_rx) = tokio::sync::oneshot::channel::<()>();
+    let (guest, guest_peer) = tokio::io::duplex(4096);
+    let shutdown = CancellationToken::new();
+    let gateway = tokio::spawn(serve_inspected(
+        guest,
+        binding,
+        lease,
+        move |_| async move {
+            let _drop_observer = dropped;
+            started.send(()).unwrap();
+            std::future::pending::<Result<(tokio::io::DuplexStream, HttpProtocol), upstream::Error>>().await
+        },
+        shutdown.clone(),
+    ));
+    let (mut sender, driver) = http2::handshake(TokioExecutor::new(), TokioIo::new(guest_peer))
+        .await
+        .unwrap();
+    let client = tokio::spawn(driver);
+    let request = tokio::spawn(
+        sender.send_request(
+            Request::get("https://allowed.test/")
+                .body(Empty::<Bytes>::new())
+                .unwrap(),
+        ),
+    );
+    started_rx.await.unwrap();
+    shutdown.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(2), gateway)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(result, Err(HttpError::Cancelled)));
+    assert!(
+        matches!(
+            dropped_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ),
+        "setup must be dropped before serving returns"
+    );
+    request.abort();
+    client.abort();
 }

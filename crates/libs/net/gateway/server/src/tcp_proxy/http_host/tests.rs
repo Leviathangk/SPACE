@@ -12,6 +12,8 @@ use super::*;
 use crate::dns::test_fixtures::a_response as dns_a_response;
 use crate::proto::NetworkState;
 use crate::state::{NetworkStateReason, PolicyLoader, PulledNetworkPolicy};
+use hyper::body::Incoming;
+use tokio::sync::Mutex;
 
 const ALLOWED_HOST: &str = "pypi.org";
 const CO_TENANT_HOST: &str = "fiddle.fastly.dev";
@@ -448,13 +450,6 @@ fn canonicalizes_the_validated_authority_and_forwards_origin_form() {
     );
 }
 
-#[test]
-fn every_gateway_refusal_closes_the_guest_connection() {
-    let response = refusal(StatusCode::FORBIDDEN);
-
-    assert_eq!(response.headers().get(header::CONNECTION).unwrap(), "close");
-}
-
 #[tokio::test]
 async fn an_unsolicited_upstream_protocol_upgrade_fails_and_closes() {
     let policy = policy();
@@ -559,4 +554,100 @@ async fn a_dead_upstream_returns_one_retryable_close() {
 
     let served = relay.await.unwrap().unwrap();
     assert_eq!((served.requests, served.upstream_failed), (1, 1));
+}
+
+#[tokio::test]
+async fn policy_is_rechecked_after_waiting_for_origin_setup() {
+    let initial = policy();
+    let cache = DnsAllowCache::default();
+    cache.observe_response(
+        &dns_a_response(ALLOWED_HOST, [93, 184, 216, 34], 60),
+        &initial,
+    );
+    let state = ready_state(initial).await;
+    let binding = HostBinding::new("test", DESTINATION.parse().unwrap(), state.clone(), cache);
+    let (guest, peer) = duplex(PIPE);
+    let (origin, origin_peer) = duplex(PIPE);
+    let (started, started_rx) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = tokio::sync::oneshot::channel();
+    let forwarded = Arc::new(AtomicBool::new(false));
+    let observed = forwarded.clone();
+    let origin_task = tokio::spawn(async move {
+        let _ = server::Builder::new()
+            .serve_connection(
+                TokioIo::new(origin_peer),
+                service_fn(move |_| {
+                    observed.store(true, Ordering::SeqCst);
+                    async { Ok::<_, Infallible>(Response::new(Empty::<hyper::body::Bytes>::new())) }
+                }),
+            )
+            .await;
+    });
+    let gateway = tokio::spawn(serve(guest, binding, move |_| async move {
+        started.send(()).unwrap();
+        release_rx.await.unwrap();
+        Ok(origin)
+    }));
+    let (mut sender, driver) = client::handshake(TokioIo::new(peer)).await.unwrap();
+    let client = tokio::spawn(driver);
+    let response = tokio::spawn(
+        sender.send_request(
+            Request::get("/")
+                .header(header::HOST, ALLOWED_HOST)
+                .body(Empty::<hyper::body::Bytes>::new())
+                .unwrap(),
+        ),
+    );
+    started_rx.await.unwrap();
+    let previous = state.snapshot().await.installed_policy_ref;
+    let expected = EffectiveNetworkPolicyRef::local(
+        EffectiveNetworkPolicyRefScope::Sandbox,
+        "updated-host-binding-test",
+        "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    )
+    .unwrap();
+    let next_ref = expected.to_string();
+    let changed = policy_loader(policy_denying(ALLOWED_HOST));
+    let changed: PolicyLoader = Arc::new(move || {
+        let result = changed();
+        let next_ref = next_ref.clone();
+        Box::pin(async move {
+            let mut pulled = result.await?;
+            pulled.policy_ref = next_ref;
+            Ok(pulled)
+        })
+    });
+    let installed = state
+        .refresh(changed, Some(expected), NetworkStateReason::ControlRefresh)
+        .await;
+    assert_ne!(installed.installed_policy_ref, previous);
+    release.send(()).unwrap();
+    let response = response.await.unwrap().unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.headers()[header::CONNECTION], "close");
+    assert!(
+        !forwarded.load(Ordering::SeqCst),
+        "revoked request reached the origin"
+    );
+    drop(response);
+    drop(sender);
+    client.abort();
+    gateway.await.unwrap().unwrap();
+    origin_task.await.unwrap();
+}
+
+async fn serve<C, F, Fut, U>(guest: C, binding: HostBinding, connect: F) -> Result<Served, Failure>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    F: FnOnce(SocketAddr) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<U, super::super::transport::Error>> + Send + 'static,
+    U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let shutdown = CancellationToken::new();
+    let result = super::serve(guest, binding, connect, shutdown.clone()).await;
+    assert!(
+        !shutdown.is_cancelled(),
+        "HTTP cleanup cancelled its caller"
+    );
+    result
 }
