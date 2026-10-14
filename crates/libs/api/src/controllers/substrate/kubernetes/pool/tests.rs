@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_common_core::types::{DiskIoLimits, NodeId, SandboxId};
 
 use super::*;
 use std::collections::BTreeMap;
@@ -23,6 +23,12 @@ type PooledExecutionRow = (
     bool,
     Option<Uuid>,
 );
+
+// These SQL fixtures omit the I/O columns, representing previously materialized
+// pools. Their stored allowance must not change when the platform default does.
+fn legacy_pool_disk_io_limits() -> DiskIoLimits {
+    DiskIoLimits::try_new(1_000, 100).unwrap()
+}
 
 struct ReadyPoolSlotFixture {
     org_id: OrgId,
@@ -359,7 +365,11 @@ async fn postgres_claim_and_bind_pool_slot() -> TestResult {
     let claim = claim_pooled_execution(&db.pool, &request, "space").await?;
     assert_eq!(
         claim.pool_shape,
-        Some(PooledExecutionPoolShape::new(4, 2048, Default::default()))
+        Some(PooledExecutionPoolShape::new(
+            4,
+            2048,
+            legacy_pool_disk_io_limits()
+        ))
     );
     let claim = claim.claim.expect("ready pool slot should be claimed");
 
@@ -451,7 +461,7 @@ async fn postgres_claim_requires_matching_disk_capacity_and_reports_it() -> Test
             4,
             2048,
             Some(32768),
-            Default::default(),
+            legacy_pool_disk_io_limits(),
         ))
     );
 
@@ -504,7 +514,11 @@ async fn postgres_default_shape_hit_reports_claimed_ready_slot_shape() -> TestRe
 
     assert_eq!(
         attempt.pool_shape,
-        Some(PooledExecutionPoolShape::new(4, 2048, Default::default()))
+        Some(PooledExecutionPoolShape::new(
+            4,
+            2048,
+            legacy_pool_disk_io_limits()
+        ))
     );
     assert_eq!(
         attempt
@@ -558,7 +572,11 @@ async fn postgres_default_shape_miss_reports_preferred_enabled_config() -> TestR
     assert!(attempt.claim.is_none());
     assert_eq!(
         attempt.pool_shape,
-        Some(PooledExecutionPoolShape::new(8, 8192, Default::default()))
+        Some(PooledExecutionPoolShape::new(
+            8,
+            8192,
+            legacy_pool_disk_io_limits()
+        ))
     );
     Ok(())
 }
@@ -567,7 +585,7 @@ async fn postgres_default_shape_miss_reports_preferred_enabled_config() -> TestR
 async fn postgres_explicit_shape_hit_and_miss_stay_exact() -> TestResult {
     let db = pg_test_db().await?;
     let slot = insert_ready_pool_slot(&db.pool).await?;
-    let explicit_shape = PooledExecutionPoolShape::new(8, 8192, Default::default());
+    let explicit_shape = PooledExecutionPoolShape::new(8, 8192, legacy_pool_disk_io_limits());
     let explicit_config = insert_pool_config(&db.pool, slot.release_id, 8, 8192, 10, true).await?;
     let explicit_sandbox_id = insert_ready_slot(
         &db.pool,
@@ -726,7 +744,11 @@ async fn postgres_invalidate_claimed_pool_slot_keeps_slot_unclaimable() -> TestR
     assert!(reclaimed.claim.is_none());
     assert_eq!(
         reclaimed.pool_shape,
-        Some(PooledExecutionPoolShape::new(4, 2048, Default::default()))
+        Some(PooledExecutionPoolShape::new(
+            4,
+            2048,
+            legacy_pool_disk_io_limits()
+        ))
     );
     Ok(())
 }
@@ -986,7 +1008,11 @@ async fn postgres_admitted_claim_adopts_and_binds_the_exact_slot() -> TestResult
         &template_network_policy,
         slot.release_id,
         &slot.content_hash,
-        Some(PooledExecutionPoolShape::new(4, 2048, Default::default())),
+        Some(PooledExecutionPoolShape::new(
+            4,
+            2048,
+            legacy_pool_disk_io_limits(),
+        )),
     );
 
     let lookup =
@@ -1003,7 +1029,7 @@ async fn postgres_admitted_claim_adopts_and_binds_the_exact_slot() -> TestResult
     assert_eq!(claim.active_node_id, Some(slot.node_id));
     assert_eq!(
         pool_shape,
-        PooledExecutionPoolShape::new(4, 2048, Default::default())
+        PooledExecutionPoolShape::new(4, 2048, legacy_pool_disk_io_limits())
     );
 
     let mut tx = db.pool.begin().await?;
