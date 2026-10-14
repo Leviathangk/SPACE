@@ -142,7 +142,7 @@ pub(crate) async fn local_provider_with_policy(
     network_credentials: crate::state::NetworkCredentialSnapshot,
 ) -> (rcgen::Certificate, GatewayAuthority, CertificateProvider) {
     let (root_certificate, root) = root();
-    let identity = ServicePortIngressState::new(Some(identity()));
+    let identity = ExecutionIdentity::new(Some(identity()));
     let (_, epoch) = identity.identity_with_epoch().unwrap();
     let candidate = Candidate::new(epoch).unwrap();
     let shutdown = CancellationToken::new();
@@ -523,7 +523,7 @@ async fn owner_issues_over_host_control_after_assignment_and_stops_on_shutdown()
             .unwrap();
     });
     let assigned = identity();
-    let identities = ServicePortIngressState::new(Some(assigned));
+    let identities = ExecutionIdentity::new(Some(assigned));
     let network = GatewayNetworkState::pending_policy().with_readiness_metrics();
     let authority_cleared = Arc::new(tokio::sync::Notify::new());
     // The owner drives a real tonic UDS server here, so the loop's scheduling
@@ -801,7 +801,7 @@ async fn owner_shutdown_does_not_wait_for_policy_registration() {
     let shutdown = CancellationToken::new();
     let owner = GatewayAuthority::new(
         "/does-not-exist/host-control.sock".into(),
-        ServicePortIngressState::new(Some(identity())),
+        ExecutionIdentity::new(Some(identity())),
         shutdown.clone(),
     );
     let worker = owner.spawn(GatewayNetworkState::pending_policy());

@@ -15,9 +15,11 @@ use tonic::{Request, Response, Status, metadata::MetadataValue};
 use tracing::info;
 
 use crate::debug::GatewayDebugState;
+use crate::execution::{
+    route_identity_from_proto, status_for_route_identity_parse, status_for_route_identity_update,
+};
 use crate::ingress::{
     ServicePortIngressState, ServicePortIngressStream, open_service_port_ingress,
-    route_identity_from_proto, status_for_route_identity_parse, status_for_route_identity_update,
 };
 use crate::proto::net_gateway_control_server::NetGatewayControl;
 use crate::proto::{

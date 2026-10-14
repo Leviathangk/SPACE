@@ -29,9 +29,8 @@ use crate::control::NetGatewayControlService;
 use crate::debug::GatewayDebugState;
 use crate::dns::DnsAllowCache;
 use crate::egress::DnsAttributedTcpTracker;
-use crate::ingress::{
-    ServicePortIngressState, route_identity_from_proto, status_for_route_identity_parse,
-};
+use crate::execution::{route_identity_from_proto, status_for_route_identity_parse};
+use crate::ingress::ServicePortIngressState;
 use crate::known_egress::KnownEgressState;
 use crate::proto::net_gateway_control_server::NetGatewayControlServer;
 use crate::reserved_dns::{BuildReservedDnsCoreError, ReservedDnsCore};
@@ -351,7 +350,7 @@ pub async fn run(
     let proxy_shutdown_token = CancellationToken::new();
     let authority = GatewayAuthority::new(
         pplx_space_common_core::host::linux::paths::SANDBOX_HOST_CONTROL_SOCKET.into(),
-        service_port_ingress.clone(),
+        service_port_ingress.execution_identity(),
         proxy_shutdown_token.clone(),
     )
     .with_readiness_observer(network_state.interception_readiness_observer());

@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::Status;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
-use crate::ingress::ServicePortIngressState;
+use crate::execution::ExecutionIdentity;
 use crate::state::{GatewayNetworkState, ReadinessObserver};
 use pplx_space_metrics::gateway::readiness::{self as metrics, Outcome};
 
@@ -72,7 +72,7 @@ struct AuthorityOwner {
     launch_capability: Result<zeroize::Zeroizing<Vec<u8>>, Status>,
     socket: PathBuf,
     channel: LazyClient<tonic::transport::Channel>,
-    identity: ServicePortIngressState,
+    identity: ExecutionIdentity,
     shutdown: CancellationToken,
     current: ArcSwapOption<AuthorityLease>,
     readiness_observer: Option<ReadinessObserver>,
@@ -349,11 +349,7 @@ fn validate_ca_validity(
 }
 
 impl GatewayAuthority {
-    pub fn new(
-        socket: PathBuf,
-        identity: ServicePortIngressState,
-        shutdown: CancellationToken,
-    ) -> Self {
+    pub fn new(socket: PathBuf, identity: ExecutionIdentity, shutdown: CancellationToken) -> Self {
         Self::from_environment_impl(
             &pplx_space_common_core::env::ProcessEnvironment,
             socket,
@@ -365,7 +361,7 @@ impl GatewayAuthority {
     pub fn from_environment(
         env: &dyn pplx_space_common_core::env::Environment,
         socket: PathBuf,
-        identity: ServicePortIngressState,
+        identity: ExecutionIdentity,
         shutdown: CancellationToken,
     ) -> Self {
         Self::from_environment_impl(env, socket, identity, shutdown)
@@ -374,7 +370,7 @@ impl GatewayAuthority {
     fn from_environment_impl(
         env: &dyn pplx_space_common_core::env::Environment,
         socket: PathBuf,
-        identity: ServicePortIngressState,
+        identity: ExecutionIdentity,
         shutdown: CancellationToken,
     ) -> Self {
         Self {
@@ -484,7 +480,8 @@ impl GatewayAuthority {
                 execution_generation: self
                     .inner
                     .identity
-                    .identity_with_epoch()?
+                    .identity_with_epoch()
+                    .map_err(|error| Status::internal(error.to_string()))?
                     .0
                     .and_then(|identity| identity.execution_generation)
                     .ok_or_else(|| {

@@ -224,7 +224,12 @@ async fn exercise_recovery(restore: bool) {
     let authority = {
         let mut env = pplx_space_test_env::TestEnv::default();
         env.set(LAUNCH_CAPABILITY_ENV, "a".repeat(64));
-        GatewayAuthority::from_environment(&env, manager_socket, ingress.clone(), shutdown.clone())
+        GatewayAuthority::from_environment(
+            &env,
+            manager_socket,
+            ingress.execution_identity(),
+            shutdown.clone(),
+        )
     };
     let network = GatewayNetworkState::pending_policy();
     let network = network.with_traffic_gate({
