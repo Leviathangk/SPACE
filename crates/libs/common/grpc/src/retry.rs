@@ -146,24 +146,65 @@ pub fn should_reconnect_status(status: &Status) -> bool {
 /// connect-failure wording (for example, proxying a guest's "connection
 /// refused") can never satisfy it. A request that fails this way is
 /// replay-safe for every RPC, idempotent or not, because it was never sent.
+/// [`client_connect_failure_cause`] says which proof the chain carried.
 pub fn is_client_connect_failure(status: &Status) -> bool {
+    client_connect_failure_cause(status).is_some()
+}
+
+/// Which proof made [`is_client_connect_failure`] count a failure as never
+/// sent: the first of the marker or a dial-failure `io::Error` that its chain
+/// walk meets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClientConnectFailureCause {
+    /// A [`crate::ConnectPhaseError`]: SPACE's TCP connector failed to
+    /// resolve or dial the peer, whatever the underlying error, a refusal
+    /// included.
+    ConnectPhase,
+    /// A refused dial outside SPACE's TCP connector, such as a Unix socket
+    /// nothing listens on or tonic's own connector.
+    Refused,
+    /// A Unix socket that does not exist.
+    NotFound,
+}
+
+impl ClientConnectFailureCause {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ConnectPhase => "connect_phase",
+            Self::Refused => "refused",
+            Self::NotFound => "not_found",
+        }
+    }
+}
+
+impl std::fmt::Display for ClientConnectFailureCause {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Why [`is_client_connect_failure`] counts `status` as never sent, or `None`
+/// when it does not. The same check, so a caller that needs the reason, for
+/// a metric, cannot disagree with the decision.
+pub fn client_connect_failure_cause(status: &Status) -> Option<ClientConnectFailureCause> {
     if status.code() != Code::Unavailable {
-        return false;
+        return None;
     }
     let mut source = std::error::Error::source(status);
     while let Some(error) = source {
         if error.is::<crate::ConnectPhaseError>() {
-            return true;
+            return Some(ClientConnectFailureCause::ConnectPhase);
         }
         if let Some(io_error) = error.downcast_ref::<std::io::Error>() {
-            return matches!(
-                io_error.kind(),
-                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-            );
+            return match io_error.kind() {
+                std::io::ErrorKind::ConnectionRefused => Some(ClientConnectFailureCause::Refused),
+                std::io::ErrorKind::NotFound => Some(ClientConnectFailureCause::NotFound),
+                _ => None,
+            };
         }
         source = error.source();
     }
-    false
+    None
 }
 
 pub fn is_temporary_tcp_failure(status: &Status) -> bool {

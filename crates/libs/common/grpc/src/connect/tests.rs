@@ -694,7 +694,8 @@ async fn an_unmarked_timed_out_dial_is_not_a_client_connect_failure() {
 }
 
 // A refused dial is a connect failure through either connector: the refusal
-// itself proves the dial failed.
+// itself proves the dial failed. SPACE's connector reports it as its own
+// connect-phase failure, tonic's as the refusal.
 #[tokio::test]
 async fn a_refused_dial_is_a_client_connect_failure_through_either_connector() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -704,16 +705,26 @@ async fn a_refused_dial_is_a_client_connect_failure_through_either_connector() {
         .unwrap()
         .connect_timeout(Duration::from_secs(1));
 
-    for (connector, channel) in [
+    for (connector, channel, cause) in [
         (
             "space",
             super::connect_tcp_channel_lazy(endpoint.clone(), None).unwrap(),
+            crate::ClientConnectFailureCause::ConnectPhase,
         ),
-        ("tonic", endpoint.connect_lazy()),
+        (
+            "tonic",
+            endpoint.connect_lazy(),
+            crate::ClientConnectFailureCause::Refused,
+        ),
     ] {
         let status = health_check_status(channel).await;
         assert!(
             crate::is_client_connect_failure(&status),
+            "{connector}: {status:?}"
+        );
+        assert_eq!(
+            crate::client_connect_failure_cause(&status),
+            Some(cause),
             "{connector}: {status:?}"
         );
     }

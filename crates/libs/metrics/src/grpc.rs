@@ -23,6 +23,39 @@ pub fn client_retry(service: &str, command: &str, phase: &str, reason: &str) {
     );
 }
 
+metric_vocabulary! {
+    /// What became of a client's replay of an RPC whose failure proved it was
+    /// never sent.
+    ClientReplayOutcome {
+        /// The replay, on a fresh connection, succeeded.
+        ReplayedOk => "replayed_ok",
+        /// The replay was attempted and failed; that failure is the call's.
+        ReplayedError => "replayed_error",
+        /// No fresh connection to replay on: the peer could not be resolved
+        /// again, or resolving it failed. The first failure is the call's.
+        NoFreshClient => "no_fresh_client",
+        /// The call's deadline expired before or during the replay.
+        DeadlineExpired => "deadline_expired",
+    }
+}
+
+/// `grpc.client.replay`: one per decision to replay an RPC whose first
+/// attempt failed before any request bytes were sent, so that replaying it is
+/// safe whatever the RPC does, mutations included. `cause` is the proof the
+/// failure carried, as `pplx_space_common_grpc::ClientConnectFailureCause`
+/// names it (`connect_phase`, `refused` or `not_found`).
+pub fn client_replay(service: &str, cause: &str, outcome: ClientReplayOutcome) {
+    counter(
+        "grpc.client.replay",
+        1,
+        &[
+            tag("service", service),
+            tag("cause", cause),
+            tag("outcome", outcome.as_str()),
+        ],
+    );
+}
+
 pub fn client_channel_cache(service: &str, outcome: &str) {
     counter(
         "grpc.client.channel_cache",
