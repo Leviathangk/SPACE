@@ -425,6 +425,12 @@ records `sandbox_id` when its refs name one sandbox, and `sandbox_ids`, a
 comma-separated list of at most sixteen, whenever they name any, with the
 rest counted in `sandbox_ids.dropped`.
 
+Each asynchronous root also names its Datadog operation, so it has its own
+APM series: `public_operation.execute`, `job.<kind>`, `node_ctl.pass`,
+`sbxmgr.detached` and `leader_election.change`. An internal span that names
+none falls back to the operation `internal`, shared by every such span of the
+service.
+
 One case remains that SPACE cannot fix. datadog-opentelemetry 0.5.2 counts no
 span whose parent is remote when the process already has that trace open
 (`TraceRegistry::register_local_root_span`), yet that span's end still lowers

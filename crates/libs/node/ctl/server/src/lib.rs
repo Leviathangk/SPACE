@@ -334,6 +334,8 @@ impl ClusterPass {
         let span = tracing::info_span!(
             parent: None,
             "node_ctl.pass",
+            otel.kind = "internal",
+            "operation.name" = "node_ctl.pass",
             cause,
             node_id = %node_id,
             refs = span_count(refs),

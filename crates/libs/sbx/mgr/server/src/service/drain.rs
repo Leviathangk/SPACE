@@ -158,7 +158,9 @@ pub(super) fn detached_trace_span(work: &'static str, sandbox_id: &str) -> traci
     let span = tracing::info_span!(
         parent: None,
         "sbxmgr.detached",
+        otel.kind = "internal",
         otel.name = work,
+        "operation.name" = "sbxmgr.detached",
         otel.status_code = tracing::field::Empty,
         otel.status_description = tracing::field::Empty,
         sandbox_id = tracing::field::Empty,
