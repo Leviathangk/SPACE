@@ -155,13 +155,6 @@ func startLinkedSpan(ctx context.Context, name, traceparent string, attrs ...att
 	return initTracer().startLinked(ctx, name, propagation.MapCarrier{"traceparent": traceparent}, attrs...)
 }
 
-// An empty or malformed serialized parent preserves the caller's context.
-func startSpanWithRemoteParent(ctx context.Context, name, traceparent string, attrs ...attribute.KeyValue) (shimSpan, context.Context) {
-	pipeline := initTracer()
-	ctx = pipeline.extract(ctx, propagation.MapCarrier{"traceparent": traceparent})
-	return pipeline.start(ctx, name, attrs...)
-}
-
 // The W3C traceparent of ctx's current span, or "" when tracing is off or no
 // span is current.
 func serializedTraceparent(ctx context.Context) string {

@@ -456,11 +456,20 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 	}
 
 	// Pod sandbox task — join pod cgroup, then create + start via sbx-manager.
+	requestedSandboxID := spec.requestedSandboxID()
 	createSpanOpts := []attribute.KeyValue{
 		attribute.String("template", sandboxTemplate),
 		attribute.String("task_id", r.ID),
 	}
-	span, ctx := startSpanWithRemoteParent(
+	if requestedSandboxID != nil {
+		createSpanOpts = append(createSpanOpts, attribute.String("sandbox_id", requestedSandboxID.String()))
+	}
+	// Kubelet retries a failed pod sandbox for the same Pod, so every attempt
+	// carries the same annotation context, and nothing the shim receives says
+	// which attempt it is. Each create therefore roots its own trace, linked to
+	// that context, rather than joining it: a crash-looping create is one trace
+	// per attempt, not one trace collecting every attempt.
+	span, ctx := startLinkedSpan(
 		ctx,
 		"shim.create",
 		spec.traceparent(),
@@ -488,7 +497,6 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 	defer conn.Close()
 
 	// Create the sandbox.
-	requestedSandboxID := spec.requestedSandboxID()
 	sandboxCheckpoint, artifactRestore, useStartRPC, parseErr := spec.sandboxStartIntent()
 	if parseErr != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid sandbox start annotations: %v", parseErr)
@@ -2539,7 +2547,7 @@ func parseEgressDestination(destination egressDestinationJSON) (*netpb.EgressDes
 
 // traceparent returns the W3C context of the Rust operation that materialized
 // the Pod. Containerd copies the annotation into the OCI spec so shim.create
-// can continue that trace after asynchronous scheduling.
+// can link to that trace after asynchronous scheduling.
 func (s *ociSpec) traceparent() string {
 	return s.Annotations["space.pplx.net/traceparent"]
 }

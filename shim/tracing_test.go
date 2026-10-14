@@ -71,6 +71,13 @@ func TestDefaultTraceExporterKeepsNativeDatadog(t *testing.T) {
 	}
 }
 
+// An empty or malformed serialized parent preserves the caller's context.
+func startSpanWithRemoteParent(ctx context.Context, name, traceparent string, attrs ...attribute.KeyValue) (shimSpan, context.Context) {
+	pipeline := initTracer()
+	ctx = pipeline.extract(ctx, propagation.MapCarrier{"traceparent": traceparent})
+	return pipeline.start(ctx, name, attrs...)
+}
+
 // Separate processes isolate both SDKs' global state and the lazy initializer.
 func TestStartSpanWithRemoteTraceparent(t *testing.T) {
 	if os.Getenv("SPACE_TRACE_PARENT_TEST") != "1" {
