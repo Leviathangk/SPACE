@@ -610,6 +610,13 @@ a sandbox subject, and every RPC a sandbox's net-gateway serves. A Rust
 service's JSON log line written inside such a span carries the same field,
 unless the event sets its own.
 
+A lifecycle request's entry span carries it too, not only its children, so a
+search by `sandbox_id` finds the request itself: space-api's `http.server`
+span for a sandbox route or a create, and the `grpc.server` span of
+node-api's and sandbox-manager's lifecycle RPCs (create, start, wake, stop,
+delete, suspend, pause, resume, kill, rollback and pool adoption). A create
+that names no sandbox records the one it allocated when it returns.
+
 Two other spellings remain where they are part of a contract, and convert by
 prefix:
 

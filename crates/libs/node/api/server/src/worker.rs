@@ -563,6 +563,10 @@ impl WorkerApi for WorkerApiService {
         &self,
         r: Request<pplx_space_sbx_mgr_client::proto::CreateRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::CreateResponse>, Status> {
+        // Before any check, so a refused create names its sandbox too.
+        if let Some(sandbox_id) = r.get_ref().sandbox_id.as_deref() {
+            record_sandbox_id(&tracing::Span::current(), sandbox_id);
+        }
         // Overrides and nonzero generations require policy authority. A generation
         // persists even without an override and can block later sandbox-specific
         // policy corrections. No override and generation zero retain inheritance.
@@ -578,13 +582,17 @@ impl WorkerApi for WorkerApiService {
         if r.get_ref().autostart {
             self.ensure_disk_allocation_open("CreateSandbox").await?;
         }
-        fwd_sbx_handoff!(self, "CreateSandbox", create, r)
+        let response = fwd_sbx_handoff!(self, "CreateSandbox", create, r)?;
+        // A create that names no sandbox learns its ID from the response.
+        record_sandbox_id(&tracing::Span::current(), &response.get_ref().sandbox_id);
+        Ok(response)
     }
 
     async fn start_sandbox(
         &self,
         r: Request<pplx_space_sbx_mgr_client::proto::StartRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::StartResponse>, Status> {
+        record_sandbox_id(&tracing::Span::current(), &r.get_ref().sandbox_id);
         reject_public_netns_path("StartSandbox", &r.get_ref().netns_path)?;
         reject_public_operation_activation_attempt(&r.get_ref().operation_activation_attempt_id)?;
         reject_public_suspend_restore_context(
@@ -611,6 +619,7 @@ impl WorkerApi for WorkerApiService {
         &self,
         r: Request<pplx_space_sbx_mgr_client::proto::KillRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::KillResponse>, Status> {
+        record_sandbox_id(&tracing::Span::current(), &r.get_ref().sandbox_id);
         fwd_sbx!(self, "KillSandbox", kill, r)
     }
 
@@ -653,6 +662,7 @@ impl WorkerApi for WorkerApiService {
         &self,
         r: Request<pplx_space_sbx_mgr_client::proto::PauseRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::PauseResponse>, Status> {
+        record_sandbox_id(&tracing::Span::current(), &r.get_ref().sandbox_id);
         fwd_sbx!(self, "PauseSandbox", pause, r)
     }
 
@@ -660,6 +670,7 @@ impl WorkerApi for WorkerApiService {
         &self,
         r: Request<pplx_space_sbx_mgr_client::proto::ResumeRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::ResumeResponse>, Status> {
+        record_sandbox_id(&tracing::Span::current(), &r.get_ref().sandbox_id);
         if r.get_ref().activation_auto_lifecycle.is_some() {
             require_policy_mutation_authority(&r)?;
         }
@@ -670,6 +681,7 @@ impl WorkerApi for WorkerApiService {
         &self,
         r: Request<pplx_space_sbx_mgr_client::proto::WakeRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::WakeResponse>, Status> {
+        record_sandbox_id(&tracing::Span::current(), &r.get_ref().sandbox_id);
         reject_public_wake_start_context("WakeSandbox", &r.get_ref().start_context)?;
         fwd_sbx!(self, "WakeSandbox", wake, r)
     }
@@ -685,6 +697,7 @@ impl WorkerApi for WorkerApiService {
         &self,
         r: Request<pplx_space_sbx_mgr_client::proto::SuspendRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::SuspendResponse>, Status> {
+        record_sandbox_id(&tracing::Span::current(), &r.get_ref().sandbox_id);
         fwd_sbx!(self, "SuspendSandbox", suspend, r)
     }
 
@@ -1382,13 +1395,16 @@ impl WorkerApiInternal for WorkerApiService {
                 require_policy_mutation_authority(&r)?;
             }
         }
-        fwd_sbx_handoff!(self, "AdoptPoolSandbox", adopt_pool_sandbox, r)
+        let response = fwd_sbx_handoff!(self, "AdoptPoolSandbox", adopt_pool_sandbox, r)?;
+        record_sandbox_id(&tracing::Span::current(), &response.get_ref().sandbox_id);
+        Ok(response)
     }
 
     async fn wake_sandbox(
         &self,
         r: Request<pplx_space_sbx_mgr_client::proto::WakeRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::WakeResponse>, Status> {
+        record_sandbox_id(&tracing::Span::current(), &r.get_ref().sandbox_id);
         if r.get_ref()
             .start_context
             .as_ref()
