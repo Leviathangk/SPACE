@@ -100,6 +100,11 @@ TELEMETRY_HELM_ARGS=()
 while IFS= read -r value; do
   TELEMETRY_HELM_ARGS+=(--set-string "$value")
 done <<<"$telemetry_values"
+# How node services get object-store credentials (lib/storage-credentials.sh);
+# helm_apply hands it to every chart, and the charts that read it act on it.
+# shellcheck source=../lib/storage-credentials.sh
+. "$KIND_DIR/lib/storage-credentials.sh"
+STORAGE_CREDENTIALS="$(space_kind_storage_credentials)" || die "invalid SPACE_KIND_STORAGE_CREDENTIALS"
 
 # ── Step 0: prereqs ──────────────────────────────────────────────────────────
 require_bin() {
@@ -326,6 +331,7 @@ helm_apply() {
     --namespace "$NAMESPACE" \
     --include-crds \
     ${TELEMETRY_HELM_ARGS[@]+"${TELEMETRY_HELM_ARGS[@]}"} \
+    --set-string "storageCredentials=$STORAGE_CREDENTIALS" \
     "$@" \
     | kubectl --context "$KCTX" apply --validate=false -f -
 }

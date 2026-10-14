@@ -1,3 +1,7 @@
+{{- $exchange := eq .Values.storageCredentials "exchange" -}}
+{{- if not (has .Values.storageCredentials (list "static" "exchange")) }}
+{{- fail (printf "storageCredentials must be static or exchange, not %q" .Values.storageCredentials) }}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -7,6 +11,10 @@ metadata:
     app.kubernetes.io/name: space-object-store
     app.kubernetes.io/instance: {{ .Release.Name }}
     team: {{ .Values.datadogTeam | quote }}
+    # Which store this cluster was created with; the transition check
+    # (infra/space/kind/scripts/check-object-store-transition.sh) refuses a
+    # bring-up that would switch it, because the stores share no data.
+    space.pplx.net/kind-storage-credentials: {{ .Values.storageCredentials | quote }}
 spec:
   replicas: 1
   selector:
@@ -32,6 +40,113 @@ spec:
       {{- end }}
       priorityClassName: {{ .Values.priorityClassName }}
       terminationGracePeriodSeconds: 10
+{{- if $exchange }}
+      initContainers:
+        # SeaweedFS signs STS session tokens with this key and refuses to
+        # serve STS without one. It is generated on the store's first start
+        # and kept in its data directory, so sessions survive a restart and
+        # the key lives exactly as long as the objects it guards.
+        - name: sts-signing-key
+          image: "{{ .Values.seaweedfs.image.repository }}:{{ .Values.seaweedfs.image.tag }}"
+          imagePullPolicy: {{ .Values.seaweedfs.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              key=/data/.sts-signing-key
+              if [ ! -s "$key" ]; then
+                (umask 077 && head -c 32 /dev/urandom | base64 >"$key.tmp")
+                mv "$key.tmp" "$key"
+              fi
+              cp /config-template/s3.json /etc/seaweedfs/s3.json
+              sed "s|@STS_SIGNING_KEY@|$(cat "$key")|" /config-template/iam.json.tmpl \
+                >/etc/seaweedfs/iam.json
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: config-template
+              mountPath: /config-template
+              readOnly: true
+            - name: config
+              mountPath: /etc/seaweedfs
+      containers:
+        - name: object-store
+          image: "{{ .Values.seaweedfs.image.repository }}:{{ .Values.seaweedfs.image.tag }}"
+          imagePullPolicy: {{ .Values.seaweedfs.image.pullPolicy }}
+          # All-in-one master, volume server, filer and S3 gateway. It binds and
+          # advertises the pod IP so the probes and the Service reach every
+          # port. The S3 gateway also answers STS on its port, configured by
+          # -s3.iam.config (templates/secret.yaml).
+          command: ["weed"]
+          args:
+            - server
+            - -dir=/data
+            - -ip=$(POD_IP)
+            - -master.port={{ .Values.seaweedfs.masterPort }}
+            - -master.volumeSizeLimitMB={{ .Values.seaweedfs.volumeSizeLimitMB }}
+            - -volume.max={{ .Values.seaweedfs.volumeMaxCount }}
+            - -filer
+            - -filer.port={{ .Values.seaweedfs.filerPort }}
+            - -s3
+            - -s3.port={{ .Values.service.s3Port }}
+            - -s3.config=/etc/seaweedfs/s3.json
+            - -s3.iam.config=/etc/seaweedfs/iam.json
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          ports:
+            - name: s3
+              containerPort: {{ .Values.service.s3Port }}
+              protocol: TCP
+          # The S3 port answers after master, volume server and filer are up,
+          # about 13 s on an idle node and longer under load, so readiness waits
+          # on it with the same slow failure budget as versitygw's, and
+          # liveness allows the start before it counts.
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.healthPath }}
+              port: s3
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.healthPath }}
+              port: s3
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            failureThreshold: 6
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: config
+              mountPath: /etc/seaweedfs
+              readOnly: true
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        # hostPath for the same reason as versitygw's below, in its own
+        # directory.
+        - name: data
+          hostPath:
+            path: {{ .Values.seaweedfs.dataHostPath }}
+            type: DirectoryOrCreate
+        - name: config-template
+          secret:
+            secretName: space-object-store
+            items:
+              - key: s3.json
+                path: s3.json
+              - key: iam.json.tmpl
+                path: iam.json.tmpl
+        - name: config
+          emptyDir: {}
+{{- else }}
       containers:
         - name: object-store
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -106,3 +221,4 @@ spec:
           hostPath:
             path: {{ .Values.dataHostPath }}
             type: DirectoryOrCreate
+{{- end }}

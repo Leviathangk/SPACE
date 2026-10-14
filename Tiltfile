@@ -76,6 +76,12 @@ TELEMETRY_CONFIG = decode_json(local(["python3", DATADOG_SCRIPT, "preflight", "-
 DATADOG_MODE = TELEMETRY_CONFIG["backend"]
 TELEMETRY_MODE = TELEMETRY_CONFIG["mode"]
 TELEMETRY_SET = TELEMETRY_CONFIG["helm_set"]
+# How node services get object-store credentials: the stores' static keys, or
+# credential-manager's storage exchange against an STS-capable store. Every
+# chart that reads `storageCredentials` gets it with the telemetry values.
+STORAGE_CREDENTIALS = str(local(["bash", "infra/space/kind/lib/storage-credentials.sh"], quiet = True)).strip()
+watch_file("infra/space/kind/lib/storage-credentials.sh")
+CHART_SET = TELEMETRY_SET + ["storageCredentials=" + STORAGE_CREDENTIALS]
 # The build SHA every SPACE image records, matching the version the workloads
 # report; see telemetry_config.py.
 KIND_GIT_SHA = TELEMETRY_CONFIG["commit"] or "unknown"
@@ -474,7 +480,7 @@ local_resource(
 # ── Helm releases (in dependency order) ───────────────────────────────────
 
 def helm_release(name, chart):
-    return helm(chart, name = name, namespace = NAMESPACE, set = TELEMETRY_SET)
+    return helm(chart, name = name, namespace = NAMESPACE, set = CHART_SET)
 
 # Both entry points use a fresh, shared render for backend transitions.
 # Fake mode never consumes SaaS credentials; SaaS uses an existing Secret only.
@@ -618,8 +624,10 @@ k8s_resource(
 #
 # Versity S3 Gateway (versitygw, Apache-2.0; replaced SeaweedFS, which replaced
 # MinIO) is a real S3-compatible object store on the infra node, serving its
-# POSIX backend from a node-local hostPath. The bucket-init Job creates the
-# `snapshots` + `templates` buckets through the S3 API. Both are public
+# POSIX backend from a node-local hostPath. With exchanged storage
+# credentials (STORAGE_CREDENTIALS above) the same resource runs SeaweedFS,
+# whose S3 port also answers STS. The bucket-init Job creates the
+# `snapshots` + `templates` buckets through the S3 API. All are public
 # registry images the kind nodes pull directly, so no `kind load` step is
 # needed.
 k8s_yaml(helm_release("space", "infra/space/kind/charts/space-object-store"))
@@ -668,7 +676,7 @@ for line in NODE_RELEASES:
     values = []
     if role == "builder" and os.path.exists(chart + "/values-builder.yaml"):
         values = [chart + "/values-builder.yaml"]
-    node_set = TELEMETRY_SET + ["node.role={}".format(role)]
+    node_set = CHART_SET + ["node.role={}".format(role)]
     if service == "node-manager" and LOOP_DEVICE_TARGET:
         node_set.append("loopDeviceTarget={}".format(LOOP_DEVICE_TARGET))
     k8s_yaml(helm(chart, name = release, namespace = NAMESPACE, values = values, set = node_set))

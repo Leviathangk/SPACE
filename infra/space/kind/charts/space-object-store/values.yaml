@@ -24,6 +24,16 @@ image:
   tag: "v1.8.0"
   pullPolicy: IfNotPresent
 
+# How node services get credentials for this store, set by every bring-up
+# path from SPACE_KIND_STORAGE_CREDENTIALS (infra/space/kind/lib/storage-credentials.sh).
+# `static` runs versitygw, whose root keys (`credentials` below) the node
+# services read. `exchange` runs SeaweedFS (`seaweedfs` below), which serves
+# STS AssumeRole on the S3 port and enforces each session's policy on every
+# S3 request, so the credential-manager authority can vend exact-object
+# sessions as deployments do. The two keep their data in different
+# directories and share none.
+storageCredentials: static
+
 # The bucket-init Job creates the buckets through the S3 API with the aws CLI
 # image CI already mirrors (ci/mirrored-images.txt).
 bucketInitImage:
@@ -45,9 +55,10 @@ healthPath: /healthz
 # Signing region the gateway validates (SigV4 is strict about region).
 region: us-east-1
 
-# Dev-only S3 credentials. Handed to volume-manager as static creds
-# (SPACE_OBJECT_STORE_STATIC_*) and used as the gateway's root account, so
-# sigv4 is actually validated. Do NOT put the
+# Dev-only S3 credentials: the store's root account in both modes, so sigv4
+# is actually validated. Handed as static creds (SPACE_OBJECT_STORE_STATIC_*)
+# to volume-manager in `static` mode, and in both modes to build-manager,
+# cluster-controller and the bucket-init and seed-publish Jobs. Do NOT put the
 # substring "space" (or "minio") anywhere in these values: Tilt redacts secret
 # VALUES from command lines (including docker build-args), so a "space"
 # substring would poison every `docker build … space-rust-build-… …`
@@ -94,3 +105,39 @@ resources:
   limits:
     cpu: "1"
     memory: 4Gi
+
+# SeaweedFS, the `exchange` store: one all-in-one process (master, volume
+# server, filer and S3 gateway) over a node-local hostPath. Apache-2.0. 4.48 is
+# the release whose STS and session-policy enforcement was probed with the
+# authority's own policy shape; since 4.19 a session policy that grants
+# `s3:PutObject` also allows the multipart calls, as AWS authorizes them,
+# which volume-manager's streamed uploads need. See
+# docs/design/kind-storage-exchange.md for how the stores compared.
+seaweedfs:
+  image:
+    repository: chrislusf/seaweedfs
+    tag: "4.48"
+    pullPolicy: IfNotPresent
+  # Its own directory: the versitygw POSIX layout and SeaweedFS's volume files
+  # are not interchangeable.
+  dataHostPath: /var/lib/space-object-store-seaweedfs
+  # Master and filer ports inside the pod; only the S3 port is a Service.
+  masterPort: 9333
+  filerPort: 8888
+  # 1 GiB volume files, allocated on demand up to the count below. The
+  # default 30 GB volume would exhaust the Kind node's disk after the first
+  # one, and once no slot is free every write fails with
+  # "topo failed to pick 1 from 0 node candidates" (S3 500).
+  volumeSizeLimitMB: 1024
+  volumeMaxCount: 48
+  # The account and role the authority assumes. AssumeRole is admitted only
+  # by the role's trust policy, which names the vend identity alone; the
+  # identity itself holds no S3 permission. The account is the store's
+  # synthetic default; the authority accepts only a 12-digit account
+  # (crates/libs/credential/mgr/server/src/iam_role_arn.rs).
+  accountId: "000000000000"
+  vendRole: kind-storage-vend
+  vendIdentity:
+    name: kind-storage-vend
+    accessKey: localvend
+    secretKey: localvend-dev-secret

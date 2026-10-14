@@ -53,8 +53,19 @@ allowedServiceAccounts:
 # Credentials for the authority's own AWS integrations (AWS Secrets Manager
 # network-credential references, resolved only where the database pool lives,
 # crates/libs/credential/mgr/server/src/run.rs): the optional
-# `space-aws-creds` Secret bootstrap creates from private.env.
+# `space-aws-creds` Secret bootstrap creates from private.env. Not used when
+# storage credentials are exchanged (below).
 awsRegion: us-east-1
+
+# How node services get object-store credentials, set by every bring-up path
+# from SPACE_KIND_STORAGE_CREDENTIALS (infra/space/kind/lib/storage-credentials.sh).
+# `exchange` enables the storage exchange against the object store's STS:
+# the Secret the space-object-store chart renders carries the vend role and
+# the identity allowed to assume it, and STS answers on the store's S3 port.
+storageCredentials: static
+storageExchange:
+  secretName: space-object-store
+  stsEndpoint: http://object-store:8333
 
 # The external key provider behind the platform KEK: the Kind-only broker
 # fixture (space-kind-key-broker). The tenant namespace is the durable

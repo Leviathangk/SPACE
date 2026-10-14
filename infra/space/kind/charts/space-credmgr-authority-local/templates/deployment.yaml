@@ -166,9 +166,7 @@ spec:
             # restarts and every replica serves every org. Kind's broker is
             # the in-repo fixture (space-kind-key-broker), reached over
             # plaintext, which the code allows for local development only:
-            # the fixture has no TLS listener. Credential exchange stays
-            # disabled because no vending role (SPACE_CREDMGR_S3_VEND_ROLE_ARN)
-            # is configured.
+            # the fixture has no TLS listener.
             - name: SPACE_PLATFORM_KEK_PROVIDER
               value: intermediate-key-broker
             - name: SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_URL
@@ -207,6 +205,40 @@ spec:
               value: {{ join "," .Values.allowedServiceAccounts | quote }}
             - name: AWS_REGION
               value: {{ .Values.awsRegion | quote }}
+            {{- if eq .Values.storageCredentials "exchange" }}
+            # Storage credential exchange, configured with the settings a
+            # deployment uses (crates/libs/credential/mgr/server/src/run.rs):
+            # the vending role enables ExchangeToken, and the authority
+            # assumes it through STS for every exchange with an exact-object
+            # session policy (assume_s3_vend_role,
+            # crates/libs/credential/mgr/server/src/service.rs). Kind's STS
+            # is the object store itself (space-object-store, SeaweedFS in
+            # this mode), reached through the AWS SDK's service endpoint
+            # setting. The base credentials are the store's vend identity,
+            # which may only assume that role; a deployment's come from its
+            # workload identity. They take the place of space-aws-creds: one
+            # default credential chain cannot sign for two accounts.
+            - name: SPACE_CREDMGR_S3_VEND_ROLE_ARN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.storageExchange.secretName }}
+                  key: STORAGE_VEND_ROLE_ARN
+            - name: AWS_ENDPOINT_URL_STS
+              value: {{ .Values.storageExchange.stsEndpoint | quote }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.storageExchange.secretName }}
+                  key: STORAGE_VEND_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.storageExchange.secretName }}
+                  key: STORAGE_VEND_SECRET_ACCESS_KEY
+            {{- else }}
+            # No vending role (SPACE_CREDMGR_S3_VEND_ROLE_ARN), so credential
+            # exchange stays disabled (run.rs) and node services read the
+            # object store's static keys instead.
             {{- range list "AWS_ACCESS_KEY_ID" "AWS_SECRET_ACCESS_KEY" "AWS_SESSION_TOKEN" }}
             - name: {{ . }}
               valueFrom:
@@ -227,6 +259,7 @@ spec:
                   name: space-aws-creds
                   key: SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN
                   optional: true
+            {{- end }}
           ports:
             - name: grpc
               containerPort: {{ .Values.service.port }}
