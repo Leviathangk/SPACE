@@ -663,6 +663,16 @@ entry span on remote context, and it reports the chunks the tracer split.
 `space-trace-chunks.json` holds the examples and counts; see
 [Datadog trace chunks](../../../docs/observability.md#datadog-trace-chunks).
 
+To size ingestion for a class of trace, such as the lifecycle traces a
+sampling rule would keep in full, capture a window that runs the operations a
+few times and group `traces-raw.json` by trace: decode its payloads as
+`datadog_trace_chunks.py` does, collect every chunk's spans under their trace
+ID, and take the span with no parent as the trace's root. Its service and
+operation are what a sampling rule matches, and the trace's span count per
+service is what keeping it costs. Work that a request causes but does not wait
+for, such as a public operation's execution, a job or a shim create, roots its
+own trace with a link to the request, so size each root separately.
+
 The three-state smoke specification, pinned inputs, measured results and
 guest/worker coverage limits are recorded with the run's evidence rather than
 in this repository.
