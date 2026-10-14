@@ -1305,6 +1305,7 @@ async fn k8s_store_postgres_behaviors() -> TestResult {
     azrebalance_variant_uid_change_does_not_leak_stale_drain_state_or_drain_started_at(&fixture)
         .await?;
     persist_k8s_node_inventory_refuses_when_tombstoned(&fixture).await?;
+    bind_registered_k8s_node_uid_admits_only_the_registered_node(&fixture).await?;
     clear_command_ready_pending_is_a_cas_against_the_reaper(&fixture).await?;
     wake_signal_classifies_post_wake_flip_by_recency_not_lease(&fixture).await?;
     post_wake_update_does_not_resurrect_quarantined_sandbox(&fixture).await?;
@@ -9014,6 +9015,139 @@ async fn persist_k8s_node_inventory_refuses_when_tombstoned(fixture: &PostgresSt
     assert_eq!(
         nodes_count, 0,
         "tombstoned upsert must not leave a nodes row"
+    );
+    Ok(())
+}
+
+/// The credential-manager authority admits a Kubernetes caller only when its
+/// node is registered under the reviewed name and UID (`registered_node`).
+/// internal-api registers builder nodes without a UID; the inventory sync
+/// finds them by role and binding the UID read from the Kubernetes API makes
+/// that registration match, leaves the node's
+/// registration-owned state alone, never creates a registration, and treats
+/// a changed UID as a replacement node.
+async fn bind_registered_k8s_node_uid_admits_only_the_registered_node(
+    fixture: &PostgresStore,
+) -> TestResult {
+    use pplx_space_common_core::types::{K8sNodeName, K8sNodeUid};
+    use pplx_space_common_svc::sql::node_registration::registered_node;
+    use pplx_space_common_svc::types::k8s::space_k8s_node_id;
+
+    let suffix = NodeId::new().as_uuid().simple().to_string();
+    let node_name = format!("space-test-builder-{suffix}");
+    let node_id = space_k8s_node_id(&node_name, NodeRole::Builder.as_str());
+    let name = K8sNodeName::parse(&node_name)?;
+    let uid_a = K8sNodeUid::parse("builder-uid-A")?;
+    let uid_b = K8sNodeUid::parse("builder-uid-B")?;
+
+    // Nothing registered: no binding, and still no row for the authority.
+    assert!(
+        !fixture
+            .store
+            .bind_registered_k8s_node_uid(&node_name, uid_a.as_str(), node_id)
+            .await?
+    );
+    let rows: i64 = sqlx::query_scalar(sql!("SELECT COUNT(*) FROM nodes WHERE id = $1"))
+        .bind(node_id)
+        .fetch_one(&fixture.pool)
+        .await?;
+    assert_eq!(rows, 0, "binding must never create a registration");
+
+    // The rows internal-api's registration writes (bootstrap_k8s_origin_node),
+    // here mid-drain.
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state, last_heartbeat,
+                            drain_phase, drain_mode, drain_started_at)
+         VALUES ($1, '10.0.0.31'::INET, 'builder', 'k8s', 'ready', NOW(),
+                 'draining', 'gentle', NOW())"
+    ))
+    .bind(node_id)
+    .execute(&fixture.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid) VALUES ($1, $2, NULL)"
+    ))
+    .bind(node_id)
+    .bind(&node_name)
+    .execute(&fixture.pool)
+    .await?;
+    assert_eq!(registered_node(&fixture.pool, &name, &uid_a).await?, None);
+    assert!(
+        fixture
+            .store
+            .registered_k8s_nodes(NodeRole::Builder)
+            .await?
+            .contains(&(node_id, node_name.clone())),
+        "the sync finds builders by their registration"
+    );
+    assert!(
+        !fixture
+            .store
+            .registered_k8s_nodes(NodeRole::Worker)
+            .await?
+            .iter()
+            .any(|(id, _)| *id == node_id)
+    );
+
+    // Another node's name under this id binds nothing.
+    assert!(
+        !fixture
+            .store
+            .bind_registered_k8s_node_uid("space-test-builder-other", uid_a.as_str(), node_id)
+            .await?
+    );
+
+    // First binding: the authority now admits the node, and the drain and
+    // lifecycle state its registration owns are untouched.
+    assert!(
+        fixture
+            .store
+            .bind_registered_k8s_node_uid(&node_name, uid_a.as_str(), node_id)
+            .await?
+    );
+    assert_eq!(
+        registered_node(&fixture.pool, &name, &uid_a).await?,
+        Some(node_id)
+    );
+    let (state, drain_phase): (String, Option<String>) =
+        sqlx::query_as(sql!("SELECT state, drain_phase FROM nodes WHERE id = $1"))
+            .bind(node_id)
+            .fetch_one(&fixture.pool)
+            .await?;
+    assert_eq!(state, "ready");
+    assert_eq!(drain_phase.as_deref(), Some("draining"));
+
+    // Unchanged UID: idempotent.
+    assert!(
+        !fixture
+            .store
+            .bind_registered_k8s_node_uid(&node_name, uid_a.as_str(), node_id)
+            .await?
+    );
+
+    // A replacement Node under the same name: the old UID stops matching, and
+    // a drain aimed at the old instance is abandoned.
+    assert!(
+        fixture
+            .store
+            .bind_registered_k8s_node_uid(&node_name, uid_b.as_str(), node_id)
+            .await?
+    );
+    assert_eq!(registered_node(&fixture.pool, &name, &uid_a).await?, None);
+    assert_eq!(
+        registered_node(&fixture.pool, &name, &uid_b).await?,
+        Some(node_id)
+    );
+    let (drain_phase, drain_mode, drain_started): (Option<String>, Option<String>, bool) =
+        sqlx::query_as(sql!(
+            "SELECT drain_phase, drain_mode, drain_started_at IS NOT NULL FROM nodes WHERE id = $1"
+        ))
+        .bind(node_id)
+        .fetch_one(&fixture.pool)
+        .await?;
+    assert_eq!(
+        (drain_phase, drain_mode, drain_started),
+        (None, None, false)
     );
     Ok(())
 }

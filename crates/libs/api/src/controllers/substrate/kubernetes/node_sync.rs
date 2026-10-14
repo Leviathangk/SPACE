@@ -8,7 +8,11 @@
 //!
 //! `sync_labeled_nodes_to_db` fills that gap: it lists all kube Nodes
 //! carrying the sandbox node-selector label and upserts each one into the
-//! `nodes` + `node_k8s` tables. Missing-node reconciliation compares stale
+//! `nodes` + `node_k8s` tables. Nodes registered as builders, which carry no
+//! sandbox selector, get only their Kubernetes UID bound onto the registration
+//! internal-api made for them, so the credential-manager authority's node
+//! check (name and UID) can admit their callers; their rows and lifecycle stay
+//! with node registration. Missing-node reconciliation compares stale
 //! ready rows with the full watcher-backed Node membership so live builders
 //! and other roles outside the sandbox selector are preserved. Idempotent —
 //! re-running on a DaemonSet-managed cluster is safe and unchanged rows are
@@ -35,6 +39,14 @@ pub enum SyncNodeInventoryError {
     Kube(String),
     #[error("DB upsert failed for node {name}: {source}")]
     Db {
+        name: String,
+        #[source]
+        source: crate::controllers::substrate::SubstrateError,
+    },
+    #[error("DB builder registration listing failed: {0}")]
+    ListBuilderRegistrations(#[source] crate::controllers::substrate::SubstrateError),
+    #[error("DB UID binding failed for builder node {name}: {source}")]
+    BindBuilderUid {
         name: String,
         #[source]
         source: crate::controllers::substrate::SubstrateError,
@@ -136,6 +148,14 @@ pub(super) async fn sync_labeled_nodes_to_db(
         }
     }
 
+    // Missing-node reconciliation below must not wait on builder identity.
+    match bind_builder_node_uids(substrate, &observed_node_names).await {
+        Ok(bound) => changed.extend(bound),
+        Err(error) => {
+            tracing::warn!(%error, "kube_node_sync: builder node UID binding failed");
+        }
+    }
+
     let Some(demotion_node_names) =
         demotion_membership_snapshot(&observed_node_names, substrate.live_node_names())
     else {
@@ -163,6 +183,52 @@ pub(super) async fn sync_labeled_nodes_to_db(
     changed.sort_unstable();
     changed.dedup();
     Ok(changed)
+}
+
+/// Bind the Kubernetes UID of each node registered as a builder onto that
+/// registration. Builders carry no sandbox selector, so the pass above never
+/// sees them; the registrations, not Node labels, say which Nodes are SPACE
+/// builders, because the builder pool's labels differ between deployments.
+/// Each UID is read fresh from the API server, as the pass above reads its
+/// Nodes. A builder internal-api has not registered stays unregistered, and a
+/// registration whose Node is gone is left for missing-node reconciliation.
+async fn bind_builder_node_uids(
+    substrate: &KubernetesSubstrate,
+    sandbox_node_names: &[String],
+) -> Result<Vec<String>, SyncNodeInventoryError> {
+    use kube::Api;
+
+    let registrations = substrate
+        .store
+        .registered_k8s_nodes(NodeRole::Builder)
+        .await
+        .map_err(SyncNodeInventoryError::ListBuilderRegistrations)?;
+    let nodes_api: Api<k8s_openapi::api::core::v1::Node> = Api::all(substrate.k8s.client.clone());
+    let mut bound = Vec::new();
+    for (node_id, name) in registrations {
+        if sandbox_node_names.contains(&name) {
+            continue;
+        }
+        let node = nodes_api
+            .get_opt(&name)
+            .await
+            .map_err(|err| SyncNodeInventoryError::Kube(err.to_string()))?;
+        let Some(uid) = node.and_then(|node| node.metadata.uid) else {
+            continue;
+        };
+        let changed = substrate
+            .store
+            .bind_registered_k8s_node_uid(&name, &uid, node_id)
+            .await
+            .map_err(|source| SyncNodeInventoryError::BindBuilderUid {
+                name: name.clone(),
+                source,
+            })?;
+        if changed {
+            bound.push(name);
+        }
+    }
+    Ok(bound)
 }
 
 fn demotion_membership_snapshot(

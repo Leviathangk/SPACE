@@ -39,6 +39,113 @@ impl K8sStore {
         Ok(changed)
     }
 
+    /// Kubernetes-managed registrations of `role` that are not deleted, as
+    /// `(node id, Kubernetes node name)`.
+    pub(in crate::controllers::substrate::kubernetes) async fn registered_k8s_nodes(
+        &self,
+        role: NodeRole,
+    ) -> Result<Vec<(NodeId, String)>, SubstrateError> {
+        sqlx::query_as(sql!(
+            "SELECT n.id, nk.k8s_node_name
+             FROM nodes n
+             JOIN node_k8s nk ON nk.node_id = n.id
+             WHERE n.managed_by = 'k8s'
+               AND n.role = $1
+               AND COALESCE(n.state, 'registered') != 'deleted'
+             ORDER BY nk.k8s_node_name"
+        ))
+        .bind(role.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .db_context("failed to list Kubernetes node registrations")
+    }
+
+    /// Bind a Kubernetes Node's UID onto the registration internal-api already
+    /// made for it, without creating a row or taking over its lifecycle.
+    ///
+    /// Builder nodes are registered by internal-api with no UID, and no
+    /// sandbox pod ever records one for them, so the credential-manager
+    /// authority's node check (name and UID, `registered_node`) refused every
+    /// caller on them. The UID comes from the Kubernetes API here, never from
+    /// the node. A Node replaced under the same name (a different UID) clears
+    /// drain state as [`Self::upsert_k8s_node_role`] does, so a drain aimed at
+    /// the old instance cannot reach its replacement; the first binding of a
+    /// registration that had no UID is not a replacement and leaves it alone.
+    ///
+    /// Returns whether the stored UID changed. A node with no registration, or
+    /// one not managed by Kubernetes, matches nothing and returns `false`.
+    pub(in crate::controllers::substrate::kubernetes) async fn bind_registered_k8s_node_uid(
+        &self,
+        node_name: &str,
+        node_uid: &str,
+        node_id: NodeId,
+    ) -> Result<bool, SubstrateError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .db_context("failed to start Kubernetes node UID binding transaction")?;
+
+        // Before the UID update below, which would hide the replacement.
+        let drain_cleared = sqlx::query(sql!(
+            "UPDATE nodes
+             SET drain_phase = NULL,
+                 drain_mode = NULL,
+                 drain_started_at = NULL,
+                 drain_last_error = NULL
+             WHERE id = $1
+               AND managed_by = 'k8s'
+               AND EXISTS (
+                 SELECT 1 FROM node_k8s
+                 WHERE node_id = $1
+                   AND k8s_node_name = $2
+                   AND k8s_node_uid IS NOT NULL
+                   AND k8s_node_uid IS DISTINCT FROM $3
+               )"
+        ))
+        .bind(node_id)
+        .bind(node_name)
+        .bind(node_uid)
+        .execute(&mut *tx)
+        .await
+        .db_context("failed to clear drain state on Kubernetes node UID replacement")?
+        .rows_affected();
+        if drain_cleared > 0 {
+            tracing::warn!(
+                node_id = %node_id,
+                node_name = %node_name,
+                new_k8s_node_uid = %node_uid,
+                "k8s Node UID changed for a registered node; cleared drain_phase/drain_mode/drain_started_at/drain_last_error — \
+                 any in-progress drain was abandoned"
+            );
+        }
+
+        let bound = sqlx::query(sql!(
+            "UPDATE node_k8s AS nk
+             SET k8s_node_uid = $3,
+                 updated_at = NOW()
+             FROM nodes AS n
+             WHERE nk.node_id = $1
+               AND n.id = nk.node_id
+               AND n.managed_by = 'k8s'
+               AND nk.k8s_node_name = $2
+               AND nk.k8s_node_uid IS DISTINCT FROM $3"
+        ))
+        .bind(node_id)
+        .bind(node_name)
+        .bind(node_uid)
+        .execute(&mut *tx)
+        .await
+        .db_context("failed to bind Kubernetes node UID")?
+        .rows_affected()
+            > 0;
+
+        tx.commit()
+            .await
+            .db_context("failed to commit Kubernetes node UID binding transaction")?;
+        Ok(bound)
+    }
+
     /// Demote stale ready rows missing from a credible full-cluster Kubernetes
     /// membership snapshot without deleting node or sandbox placement records.
     pub(in crate::controllers::substrate::kubernetes) async fn demote_unobserved_k8s_nodes(
