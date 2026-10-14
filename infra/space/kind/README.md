@@ -1137,7 +1137,7 @@ these units, enabled in the image:
 | `space-loop-nodes.service` | mknods loop-device nodes in the node's `/dev` (64, raised past any index in use); pods copy the node's `/dev` when they start | `max_loop=10000` (07-sysctl.sh) |
 | `space-kind-devices.service` | mode 0666 on `/dev/kvm`, `/dev/vhost-vsock`, `/dev/vhost-net` | the `kvm` group; Kind-only, never on a worker |
 | `space-cgroup.service` | `/sys/fs/cgroup/space` with `+cpu +memory +io +pids` delegated | `space-cgroup.service` (07-sysctl.sh) |
-| `space-layout.service` | the SPACE groups and service accounts; the `/space/run` skeleton and dependency-drain gates; `/space/bin/{firecracker,jailer}` links onto the vendor tree; `/space/etc/sandbox.toml`; `/var/run/netns` | 07-sysctl.sh accounts and directory skeleton, 04-firecracker.sh links |
+| `space-layout.service` | the SPACE groups and service accounts; the `/space/run` skeleton and dependency-drain gates; protected Firecracker copies under `/space/bin/runtime/firecracker` and `/space/bin/{firecracker,jailer}` links; `/space/etc/sandbox.toml`; `/var/run/netns` | 07-sysctl.sh accounts and directory skeleton, 04-firecracker.sh runtime installation |
 | `space-cache.service` | formats `/var/lib/space-cache.img` on first boot (sparse, 40 GiB), mounts it on `/space/cache` with loop autoclear and shared propagation, then creates the cache skeleton | 01-partitions.sh / 11-nvme-cache.sh |
 | `space-kind-vsock-jails.service` | long-running: mknods `/dev/vhost-vsock` into each Firecracker jail under `/space/cache/firecracker/jails` as it appears (the jailer does not) | the node image provides it; Kind-only |
 
@@ -1152,6 +1152,15 @@ every node runs the same Kubernetes version. The cache image sits on the node's
 restarts. Defaults are baked like the rest of the layer; a node's
 `/etc/space/kind-node.env` can override `SPACE_CACHE_SIZE_MB` and
 `SPACE_LOOP_DEVICE_TARGET` for its next boot.
+
+The vendor mount remains a read-only, developer-owned download cache. At boot,
+`space-layout.service` copies the bootstrap Firecracker 1.15.1 binaries into
+root-owned `/space/bin/runtime/firecracker`; node-manager uses this path and
+verifies the compiled binary digests before execution. Repeated boots keep the
+installed files unchanged. A differing installed copy fails staging and requires
+node recreation rather than overwriting binaries that a sandbox may be using.
+The production init container still stages the guest kernel into the cache.
+Recreate existing Kind clusters to pick up this node-image change.
 
 **Distribution.** [`kind-node-image.sh`](scripts/kind-node-image.sh) follows
 `ci/scripts/ci-image.sh`. The tag is the SHA-256 of the image's inputs (the
