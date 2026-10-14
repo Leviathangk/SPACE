@@ -40,12 +40,14 @@ impl SandboxManagerService {
             .slot
             .ok_or_else(|| Status::failed_precondition("sandbox has no allocated network slot"))?;
 
-        let mut node_client = connect_node(&self.node_manager)
-            .await
-            .map_err(|e| Status::internal(format!("cannot connect to node-manager: {e}")))?;
-
-        let inspect = node_client
-            .inspect_sandbox(pplx_space_node_mgr_client::proto::InspectSandboxRequest {
+        // A read made for every `Stats` call: it shares the service's kept
+        // node-manager channel and retries as a replay-safe read, rather than
+        // dialing node-manager for each call.
+        let inspect = pplx_space_common_grpc::fwd_retry!(
+            "node-manager",
+            self.node_manager.lazy(),
+            inspect_sandbox,
+            Request::new(pplx_space_node_mgr_client::proto::InspectSandboxRequest {
                 sandbox_id: id.clone(),
                 uuid8: sandbox.uuid8.to_string(),
                 uid: Some(uid),
@@ -53,9 +55,9 @@ impl SandboxManagerService {
                 template: Some(sandbox.template.clone()),
                 execution_only: false,
             })
-            .await
-            .map_err(|e| Status::internal(format!("inspect failed: {e}")))?
-            .into_inner();
+        )
+        .map_err(|e| Status::internal(format!("inspect failed: {e}")))?
+        .into_inner();
 
         // CPU time comes from the cgroup inspect reads `cpu_max` from. Only
         // node-manager can read it: sandbox-manager runs in its own cgroup
@@ -83,7 +85,13 @@ impl SandboxManagerService {
         let probe_net_gateway =
             sandbox.netgtw_pid.is_some() || health.as_ref().is_some_and(|h| h.netgtw_alive);
         let net_gateway_stats = self
-            .collect_net_gateway_stats(id, probe_net_gateway, network_tx_bytes, network_rx_bytes)
+            .collect_net_gateway_stats(
+                id,
+                probe_net_gateway,
+                sandbox.netgtw_pid,
+                network_tx_bytes,
+                network_rx_bytes,
+            )
             .await;
 
         Ok(Response::new(StatsResponse {

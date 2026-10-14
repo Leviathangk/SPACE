@@ -962,6 +962,7 @@ impl SandboxWatchdog {
             let mut map = self.sidecars.lock().await;
             map.remove(sandbox_id);
         }
+        crate::net_gateway_clients::forget(sandbox_id);
         let mut map = self.state.lock().await;
         map.remove(sandbox_id);
     }
@@ -982,6 +983,7 @@ impl SandboxWatchdog {
             sidecars.remove(&sandbox_id);
             vm_outputs.detach(&sandbox_id);
             restored_guests.forget(&sandbox_id);
+            crate::net_gateway_clients::forget(&sandbox_id);
         })
     }
 
@@ -2089,7 +2091,7 @@ async fn probe_net_gateway_stats(
         NET_GATEWAY_BACKGROUND_STATS_TIMEOUT,
         "net-gateway stats probe",
         async {
-            let mut client = pplx_space_net_gateway_client::connect(sandbox_id)
+            let mut client = crate::net_gateway_clients::client(sandbox_id, Some(netgtw_pid))
                 .await
                 .map_err(|error| error.to_string())?;
             let stats = client
@@ -2114,6 +2116,7 @@ async fn probe_net_gateway_stats(
     let observation = match result {
         Ok(observation) => observation,
         Err(error) => {
+            crate::net_gateway_clients::discard(sandbox_id, Some(netgtw_pid));
             tracing::debug!(
                 sandbox_id = %sandbox_id,
                 %error,
@@ -2496,6 +2499,9 @@ async fn probe_spaced_guest_health(
     observation_from_probe_result(started, result, "pong")
 }
 
+// The probe dials afresh, unlike the gateway's kept clients: a dial is what
+// shows the gateway still accepts connections, which a kept connection could
+// keep answering past.
 async fn probe_net_gateway_health(sandbox_id: &str) -> HealthObservation {
     let started = Instant::now();
     let result = tokio::time::timeout(NET_GATEWAY_HEALTH_TIMEOUT, async {

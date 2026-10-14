@@ -1579,6 +1579,7 @@ impl SandboxManagerService {
         &self,
         sandbox_id: &str,
         probe_net_gateway: bool,
+        gateway_pid: Option<u32>,
         fallback_tx_bytes: u64,
         fallback_rx_bytes: u64,
     ) -> NetGatewayStatsSnapshot {
@@ -1588,7 +1589,7 @@ impl SandboxManagerService {
         }
 
         let result = tokio::time::timeout(NET_GATEWAY_FOREGROUND_STATS_TIMEOUT, async {
-            let mut client = pplx_space_net_gateway_client::connect(sandbox_id)
+            let mut client = crate::net_gateway_clients::client(sandbox_id, gateway_pid)
                 .await
                 .map_err(|error| error.to_string())?;
             client
@@ -1598,6 +1599,9 @@ impl SandboxManagerService {
                 .map_err(|error| error.to_string())
         })
         .await;
+        if !matches!(result, Ok(Ok(_))) {
+            crate::net_gateway_clients::discard(sandbox_id, gateway_pid);
+        }
 
         let stats = match result {
             Ok(Ok(stats)) => stats,
