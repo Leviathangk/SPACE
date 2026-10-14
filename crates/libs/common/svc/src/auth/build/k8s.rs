@@ -182,15 +182,27 @@ impl BuildTokenReviewer {
         let status = response
             .status
             .ok_or_else(|| Status::unauthenticated("invalid build token"))?;
-        if let Some(error) = status.error.as_deref().filter(|error| !error.is_empty()) {
+        let review_error = status.error.as_deref().filter(|error| !error.is_empty());
+        // The apiserver answers an ordinary rejection (forged, expired or
+        // wrong-audience token) with `authenticated: false` and the reason in
+        // `error`. That is a verdict on the token, not an outage: callers must
+        // not retry it.
+        if status.authenticated != Some(true) {
+            tracing::warn!(
+                error = review_error.unwrap_or("TokenReview rejected token"),
+                audience = %policy.audience,
+                "build TokenReview rejected token"
+            );
+            return Err(Status::unauthenticated("invalid build token"));
+        }
+        if let Some(error) = review_error {
             tracing::warn!(error, audience = %policy.audience, "build TokenReview evaluation failed");
             return Err(Status::unavailable("build token review failed"));
         }
-        if status.authenticated != Some(true)
-            || !status
-                .audiences
-                .as_ref()
-                .is_some_and(|audiences| audiences.contains(&policy.audience))
+        if !status
+            .audiences
+            .as_ref()
+            .is_some_and(|audiences| audiences.contains(&policy.audience))
         {
             return Err(Status::unauthenticated("invalid build token"));
         }
