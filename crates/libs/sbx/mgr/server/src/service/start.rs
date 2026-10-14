@@ -680,17 +680,14 @@ impl SandboxManagerService {
         let response = node_client
             .get_network_pool_status(NetworkPoolStatusRequest {})
             .await
-            .map_err(|error| {
-                Status::new(
-                    error.code(),
-                    format!(
-                        "node-manager memory policy lookup failed: {}",
-                        error.message()
-                    ),
-                )
-            })?
+            .map_err(memory_policy_lookup_error)?
             .into_inner();
+        Self::node_sandbox_memory_policy_from(response)
+    }
 
+    fn node_sandbox_memory_policy_from(
+        response: pplx_space_node_mgr_client::proto::NetworkPoolStatusResponse,
+    ) -> Result<NodeSandboxMemoryPolicy, Status> {
         let cgroup_memory_mib = required_node_memory_policy_field(
             response.sandbox_cgroup_memory_mib,
             "sandbox_cgroup_memory_mib",
@@ -751,11 +748,34 @@ impl SandboxManagerService {
     pub(super) async fn resolve_sandbox_memory_policy_for_request(
         &self,
         requested_memory_mib: u32,
+        retry_context: pplx_space_common_grpc::GrpcRetryContext,
     ) -> Result<ResolvedSandboxMemoryPolicy, Status> {
-        let mut node_client = connect_node(&self.node_manager)
-            .await
-            .map_err(|e| Status::internal(format!("cannot connect to node-manager: {e}")))?;
-        let node_memory_policy = Self::node_sandbox_memory_policy(&mut node_client).await?;
+        // Template-manager asks for this on every reconcile, so the read shares
+        // the service's kept node-manager channel rather than dialing
+        // node-manager for each call. It keeps the 10 s budget the dial used
+        // to retry within: template-manager falls back to an unclamped memory
+        // size when this fails, so a node-manager restart must be waited out,
+        // not failed fast. The caller's deadline, when it sent one, ends the
+        // retries sooner.
+        let node_manager = self.node_manager.lazy();
+        let response = pplx_space_common_grpc::retry_grpc_status_with_context(
+            "node-manager",
+            "GetNetworkPoolStatus",
+            pplx_space_common_grpc::DEFAULT_GRPC_CONNECT_RETRY_POLICY,
+            retry_context,
+            || {
+                let mut client = node_manager.clone();
+                async move {
+                    client
+                        .get_network_pool_status(NetworkPoolStatusRequest {})
+                        .await
+                }
+            },
+        )
+        .await
+        .map_err(memory_policy_lookup_error)?
+        .into_inner();
+        let node_memory_policy = Self::node_sandbox_memory_policy_from(response)?;
         Ok(self.resolve_sandbox_memory_policy(requested_memory_mib, node_memory_policy))
     }
 
@@ -2587,6 +2607,16 @@ fn firecracker_balloon_field(
             pplx_space_node_runtime_core::fc_api::balloon_json(balloon)
         )
     })
+}
+
+fn memory_policy_lookup_error(error: Status) -> Status {
+    Status::new(
+        error.code(),
+        format!(
+            "node-manager memory policy lookup failed: {}",
+            error.message()
+        ),
+    )
 }
 
 #[cfg(test)]

@@ -356,3 +356,71 @@ async fn uncommitted_encrypted_capture_record_is_never_sealed() {
     );
     assert!(staging.exists());
 }
+
+/// Template-manager falls back to an unclamped memory size when this read
+/// fails, so a node-manager that is restarting must be waited out within the
+/// connect budget the read always had, not failed after a short local retry.
+#[tokio::test]
+async fn memory_policy_read_waits_out_a_restarting_node_manager() {
+    use pplx_space_node_mgr_client::proto::{NetworkPoolStatusRequest, NetworkPoolStatusResponse};
+    let restarted_at = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let node_manager = FakeNodeManager::default()
+        .unary(
+            "GetNetworkPoolStatus",
+            move |_: NetworkPoolStatusRequest| {
+                if std::time::Instant::now() < restarted_at {
+                    return Err(Status::unavailable("node-manager is restarting"));
+                }
+                Ok(NetworkPoolStatusResponse {
+                    sandbox_cgroup_memory_mib: 4096,
+                    sandbox_guest_memory_max_mib: 3584,
+                    sandbox_memory_headroom_mib: 512,
+                    ..Default::default()
+                })
+            },
+        )
+        .serve();
+    let service = service_with_node_manager(crate::db::test_conn(), node_manager.connector());
+
+    let resolved = service
+        .resolve_sandbox_memory(internal_request(ResolveSandboxMemoryRequest {
+            requested_memory_mib: 8192,
+        }))
+        .await
+        .expect("the read outlasts the restart")
+        .into_inner();
+    assert_eq!(resolved.effective_memory_mib, 3584);
+}
+
+/// The connect budget never outlasts the caller: once its `grpc-timeout` has
+/// passed, the read stops retrying a node-manager that is still down.
+#[tokio::test]
+async fn memory_policy_read_stops_retrying_at_the_caller_deadline() {
+    use pplx_space_node_mgr_client::proto::{NetworkPoolStatusRequest, NetworkPoolStatusResponse};
+    let node_manager = FakeNodeManager::default()
+        .unary(
+            "GetNetworkPoolStatus",
+            |_: NetworkPoolStatusRequest| -> Result<NetworkPoolStatusResponse, Status> {
+                Err(Status::unavailable("node-manager is restarting"))
+            },
+        )
+        .serve();
+    let service = service_with_node_manager(crate::db::test_conn(), node_manager.connector());
+    let mut request = internal_request(ResolveSandboxMemoryRequest {
+        requested_memory_mib: 8192,
+    });
+    request
+        .metadata_mut()
+        .insert("grpc-timeout", "500m".parse().unwrap());
+
+    let started = std::time::Instant::now();
+    service
+        .resolve_sandbox_memory(request)
+        .await
+        .expect_err("node-manager never came back");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "retried for {:?} past a 500 ms caller deadline",
+        started.elapsed()
+    );
+}

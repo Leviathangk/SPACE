@@ -10,6 +10,8 @@ impl SandboxManagerService {
             "ResolveSandboxMemory",
             ALLOW_SANDBOX_OBSERVER_OR_TMPLMGR,
         )?;
+        let retry_context = pplx_space_common_grpc::GrpcRetryContext::none()
+            .with_grpc_timeout_metadata(request.metadata());
         let requested_memory_mib = request.get_ref().requested_memory_mib;
         if requested_memory_mib == 0 {
             return Err(Status::invalid_argument(
@@ -18,7 +20,7 @@ impl SandboxManagerService {
         }
 
         let resolved = self
-            .resolve_sandbox_memory_policy_for_request(requested_memory_mib)
+            .resolve_sandbox_memory_policy_for_request(requested_memory_mib, retry_context)
             .await?;
         Ok(Response::new(ResolveSandboxMemoryResponse {
             requested_memory_mib: resolved.requested_memory_mib,
