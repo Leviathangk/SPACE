@@ -5,7 +5,7 @@ use pplx_space_common_core::host::linux::paths;
 use pplx_space_common_core::host::linux::paths::{FIRECRACKER_LOG_FILE, FIRECRACKER_METRICS_FIFO};
 use pplx_space_common_core::sandbox_storage::{validate_rootfs_bytes, validate_rootfs_mib};
 use pplx_space_node_runtime_core::runtime_inventory::{
-    ExecutionResolver, ExecutionSelectionMode, RuntimeFileRole, boot_component_role,
+    ExecutionSelectionMode, RuntimeFileRole, boot_component_role,
 };
 
 struct PreparationOwnership {
@@ -273,10 +273,9 @@ impl NodeManagerService {
                 "snapshot_restore and execution_selection_mode disagree",
             ));
         }
-        let runtime_inventory = self.runtime_inventory().await?;
-        let resolved_execution = runtime_inventory
-            .resolve_execution(requested_runtime.as_ref(), runtime, selection_mode)
-            .map_err(RuntimeInventoryError::into_status)?;
+        let resolved_execution = self
+            .resolve_bound_execution(requested_runtime.as_ref(), runtime, selection_mode)
+            .await?;
         let firecracker_bin = resolved_execution
             .runtime_files
             .path(RuntimeFileRole::FirecrackerBinary)
@@ -681,10 +680,9 @@ impl NodeManagerService {
         let (runtime, requested_runtime) =
             parse_runtime_request(&req.runtime, req.requested_execution.as_ref())?;
         let selection_mode = parse_execution_selection_mode(req.execution_selection_mode)?;
-        let runtime_inventory = self.runtime_inventory().await?;
-        let runtime_installation = runtime_inventory
-            .resolve_execution(requested_runtime.as_ref(), runtime, selection_mode)
-            .map_err(RuntimeInventoryError::into_status)?;
+        let runtime_installation = self
+            .resolve_bound_execution(requested_runtime.as_ref(), runtime, selection_mode)
+            .await?;
         log_resolved_execution("prepare", sandbox_id, &runtime_installation.execution);
         let sandbox_metadata = sandbox_metadata_json(req, runtime_installation.execution.clone())?;
         let lifecycle_permit = self

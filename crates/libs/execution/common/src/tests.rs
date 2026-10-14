@@ -13,6 +13,7 @@ fn unspecified_enum_values_are_rejected() {
         }),
         state_format: None,
         components: vec![],
+        environment: None,
     };
 
     assert!(matches!(

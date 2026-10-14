@@ -3,6 +3,7 @@ use pplx_space_common_core::types::{JobId, OrgId};
 pub mod blob;
 mod blob_storage;
 mod environment;
+mod execution_binding;
 pub mod object_store;
 pub mod oci;
 pub mod publish;
@@ -46,6 +47,8 @@ use tracing::Instrument as _;
 
 use environment::StepEnvironment;
 pub use environment::{BuildEnvironmentError, PreparedRecipe};
+use execution_binding::BuildExecutionBinding;
+pub use execution_binding::BuildExecutionBindingError;
 pub use pplx_space_common_core::types::{SystemPublicationGrantId, TenantPublicationGrantId};
 pub use publish::{
     PublishError, TemplateOrg, TemplatePublication, publish_build, register_build_template,
@@ -164,7 +167,7 @@ struct BaseTemplateBuild {
     build_id: TemplateBuildId,
     resolved_reference: String,
     rootfs_path: String,
-    metadata: Option<TemplateMetadata>,
+    metadata: TemplateMetadata,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -175,6 +178,8 @@ struct GuestRuntimeMetadata {
 
 #[derive(Debug, thiserror::Error)]
 pub enum BuildError {
+    #[error(transparent)]
+    ExecutionBinding(#[from] BuildExecutionBindingError),
     #[error(transparent)]
     Environment(#[from] BuildEnvironmentError),
     #[error(transparent)]
@@ -232,7 +237,8 @@ impl BuildError {
             Self::RootfsReservation(status) if status.code() == tonic::Code::ResourceExhausted => {
                 TemplateBuildErrorKind::StorageAdmission
             }
-            Self::RootfsReservation(_)
+            Self::ExecutionBinding(_)
+            | Self::RootfsReservation(_)
             | Self::InvalidSpacedVersion { .. }
             | Self::InvalidSandboxId(_)
             | Self::Message(_)
@@ -703,9 +709,9 @@ impl TemplateBuilder {
                 )));
             }
             let build_id = TemplateBuildId::new(base_name, base_content_hash);
-            let metadata = std::fs::read_to_string(format!("{template_dir}/metadata.json"))
-                .ok()
-                .and_then(|data| serde_json::from_str::<TemplateMetadata>(&data).ok());
+            let metadata = execution_binding::read_metadata(
+                &Path::new(&template_dir).join("metadata.json"),
+            )?;
             let resolved_base = BaseTemplateBuild {
                 resolved_reference: format!("{}@{}", build_id.template(), build_id.content_hash()),
                 rootfs_path: format!("{template_dir}/rootfs.ext4"),
@@ -715,6 +721,15 @@ impl TemplateBuilder {
             Ok::<BaseTemplateBuild, BuildError>(resolved_base)
         })
         .await?;
+        let base_metadata = &resolved_base.metadata;
+        let base_execution = base_metadata
+            .execution_metadata()
+            .map_err(BuildExecutionBindingError::from)?
+            .ok_or(BuildExecutionBindingError::Missing(
+                "base execution metadata",
+            ))?;
+        let execution_binding = BuildExecutionBinding::for_base(None, base_execution).await?;
+
         println!("  Resolved base: {}", resolved_base.resolved_reference);
         if !std::path::Path::new(&resolved_base.rootfs_path).exists() {
             return Err(BuildError::message(format!(
@@ -1065,17 +1080,6 @@ impl TemplateBuilder {
                 ))
             })
             .map(|metadata| metadata.execution),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let architecture = std::env::consts::ARCH
-                    .parse::<pplx_space_common_core::types::Arch>()
-                    .map_err(|error| BuildError::message(error.to_string()))?;
-                Ok(
-                    pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
-                        architecture,
-                        vec![],
-                    ),
-                )
-            }
             Err(source) => Err(BuildError::Io {
                 operation: "read sandbox runtime metadata",
                 source,
@@ -1102,6 +1106,10 @@ impl TemplateBuilder {
             );
         }
         let execution = execution?;
+        let execution = match &execution_binding {
+            Some(binding) => binding.bind(execution)?,
+            None => execution,
+        };
 
         // Shrink rootfs for storage/transfer, then add a small fixed amount of
         // free space. If the recipe declares a runtime disk size, template-manager
@@ -1195,9 +1203,9 @@ impl TemplateBuilder {
         let now = now_iso8601();
         let (spaced_version, spaced_compatibility_family) =
             template_guest_runtime_metadata(&resolved_base, oci_guest_runtime.as_ref());
-        let tmeta = TemplateMetadata {
-            schema_version: Some(pplx_space_common_core::types::TEMPLATE_METADATA_SCHEMA_VERSION),
-            execution: Some(execution),
+        let mut tmeta = TemplateMetadata {
+            schema_version: None,
+            execution: None,
             id: template_id.to_string(),
             name: template_id.to_string(),
             description: recipe.metadata.description.clone(),
@@ -1220,6 +1228,7 @@ impl TemplateBuilder {
             // `arch` field. Leaving None preserves that behavior.
             arch: None,
         };
+        tmeta.set_execution_metadata(execution);
         let meta_path = format!("{output_dir}/metadata.json");
         let meta_json = serde_json::to_string_pretty(&tmeta).expect("serialize template metadata");
         build_phase(template_id, BuildPhase::WriteMetadata, async {
@@ -1327,7 +1336,18 @@ impl TemplateBuilder {
         cmd.env("SPACE_SEED_SPACED_VERSION", &spaced_version);
         cmd.env("SPACE_SEED_GUEST_BIN_DIR", &guest_bin_dir);
         cmd.env("SPACE_SEED_ROOTFS_BUILDER_SCRIPT", &rootfs_builder_path);
-        configure_scratch_guest_kernel(&mut cmd, guest_kernel.as_ref());
+        let execution_binding = BuildExecutionBinding::for_scratch(
+            None,
+            guest_kernel.as_ref(),
+            std::env::consts::ARCH
+                .parse()
+                .map_err(BuildExecutionBindingError::from)?,
+        )
+        .await?;
+        match &execution_binding {
+            Some(binding) => binding.configure_scratch(&mut cmd, guest_kernel.as_ref())?,
+            None => execution_binding::configure_legacy_scratch(&mut cmd, guest_kernel.as_ref()),
+        }
         if let Some(cargo_toml) = workspace_cargo_toml {
             cmd.env("SPACE_SEED_CARGO_TOML", cargo_toml);
         }
@@ -1360,6 +1380,50 @@ impl TemplateBuilder {
         })
         .await?;
 
+        if let Some(binding) = execution_binding {
+            let metadata_path = Path::new(&final_output_dir).join("metadata.json");
+            let bytes = std::fs::read(&metadata_path).map_err(|source| BuildError::Io {
+                operation: "read scratch template metadata",
+                source,
+            })?;
+            let bytes = binding.bind_document(&bytes)?;
+            use std::io::Write as _;
+            let mut temporary =
+                tempfile::NamedTempFile::new_in(&final_output_dir).map_err(|source| {
+                    BuildError::Io {
+                        operation: "create bound metadata staging file",
+                        source,
+                    }
+                })?;
+            temporary
+                .write_all(&bytes)
+                .map_err(|source| BuildError::Io {
+                    operation: "write bound scratch template metadata",
+                    source,
+                })?;
+            // Preserve the mode established by the scratch output normalizer.
+            temporary
+                .as_file()
+                .set_permissions(
+                    std::fs::metadata(&metadata_path)
+                        .map_err(|source| BuildError::Io {
+                            operation: "stat scratch template metadata",
+                            source,
+                        })?
+                        .permissions(),
+                )
+                .map_err(|source| BuildError::Io {
+                    operation: "set bound metadata permissions",
+                    source,
+                })?;
+            temporary
+                .persist(&metadata_path)
+                .map_err(|error| BuildError::Io {
+                    operation: "publish bound scratch template metadata",
+                    source: error.error,
+                })?;
+        }
+
         println!("Scratch build output: {final_output_dir}");
         let content_hash = build_phase(template_id, BuildPhase::RegisterTemplate, async {
             register_built_template(template_id, &staging_dir_name, true).await
@@ -1370,20 +1434,6 @@ impl TemplateBuilder {
             content_hash: Some(content_hash),
         })
     }
-}
-
-fn configure_scratch_guest_kernel(
-    command: &mut tokio::process::Command,
-    guest_kernel: Option<&GuestKernelPin>,
-) {
-    command.env_remove("SPACE_SEED_KERNEL_VERSION");
-    command.env_remove("SPACE_SEED_KERNEL_DIGEST");
-
-    let Some(guest_kernel) = guest_kernel else {
-        return;
-    };
-    command.env("SPACE_SEED_KERNEL_VERSION", guest_kernel.version.as_str());
-    command.env("SPACE_SEED_KERNEL_DIGEST", guest_kernel.digest.to_string());
 }
 
 fn oci_source_message(
@@ -1678,10 +1728,10 @@ fn template_guest_runtime_metadata(
             Some(metadata.spaced_compatibility_family.clone()),
         );
     }
-    let metadata = resolved_base.metadata.as_ref();
+    let metadata = &resolved_base.metadata;
     (
-        metadata.and_then(|metadata| metadata.spaced_version.clone()),
-        metadata.and_then(|metadata| metadata.spaced_compatibility_family.clone()),
+        metadata.spaced_version.clone(),
+        metadata.spaced_compatibility_family.clone(),
     )
 }
 
@@ -2366,9 +2416,6 @@ mod build_staging_tests;
 
 #[cfg(test)]
 mod scratch_output_tests;
-
-#[cfg(test)]
-mod scratch_guest_kernel_tests;
 
 #[cfg(test)]
 mod tar_symlink_tests;

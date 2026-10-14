@@ -57,7 +57,8 @@
 //! - `base_resolved`, `spaced_version`, `spaced_compatibility_family`,
 //!   `disk_size_mb` skip when `None` — matches the old struct.
 //! - Missing `schema_version` means the legacy version-1 shape. Version 2 requires
-//!   `execution`; unsupported or partial versioned documents are rejected by
+//!   unbound `execution`; version 3 additionally requires its environment reference.
+//!   Unsupported or partial versioned documents are rejected by
 //!   [`TemplateMetadata::execution_metadata`].
 //! - `arch` is a new field added by the typing pass (build-mgr never
 //!   wrote it; the seed builder did). It skips when `None` so
@@ -72,17 +73,21 @@
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-/// Current template `metadata.json` schema version.
+/// Unbound template `metadata.json` schema version.
 pub const TEMPLATE_METADATA_SCHEMA_VERSION: u32 = 2;
+/// Environment-bound documents require readers that preserve the binding.
+pub const BOUND_TEMPLATE_METADATA_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum TemplateMetadataSchemaError {
     #[error("unsupported template metadata schema version {0}")]
     UnsupportedVersion(u32),
-    #[error("template metadata schema version 2 requires execution metadata")]
+    #[error("versioned template metadata requires execution metadata")]
     MissingExecution,
     #[error("legacy template metadata must not contain versioned execution metadata")]
     LegacyExecution,
+    #[error("template schema and execution environment binding disagree")]
+    EnvironmentBinding,
 }
 
 /// Typed view of `metadata.json` carried with every template build.
@@ -231,7 +236,11 @@ pub struct TemplateMetadata {
 
 impl TemplateMetadata {
     pub fn set_execution_metadata(&mut self, execution: crate::types::ExecutionMetadata) {
-        self.schema_version = Some(TEMPLATE_METADATA_SCHEMA_VERSION);
+        self.schema_version = Some(if execution.environment().is_some() {
+            BOUND_TEMPLATE_METADATA_SCHEMA_VERSION
+        } else {
+            TEMPLATE_METADATA_SCHEMA_VERSION
+        });
         self.execution = Some(execution);
     }
 
@@ -241,10 +250,21 @@ impl TemplateMetadata {
         match (self.schema_version, self.execution.as_ref()) {
             (None, None) => Ok(None),
             (None, Some(_)) => Err(TemplateMetadataSchemaError::LegacyExecution),
-            (Some(TEMPLATE_METADATA_SCHEMA_VERSION), Some(execution)) => Ok(Some(execution)),
-            (Some(TEMPLATE_METADATA_SCHEMA_VERSION), None) => {
-                Err(TemplateMetadataSchemaError::MissingExecution)
+            (Some(version), Some(execution))
+                if version == TEMPLATE_METADATA_SCHEMA_VERSION
+                    || version == BOUND_TEMPLATE_METADATA_SCHEMA_VERSION =>
+            {
+                if execution.environment().is_some()
+                    != (version == BOUND_TEMPLATE_METADATA_SCHEMA_VERSION)
+                {
+                    return Err(TemplateMetadataSchemaError::EnvironmentBinding);
+                }
+                Ok(Some(execution))
             }
+            (
+                Some(TEMPLATE_METADATA_SCHEMA_VERSION | BOUND_TEMPLATE_METADATA_SCHEMA_VERSION),
+                None,
+            ) => Err(TemplateMetadataSchemaError::MissingExecution),
             (Some(version), _) => Err(TemplateMetadataSchemaError::UnsupportedVersion(version)),
         }
     }

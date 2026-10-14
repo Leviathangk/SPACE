@@ -544,7 +544,7 @@ impl RegisterRetrySchedule {
 /// callers' `async_trait` bounds).
 enum RegisterRequest {
     Template(RegisterTemplateRequest),
-    Release(RegisterTemplateReleaseRequest),
+    Release(Box<RegisterTemplateReleaseRequest>),
 }
 
 impl RegisterRequest {
@@ -586,7 +586,7 @@ async fn register_with_retry_schedule(
                 .await
                 .map(|_| ()),
             RegisterRequest::Release(inner) => cluster_api
-                .register_template_release(inner.clone())
+                .register_template_release(inner.as_ref().clone())
                 .await
                 .map(|_| ()),
         };
@@ -643,14 +643,14 @@ async fn register_cluster_release(
     publication: TemplatePublication,
     execution: Option<pplx_space_execution_common::proto::ExecutionMetadata>,
 ) -> Result<(), PublishError> {
-    let request = RegisterRequest::Release(release_registration_request(
+    let request = RegisterRequest::Release(Box::new(release_registration_request(
         template,
         content_hash,
         tags,
         storage_connection_strings,
         publication,
         execution,
-    ));
+    )));
     register_with_transient_retry(cluster_api, template, request)
         .await
         .map_err(PublishError::RegisterTemplateRelease)

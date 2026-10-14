@@ -80,10 +80,10 @@ fn rejects_partial_or_unknown_versioned_metadata() {
         TemplateMetadataSchemaError::MissingExecution
     );
 
-    let unknown: TemplateMetadata = serde_json::from_str(r#"{"schema_version":3}"#).unwrap();
+    let unknown: TemplateMetadata = serde_json::from_str(r#"{"schema_version":99}"#).unwrap();
     assert_eq!(
         unknown.execution_metadata().unwrap_err(),
-        TemplateMetadataSchemaError::UnsupportedVersion(3)
+        TemplateMetadataSchemaError::UnsupportedVersion(99)
     );
 }
 
@@ -150,6 +150,44 @@ fn always_serialized_string_fields_preserve_pre_typing_wire() {
             json.contains(required),
             "wire-parity field {required} missing from default-metadata serialization: {json}"
         );
+    }
+}
+
+#[test]
+fn bound_template_documents_cannot_be_downgraded_or_lose_the_reference() {
+    use crate::types::{Arch, Digest, EnvironmentReference, ExecutionMetadata, TemplateManifest};
+    let reference = EnvironmentReference::new(Digest::sha256([1; 32]));
+    for bound in [false, true] {
+        let execution = ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![]);
+        let execution = if bound {
+            execution.with_environment(reference)
+        } else {
+            execution
+        };
+        let mut metadata = TemplateMetadata::default();
+        let mut manifest = TemplateManifest::default();
+        metadata.set_execution_metadata(execution.clone());
+        manifest.set_execution_metadata(execution.clone());
+        let metadata: TemplateMetadata =
+            serde_json::from_str(&serde_json::to_string(&metadata).unwrap()).unwrap();
+        let manifest: TemplateManifest =
+            serde_json::from_str(&serde_json::to_string(&manifest).unwrap()).unwrap();
+        assert_eq!(metadata.execution_metadata().unwrap(), Some(&execution));
+        assert_eq!(manifest.execution_metadata().unwrap(), Some(&execution));
+        for schema in [2, 3] {
+            let mut metadata = metadata.clone();
+            let mut manifest = manifest.clone();
+            metadata.schema_version = Some(schema);
+            manifest.schema_version = Some(schema);
+            assert_eq!(
+                metadata.execution_metadata().is_ok(),
+                bound == (schema == 3)
+            );
+            assert_eq!(
+                manifest.execution_metadata().is_ok(),
+                bound == (schema == 3)
+            );
+        }
     }
 }
 

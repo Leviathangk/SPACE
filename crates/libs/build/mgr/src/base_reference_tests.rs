@@ -17,11 +17,11 @@ fn oci_guest_metadata_fixture() -> (BaseTemplateBuild, GuestRuntimeMetadata) {
         ),
         resolved_reference: format!("seed@{HASH}"),
         rootfs_path: "/space/templates/seed/rootfs.ext4".to_string(),
-        metadata: Some(TemplateMetadata {
+        metadata: TemplateMetadata {
             spaced_version: Some("0.1.0".to_string()),
             spaced_compatibility_family: Some("0.1".to_string()),
             ..TemplateMetadata::default()
-        }),
+        },
     };
     let installed = GuestRuntimeMetadata {
         spaced_version: "0.2.0".to_string(),

@@ -59,6 +59,19 @@ die() { printf '[build-seed] ERROR: %s\n' "$*" >&2; exit 1; }
 command -v docker >/dev/null 2>&1 || die "docker not on PATH"
 command -v python3 >/dev/null 2>&1 || die "python3 not on PATH (needed to author manifest.json)"
 
+# Record the bytes staged for the Kind workers, not a guessed kernel release.
+# shellcheck source=lib/kind-host-paths.sh
+source "$REPO_ROOT/infra/space/kind/scripts/lib/kind-host-paths.sh"
+kind_host_paths__require SPACE_VENDOR_ROOT
+kernel_path="$SPACE_VENDOR_ROOT/firecracker/default/kernel/vmlinux.bin"
+if [[ ! -f "$kernel_path" ]]; then
+  SPACE_VENDOR_ROOT="$SPACE_VENDOR_ROOT" bash "$REPO_ROOT/infra/space/kind/scripts/install-fc-vendor.sh"
+fi
+[[ -f "$kernel_path" ]] || die "staged guest kernel missing: $kernel_path"
+SEED_KERNEL_SHA256="$(sha256sum "$kernel_path" | awk '{print $1}')"
+SEED_KERNEL_VERSION="legacy-${SEED_KERNEL_SHA256:0:12}"
+SEED_KERNEL_DIGEST="sha256:$SEED_KERNEL_SHA256"
+
 # ── Sandbox SSH keypair (Packer-parity, generated once per devbox) ───────────
 if [[ ! -f "$SSH_DIR/sandbox_ed25519" ]]; then
   log "generating sandbox SSH keypair → $SSH_DIR/sandbox_ed25519"
@@ -96,7 +109,7 @@ inputs_hash=$( (
   cat "$GUEST_BIN_DIR/spaced" "$GUEST_BIN_DIR/spaced-svc" \
       "$SEED_DIR/rootfs-builder.sh" "$SEED_DIR/Dockerfile" \
       "$SEED_RECIPE" "$SSH_DIR/sandbox_ed25519.pub"
-  echo "$SEED_RUNTIME_VERSION $SEED_STATE_FORMAT_VERSION"
+  echo "$SEED_RUNTIME_VERSION $SEED_STATE_FORMAT_VERSION $SEED_KERNEL_VERSION $SEED_KERNEL_DIGEST"
 ) | sha256sum | awk '{print $1}')
 stamp="$OUT_DIR/.inputs-sha256"
 if [[ "${SPACE_SEED_REBUILD:-0}" != "1" \
@@ -147,6 +160,8 @@ docker run --rm --privileged \
   -e "SPACE_SEED_UBUNTU_DATE=$SEED_UBUNTU_DATE" \
   -e "SPACE_SEED_RUNTIME_VERSION=$SEED_RUNTIME_VERSION" \
   -e "SPACE_SEED_STATE_FORMAT_VERSION=$SEED_STATE_FORMAT_VERSION" \
+  -e "SPACE_SEED_KERNEL_VERSION=$SEED_KERNEL_VERSION" \
+  -e "SPACE_SEED_KERNEL_DIGEST=$SEED_KERNEL_DIGEST" \
   space-seed-builder:local --id seed --force
 
 [[ -f "$OUT_DIR/rootfs.ext4" && -f "$OUT_DIR/metadata.json" ]] \

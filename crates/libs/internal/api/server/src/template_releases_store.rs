@@ -1,4 +1,4 @@
-//! Postgres store for `template_releases` reads used by the
+//! Postgres store for `template_releases` reads and publication writes used by the
 //! [`super::ClusterApiService`] handlers. Mirrors [`WarmPoolStore`] in
 //! `pplx-space-cluster-pool`: holds a `PgPool`, exposes async methods
 //! per query, returns plain Rust domain types so the store is
@@ -495,4 +495,46 @@ impl TemplateReleasesStore {
             })
             .collect())
     }
+}
+
+pub(super) async fn insert_release(
+    executor: impl sqlx::PgExecutor<'_>,
+    template_name: &str,
+    runtime: &str,
+    hash: &str,
+    org_id: Option<OrgId>,
+    execution_metadata: Option<&serde_json::Value>,
+) -> Result<Option<super::TemplateReleaseRow>, sqlx::Error> {
+    sqlx::query_as::<_, super::TemplateReleaseRow>(sql!(
+        "INSERT INTO template_releases (template_name, type, hash, org_id, execution_metadata)
+         SELECT $1, $2, $3, COALESCE($4, org_id), $5
+         FROM templates
+         WHERE name = $1
+         ON CONFLICT (template_name, hash) DO NOTHING
+         RETURNING id, template_name, type, hash, org_id, created_at"
+    ))
+    .bind(template_name)
+    .bind(runtime)
+    .bind(hash)
+    .bind(org_id)
+    .bind(execution_metadata)
+    .fetch_optional(executor)
+    .await
+}
+
+/// The caller holds the release row lock while comparing or filling evidence.
+pub(super) async fn fill_execution_metadata(
+    executor: impl sqlx::PgExecutor<'_>,
+    release_id: Uuid,
+    execution: &serde_json::Value,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "UPDATE template_releases SET execution_metadata = $2
+         WHERE id = $1 AND execution_metadata IS NULL"
+    ))
+    .bind(release_id)
+    .bind(execution)
+    .execute(executor)
+    .await?;
+    Ok(())
 }

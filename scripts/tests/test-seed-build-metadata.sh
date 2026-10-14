@@ -19,19 +19,6 @@ exec "$@"
 SH
 chmod +x "${fake_bin}/sudo"
 
-cat >"${fake_bin}/find" <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-if [[ "${1:-}" == "/space/vendor/firecracker" ]]; then
-  if [[ -n "${FAKE_VENDOR_ROOT:-}" ]]; then
-    exec /usr/bin/find "${FAKE_VENDOR_ROOT}" "${@:2}"
-  fi
-  exit 0
-fi
-exec /usr/bin/find "$@"
-SH
-chmod +x "${fake_bin}/find"
-
 cat >"${fake_bin}/ctr" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -103,35 +90,6 @@ esac
 SH
 chmod +x "${fake_bin}/ctr"
 
-vendor_root="${tmp_dir}/vendor/firecracker"
-vendor_version_dir="${vendor_root}/v1.16.0"
-mkdir -p "${vendor_version_dir}/bin" "${vendor_version_dir}/kernel"
-touch "${vendor_version_dir}/kernel/vmlinux.bin" "${vendor_version_dir}/bin/jailer"
-chmod +x "${vendor_version_dir}/bin/jailer"
-cat >"${vendor_version_dir}/bin/firecracker" <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-if [[ "${FAIL_IF_FIRECRACKER_CALLED:-}" == "1" ]]; then
-  echo "firecracker should not be inspected in this case" >&2
-  exit 98
-fi
-case "${1:-}" in
-  --version)
-    echo "Firecracker v1.16.0"
-    echo "2026-06-22T00:58:19.212313456 [anonymous-instance:main] Firecracker exiting successfully. exit_code=0"
-    ;;
-  --snapshot-version)
-    echo "v10.1.0"
-    echo "2026-06-22T00:58:19.215689465 [anonymous-instance:main] Firecracker exiting successfully. exit_code=0"
-    ;;
-  *)
-    echo "unexpected firecracker invocation: $*" >&2
-    exit 1
-    ;;
-esac
-SH
-chmod +x "${vendor_version_dir}/bin/firecracker"
-
 make_case_dirs() {
   local name="$1"
   case_root="${tmp_dir}/${name}"
@@ -167,6 +125,9 @@ run_success() {
     SPACE_SEED_GUEST_BIN_DIR="$guest_bin_dir" \
     SPACE_SEED_ROOTFS_BUILDER_SCRIPT="$rootfs_builder" \
     SPACE_SEED_CARGO_TOML="$cargo_toml" \
+    SPACE_SEED_RUNTIME=firecracker \
+    SPACE_SEED_RUNTIME_VERSION=1.15.1 \
+    SPACE_SEED_STATE_FORMAT_VERSION=9.0.0 \
     SPACE_SEED_SOURCE_TYPE="ubuntu-minimal-cloud-squashfs" \
     SPACE_SEED_UBUNTU_RELEASE="resolute" \
     SPACE_SEED_UBUNTU_VERSION="26.04" \
@@ -190,6 +151,9 @@ run_failure() {
     SPACE_SEED_GUEST_BIN_DIR="$guest_bin_dir" \
     SPACE_SEED_ROOTFS_BUILDER_SCRIPT="$rootfs_builder" \
     SPACE_SEED_CARGO_TOML="$cargo_toml" \
+    SPACE_SEED_RUNTIME=firecracker \
+    SPACE_SEED_RUNTIME_VERSION=1.15.1 \
+    SPACE_SEED_STATE_FORMAT_VERSION=9.0.0 \
     SPACE_SEED_SOURCE_TYPE="ubuntu-minimal-cloud-squashfs" \
     SPACE_SEED_UBUNTU_RELEASE="resolute" \
     SPACE_SEED_UBUNTU_VERSION="26.04" \
@@ -230,30 +194,18 @@ assert_export() {
   }
 }
 
-run_success no-vendor-defaults
+run_success explicit-runtime
 assert_export "$captured_env" SPACE_SEED_RUNTIME firecracker
 assert_export "$captured_env" SPACE_SEED_RUNTIME_VERSION 1.15.1
 assert_export "$captured_env" SPACE_SEED_STATE_FORMAT_VERSION 9.0.0
 
-runtime_pair_error='requires both SPACE_SEED_RUNTIME_VERSION and SPACE_SEED_STATE_FORMAT_VERSION'
-run_failure no-vendor-one-sided "$runtime_pair_error" SPACE_SEED_RUNTIME_VERSION=1.16.0
+run_failure missing-runtime 'builder-provided runtime is required' SPACE_SEED_RUNTIME=
+run_failure missing-version 'builder-provided runtime version is required' SPACE_SEED_RUNTIME_VERSION=
+run_failure missing-format 'builder-provided state format is required' SPACE_SEED_STATE_FORMAT_VERSION=
 
-run_failure vendor-one-sided "$runtime_pair_error" \
-  FAKE_VENDOR_ROOT="$vendor_root" \
-  FAIL_IF_FIRECRACKER_CALLED=1 \
-  SPACE_SEED_RUNTIME_VERSION=1.16.0
-
-run_success vendor-explicit \
-  FAKE_VENDOR_ROOT="$vendor_root" \
-  FAIL_IF_FIRECRACKER_CALLED=1 \
-  SPACE_SEED_RUNTIME_VERSION=9.9.9 \
-  SPACE_SEED_STATE_FORMAT_VERSION=8.8.8
-assert_export "$captured_env" SPACE_SEED_RUNTIME_VERSION 9.9.9
-assert_export "$captured_env" SPACE_SEED_STATE_FORMAT_VERSION 8.8.8
-
-run_success vendor-detected FAKE_VENDOR_ROOT="$vendor_root"
-assert_export "$captured_env" SPACE_SEED_RUNTIME_VERSION 1.16.0
-assert_export "$captured_env" SPACE_SEED_STATE_FORMAT_VERSION 10.1.0
+run_success explicit-new-runtime SPACE_SEED_RUNTIME_VERSION=1.17.0 SPACE_SEED_STATE_FORMAT_VERSION=12.0.0
+assert_export "$captured_env" SPACE_SEED_RUNTIME_VERSION 1.17.0
+assert_export "$captured_env" SPACE_SEED_STATE_FORMAT_VERSION 12.0.0
 
 kernel_version="vmlinux-6.1.200-custom"
 kernel_digest="sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

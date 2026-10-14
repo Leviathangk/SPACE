@@ -65,6 +65,13 @@ impl NodeManager for NodeManagerService {
         }))
     }
 
+    async fn resolve_execution_environment(
+        &self,
+        request: Request<crate::proto::ResolveExecutionEnvironmentRequest>,
+    ) -> Result<Response<crate::proto::ResolveExecutionEnvironmentResponse>, Status> {
+        NodeManagerService::resolve_execution_environment(self, request).await
+    }
+
     async fn get_execution_inventory(
         &self,
         request: Request<GetExecutionInventoryRequest>,

@@ -6,6 +6,9 @@ use pplx_space_common_core::types::*;
 
 use crate::{ExecutionProtoError, proto};
 
+mod binding;
+pub use binding::EnvironmentBindingError;
+
 pub const ENVIRONMENT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -77,7 +80,7 @@ pub fn canonical_descriptor(descriptor: &EnvironmentDescriptor) -> String {
     let ExecutionCompatibilityProfile::FirecrackerSnapshotV1 { state_format } = &spec.compatibility;
     format!(
         concat!(
-            "space.execution.environment\nschema=1\n",
+            "space.execution.environment\nschema={}\n",
             "host.os={}\nhost.arch={}\nbackend={}\nguest.os={}\nguest.arch={}\n",
             "runtime.provider=managed_release\nruntime.kind={}\nruntime.version={}\nruntime.digest={}\n",
             "runtime.target.os={}\nruntime.target.arch={}\nruntime.layout={}\n",
@@ -85,6 +88,7 @@ pub fn canonical_descriptor(descriptor: &EnvironmentDescriptor) -> String {
             "isolation={}\ncompatibility.profile=firecracker_snapshot_v1\n",
             "compatibility.state.format={}\ncompatibility.state.version={}\n"
         ),
+        ENVIRONMENT_SCHEMA_VERSION,
         spec.host.os,
         spec.host.architecture,
         spec.backend,

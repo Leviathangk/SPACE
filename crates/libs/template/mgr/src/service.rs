@@ -676,6 +676,28 @@ pub(crate) enum NormalizeTemplateManifestError {
     ExecutionMismatch,
 }
 
+/// Register keeps the digest-addressed manifest. Metadata refresh cannot change
+/// its environment binding, including an upgrade from an unbound release.
+fn validate_retained_environment_binding(
+    manifest: &pplx_space_common_core::types::TemplateManifest,
+    metadata: &pplx_space_common_core::types::TemplateMetadata,
+) -> Result<(), Status> {
+    let retained = manifest
+        .execution_metadata()
+        .map_err(|error| Status::data_loss(error.to_string()))?
+        .and_then(|execution| execution.environment());
+    let incoming = metadata
+        .execution_metadata()
+        .map_err(|error| Status::invalid_argument(error.to_string()))?
+        .and_then(|execution| execution.environment());
+    if retained != incoming {
+        return Err(Status::already_exists(
+            "rootfs digest already has a different environment binding; retain the release unchanged",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn normalize_template_manifest(
     mut manifest: pplx_space_common_core::types::TemplateManifest,
     name: &str,
@@ -2257,6 +2279,14 @@ impl TemplateManagerService {
         }
 
         if let Some(bytes) = metadata_json {
+            let manifest_bytes = std::fs::read(digest_path.join("manifest.json"))
+                .map_err(|error| Status::data_loss(format!("read retained manifest: {error}")))?;
+            let manifest = serde_json::from_slice(&manifest_bytes)
+                .map_err(|error| Status::data_loss(format!("parse retained manifest: {error}")))?;
+            let incoming = serde_json::from_slice(bytes).map_err(|error| {
+                Status::invalid_argument(format!("parse incoming metadata: {error}"))
+            })?;
+            validate_retained_environment_binding(&manifest, &incoming)?;
             let metadata_path = digest_path.join("metadata.json");
             if !template_file_replacement_is_unchanged(&metadata_path, Some(bytes))? {
                 std::fs::write(&metadata_path, bytes).map_err(|error| {

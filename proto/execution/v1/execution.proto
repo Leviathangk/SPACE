@@ -69,6 +69,9 @@ message ExecutionMetadata {
   GuestPlatform guest = 2;
   optional StateFormatIdentity state_format = 3;
   repeated ArtifactComponent components = 4;
+  // Complete immutable binding, when explicitly verified by an environment-aware
+  // resolver. Absence must not be interpreted as E0 or as peer support.
+  optional string environment = 5;
 }
 
 message StateFormatCapability {
