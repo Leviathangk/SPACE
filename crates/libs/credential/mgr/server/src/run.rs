@@ -243,8 +243,15 @@ pub enum RunCredmgrError {
     AgentUpstreamEndpoint(#[source] pplx_space_credmgr_client::EndpointConfigError),
     #[error(transparent)]
     AgentUpstream(#[from] crate::node_service::AgentUpstreamError),
-    #[error("node credential agent could not connect to the upstream authority: {0}")]
-    AgentUpstreamConnect(#[source] pplx_space_credmgr_client::ConnectError),
+    #[error(
+        "node credential agent could not connect to the upstream authority \
+         within {window:?}: {source}"
+    )]
+    AgentUpstreamConnect {
+        window: Duration,
+        #[source]
+        source: pplx_space_credmgr_client::ConnectError,
+    },
     #[error("could not generate this node's intermediate CA keypair: {0}")]
     NodeCaKeypair(#[source] rcgen::Error),
     /// A gRPC server returned before shutdown was requested.
@@ -1202,6 +1209,82 @@ fn server_join_result(
     }
 }
 
+/// How long the node credential agent redials the upstream authority at
+/// startup before it exits. Agents can start well before the authority's
+/// Service exists on a cluster bring-up, and exiting at the standard connect
+/// budget only trades the wait for kubelet's restart backoff. The health socket
+/// stays unbound while the agent waits, within the startup probe's allowance.
+const AGENT_UPSTREAM_CONNECT_WINDOW: Duration = Duration::from_secs(60);
+
+/// The standard connect policy, with its per-attempt bounds and its backoff
+/// capped near a second, so the agent connects soon after the authority
+/// appears; the window rather than a retry count ends the wait.
+const AGENT_UPSTREAM_CONNECT_POLICY: pplx_space_common_grpc::GrpcRetryPolicy =
+    pplx_space_common_grpc::GrpcRetryPolicy {
+        max_retries: usize::MAX,
+        max_elapsed: AGENT_UPSTREAM_CONNECT_WINDOW,
+        ..pplx_space_common_grpc::DEFAULT_GRPC_CONNECT_RETRY_POLICY
+    };
+
+/// How often the agent warns that it is still waiting for the authority.
+const AGENT_UPSTREAM_WAIT_WARNING_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Spaces out the agent's still-waiting warnings: one is due once an interval
+/// of the wait has passed since the previous one.
+struct WaitWarnings {
+    next_due: Duration,
+}
+
+impl WaitWarnings {
+    fn new() -> Self {
+        Self {
+            next_due: AGENT_UPSTREAM_WAIT_WARNING_INTERVAL,
+        }
+    }
+
+    fn due(&mut self, elapsed: Duration) -> bool {
+        if elapsed < self.next_due {
+            return false;
+        }
+        self.next_due = elapsed + AGENT_UPSTREAM_WAIT_WARNING_INTERVAL;
+        true
+    }
+}
+
+/// Connect the agent to its upstream authority, redialing for up to
+/// [`AGENT_UPSTREAM_CONNECT_WINDOW`] and warning while it waits. Returns `None`
+/// once shutdown is requested, so a wait longer than the pod's termination
+/// grace period does not hold the agent until it is killed.
+async fn connect_agent_upstream(
+    endpoint: &crate::CredmgrEndpoint,
+    shutdown_token: &CancellationToken,
+) -> Result<Option<pplx_space_credmgr_client::CredentialManagerGrpcClient>, RunCredmgrError> {
+    let mut warnings = WaitWarnings::new();
+    let connect = endpoint.connect_with_retry(AGENT_UPSTREAM_CONNECT_POLICY, |retry| {
+        if warnings.due(retry.elapsed) {
+            tracing::warn!(
+                elapsed_ms = retry.elapsed.as_millis(),
+                attempts = retry.attempts,
+                window = ?AGENT_UPSTREAM_CONNECT_WINDOW,
+                error = %retry.error,
+                "upstream credential authority not reachable yet; still retrying"
+            );
+        }
+    });
+    tokio::select! {
+        connected = connect => connected.map(Some).map_err(|source| {
+            RunCredmgrError::AgentUpstreamConnect {
+                window: AGENT_UPSTREAM_CONNECT_WINDOW,
+                source,
+            }
+        }),
+        () = shutdown_token.cancelled() => {
+            tracing::warn!("terminated while waiting for the upstream authority; exiting cleanly");
+            Ok(None)
+        }
+    }
+}
+
 /// Run as the node credential agent: bind the node-local Unix socket and
 /// forward every RPC to the upstream authority. Holds no broker credential,
 /// plaintext branching key, or database; those belong to the control-plane
@@ -1224,16 +1307,14 @@ async fn run_agent(
         crate::CredmgrEndpoint::from_env().map_err(RunCredmgrError::AgentUpstreamEndpoint)?;
     crate::node_service::validate_upstream(&endpoint)?;
 
+    let Some(upstream) = connect_agent_upstream(&endpoint, &shutdown_token).await? else {
+        return Ok(());
+    };
     let Some((upstream, node_local)) = initialize_node_local(
         &config,
         &shutdown_token,
         Path::new(SERVICE_MUTEX_PATH),
-        async move {
-            endpoint
-                .connect()
-                .await
-                .map_err(RunCredmgrError::AgentUpstreamConnect)
-        },
+        async move { Ok(upstream) },
     )
     .await?
     else {

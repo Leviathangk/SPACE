@@ -395,3 +395,160 @@ fn volume_socket_requires_a_distinct_uds_listener() {
 
 #[cfg(target_os = "linux")]
 mod volume_socket;
+
+/// A port this test owns that refuses connections: bound, so nothing else can
+/// take it, but not listening until the caller calls `listen`.
+fn refusing_authority() -> (tokio::net::TcpSocket, crate::CredmgrEndpoint) {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = socket.local_addr().unwrap();
+    let endpoint = crate::CredmgrEndpoint::Tcp(format!("http://{address}").parse().unwrap());
+    (socket, endpoint)
+}
+
+/// Keeps a timer due every millisecond. The paused clock jumps to the next
+/// timer whenever every task awaits I/O, and a loopback dial's result reaches
+/// its task only after one such jump; without this the jump would be to the
+/// dial's own 3s bound rather than a millisecond.
+fn tick_paused_clock() -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async {
+        loop {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+}
+
+/// Ample room for the ticked milliseconds a loopback dial takes.
+const LOOPBACK_DIAL_ALLOWANCE: Duration = Duration::from_millis(100);
+
+/// The longest backoff the standard connect policy waits between attempts,
+/// which the agent's longer wait keeps.
+fn longest_standard_backoff() -> Duration {
+    let standard = pplx_space_common_grpc::DEFAULT_GRPC_CONNECT_RETRY_POLICY;
+    standard.max_delay.mul_f64(1.0 + standard.jitter_factor)
+}
+
+// An authority that comes up well past the standard connect budget is still
+// connected, and within a standard backoff of starting to listen, rather than
+// after the agent gave up for kubelet to restart it. A listening socket
+// completes the TCP and HTTP/2 client handshakes from its accept queue, so it
+// needs no server.
+#[tokio::test(start_paused = true)]
+async fn agent_connects_to_an_authority_that_comes_up_late() {
+    let ticker = tick_paused_clock();
+    let (socket, endpoint) = refusing_authority();
+    let connecting =
+        tokio::spawn(
+            async move { connect_agent_upstream(&endpoint, &CancellationToken::new()).await },
+        );
+
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert!(
+        !connecting.is_finished(),
+        "the agent stopped waiting: {:?}",
+        connecting.await.map(|result| result.map(|_| ()))
+    );
+    let _listener = socket.listen(16).unwrap();
+    let reachable_at = tokio::time::Instant::now();
+
+    let upstream = connecting
+        .await
+        .unwrap()
+        .expect("the agent must connect once the authority listens");
+    assert!(upstream.is_some(), "no shutdown was requested");
+    let delay = reachable_at.elapsed();
+    ticker.abort();
+    assert!(
+        delay <= longest_standard_backoff() + LOOPBACK_DIAL_ALLOWANCE,
+        "connected {delay:?} after the authority became reachable"
+    );
+}
+
+// An authority that never comes up ends the agent's startup with a typed error
+// that names the window, at the end of the window rather than of the standard
+// connect budget. Each refused dial takes no more than its ticked
+// milliseconds, so the wait ends within the window's last backoff.
+#[tokio::test(start_paused = true)]
+async fn agent_gives_up_on_an_unreachable_authority_after_the_window() {
+    let ticker = tick_paused_clock();
+    let (_socket, endpoint) = refusing_authority();
+
+    let started = tokio::time::Instant::now();
+    let error = connect_agent_upstream(&endpoint, &CancellationToken::new())
+        .await
+        .map(|_| ())
+        .expect_err("an authority that never listens must not connect");
+    let elapsed = started.elapsed();
+    ticker.abort();
+
+    assert!(
+        matches!(
+            error,
+            RunCredmgrError::AgentUpstreamConnect { window, .. }
+                if window == AGENT_UPSTREAM_CONNECT_WINDOW
+        ),
+        "{error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("{AGENT_UPSTREAM_CONNECT_WINDOW:?}")),
+        "{error}"
+    );
+    assert!(
+        elapsed > AGENT_UPSTREAM_CONNECT_WINDOW - longest_standard_backoff()
+            && elapsed <= AGENT_UPSTREAM_CONNECT_WINDOW + LOOPBACK_DIAL_ALLOWANCE,
+        "gave up after {elapsed:?}"
+    );
+}
+
+// Shutdown ends the wait at once and cleanly: the window can outlast the
+// pod's termination grace period, and an agent that has not connected holds
+// nothing to drain.
+#[tokio::test(start_paused = true)]
+async fn shutdown_ends_the_agents_wait_for_its_authority() {
+    let ticker = tick_paused_clock();
+    let (_socket, endpoint) = refusing_authority();
+    let shutdown_token = CancellationToken::new();
+    let requested_after = Duration::from_secs(30);
+    let cancel = shutdown_token.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(requested_after).await;
+        cancel.cancel();
+    });
+
+    let started = tokio::time::Instant::now();
+    let upstream = connect_agent_upstream(&endpoint, &shutdown_token)
+        .await
+        .expect("shutdown is not a connect failure");
+    let elapsed = started.elapsed();
+    ticker.abort();
+
+    assert!(upstream.is_none());
+    assert!(
+        elapsed <= requested_after + LOOPBACK_DIAL_ALLOWANCE,
+        "the wait ended {elapsed:?} in"
+    );
+}
+
+// Attempts arrive about once a second; the still-waiting warning is due at
+// most once per interval, yet more than once over a wait several intervals
+// long.
+#[test]
+fn still_waiting_warnings_are_spaced_by_the_interval() {
+    let mut warnings = WaitWarnings::new();
+    let wait = AGENT_UPSTREAM_WAIT_WARNING_INTERVAL * 4;
+    let due: Vec<Duration> = (0..)
+        .map(|attempt| Duration::from_millis(250) * attempt)
+        .take_while(|elapsed| *elapsed <= wait)
+        .filter(|elapsed| warnings.due(*elapsed))
+        .collect();
+
+    assert!(due.len() > 1, "{due:?}");
+    assert!(due[0] >= AGENT_UPSTREAM_WAIT_WARNING_INTERVAL, "{due:?}");
+    assert!(
+        due.windows(2)
+            .all(|pair| pair[1] - pair[0] >= AGENT_UPSTREAM_WAIT_WARNING_INTERVAL),
+        "{due:?}"
+    );
+}

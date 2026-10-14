@@ -5580,6 +5580,7 @@ dependencies = [
  "lru 0.18.4",
  "nix 0.31.3",
  "pplx-space-common-core",
+ "pplx-space-common-grpc",
  "pplx-space-common-svc",
  "pplx-space-credential-injection-core",
  "pplx-space-credential-injection-store",
