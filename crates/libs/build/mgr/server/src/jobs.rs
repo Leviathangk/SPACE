@@ -8,6 +8,48 @@ use serde::{Deserialize, Serialize};
 
 pub const BUILD_JOB_KIND: &str = "template_build";
 
+// The job kind remains stable for queue accounting and scheduling. Nest the
+// legacy fields so a downgraded worker cannot interpret selection as E0.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "schema", deny_unknown_fields)]
+pub enum VersionedBuildJobPayload {
+    #[serde(rename = "environment_v1")]
+    Environment {
+        environment: pplx_space_common_core::types::EnvironmentReference,
+        build: BuildJobPayload,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredBuildJobPayload {
+    Versioned(VersionedBuildJobPayload),
+    Legacy(BuildJobPayload),
+}
+
+pub fn decode_payload(
+    job: &pplx_space_common_jobs::Job,
+) -> Result<
+    (
+        BuildJobPayload,
+        Option<pplx_space_common_core::types::EnvironmentReference>,
+    ),
+    pplx_space_common_jobs::JobError,
+> {
+    if job.kind != BUILD_JOB_KIND {
+        return Err(pplx_space_common_jobs::JobError::permanent(
+            "unsupported build job kind",
+        ));
+    }
+    match job.payload_as::<StoredBuildJobPayload>()? {
+        StoredBuildJobPayload::Versioned(VersionedBuildJobPayload::Environment {
+            environment,
+            build,
+        }) => Ok((build, Some(environment))),
+        StoredBuildJobPayload::Legacy(build) => Ok((build, None)),
+    }
+}
+
 fn db_lock(db: &Arc<Mutex<Connection>>) -> rusqlite::Result<MutexGuard<'_, Connection>> {
     db.lock().map_err(|error| {
         rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(format!(
@@ -21,6 +63,7 @@ pub(super) fn sqlite_count_to_usize(count: i64) -> usize {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BuildJobPayload {
     pub recipe_proto: Vec<u8>,
     pub recipe_label: String,

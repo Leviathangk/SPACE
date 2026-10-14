@@ -199,6 +199,16 @@ impl SandboxManagerService {
         sandbox: &crate::db::SandboxRow,
         operation: &'static str,
     ) -> Result<(), Status> {
+        let execution = super::tail_support::sandbox_execution_metadata(&sandbox.id)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        if execution.environment().is_some()
+            && execution.runtime().version.as_str()
+                != pplx_space_common_core::types::INITIAL_FIRECRACKER_RUNTIME_VERSION
+        {
+            return Err(Status::failed_precondition(
+                "experimental environments do not support snapshot operations",
+            ));
+        }
         let Some(pool_template) = sandbox.pool_template.as_deref() else {
             return Ok(());
         };
@@ -569,6 +579,7 @@ impl SandboxManagerService {
             };
             let r = start_resp.into_inner();
             return Ok(Response::new(CreateResponse {
+                environment: None,
                 sandbox_id: id,
                 pid: Some(r.pid),
                 guest_ip: Some(r.guest_ip),

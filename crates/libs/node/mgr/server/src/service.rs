@@ -201,6 +201,7 @@ pub struct NodeManagerService {
     runtime_inventory: std::sync::Arc<ArcSwapOption<RuntimeInventory>>,
     runtime_inventory_refresh_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     runtime_paths: crate::config::RuntimePaths,
+    experiment_policy: crate::config::ExperimentPolicy,
     guest_console_logs: bool,
     lifecycle_limiter: std::sync::Arc<crate::lifecycle_limiter::LifecycleLimiter>,
     disk_admission: std::sync::Arc<DiskAdmission>,
@@ -296,7 +297,23 @@ impl NodeManagerService {
     ) -> Result<Response<pplx_space_execution_common::proto::NodeExecutionInventory>, Status> {
         self.authorize_peer(&request, "GetExecutionInventory", ALLOW_NODE_STATUS)?;
         let inventory = self.runtime_inventory().await?;
-        Ok(Response::new(inventory.to_proto()))
+        let mut report = inventory.to_proto();
+        // Experimental local execution is not a cluster placement capability.
+        if self.experiment_policy.retains()
+            && let Some(experiment) = node_artifacts::benchmark_environment()?
+        {
+            report.runtimes.retain(|entry| {
+                !entry.runtime.as_ref().is_some_and(|runtime| {
+                    runtime.version == experiment.release().release.version.as_str()
+                })
+            });
+            report.components.retain(|entry| {
+                !entry.component.as_ref().is_some_and(|component| {
+                    component.digest.as_deref() == Some(&experiment.kernel().sha256.to_string())
+                })
+            });
+        }
+        Ok(Response::new(report))
     }
 
     pub(crate) async fn with_memory_admission_config_and_task_tracker(
@@ -377,6 +394,7 @@ impl NodeManagerService {
             runtime_inventory: std::sync::Arc::default(),
             runtime_inventory_refresh_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             runtime_paths: settings.runtime_paths,
+            experiment_policy: settings.experiment_policy,
             guest_console_logs: settings.guest_console_logs,
             lifecycle_limiter: std::sync::Arc::new(
                 settings
@@ -431,6 +449,7 @@ impl NodeManagerService {
             .await;
         let snapshot = self.runtime_inventory.clone();
         let paths = self.runtime_paths.clone();
+        let policy = self.experiment_policy;
         self.off_runtime("discover runtime inventory", move || {
             let _guard = guard;
             if let Some(inventory) = snapshot.load_full()
@@ -439,7 +458,8 @@ impl NodeManagerService {
                 return Ok(inventory);
             }
             snapshot.store(None);
-            let inventory = std::sync::Arc::new(node_artifacts::execution_inventory(&paths)?);
+            let inventory =
+                std::sync::Arc::new(node_artifacts::execution_inventory(&paths, policy)?);
             snapshot.store(Some(inventory.clone()));
             Ok(inventory)
         })

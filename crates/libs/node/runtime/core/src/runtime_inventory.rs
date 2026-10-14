@@ -1060,7 +1060,7 @@ impl RuntimeInventory {
                     return Err(RuntimeInventoryError::NoCompatibleRuntime { runtime });
                 }
                 match mode {
-                    ExecutionSelectionMode::NewColdBoot => {
+                    ExecutionSelectionMode::NewColdBoot if requested.environment().is_none() => {
                         let selected = self
                             .default_installation(runtime)
                             .ok_or(RuntimeInventoryError::NoCompatibleRuntime { runtime })?;
@@ -1069,7 +1069,8 @@ impl RuntimeInventory {
                         }
                         selected
                     }
-                    ExecutionSelectionMode::ExistingColdBoot => {
+                    ExecutionSelectionMode::ExistingColdBoot
+                    | ExecutionSelectionMode::NewColdBoot => {
                         let installation = self
                             .runtimes
                             .iter()

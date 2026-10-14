@@ -520,6 +520,7 @@ impl WorkerApi for SimWorkerApiService {
                 .map_err(map_state_error)?;
         }
         Ok(Response::new(sbx::CreateResponse {
+            environment: None,
             sandbox_id,
             pid: None,
             guest_ip: None,
