@@ -29,6 +29,8 @@ pub use source::{
 };
 mod egress;
 pub use egress::ReservedDnsCancellation;
+mod lifecycle;
+use lifecycle::{HydrationFailure, InstalledPolicy, PolicyLifecycle};
 mod startup_timing;
 use startup_timing::StartupTiming;
 
@@ -115,13 +117,11 @@ pub enum TrafficPolicy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PolicyNotReady {
     InterceptionNotReady,
-    ReadyWithoutPolicy,
     PendingPolicyTimeout,
     NoIdentity,
     PolicyError,
     Draining,
     Stopped,
-    Unspecified,
     /// Reached only by the UDP path, which buffers rather than drops here.
     PendingPolicy,
 }
@@ -136,13 +136,11 @@ impl PolicyNotReady {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::InterceptionNotReady => "interception_not_ready",
-            Self::ReadyWithoutPolicy => "ready_without_policy",
             Self::PendingPolicyTimeout => "pending_policy_timeout",
             Self::NoIdentity => "no_identity",
             Self::PolicyError => "policy_error",
             Self::Draining => "draining",
             Self::Stopped => "stopped",
-            Self::Unspecified => "unspecified",
             Self::PendingPolicy => "pending_policy",
         }
     }
@@ -164,12 +162,14 @@ pub struct GatewayNetworkState {
 
 #[derive(Clone, Debug)]
 struct NetworkStateInner {
-    mode: NetworkState,
-    policy: Option<Arc<NetworkPolicyV1>>,
-    network_credentials: Option<Arc<NetworkCredentialSnapshot>>,
-    installed_policy_ref: String,
-    last_error: String,
-    last_error_kind: NetworkPolicyErrorKind,
+    lifecycle: PolicyLifecycle,
+    diagnostics: HydrationDiagnostics,
+}
+
+#[derive(Clone, Debug, Default)]
+struct HydrationDiagnostics {
+    // Retained after policy removal for control-plane diagnostics only.
+    installed_policy_ref: Option<EffectiveNetworkPolicyRef>,
     last_hydration_latency_ms: u64,
     last_transition_unix_ms: u64,
     current_retry_backoff_ms: u64,
@@ -259,31 +259,22 @@ impl std::fmt::Display for NetworkStateReason {
 impl GatewayNetworkState {
     pub fn pending_policy() -> Self {
         Self::new(NetworkStateInner {
-            mode: NetworkState::PendingPolicy,
-            policy: None,
-            network_credentials: None,
-            installed_policy_ref: String::new(),
-            last_error: String::new(),
-            last_error_kind: NetworkPolicyErrorKind::None,
-            last_hydration_latency_ms: 0,
-            last_transition_unix_ms: unix_time_ms(),
-            current_retry_backoff_ms: 0,
-            consecutive_hydration_failures: 0,
+            lifecycle: PolicyLifecycle::Pending { previous: None },
+            diagnostics: HydrationDiagnostics {
+                last_transition_unix_ms: unix_time_ms(),
+                ..Default::default()
+            },
         })
     }
 
     pub fn no_identity() -> Self {
         Self::new(NetworkStateInner {
-            mode: NetworkState::NoIdentity,
-            policy: None,
-            network_credentials: None,
-            installed_policy_ref: EffectiveNetworkPolicyRef::no_identity().to_string(),
-            last_error: String::new(),
-            last_error_kind: NetworkPolicyErrorKind::None,
-            last_hydration_latency_ms: 0,
-            last_transition_unix_ms: unix_time_ms(),
-            current_retry_backoff_ms: 0,
-            consecutive_hydration_failures: 0,
+            lifecycle: PolicyLifecycle::NoIdentity,
+            diagnostics: HydrationDiagnostics {
+                installed_policy_ref: Some(EffectiveNetworkPolicyRef::no_identity()),
+                last_transition_unix_ms: unix_time_ms(),
+                ..Default::default()
+            },
         })
     }
 
@@ -350,13 +341,6 @@ impl GatewayNetworkState {
         }
     }
 
-    // Hydration and admission must distinguish an installed policy from an
-    // unavailable CA. In particular, CA startup must not spend policy retries.
-    fn policy_snapshot(&self) -> NetworkStateSnapshot {
-        let inner = self.state_rx.borrow();
-        self.snapshot_from_inner(inner.as_ref())
-    }
-
     /// Wait until the installed policy requires interception. Gateway CA
     /// preparation stays dormant for the default-off policy.
     pub(crate) async fn wait_for_interception_policy(&self, shutdown: &CancellationToken) -> bool {
@@ -365,10 +349,9 @@ impl GatewayNetworkState {
             biased;
             () = shutdown.cancelled() => false,
             installed = state.wait_for(|inner| {
-                inner.mode == NetworkState::Ready
-                    && inner.policy.as_ref().is_some_and(|policy| {
-                        policy.tls_interception == TlsInterception::On
-                    })
+                inner.lifecycle.ready().is_some_and(|installed| {
+                    installed.policy.tls_interception == TlsInterception::On
+                })
             }) => installed.is_ok(),
         }
     }
@@ -393,10 +376,9 @@ impl GatewayNetworkState {
     /// pointer identity is the generation token without duplicating state.
     pub(crate) fn is_current_tcp_policy(&self, expected: &Arc<NetworkPolicyV1>) -> bool {
         let inner = self.state_rx.borrow();
-        inner.mode == NetworkState::Ready
-            && inner.policy.as_ref().is_some_and(|current| {
-                Arc::ptr_eq(current, expected) && self.policy_traffic_ready(current)
-            })
+        inner.lifecycle.ready().is_some_and(|installed| {
+            Arc::ptr_eq(&installed.policy, expected) && self.policy_traffic_ready(&installed.policy)
+        })
     }
 
     /// Keep raw values inside the checked snapshot borrow; callers may only
@@ -407,24 +389,20 @@ impl GatewayNetworkState {
         use_credentials: impl FnOnce(&NetworkCredentialSnapshot) -> T,
     ) -> Result<T, NetworkCredentialSnapshotError> {
         let inner = self.state_rx.borrow();
-        let same_policy = inner
-            .policy
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, expected_policy));
-        if same_policy && inner.mode == NetworkState::PendingPolicy {
-            return Err(NetworkCredentialSnapshotError::TemporarilyUnavailable);
+        match &inner.lifecycle {
+            PolicyLifecycle::Pending {
+                previous: Some(installed),
+            } if Arc::ptr_eq(&installed.policy, expected_policy) => {
+                Err(NetworkCredentialSnapshotError::TemporarilyUnavailable)
+            }
+            PolicyLifecycle::Ready(installed)
+                if Arc::ptr_eq(&installed.policy, expected_policy)
+                    && self.policy_traffic_ready(expected_policy) =>
+            {
+                Ok(use_credentials(&installed.credentials))
+            }
+            _ => Err(NetworkCredentialSnapshotError::Stale),
         }
-        if inner.mode != NetworkState::Ready
-            || !same_policy
-            || !self.policy_traffic_ready(expected_policy)
-        {
-            return Err(NetworkCredentialSnapshotError::Stale);
-        }
-        let credentials = inner
-            .network_credentials
-            .as_ref()
-            .ok_or(NetworkCredentialSnapshotError::TemporarilyUnavailable)?;
-        Ok(use_credentials(credentials))
     }
 
     pub fn spawn_hydration(
@@ -447,45 +425,40 @@ impl GatewayNetworkState {
                 break;
             }
 
-            let snapshot = self.policy_snapshot();
-            match snapshot.mode {
-                NetworkState::Ready => {
-                    attempts = 0;
-                    retry_delay = INITIAL_HYDRATION_RETRY_INTERVAL;
-                    self.set_retry_backoff(Duration::ZERO).await;
-                    if self
-                        .wait_for_state_change_or_shutdown(
-                            READY_HYDRATION_RECHECK_INTERVAL,
-                            &shutdown_token,
-                        )
-                        .await
-                    {
-                        break;
+            let recheck = {
+                let current = self.state_rx.borrow();
+                match &current.lifecycle {
+                    PolicyLifecycle::Ready(_) => {
+                        Some((Duration::ZERO, READY_HYDRATION_RECHECK_INTERVAL))
                     }
-                    continue;
-                }
-                NetworkState::PolicyError
-                    if snapshot.last_error_kind == NetworkPolicyErrorKind::PolicyRefMismatch =>
-                {
-                    attempts = 0;
-                    retry_delay = INITIAL_HYDRATION_RETRY_INTERVAL;
-                    self.set_retry_backoff(POLICY_REF_MISMATCH_RECHECK_INTERVAL)
-                        .await;
-                    if self
-                        .wait_for_state_change_or_shutdown(
+                    PolicyLifecycle::PolicyError(failure)
+                        if matches!(
+                            failure.as_ref(),
+                            HydrationFailure::ReferenceMismatch { .. }
+                        ) =>
+                    {
+                        Some((
                             POLICY_REF_MISMATCH_RECHECK_INTERVAL,
-                            &shutdown_token,
-                        )
-                        .await
-                    {
-                        break;
+                            POLICY_REF_MISMATCH_RECHECK_INTERVAL,
+                        ))
                     }
-                    continue;
+                    PolicyLifecycle::NoIdentity
+                    | PolicyLifecycle::Draining { .. }
+                    | PolicyLifecycle::Stopped => break,
+                    PolicyLifecycle::Pending { .. } | PolicyLifecycle::PolicyError(_) => None,
                 }
-                NetworkState::NoIdentity | NetworkState::Draining | NetworkState::Stopped => break,
-                NetworkState::PendingPolicy
-                | NetworkState::PolicyError
-                | NetworkState::Unspecified => {}
+            };
+            if let Some((retry_backoff, interval)) = recheck {
+                attempts = 0;
+                retry_delay = INITIAL_HYDRATION_RETRY_INTERVAL;
+                self.set_retry_backoff(retry_backoff).await;
+                if self
+                    .wait_for_state_change_or_shutdown(interval, &shutdown_token)
+                    .await
+                {
+                    break;
+                }
+                continue;
             }
 
             if attempts >= MAX_SELF_HYDRATION_RETRIES {
@@ -501,7 +474,7 @@ impl GatewayNetworkState {
             let snapshot = self
                 .refresh(loader.clone(), None, NetworkStateReason::SelfRetry)
                 .await;
-            if self.policy_snapshot().mode == NetworkState::Ready {
+            if self.state_rx.borrow().lifecycle.ready().is_some() {
                 attempts = 0;
                 retry_delay = INITIAL_HYDRATION_RETRY_INTERVAL;
                 continue;
@@ -545,10 +518,11 @@ impl GatewayNetworkState {
         let current = self.state_rx.borrow().clone();
         let mut inner = current.as_ref().clone();
         update(&mut inner);
-        if current.mode == NetworkState::Ready && inner.mode != NetworkState::Ready {
+        if current.lifecycle.ready().is_some() && inner.lifecycle.ready().is_none() {
             self.reserved_dns_cancellation.cancel_in_flight();
         }
-        let policy_removed = current.policy.is_some() && inner.policy.is_none();
+        let policy_removed =
+            current.lifecycle.installed().is_some() && inner.lifecycle.installed().is_none();
         let inner = Arc::new(inner);
         self.state_tx.send_replace(inner.clone());
         if let Some(observer) = &self.readiness_observer {
@@ -571,7 +545,7 @@ impl GatewayNetworkState {
 
     pub async fn set_retry_backoff(&self, retry_backoff: Duration) {
         self.update_inner(|inner| {
-            inner.current_retry_backoff_ms =
+            inner.diagnostics.current_retry_backoff_ms =
                 u64::try_from(retry_backoff.as_millis()).unwrap_or(u64::MAX);
         })
         .await;
@@ -580,23 +554,22 @@ impl GatewayNetworkState {
     async fn mark_permanent_policy_error(&self, attempts: u64) -> NetworkStateSnapshot {
         let inner = self
             .update_inner(|inner| {
-                set_mode(
+                set_lifecycle(
                     inner,
-                    NetworkState::PolicyError,
+                    PolicyLifecycle::PolicyError(Arc::new(HydrationFailure::RetryExhausted {
+                        attempts,
+                    })),
                     NetworkStateReason::SelfRetry,
                 );
-                inner.policy = None;
-                inner.network_credentials = None;
-                inner.last_error =
-                    format!("policy hydration exhausted retry budget after {attempts} attempts");
-                inner.last_error_kind = NetworkPolicyErrorKind::LoaderError;
-                inner.current_retry_backoff_ms = 0;
-                inner.consecutive_hydration_failures =
-                    inner.consecutive_hydration_failures.saturating_add(1);
+                inner.diagnostics.current_retry_backoff_ms = 0;
+                inner.diagnostics.consecutive_hydration_failures = inner
+                    .diagnostics
+                    .consecutive_hydration_failures
+                    .saturating_add(1);
                 pplx_space_metrics::gateway::policy_hydration_error("permanent");
                 record_hydration_failures(
-                    inner.last_error_kind,
-                    inner.consecutive_hydration_failures,
+                    inner.lifecycle.error_kind(),
+                    inner.diagnostics.consecutive_hydration_failures,
                 );
             })
             .await;
@@ -606,25 +579,25 @@ impl GatewayNetworkState {
     pub async fn set_no_identity(&self, reason: NetworkStateReason) -> NetworkStateSnapshot {
         let inner = self
             .update_inner(|inner| {
-                if inner.policy.is_some() {
+                if let Some(installed) = inner.lifecycle.installed() {
                     info!(
-                        cleared_policy_ref = %inner.installed_policy_ref,
+                        cleared_policy_ref = %installed.reference,
                         reason = reason.as_str(),
                         "net-gateway policy cleared"
                     );
                 }
-                set_mode(inner, NetworkState::NoIdentity, reason);
-                inner.policy = None;
-                inner.network_credentials = None;
-                inner.installed_policy_ref = EffectiveNetworkPolicyRef::no_identity().to_string();
-                inner.last_error.clear();
-                inner.last_error_kind = NetworkPolicyErrorKind::None;
-                inner.current_retry_backoff_ms = 0;
-                inner.consecutive_hydration_failures = 0;
-                pplx_space_metrics::gateway::policy_ref("no_identity", inner.mode.as_str());
+                set_lifecycle(inner, PolicyLifecycle::NoIdentity, reason);
+                inner.diagnostics.installed_policy_ref =
+                    Some(EffectiveNetworkPolicyRef::no_identity());
+                inner.diagnostics.current_retry_backoff_ms = 0;
+                inner.diagnostics.consecutive_hydration_failures = 0;
+                pplx_space_metrics::gateway::policy_ref(
+                    "no_identity",
+                    inner.lifecycle.mode().as_str(),
+                );
                 record_hydration_failures(
-                    inner.last_error_kind,
-                    inner.consecutive_hydration_failures,
+                    inner.lifecycle.error_kind(),
+                    inner.diagnostics.consecutive_hydration_failures,
                 );
             })
             .await;
@@ -632,8 +605,8 @@ impl GatewayNetworkState {
     }
 
     /// Re-pull and reconcile the network policy. Skips the pull when the gateway
-    /// is already `Ready` and the installed v0 policy ref satisfies the
-    /// expectation.
+    /// is already `Ready`, its reference satisfies the expectation, and no
+    /// network credentials need to be refreshed.
     pub async fn refresh(
         &self,
         loader: PolicyLoader,
@@ -643,67 +616,84 @@ impl GatewayNetworkState {
         let _guard = self.refresh_lock.lock().await;
 
         let current = self.state_rx.borrow().clone();
-        if current.mode == NetworkState::Ready
-            && installed_ref_matches(&current.installed_policy_ref, expected_policy_ref.as_ref())
-            && current
-                .policy
+        if current.lifecycle.ready().is_some_and(|installed| {
+            expected_policy_ref
                 .as_ref()
-                .is_none_or(|policy| policy.network_credential_rules.is_empty())
-        {
+                .is_none_or(|expected| &installed.reference == expected)
+                && installed.policy.network_credential_rules.is_empty()
+        }) {
             return self.snapshot_from_inner(current.as_ref());
         }
 
         let current = self
             .update_inner(|inner| {
-                if matches!(inner.mode, NetworkState::Draining | NetworkState::Stopped) {
+                if matches!(
+                    inner.lifecycle,
+                    PolicyLifecycle::Draining { .. } | PolicyLifecycle::Stopped
+                ) {
                     return;
                 }
-                set_mode(inner, NetworkState::PendingPolicy, reason);
-                inner.last_error.clear();
-                inner.last_error_kind = NetworkPolicyErrorKind::None;
+                let previous = inner.lifecycle.installed().cloned();
+                set_lifecycle(inner, PolicyLifecycle::Pending { previous }, reason);
             })
             .await;
-        if matches!(current.mode, NetworkState::Draining | NetworkState::Stopped) {
+        if matches!(
+            current.lifecycle,
+            PolicyLifecycle::Draining { .. } | PolicyLifecycle::Stopped
+        ) {
             return self.snapshot_from_inner(current.as_ref());
         }
 
         let started_at = Instant::now();
         let result = tokio::time::timeout(HYDRATION_DEADLINE, (loader)()).await;
         let latency_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let expected_ref_for_log = expected_ref_display(expected_policy_ref.as_ref());
+        let result = match result {
+            Ok(Ok(pulled)) => match expected_policy_ref {
+                Some(expected) if expected != pulled.policy_ref => {
+                    Err(HydrationFailure::ReferenceMismatch {
+                        expected,
+                        actual: pulled.policy_ref,
+                    })
+                }
+                _ => Ok(pulled),
+            },
+            Ok(Err(error)) => Err(HydrationFailure::Load(error)),
+            Err(_) => Err(HydrationFailure::Timeout {
+                deadline: HYDRATION_DEADLINE,
+            }),
+        };
 
         let inner = self
             .update_inner(move |inner| {
-                if refresh_result_must_not_mutate(inner.mode) {
+                if matches!(
+                    inner.lifecycle,
+                    PolicyLifecycle::NoIdentity
+                        | PolicyLifecycle::Draining { .. }
+                        | PolicyLifecycle::Stopped
+                ) {
                     return;
                 }
-                inner.last_hydration_latency_ms = latency_ms;
+                inner.diagnostics.last_hydration_latency_ms = latency_ms;
                 match result {
-                    Ok(Ok(pulled))
-                        if pulled_ref_matches(&pulled.policy_ref, expected_policy_ref.as_ref()) =>
-                    {
-                        let policy = Arc::new(pulled.policy);
-                        let network_credentials = Arc::new(pulled.network_credentials);
-                        let (action, allow_counts, deny_counts) = policy_log_summary(&policy);
-                        self.reconcile_policy(&policy);
-                        set_mode(inner, NetworkState::Ready, reason);
-                        inner.policy = Some(Arc::clone(&policy));
-                        inner.network_credentials = Some(network_credentials);
-                        inner.installed_policy_ref = pulled.policy_ref.to_string();
-                        inner.last_error.clear();
-                        inner.last_error_kind = NetworkPolicyErrorKind::None;
-                        inner.current_retry_backoff_ms = 0;
-                        inner.consecutive_hydration_failures = 0;
+                    Ok(pulled) => {
+                        let installed = Arc::new(InstalledPolicy::from(pulled));
+                        let policy = &installed.policy;
+                        let (action, allow_counts, deny_counts) = policy_log_summary(policy);
+                        self.reconcile_policy(policy);
+                        set_lifecycle(inner, PolicyLifecycle::Ready(installed.clone()), reason);
+                        inner.diagnostics.installed_policy_ref = Some(installed.reference.clone());
+                        inner.diagnostics.current_retry_backoff_ms = 0;
+                        inner.diagnostics.consecutive_hydration_failures = 0;
                         pplx_space_metrics::gateway::policy_hydration_latency(
                             "success",
                             latency_ms as f64,
                         );
                         pplx_space_metrics::gateway::policy_ref(
-                            pulled.policy_ref.authority_label(),
-                            inner.mode.as_str(),
+                            installed.reference.authority_label(),
+                            inner.lifecycle.mode().as_str(),
                         );
                         info!(
-                            installed_policy_ref = %inner.installed_policy_ref,
+                            installed_policy_ref = %installed.reference,
                             latency_ms,
                             policy_version = "v1",
                             action,
@@ -732,95 +722,77 @@ impl GatewayNetworkState {
                             "net-gateway policy hydration ready"
                         );
                     }
-                    Ok(Ok(pulled)) => {
-                        set_mode(inner, NetworkState::PolicyError, reason);
-                        inner.policy = None;
-                        inner.network_credentials = None;
-                        inner.last_error = format!(
-                            "policy ref mismatch: expected {}, got {}",
-                            expected_ref_for_log, pulled.policy_ref
-                        );
-                        inner.last_error_kind = NetworkPolicyErrorKind::PolicyRefMismatch;
-                        inner.consecutive_hydration_failures =
-                            inner.consecutive_hydration_failures.saturating_add(1);
-                        pplx_space_metrics::gateway::policy_hydration_error("policy_ref_mismatch");
-                        pplx_space_metrics::gateway::policy_ref(
-                            pulled.policy_ref.authority_label(),
-                            inner.mode.as_str(),
-                        );
-                        warn!(
-                            expected_policy_ref = %expected_ref_for_log,
-                            installed_policy_ref = %pulled.policy_ref,
-                            reason = reason.as_str(),
-                            "net-gateway policy hydration returned mismatched policy"
-                        );
-                    }
-                    Ok(Err(error @ HydrateNetworkStateError::InvalidReference { .. })) => {
-                        set_mode(inner, NetworkState::PolicyError, reason);
-                        inner.policy = None;
-                        inner.network_credentials = None;
-                        inner.last_error = error.to_string();
-                        inner.last_error_kind = NetworkPolicyErrorKind::LoaderError;
-                        inner.consecutive_hydration_failures =
-                            inner.consecutive_hydration_failures.saturating_add(1);
-                        pplx_space_metrics::gateway::policy_hydration_error("invalid_policy_ref");
-                        pplx_space_metrics::gateway::policy_hydration_latency(
-                            "error",
-                            latency_ms as f64,
-                        );
-                        warn!(
-                            last_error = %inner.last_error,
-                            latency_ms,
-                            reason = reason.as_str(),
-                            "net-gateway policy hydration returned invalid policy ref"
-                        );
-                    }
-                    Ok(Err(error)) => {
-                        set_mode(inner, NetworkState::PolicyError, reason);
-                        inner.policy = None;
-                        inner.network_credentials = None;
-                        inner.last_error = error.to_string();
-                        inner.last_error_kind = NetworkPolicyErrorKind::LoaderError;
-                        inner.consecutive_hydration_failures =
-                            inner.consecutive_hydration_failures.saturating_add(1);
-                        pplx_space_metrics::gateway::policy_hydration_error("loader_error");
-                        pplx_space_metrics::gateway::policy_hydration_latency(
-                            "error",
-                            latency_ms as f64,
-                        );
-                        warn!(
-                            last_error = %inner.last_error,
-                            latency_ms,
-                            reason = reason.as_str(),
-                            "net-gateway policy hydration failed"
-                        );
-                    }
-                    Err(_) => {
-                        set_mode(inner, NetworkState::PolicyError, reason);
-                        inner.policy = None;
-                        inner.network_credentials = None;
-                        inner.last_error = format!(
-                            "policy hydration timed out after {} ms",
-                            HYDRATION_DEADLINE.as_millis()
-                        );
-                        inner.last_error_kind = NetworkPolicyErrorKind::Timeout;
-                        inner.consecutive_hydration_failures =
-                            inner.consecutive_hydration_failures.saturating_add(1);
-                        pplx_space_metrics::gateway::policy_hydration_error("timeout");
-                        pplx_space_metrics::gateway::policy_hydration_latency(
-                            "timeout",
-                            latency_ms as f64,
-                        );
-                        warn!(
-                            latency_ms,
-                            reason = reason.as_str(),
-                            "net-gateway policy hydration timed out"
-                        );
+                    Err(failure) => {
+                        let failure = Arc::new(failure);
+                        set_lifecycle(inner, PolicyLifecycle::PolicyError(failure.clone()), reason);
+                        inner.diagnostics.consecutive_hydration_failures = inner
+                            .diagnostics
+                            .consecutive_hydration_failures
+                            .saturating_add(1);
+                        match failure.as_ref() {
+                            HydrationFailure::ReferenceMismatch { expected, actual } => {
+                                pplx_space_metrics::gateway::policy_hydration_error(
+                                    "policy_ref_mismatch",
+                                );
+                                pplx_space_metrics::gateway::policy_ref(
+                                    actual.authority_label(),
+                                    inner.lifecycle.mode().as_str(),
+                                );
+                                warn!(
+                                    expected_policy_ref = %expected,
+                                    installed_policy_ref = %actual,
+                                    reason = reason.as_str(),
+                                    "net-gateway policy hydration returned mismatched policy"
+                                );
+                            }
+                            HydrationFailure::Load(
+                                HydrateNetworkStateError::InvalidReference { .. },
+                            ) => {
+                                pplx_space_metrics::gateway::policy_hydration_error(
+                                    "invalid_policy_ref",
+                                );
+                                pplx_space_metrics::gateway::policy_hydration_latency(
+                                    "error",
+                                    latency_ms as f64,
+                                );
+                                warn!(
+                                    last_error = %failure,
+                                    latency_ms,
+                                    reason = reason.as_str(),
+                                    "net-gateway policy hydration returned invalid policy ref"
+                                );
+                            }
+                            HydrationFailure::Load(_) | HydrationFailure::RetryExhausted { .. } => {
+                                pplx_space_metrics::gateway::policy_hydration_error("loader_error");
+                                pplx_space_metrics::gateway::policy_hydration_latency(
+                                    "error",
+                                    latency_ms as f64,
+                                );
+                                warn!(
+                                    last_error = %failure,
+                                    latency_ms,
+                                    reason = reason.as_str(),
+                                    "net-gateway policy hydration failed"
+                                );
+                            }
+                            HydrationFailure::Timeout { .. } => {
+                                pplx_space_metrics::gateway::policy_hydration_error("timeout");
+                                pplx_space_metrics::gateway::policy_hydration_latency(
+                                    "timeout",
+                                    latency_ms as f64,
+                                );
+                                warn!(
+                                    latency_ms,
+                                    reason = reason.as_str(),
+                                    "net-gateway policy hydration timed out"
+                                );
+                            }
+                        }
                     }
                 }
                 record_hydration_failures(
-                    inner.last_error_kind,
-                    inner.consecutive_hydration_failures,
+                    inner.lifecycle.error_kind(),
+                    inner.diagnostics.consecutive_hydration_failures,
                 );
             })
             .await;
@@ -835,23 +807,20 @@ impl GatewayNetworkState {
         let mut state_rx = self.state_rx.clone();
 
         loop {
-            let snapshot = self.snapshot_from_inner(state_rx.borrow().as_ref());
-            match snapshot.mode {
-                NetworkState::Ready => {
+            let inner = state_rx.borrow().clone();
+            let snapshot = self.snapshot_from_inner(&inner);
+            match &inner.lifecycle {
+                PolicyLifecycle::Ready(installed) => {
                     if pending_waiter.take().is_some() {
                         record_tcp_pending_wait("ready", started_at);
                     }
-                    if let Some(policy) = snapshot.policy {
-                        if snapshot.interception_readiness.blocks_admission() {
-                            record_not_ready_denial("tcp", PolicyNotReady::InterceptionNotReady);
-                            return TrafficPolicy::NotReady(PolicyNotReady::InterceptionNotReady);
-                        }
-                        return TrafficPolicy::Ready(policy);
+                    if snapshot.interception_readiness.blocks_admission() {
+                        record_not_ready_denial("tcp", PolicyNotReady::InterceptionNotReady);
+                        return TrafficPolicy::NotReady(PolicyNotReady::InterceptionNotReady);
                     }
-                    record_not_ready_denial("tcp", PolicyNotReady::ReadyWithoutPolicy);
-                    return TrafficPolicy::NotReady(PolicyNotReady::ReadyWithoutPolicy);
+                    return TrafficPolicy::Ready(installed.policy.clone());
                 }
-                NetworkState::PendingPolicy => {
+                PolicyLifecycle::Pending { .. } => {
                     if pending_waiter.is_none() {
                         pending_waiter = Some(self.start_tcp_pending_waiter());
                         pplx_space_metrics::gateway::pending_tcp_wait("started");
@@ -888,98 +857,83 @@ impl GatewayNetworkState {
                         return TrafficPolicy::NotReady(PolicyNotReady::PendingPolicyTimeout);
                     }
                 }
-                NetworkState::NoIdentity => {
+                PolicyLifecycle::NoIdentity => {
                     if pending_waiter.take().is_some() {
                         record_tcp_pending_wait("no_identity", started_at);
                     }
                     record_not_ready_denial("tcp", PolicyNotReady::NoIdentity);
                     return TrafficPolicy::NotReady(PolicyNotReady::NoIdentity);
                 }
-                NetworkState::PolicyError => {
+                PolicyLifecycle::PolicyError(_) => {
                     if pending_waiter.take().is_some() {
                         record_tcp_pending_wait("policy_error", started_at);
                     }
                     record_not_ready_denial("tcp", PolicyNotReady::PolicyError);
                     return TrafficPolicy::NotReady(PolicyNotReady::PolicyError);
                 }
-                NetworkState::Draining => {
+                PolicyLifecycle::Draining { .. } => {
                     if pending_waiter.take().is_some() {
                         record_tcp_pending_wait("draining", started_at);
                     }
                     record_not_ready_denial("tcp", PolicyNotReady::Draining);
                     return TrafficPolicy::NotReady(PolicyNotReady::Draining);
                 }
-                NetworkState::Stopped => {
+                PolicyLifecycle::Stopped => {
                     if pending_waiter.take().is_some() {
                         record_tcp_pending_wait("stopped", started_at);
                     }
                     record_not_ready_denial("tcp", PolicyNotReady::Stopped);
                     return TrafficPolicy::NotReady(PolicyNotReady::Stopped);
                 }
-                NetworkState::Unspecified => {
-                    if pending_waiter.take().is_some() {
-                        record_tcp_pending_wait("unspecified", started_at);
-                    }
-                    record_not_ready_denial("tcp", PolicyNotReady::Unspecified);
-                    return TrafficPolicy::NotReady(PolicyNotReady::Unspecified);
-                }
             }
         }
     }
 
     pub async fn udp_policy(&self) -> TrafficPolicy {
-        let snapshot = self.policy_snapshot();
-        if snapshot.mode == NetworkState::Ready
-            && let Some(policy) = snapshot.policy
-        {
-            // One live gate read per datagram, taken by the snapshot.
-            if snapshot.interception_readiness.blocks_admission() {
-                // UDP has no connection to hold: a datagram either goes out
-                // inspected or not at all. Deny per datagram.
-                record_not_ready_denial("udp", PolicyNotReady::InterceptionNotReady);
-                return TrafficPolicy::NotReady(PolicyNotReady::InterceptionNotReady);
+        let inner = self.state_rx.borrow().clone();
+        let snapshot = self.snapshot_from_inner(&inner);
+        let reason = match &inner.lifecycle {
+            PolicyLifecycle::Ready(installed) => {
+                // One live gate read per datagram, taken by the snapshot.
+                if snapshot.interception_readiness.blocks_admission() {
+                    // UDP has no connection to hold: a datagram either goes out
+                    // inspected or not at all. Deny per datagram.
+                    record_not_ready_denial("udp", PolicyNotReady::InterceptionNotReady);
+                    return TrafficPolicy::NotReady(PolicyNotReady::InterceptionNotReady);
+                }
+                return TrafficPolicy::Ready(installed.policy.clone());
             }
-            return TrafficPolicy::Ready(policy);
-        }
-        debug!(state = ?snapshot.mode, "UDP dropped while network policy is not ready");
-        let reason = match snapshot.mode {
-            NetworkState::Ready => PolicyNotReady::ReadyWithoutPolicy,
-            NetworkState::PendingPolicy => PolicyNotReady::PendingPolicy,
-            NetworkState::NoIdentity => PolicyNotReady::NoIdentity,
-            NetworkState::PolicyError => PolicyNotReady::PolicyError,
-            NetworkState::Draining => PolicyNotReady::Draining,
-            NetworkState::Stopped => PolicyNotReady::Stopped,
-            NetworkState::Unspecified => PolicyNotReady::Unspecified,
+            PolicyLifecycle::Pending { .. } => PolicyNotReady::PendingPolicy,
+            PolicyLifecycle::NoIdentity => PolicyNotReady::NoIdentity,
+            PolicyLifecycle::PolicyError(_) => PolicyNotReady::PolicyError,
+            PolicyLifecycle::Draining { .. } => PolicyNotReady::Draining,
+            PolicyLifecycle::Stopped => PolicyNotReady::Stopped,
         };
+        debug!(state = ?snapshot.mode, "UDP dropped while network policy is not ready");
         record_not_ready_denial("udp", reason);
         TrafficPolicy::NotReady(reason)
     }
 
     pub async fn set_draining(&self, reason: NetworkStateReason) {
         self.update_inner(|inner| {
-            set_mode(inner, NetworkState::Draining, reason);
-            inner.last_error.clear();
-            inner.last_error_kind = NetworkPolicyErrorKind::None;
-            inner.current_retry_backoff_ms = 0;
+            let previous = inner.lifecycle.installed().cloned();
+            set_lifecycle(inner, PolicyLifecycle::Draining { previous }, reason);
+            inner.diagnostics.current_retry_backoff_ms = 0;
         })
         .await;
     }
 
     pub async fn set_stopped(&self, reason: NetworkStateReason) {
         self.update_inner(|inner| {
-            if inner.policy.is_some() {
+            if let Some(installed) = inner.lifecycle.installed() {
                 info!(
-                    cleared_policy_ref = %inner.installed_policy_ref,
+                    cleared_policy_ref = %installed.reference,
                     reason = reason.as_str(),
                     "net-gateway policy cleared"
                 );
             }
-            set_mode(inner, NetworkState::Stopped, reason);
-            inner.policy = None;
-            inner.network_credentials = None;
-            inner.last_error.clear();
-            inner.last_error_kind = NetworkPolicyErrorKind::None;
-            inner.current_retry_backoff_ms = 0;
+            set_lifecycle(inner, PolicyLifecycle::Stopped, reason);
+            inner.diagnostics.current_retry_backoff_ms = 0;
         })
         .await;
     }
@@ -993,68 +947,53 @@ impl GatewayNetworkState {
     }
 
     fn snapshot_from_inner(&self, inner: &NetworkStateInner) -> NetworkStateSnapshot {
-        let mut snapshot = NetworkStateSnapshot {
-            mode: inner.mode,
-            policy: inner.policy.clone(),
-            installed_policy_ref: inner.installed_policy_ref.clone(),
-            last_error: inner.last_error.clone(),
-            last_error_kind: inner.last_error_kind,
-            last_hydration_latency_ms: inner.last_hydration_latency_ms,
-            last_transition_unix_ms: inner.last_transition_unix_ms,
+        let policy = inner
+            .lifecycle
+            .installed()
+            .map(|installed| installed.policy.clone());
+        NetworkStateSnapshot {
+            mode: inner.lifecycle.mode(),
+            installed_policy_ref: inner
+                .diagnostics
+                .installed_policy_ref
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            last_error: inner
+                .lifecycle
+                .failure()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            last_error_kind: inner.lifecycle.error_kind(),
+            last_hydration_latency_ms: inner.diagnostics.last_hydration_latency_ms,
+            last_transition_unix_ms: inner.diagnostics.last_transition_unix_ms,
             pending_tcp_connections: self.pending_tcp_connections.load(Ordering::Relaxed),
-            current_retry_backoff_ms: inner.current_retry_backoff_ms,
-            consecutive_hydration_failures: inner.consecutive_hydration_failures,
+            current_retry_backoff_ms: inner.diagnostics.current_retry_backoff_ms,
+            consecutive_hydration_failures: inner.diagnostics.consecutive_hydration_failures,
             // Evaluated live on every read; the gate is not part of the
-            // watch channel.
-            interception_readiness: self.interception_readiness_for(inner.policy.as_deref()),
-        };
-        // Ready always means an installed policy. TLS-interception
-        // dependencies do not demote the state:
-        // sandbox-manager keys sandbox start on Ready + matching ref, and a
-        // CA the node cannot issue must fail closed per connection, never
-        // fail the boot. Peers read `interception_readiness` for that.
-        if snapshot.mode == NetworkState::Ready && snapshot.policy.is_none() {
-            snapshot.mode = NetworkState::PendingPolicy;
-            snapshot.last_error = "network policy is not installed".to_owned();
+            // watch channel. Policy readiness is independent of CA readiness.
+            interception_readiness: self.interception_readiness_for(policy.as_deref()),
+            policy,
         }
-        snapshot
     }
 }
 
-fn set_mode(inner: &mut NetworkStateInner, mode: NetworkState, reason: NetworkStateReason) {
-    if inner.mode == mode {
-        return;
+fn set_lifecycle(
+    inner: &mut NetworkStateInner,
+    lifecycle: PolicyLifecycle,
+    reason: NetworkStateReason,
+) {
+    let from = inner.lifecycle.mode();
+    let to = lifecycle.mode();
+    if from != to {
+        pplx_space_metrics::gateway::network_state_transition(
+            from.as_str(),
+            to.as_str(),
+            reason.as_str(),
+        );
+        inner.diagnostics.last_transition_unix_ms = unix_time_ms();
     }
-    pplx_space_metrics::gateway::network_state_transition(
-        inner.mode.as_str(),
-        mode.as_str(),
-        reason.as_str(),
-    );
-    inner.last_transition_unix_ms = unix_time_ms();
-    inner.mode = mode;
-}
-
-fn installed_ref_matches(installed: &str, expected: Option<&EffectiveNetworkPolicyRef>) -> bool {
-    match expected {
-        None => true,
-        Some(expected) => installed
-            .parse::<EffectiveNetworkPolicyRef>()
-            .is_ok_and(|installed| &installed == expected),
-    }
-}
-
-fn pulled_ref_matches(
-    pulled: &EffectiveNetworkPolicyRef,
-    expected: Option<&EffectiveNetworkPolicyRef>,
-) -> bool {
-    expected.is_none_or(|expected| pulled == expected)
-}
-
-fn refresh_result_must_not_mutate(mode: NetworkState) -> bool {
-    matches!(
-        mode,
-        NetworkState::NoIdentity | NetworkState::Draining | NetworkState::Stopped
-    )
+    inner.lifecycle = lifecycle;
 }
 
 /// The bounded, non-sensitive shape of a policy for the hydration log: the
@@ -1077,12 +1016,6 @@ fn policy_log_summary(
         policy.egress.allow_counts(),
         policy.egress.deny_counts(),
     )
-}
-
-fn expected_ref_display(expected: Option<&EffectiveNetworkPolicyRef>) -> String {
-    expected
-        .map(ToString::to_string)
-        .unwrap_or_else(|| "<any>".to_string())
 }
 
 fn record_hydration_failures(active_kind: NetworkPolicyErrorKind, active_failures: u64) {

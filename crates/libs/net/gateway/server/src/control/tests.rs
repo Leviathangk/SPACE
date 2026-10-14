@@ -149,5 +149,70 @@ async fn control_rpcs_preserve_readiness_and_report_installed_tls_policy() {
                 );
             }
         }
+
+        let next_ref = EffectiveNetworkPolicyRef::local(
+            EffectiveNetworkPolicyRefScope::Sandbox,
+            "sandbox-1",
+            "f".repeat(64),
+        )
+        .unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = CancellationToken::new();
+        let refresh = tokio::spawn({
+            let state = service.network_state.clone();
+            let started = started.clone();
+            let release = release.clone();
+            async move {
+                let expected = next_ref.clone();
+                let loader: PolicyLoader = Arc::new(move || {
+                    let started = started.clone();
+                    let release = release.clone();
+                    let policy_ref = next_ref.clone();
+                    Box::pin(async move {
+                        started.notify_one();
+                        release.cancelled().await;
+                        Ok(PulledNetworkPolicy {
+                            policy: NetworkPolicyV1::deny_all(),
+                            policy_ref,
+                            network_credentials: Default::default(),
+                        })
+                    })
+                });
+                state
+                    .refresh(loader, Some(expected), NetworkStateReason::ControlRefresh)
+                    .await
+            }
+        });
+        started.notified().await;
+        for expected_state in [
+            crate::proto::NetworkState::PendingPolicy,
+            crate::proto::NetworkState::Draining,
+        ] {
+            if expected_state == crate::proto::NetworkState::Draining {
+                service
+                    .network_state
+                    .set_draining(NetworkStateReason::Shutdown)
+                    .await;
+            }
+            let snapshot = service.network_state.snapshot().await;
+            assert_eq!(snapshot.mode, expected_state);
+            let reported = service
+                .get_network_policy(root_request(GetNetworkPolicyRequest {}))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(reported.installed_policy_ref, policy_ref.to_string());
+            let reported = NetworkPolicyV1::try_from(reported.policy.as_ref().unwrap()).unwrap();
+            assert_eq!(reported.tls_interception, mode);
+            assert_eq!(
+                reported.default_action(),
+                pplx_space_net_common::EgressDefaultAction::Allow
+            );
+        }
+        release.cancel();
+        assert_eq!(
+            refresh.await.unwrap().mode,
+            crate::proto::NetworkState::Draining
+        );
     }
 }
