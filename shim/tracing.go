@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"os"
 	"strings"
@@ -166,6 +167,16 @@ func serializedTraceparent(ctx context.Context) string {
 func injectTraceMetadata(ctx context.Context, pipeline tracePipeline) context.Context {
 	carrier := propagation.MapCarrier{}
 	pipeline.inject(ctx, carrier)
+	if _, off := pipeline.(disabledTracePipeline); !off && carrier["traceparent"] == "" {
+		// A call made outside any shim operation, such as containerd relaying
+		// kubelet's periodic stats polls, carries an unsampled context, as a
+		// Rust caller with no traced request does: the server records it, so
+		// its APM stats and a failure still see it, without starting a
+		// sampled trace for every poll.
+		if traceparent := unsampledTraceparent(); traceparent != "" {
+			carrier["traceparent"] = traceparent
+		}
+	}
 	if len(carrier) == 0 {
 		return ctx
 	}
@@ -184,4 +195,13 @@ func traceparentInjectingUnaryInterceptor(ctx context.Context, method string, re
 		ctx = injectTraceMetadata(ctx, pipeline.tracePipeline)
 	}
 	return invoker(ctx, method, req, reply, cc, opts...)
+}
+
+// A W3C context for a span nobody records: fresh IDs, not sampled.
+func unsampledTraceparent() string {
+	var ids [24]byte
+	if _, err := rand.Read(ids[:]); err != nil {
+		return ""
+	}
+	return fmt.Sprintf("00-%x-%x-00", ids[:16], ids[16:])
 }

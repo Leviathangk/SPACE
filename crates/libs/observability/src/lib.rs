@@ -1415,6 +1415,29 @@ pub mod trace_propagation {
             .is_valid()
     }
 
+    /// Parent `span` on a fresh unsampled context that nothing records, for a
+    /// call made with no traced request in scope, such as a periodic poll.
+    ///
+    /// Both samplers follow an unsampled parent: the span is recorded, so APM
+    /// stats count it, but not sampled, and the call propagates that unsampled
+    /// context to its server. Under native Datadog the span takes the
+    /// auto-reject priority, which leaves a chunk with an error to the Agent's
+    /// error sampler; a sampling rule's user reject would drop it. Call it
+    /// after creating `span` and before entering it, when the sampler decides.
+    pub fn set_unsampled_remote_parent(span: &tracing::Span) {
+        use opentelemetry::trace::{SpanContext, TraceContextExt as _, TraceFlags, TraceState};
+        use opentelemetry_sdk::trace::{IdGenerator as _, RandomIdGenerator};
+        let ids = RandomIdGenerator::default();
+        let parent = SpanContext::new(
+            ids.new_trace_id(),
+            ids.new_span_id(),
+            TraceFlags::default(),
+            true,
+            TraceState::default(),
+        );
+        let _ = span.set_parent(opentelemetry::Context::new().with_remote_span_context(parent));
+    }
+
     /// Link a root span to the context of the work that caused it, such as
     /// the request that persisted the intent the root applies, and make its
     /// sampling follow that context.
@@ -1526,6 +1549,7 @@ pub mod trace_propagation {
     pub fn has_traced_current_span() -> bool {
         false
     }
+    pub fn set_unsampled_remote_parent(_span: &tracing::Span) {}
     pub fn set_span_attribute(_span: &tracing::Span, _key: &'static str, _value: &str) {}
     pub fn link_root_to_origins<'a>(
         _span: &tracing::Span,

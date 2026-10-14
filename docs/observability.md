@@ -320,9 +320,21 @@ filter:
   lost race, not a failure. A tick that acquires or loses leadership records
   `leader_election.change`.
 
-Periodic gRPC polls outside these rules still open a trace per call: dropping
-one end to end needs the caller to propagate a not-sampled context, which is
-the sampler's decision rather than the span layer's.
+Other gRPC calls made while no traced span is current, such as periodic
+polls, keep their spans so APM stats still count them, but start no sampled
+trace. The client span records `untraced_caller` and takes as its parent a
+fresh unsampled context that nothing records, so both samplers record it
+without sampling it, and the call propagates that unsampled context to its
+server, whose spans are recorded unsampled too. The native Datadog sampler
+gives such spans the auto-reject priority; under OTLP the wrapped sampler
+records every span whose parent was not sampled unsampled, whatever
+`OTEL_TRACES_SAMPLER` selects, Kind's `always_on` included. A failed call
+still reaches the backend: the Datadog exporter keeps a rejected chunk that
+contains an error for the Agent's error sampler (a sampling rule's user reject
+would drop it), and under OTLP an unsampled span is exported only when it
+failed. Such a span's parent is the unrecorded context, so it heads its trace.
+The shim does the same for its calls outside any shim operation, such as
+containerd relaying kubelet's stats polls: it sends a fresh unsampled context.
 
 ## S3 client spans
 

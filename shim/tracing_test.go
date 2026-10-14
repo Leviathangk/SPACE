@@ -149,6 +149,21 @@ func TestStartSpanWithRemoteTraceparent(t *testing.T) {
 			span.End(nil)
 		})
 	}
+	// A call outside any span, such as a relayed stats poll, carries an
+	// unsampled context of its own, unless tracing is off.
+	t.Run("untraced call", func(t *testing.T) {
+		md, _ := metadata.FromOutgoingContext(injectTraceMetadata(context.Background(), initTracer()))
+		value := md.Get("traceparent")
+		if os.Getenv("SPACE_TRACE_EXPORTER") == "off" {
+			if len(value) != 0 {
+				t.Fatalf("disabled tracing propagated context: %v", value)
+			}
+			return
+		}
+		if len(value) != 1 || len(value[0]) != 55 || !strings.HasPrefix(value[0], "00-") || !strings.HasSuffix(value[0], "-00") {
+			t.Fatalf("untraced call did not carry an unsampled context: %v", value)
+		}
+	})
 	started := time.Now()
 	stopTelemetry()
 	if elapsed := time.Since(started); elapsed > telemetryShutdownBudget+300*time.Millisecond {

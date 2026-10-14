@@ -8,6 +8,12 @@
 //! keep work that links to nothing. A root that links to an origin therefore
 //! follows the origin's sampled flag; a root with no origin, and every span
 //! with a parent, keeps the configured sampler.
+//!
+//! Every span under a parent that was not sampled is recorded unsampled, so
+//! APM stats count it and a failure can still be exported. A gRPC call made
+//! with no traced request in scope takes such a parent
+//! ([`crate::trace_propagation::set_unsampled_remote_parent`]), and its server
+//! follows the unsampled context it propagates.
 
 use opentelemetry::{
     Context, KeyValue,
@@ -47,14 +53,29 @@ impl ShouldSample for FollowOrigin {
         attributes: &[KeyValue],
         links: &[Link],
     ) -> SamplingResult {
-        let has_parent = parent_context.is_some_and(|context| {
-            context.has_active_span() && context.span().span_context().is_valid()
-        });
+        let parent = parent_context
+            .filter(|context| context.has_active_span())
+            .map(|context| context.span().span_context().clone())
+            .filter(|parent| parent.is_valid());
+        let has_parent = parent.is_some();
         let mut origins = links
             .iter()
             .map(|link| &link.span_context)
             .filter(|origin| origin.is_valid())
             .peekable();
+        // A span under a parent that was not sampled is recorded unsampled
+        // whatever OTEL_TRACES_SAMPLER says, as the native Datadog sampler
+        // does: `always_on` would otherwise sample the server side of a call
+        // its caller left unsampled.
+        if parent.as_ref().is_some_and(|parent| !parent.is_sampled()) {
+            return SamplingResult {
+                decision: SamplingDecision::RecordOnly,
+                attributes: Vec::new(),
+                trace_state: parent
+                    .map(|parent| parent.trace_state().clone())
+                    .unwrap_or_default(),
+            };
+        }
         if has_parent || origins.peek().is_none() {
             return self.configured.should_sample(
                 parent_context,
