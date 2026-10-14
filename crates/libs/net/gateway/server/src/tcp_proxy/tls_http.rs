@@ -29,8 +29,8 @@ use super::tls::TlsTransportError;
 use super::upstream::{self, Upstream};
 use crate::certificates::CertificateLease;
 use crate::tls_sni::HttpAlpn;
-pub(super) use error::HttpError;
 pub(super) use error::http_reason;
+pub(super) use error::{HttpError, RequestError};
 
 mod connect;
 mod credentials;
@@ -155,9 +155,13 @@ where
         tracing::Span::current().record("protocol", protocol.as_str());
         let request = SanitizedRequest::try_from(request);
         async move {
-            Ok::<_, Infallible>(match request {
+            let result = match request {
                 Ok(request) => session.forward(request).await,
-                Err(_) => session.refuse(protocol, "invalid_headers", StatusCode::BAD_REQUEST),
+                Err(_) => Err(super::http_host::BindingOutcome::InvalidHeaders.into()),
+            };
+            Ok::<_, Infallible>(match result {
+                Ok(response) => response,
+                Err(error) => session.refuse(protocol, error),
             })
         }
     });
@@ -213,21 +217,10 @@ where
         ForwardingBody::new(body, protocol.as_str(), operation)
     }
 
-    fn refuse(
-        &self,
-        protocol: HttpProtocol,
-        reason: &'static str,
-        status: StatusCode,
-    ) -> Response<Body> {
-        Self::record(protocol, reason, status);
-        let mut response = Response::new(Either::Right(Empty::new()));
-        *response.status_mut() = status;
-        if protocol == HttpProtocol::Http1 {
-            response
-                .headers_mut()
-                .insert(header::CONNECTION, http::HeaderValue::from_static("close"));
-        }
-        response
+    fn refuse(&self, protocol: HttpProtocol, error: RequestError) -> Response<Body> {
+        let response = error.response(protocol);
+        Self::record(protocol, error.reason(), response.status());
+        response.map(Either::Right)
     }
 
     fn record(protocol: HttpProtocol, outcome: &'static str, status: StatusCode) {

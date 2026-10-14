@@ -30,7 +30,7 @@ use tokio::sync::Mutex;
 
 use super::routing_headers::SanitizedRequest;
 use super::{
-    tls_http::HttpProtocol,
+    tls_http::{HttpProtocol, RequestError},
     upstream::{self, Upstream},
 };
 use crate::dns::DnsAllowCache;
@@ -197,19 +197,48 @@ where
             let tally = tally.clone();
             let binding = binding.clone();
             async move {
-                let (response, outcome, setup_failure) = match request {
+                let result = match request {
                     Ok(request) => forward(request, upstream, &binding).await,
-                    Err(_) => {
-                        let outcome = BindingOutcome::InvalidHeaders;
-                        pplx_space_metrics::gateway::domain_binding(
-                            "tcp",
-                            "http_host",
-                            outcome.as_str(),
-                            None,
-                        );
-                        (refusal(outcome.refusal_status()), outcome, None)
+                    Err(_) => Err(BindingOutcome::InvalidHeaders.into()),
+                };
+                let (response, outcome, setup_failure) = match result {
+                    Ok(response) => (response, BindingOutcome::Allowed, None),
+                    Err(error) => {
+                        let outcome = error.binding_outcome();
+                        let response = error.response(HttpProtocol::Http1).map(Either::Right);
+                        let setup_failure = if let RequestError::Setup(error) = error {
+                            let (failure, error_kind) = match error.as_ref() {
+                                upstream::Error::Connect(error) => ("connect", error.io_kind()),
+                                upstream::Error::Http(_) => ("http_handshake", None),
+                                upstream::Error::Tls(_) | upstream::Error::Cancelled => {
+                                    ("setup", None)
+                                }
+                            };
+                            tracing::debug!(
+                                sandbox_id = binding.sandbox_id,
+                                dst_port = binding.destination.port(),
+                                address_family = if binding.destination.is_ipv6() {
+                                    "ipv6"
+                                } else {
+                                    "ipv4"
+                                },
+                                failure,
+                                ?error_kind,
+                                "plaintext HTTP upstream connection failed"
+                            );
+                            Some(Failure::Setup(error))
+                        } else {
+                            None
+                        };
+                        (response, outcome, setup_failure)
                     }
                 };
+                pplx_space_metrics::gateway::domain_binding(
+                    "tcp",
+                    "http_host",
+                    outcome.as_str(),
+                    None,
+                );
                 let mut tally = tally.lock().await;
                 if tally.setup_failure.is_none() {
                     tally.setup_failure = setup_failure;
@@ -248,98 +277,30 @@ async fn forward<F, Fut, U>(
     mut request: SanitizedRequest<ForwardBody>,
     upstream: Arc<Upstream<F, ForwardBody>>,
     binding: &HostBinding,
-) -> (Response<ForwardBody>, BindingOutcome, Option<Failure>)
+) -> Result<Response<ForwardBody>, RequestError>
 where
     F: FnOnce(HttpProtocol) -> Fut + Send + 'static,
     Fut: Future<Output = Result<(U, HttpProtocol), upstream::Error>> + Send + 'static,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let authorization: Result<Authority, BindingOutcome> = async {
-        let (host, authority) =
-            validated_request_authority(&request).map_err(|()| BindingOutcome::InvalidHost)?;
-        binding.authorize(&host).await?;
-        Ok(authority)
-    }
-    .await;
-    let authority = match authorization {
-        Ok(authority) => authority,
-        Err(outcome) => {
-            pplx_space_metrics::gateway::domain_binding("tcp", "http_host", outcome.as_str(), None);
-            return (refusal(outcome.refusal_status()), outcome, None);
-        }
-    };
+    let (host, authority) =
+        validated_request_authority(&request).map_err(|()| BindingOutcome::InvalidHost)?;
+    binding.authorize(&host).await?;
     // This relay cannot leave HTTP framing. Refuse before hop-header stripping
     // can turn an upgrade into an ordinary request to the origin.
     if request.headers().contains_key(header::UPGRADE) {
-        let outcome = BindingOutcome::UpgradeUnsupported;
-        pplx_space_metrics::gateway::domain_binding("tcp", "http_host", outcome.as_str(), None);
-        return (refusal(outcome.refusal_status()), outcome, None);
+        return Err(RequestError::UnsupportedUpgrade);
     }
-    if normalize_upstream_routing(&mut request, &authority).is_err() {
-        let outcome = BindingOutcome::InvalidHost;
-        pplx_space_metrics::gateway::domain_binding("tcp", "http_host", outcome.as_str(), None);
-        return (refusal(outcome.refusal_status()), outcome, None);
-    }
+    normalize_upstream_routing(&mut request, &authority)
+        .map_err(|()| BindingOutcome::InvalidHost)?;
 
-    let sender = match upstream.sender(HttpProtocol::Http1).await {
-        Ok(sender) => sender,
-        Err(error) => {
-            let outcome = BindingOutcome::UpstreamFailed;
-            let (failure, error_kind) = match error.as_ref() {
-                upstream::Error::Connect(error) => ("connect", error.io_kind()),
-                upstream::Error::Http(_) => ("http_handshake", None),
-                upstream::Error::Tls(_) | upstream::Error::Cancelled => ("setup", None),
-            };
-            tracing::debug!(
-                sandbox_id = binding.sandbox_id,
-                dst_port = binding.destination.port(),
-                address_family = if binding.destination.is_ipv6() {
-                    "ipv6"
-                } else {
-                    "ipv4"
-                },
-                failure,
-                ?error_kind,
-                "plaintext HTTP upstream connection failed"
-            );
-            pplx_space_metrics::gateway::domain_binding("tcp", "http_host", outcome.as_str(), None);
-            return (
-                refusal(outcome.refusal_status()),
-                outcome,
-                Some(Failure::Setup(error)),
-            );
-        }
-    };
-    let sender = match sender.ready().await {
-        Ok(sender) => sender,
-        Err(_) => {
-            let outcome = BindingOutcome::UpstreamFailed;
-            pplx_space_metrics::gateway::domain_binding("tcp", "http_host", outcome.as_str(), None);
-            return (refusal(outcome.refusal_status()), outcome, None);
-        }
-    };
-    let (response, outcome) = match sender.send(request).await {
-        Ok(response) if response.status() == StatusCode::SWITCHING_PROTOCOLS => {
-            let outcome = BindingOutcome::UpstreamFailed;
-            pplx_space_metrics::gateway::domain_binding("tcp", "http_host", outcome.as_str(), None);
-            (refusal(outcome.refusal_status()), outcome)
-        }
-        Ok(response) => {
-            pplx_space_metrics::gateway::domain_binding(
-                "tcp",
-                "http_host",
-                BindingOutcome::Allowed.as_str(),
-                None,
-            );
-            (response.map(Either::Left), BindingOutcome::Allowed)
-        }
-        Err(_) => {
-            let outcome = BindingOutcome::UpstreamFailed;
-            pplx_space_metrics::gateway::domain_binding("tcp", "http_host", outcome.as_str(), None);
-            (refusal(outcome.refusal_status()), outcome)
-        }
-    };
-    (response, outcome, None)
+    let sender = upstream.sender(HttpProtocol::Http1).await?;
+    let sender = sender.ready().await?;
+    let response = sender.send(request).await?;
+    if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+        return Err(RequestError::UnexpectedUpgrade);
+    }
+    Ok(response.map(Either::Left))
 }
 
 /// Make the bytes forwarded upstream express the same authority that passed
@@ -400,15 +361,6 @@ fn request_authority<B>(request: &SanitizedRequest<B>) -> Result<Authority, ()> 
         .ok()
         .and_then(|value| value.parse::<Authority>().ok())
         .ok_or(())
-}
-
-fn refusal(status: StatusCode) -> Response<ForwardBody> {
-    let mut response = Response::new(Either::Right(Empty::new()));
-    *response.status_mut() = status;
-    response
-        .headers_mut()
-        .insert(header::CONNECTION, http::HeaderValue::from_static("close"));
-    response
 }
 
 pub(super) struct MeteredIo<T> {

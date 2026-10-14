@@ -13,7 +13,10 @@ where
     Fut: Future<Output = Result<(U, HttpProtocol), upstream::Error>> + Send + 'static,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    pub(super) async fn forward(&self, mut request: SanitizedRequest<Incoming>) -> Response<Body> {
+    pub(super) async fn forward(
+        &self,
+        mut request: SanitizedRequest<Incoming>,
+    ) -> Result<Response<Body>, RequestError> {
         if request.method() == http::Method::CONNECT {
             return self.connect_request(request).await;
         }
@@ -24,31 +27,27 @@ where
             Ok(handshake) => handshake,
             Err(()) => {
                 authorization.finish(Outcome::Denied, "unsupported_upgrade");
-                return self.refuse(protocol, "unsupported_upgrade", StatusCode::FORBIDDEN);
+                return Err(RequestError::UnsupportedUpgrade);
             }
         };
         if let Err(reason) = authorize_authority(&request, self.lease.host(), self.lease.port()) {
             authorization.finish(Outcome::Denied, reason.as_str());
-            return self.refuse(protocol, reason.as_str(), StatusCode::FORBIDDEN);
+            return Err(reason.into());
         }
         if let Err(reason) = self.binding.authorize(self.lease.host()).await {
             authorization.finish(Outcome::Denied, reason.as_str());
-            return self.refuse(protocol, reason.as_str(), reason.refusal_status());
+            return Err(reason.into());
         }
         let credential_bearing = match credential_headers(&self.lease, &request) {
             Ok(headers) => !headers.is_empty(),
             Err(error) => {
                 authorization.finish(initial_credential_outcome(error), error.as_str());
-                return self.refuse(protocol, error.as_str(), error.status());
+                return Err(error.into());
             }
         };
         if handshake.is_some() && credential_bearing {
             authorization.finish(Outcome::Denied, "credential_upgrade_unsupported");
-            return self.refuse(
-                protocol,
-                "credential_upgrade_unsupported",
-                StatusCode::FORBIDDEN,
-            );
+            return Err(RequestError::CredentialUpgrade);
         }
         authorization.finish(Outcome::Success, "authorized");
 
@@ -62,7 +61,7 @@ where
             Err(error) => {
                 forwarding.finish(Outcome::Error, "origin_setup");
                 error.record("upstream_setup");
-                return self.refuse(protocol, error.as_str(), StatusCode::BAD_GATEWAY);
+                return Err(error.into());
             }
         };
         let sender = match sender.ready().await {
@@ -70,8 +69,8 @@ where
             Err(error) => {
                 forwarding.finish(Outcome::Error, "upstream_http");
                 self.draining.cancel();
-                HttpError::Protocol(error).record("upstream_request");
-                return self.refuse(protocol, "upstream_http_error", StatusCode::BAD_GATEWAY);
+                HttpError::record_protocol(&error, "upstream_request");
+                return Err(error.into());
             }
         };
 
@@ -81,7 +80,7 @@ where
             Ok(headers) => headers,
             Err(error) => {
                 forwarding.finish(Outcome::Cancelled, error.as_str());
-                return self.refuse(protocol, error.as_str(), error.status());
+                return Err(error.into());
             }
         };
         inject(&mut request, headers);
@@ -117,24 +116,24 @@ where
                     .in_current_span(),
                 );
                 forwarding.finish(Outcome::Success, "response_headers");
-                response.map(|_| Either::Right(Empty::new()))
+                Ok(response.map(|_| Either::Right(Empty::new())))
             }
             Ok(response) if response.status() != StatusCode::SWITCHING_PROTOCOLS => {
                 Self::record(protocol, "allowed", response.status());
                 forwarding.finish(Outcome::Success, "response_headers");
-                response.map(|body| {
+                Ok(response.map(|body| {
                     Either::Left(Self::forwarding_body(protocol, body, "response_body"))
-                })
+                }))
             }
             Ok(_) => {
                 forwarding.finish(Outcome::Error, "unexpected_upgrade");
-                self.refuse(protocol, "unexpected_upgrade", StatusCode::BAD_GATEWAY)
+                Err(RequestError::UnexpectedUpgrade)
             }
             Err(error) => {
                 forwarding.finish(Outcome::Error, "upstream_http");
                 self.draining.cancel();
-                HttpError::Protocol(error).record("upstream_request");
-                self.refuse(protocol, "upstream_http_error", StatusCode::BAD_GATEWAY)
+                HttpError::record_protocol(&error, "upstream_request");
+                Err(error.into())
             }
         }
     }
@@ -177,7 +176,7 @@ fn websocket_response_headers(headers: &mut HeaderMap) {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(super) enum AuthorityError {
+pub(in crate::tcp_proxy) enum AuthorityError {
     #[error("HTTP request authority is missing or malformed")]
     Invalid,
     #[error("HTTP request authority differs from the admitted TLS origin")]
@@ -185,7 +184,7 @@ pub(super) enum AuthorityError {
 }
 
 impl AuthorityError {
-    const fn as_str(&self) -> &'static str {
+    pub(super) const fn as_str(&self) -> &'static str {
         match self {
             Self::Invalid => "invalid_authority",
             Self::Mismatch => "authority_mismatch",

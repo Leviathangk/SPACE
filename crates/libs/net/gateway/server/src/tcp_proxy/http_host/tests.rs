@@ -449,10 +449,20 @@ fn canonicalizes_the_validated_authority_and_forwards_origin_form() {
 }
 
 #[test]
-fn every_gateway_refusal_closes_the_guest_connection() {
-    let response = refusal(StatusCode::FORBIDDEN);
-
-    assert_eq!(response.headers().get(header::CONNECTION).unwrap(), "close");
+fn gateway_refusals_close_only_http1_connections() {
+    for (protocol, connection) in [
+        (HttpProtocol::Http1, Some("close")),
+        (HttpProtocol::Http2, None),
+    ] {
+        let response = RequestError::Binding(BindingOutcome::PolicyDenied).response(protocol);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONNECTION)
+                .map(|value| value.to_str().unwrap()),
+            connection
+        );
+    }
 }
 
 #[tokio::test]

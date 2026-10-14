@@ -83,23 +83,23 @@ where
     pub(super) async fn connect_request(
         &self,
         mut request: SanitizedRequest<Incoming>,
-    ) -> Response<Body> {
+    ) -> Result<Response<Body>, RequestError> {
         let protocol = HttpProtocol::of(request.version());
         let mut authorization = Attempt::http_authorization(protocol.as_str());
         let target = match target(&request) {
             Ok(target) => target,
             Err(()) => {
                 authorization.finish(Outcome::Denied, "invalid_connect");
-                return self.refuse(protocol, "invalid_connect", StatusCode::FORBIDDEN);
+                return Err(RequestError::InvalidConnect);
             }
         };
         if !self.lease.is_usable() {
             authorization.finish(Outcome::Cancelled, "lease_invalidated");
-            return self.refuse(protocol, "lease_invalidated", StatusCode::FORBIDDEN);
+            return Err(RequestError::Cancelled);
         }
         if let Err(reason) = self.binding.authorize(self.lease.host()).await {
             authorization.finish(Outcome::Denied, reason.as_str());
-            return self.refuse(protocol, reason.as_str(), reason.refusal_status());
+            return Err(reason.into());
         }
         authorization.finish(Outcome::Success, "authorized");
         let authority = target.to_string();
@@ -112,20 +112,20 @@ where
             Err(error) => {
                 forwarding.finish(Outcome::Error, "origin_setup");
                 error.record("connect_proxy_setup");
-                return self.refuse(protocol, error.as_str(), StatusCode::BAD_GATEWAY);
+                return Err(error.into());
             }
         };
         let ready = match sender.ready().await {
             Ok(ready) if ready.is_http1() => ready,
-            Ok(_) => return self.refuse(protocol, "invalid_connect", StatusCode::FORBIDDEN),
+            Ok(_) => return Err(RequestError::InvalidConnect),
             Err(error) => {
-                HttpError::Protocol(error).record("connect_proxy_ready");
-                return self.refuse(protocol, "upstream_http_error", StatusCode::BAD_GATEWAY);
+                HttpError::record_protocol(&error, "connect_proxy_ready");
+                return Err(error.into());
             }
         };
         if !self.lease.is_usable() {
             forwarding.finish(Outcome::Cancelled, "lease_invalidated");
-            return self.refuse(protocol, "lease_invalidated", StatusCode::FORBIDDEN);
+            return Err(RequestError::Cancelled);
         }
         let mut response =
             match ready
@@ -137,19 +137,19 @@ where
                 Ok(response) => response,
                 Err(error) => {
                     forwarding.finish(Outcome::Error, "upstream_http");
-                    HttpError::Protocol(error).record("connect_proxy_request");
-                    return self.refuse(protocol, "upstream_http_error", StatusCode::BAD_GATEWAY);
+                    HttpError::record_protocol(&error, "connect_proxy_request");
+                    return Err(error.into());
                 }
             };
         if response.status() == StatusCode::SWITCHING_PROTOCOLS {
             forwarding.finish(Outcome::Error, "unexpected_upgrade");
-            return self.refuse(protocol, "unexpected_upgrade", StatusCode::BAD_GATEWAY);
+            return Err(RequestError::UnexpectedUpgrade);
         }
         if !response.status().is_success() {
             Self::record(protocol, "connect_proxy_refused", response.status());
             forwarding.finish(Outcome::Success, "response_headers");
-            return response
-                .map(|body| Either::Left(Self::forwarding_body(protocol, body, "response_body")));
+            return Ok(response
+                .map(|body| Either::Left(Self::forwarding_body(protocol, body, "response_body"))));
         }
         let origin = hyper::upgrade::on(&mut response);
         response.headers_mut().remove(header::CONTENT_LENGTH);
@@ -165,7 +165,7 @@ where
         );
         Self::record(protocol, "connect_forwarded", response.status());
         forwarding.finish(Outcome::Success, "response_headers");
-        response.map(|_| Either::Right(Empty::new()))
+        Ok(response.map(|_| Either::Right(Empty::new())))
     }
 }
 
