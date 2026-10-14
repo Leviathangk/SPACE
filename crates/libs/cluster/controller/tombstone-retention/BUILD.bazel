@@ -1,0 +1,48 @@
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("//ci/benchmarks/controller-bazel:test_rules.bzl", "aggregate_rust_test")
+
+# gazelle:lang rs
+# gazelle:rust_visibility //crates/libs/cluster/controller/server:__pkg__
+# gazelle:resolve rs pplx_space_common_core //crates/libs/common/core:core
+# gazelle:resolve rs pplx_space_cluster_pool //crates/libs/cluster/pool:pool
+# gazelle:resolve rs pplx_space_metrics //crates/libs/metrics:metrics
+# gazelle:resolve rs pplx_space_db_test_fixtures //crates/libs/db-test-fixtures:db-test-fixtures
+# gazelle:resolve rs pplx_space_test_env //crates/libs/test-env:test-env
+
+rust_library(
+    name = "tombstone-retention",
+    srcs = ["lib.rs"],
+    crate_name = "pplx_space_cluster_controller_tombstone_retention",
+    crate_root = "lib.rs",
+    edition = "2024",
+    version = "0.8.0",
+    visibility = ["//crates/libs/cluster/controller/server:__pkg__"],
+    deps = [
+        "//crates/libs/cluster/pool",
+        "//crates/libs/common/core",
+        "//crates/libs/metrics",
+        "@crates//:sqlx",
+        "@crates//:tokio",
+        "@crates//:tokio-util",
+        "@crates//:tracing",
+        "@crates//:uuid",
+    ],
+)
+
+aggregate_rust_test(
+    name = "retention",
+    srcs = ["retention.test.rs"],
+    crate_name = "retention",
+    crate_root = "retention.test.rs",
+    edition = "2024",
+    visibility = ["//crates/libs/cluster/controller/server:__pkg__"],
+    deps = [
+        ":tombstone-retention",
+        "//crates/libs/common/core",
+        "//crates/libs/db-test-fixtures",
+        "//crates/libs/test-env",
+        "@crates//:sqlx",
+        "@crates//:tokio",
+        "@crates//:uuid",
+    ],
+)

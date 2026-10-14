@@ -30,3 +30,6 @@ __pycache__/
 infra/space/kind/private.env
 .playwright-mcp/
 /.cache/
+
+/bazel-*
+/build/

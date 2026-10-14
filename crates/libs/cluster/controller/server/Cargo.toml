@@ -60,6 +60,7 @@ tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 
 # internal
+pplx-space-cluster-controller-tombstone-retention = { workspace = true }
 pplx-space-api = { workspace = true }
 pplx-space-aws-client = { workspace = true }
 pplx-space-cluster-pool = { workspace = true }

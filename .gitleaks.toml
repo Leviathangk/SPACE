@@ -28,3 +28,11 @@ targetRules = ["generic-api-key"]
 condition = "AND"
 paths = ['''(^|/)crates/libs/sbx/mgr/server/src/snapshot_restore/tests\.rs$''']
 regexes = ['''^019e31d9-79a6-7132-b90f-007f1c62ddea$''']
+
+# Cargo.lock pins this public dependency; the generated macro list resembles a key assignment.
+[[allowlists]]
+description = "Public clap_derive 4.6.7 package identifier in the generated Cargo profile"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''^ci/benchmarks/controller-bazel/units\.bzl$''']
+regexes = ['''^clap_derive-4[.]6[.]7$''']

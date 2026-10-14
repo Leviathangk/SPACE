@@ -1,0 +1,31 @@
+--- a/toolchain/merged_resource_directory.bzl
++++ b/toolchain/merged_resource_directory.bzl
+@@ -8,6 +8,18 @@
+ 
+ def _merged_resource_directory_impl(ctx):
+     parent = ctx.file.parent
++    # A repository directory is represented as a File rather than a tree
++    # artifact. Materialize the allowed subtrees before copy_to_directory's
++    # filtering; otherwise it drops the directory before visiting its headers.
++    headers = ctx.actions.declare_directory(ctx.label.name + "_headers")
++    ctx.actions.run_shell(
++        inputs = [parent],
++        outputs = [headers],
++        arguments = [parent.path, headers.path],
++        command = 'mkdir -p "$2" && cp -a "$1/include" "$2/" && if [ -d "$1/share" ]; then cp -a "$1/share" "$2/"; fi',
++        mnemonic = "CompilerResourceHeaders",
++    )
++    parent = headers
+     parent_path = _workspace_path(parent)
+     src_paths = [_workspace_path(src) for src in ctx.files.srcs]
+     out = ctx.actions.declare_directory(ctx.label.name)
+@@ -21,8 +33,7 @@
+         include_external_repositories = ["**"],
+         # Never import a prebuilt compiler's host runtime libraries.
+         include_srcs_patterns = [
+-            parent_path + "/include/**",
+-            parent_path + "/share/**",
++            parent_path + "/**",
+         ] + [path + "/**" for path in src_paths],
+         replace_prefixes = {parent_path: ""} | {path: "" for path in src_paths},
+     )

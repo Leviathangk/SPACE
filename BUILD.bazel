@@ -1,0 +1,59 @@
+load("@gazelle//:def.bzl", "gazelle", "gazelle_binary")
+
+# gazelle:exclude .cache
+# gazelle:generation_mode update_only
+# gazelle:lang
+# gazelle:rust_edition 2024
+# gazelle:rust_cargo_lock @crates Cargo.toml Cargo.lock
+# gazelle:map_kind rust_test aggregate_rust_test //ci/benchmarks/controller-bazel:test_rules.bzl
+
+gazelle_binary(
+    name = "gazelle_bin",
+    languages = ["@gazelle_rs//rs"],
+)
+
+gazelle(
+    name = "gazelle",
+    gazelle = ":gazelle_bin",
+)
+
+exports_files([
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain.toml",
+])
+
+filegroup(
+    name = "build_inputs",
+    srcs = glob([
+        "proto/**",
+        "db/**",
+        "templates/firecracker/recipes/**",
+    ]) + [
+        "Cargo.toml",
+        "infra/space/identity/node-identities.sh",
+        "scripts/build-runtime-supervisor.sh",
+        "templates/firecracker/seed/rootfs-builder.sh",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+exports_files([
+    ".cache/controller-benchmark/runtime.oci.tar",
+    ".cache/controller-benchmark/revision.txt",
+    ".cache/controller-benchmark/labels.txt",
+])
+
+exports_files([
+    ".cache/controller-benchmark/resolver/Cargo.toml",
+    ".cache/controller-benchmark/resolver/Cargo.lock",
+])
+
+filegroup(
+    name = "smoke_test_support",
+    srcs = [
+        "pyproject.toml",
+        "uv.lock",
+    ] + glob(["infra/space/kind/charts/**"]),
+    visibility = ["//visibility:public"],
+)

@@ -1,0 +1,8 @@
+load("//ci/benchmarks/kind-bazel:unit.bzl", "smoke_unit_tests")
+
+filegroup(
+    name = "sources",
+    srcs = glob(["**/*.py"]),
+)
+
+smoke_unit_tests()

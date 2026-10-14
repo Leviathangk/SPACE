@@ -1,0 +1,22 @@
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+
+rust_library(
+    name = "db-test-fixtures",
+    testonly = True,
+    srcs = ["src/lib.rs"],
+    compile_data = ["//:build_inputs"],
+    crate_name = "pplx_space_db_test_fixtures",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    version = "0.8.0",
+    visibility = ["//crates/libs/cluster/controller/tombstone-retention:__pkg__"],
+    deps = [
+        "//crates/libs/common/core",
+        "@crates//:sqlx",
+        "@crates//:testcontainers-0.27.3",
+        "@crates//:testcontainers-modules-0.15.0",
+        "@crates//:thiserror-2.0.20",
+        "@crates//:tokio",
+        "@crates//:uuid",
+    ],
+)

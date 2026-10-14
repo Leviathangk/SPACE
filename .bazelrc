@@ -1,0 +1,6 @@
+build --compilation_mode=opt
+build --@rules_rust//rust/settings:extra_rustc_flags=-Copt-level=3,-Ccodegen-units=16,-Cstrip=symbols,-Cembed-bitcode=no,-Clink-arg=-pie
+build --jobs=16
+build --@rules_rust//rust/settings:extra_exec_rustc_flags=-Copt-level=0,-Ccodegen-units=256,-Cdebug-assertions=off,-Cstrip=symbols,-Cembed-bitcode=no
+build --host_platform=//ci/benchmarks/controller-bazel:host_platform
+build --platforms=//ci/benchmarks/controller-bazel:target_platform

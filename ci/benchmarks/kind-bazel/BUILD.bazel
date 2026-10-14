@@ -1,0 +1,5 @@
+load(":functional.bzl", "kind_functional_tests")
+
+exports_files(["unit.sh"])
+
+kind_functional_tests()

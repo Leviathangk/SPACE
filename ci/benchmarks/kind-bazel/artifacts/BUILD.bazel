@@ -1,0 +1,528 @@
+load("@rules_oci//oci:defs.bzl", "oci_image", "oci_load")
+load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
+load("//ci/benchmarks/controller-bazel:variants.bzl", "supervisor_profile")
+
+supervisor_profile(
+    name = "supervisor",
+    actual = "//crates/apps/node/runtime/supervisor/svc:svc",
+)
+
+genrule(
+    name = "probe_binary",
+    srcs = ["@benchmark_health_probe//file"],
+    outs = ["grpc_health_probe"],
+    cmd = "cp \"$(location @benchmark_health_probe//file)\" \"$@\"",
+)
+
+genrule(
+    name = "copy_space-api-svc",
+    srcs = ["//crates/apps/api/svc"],
+    outs = ["space-api-svc"],
+    cmd = "cp \"$(location //crates/apps/api/svc:svc)\" \"$@\"",
+)
+
+pkg_tar(
+    name = "space-api-svc_layer",
+    srcs = [":copy_space-api-svc"],
+    compression_level = 6,
+    extension = "tar.gz",
+    mode = "0755",
+    package_dir = "/artifacts/bin",
+)
+
+genrule(
+    name = "copy_space-buildmgr",
+    srcs = ["//crates/apps/builder/cli"],
+    outs = ["space-buildmgr"],
+    cmd = "cp \"$(location //crates/apps/builder/cli:cli)\" \"$@\"",
+)
+
+pkg_tar(
+    name = "space-buildmgr_layer",
+    srcs = [":copy_space-buildmgr"],
+    compression_level = 6,
+    extension = "tar.gz",
+    mode = "0755",
+    package_dir = "/artifacts/bin",
+)
+
+genrule(
+    name = "copy_space-buildmgr-svc",
+    srcs = ["//crates/apps/builder/svc"],
+    outs = ["space-buildmgr-svc"],
+    cmd = "cp \"$(location //crates/apps/builder/svc:svc)\" \"$@\"",
+)
+
+pkg_tar(
+    name = "space-buildmgr-svc_layer",
+    srcs = [":copy_space-buildmgr-svc"],
+    compression_level = 6,
+    extension = "tar.gz",
+    mode = "0755",
+    package_dir = "/artifacts/bin",
+)
+
+genrule(
+    name = "copy_space-cluster-controller",
+    srcs = ["//crates/apps/cluster/controller/svc"],
+    outs = ["space-cluster-controller"],
+    cmd = "cp \"$(location //crates/apps/cluster/controller/svc:svc)\" \"$@\"",
+)
+
+pkg_tar(
+    name = "space-cluster-controller_layer",
+    srcs = [":copy_space-cluster-controller"],
+    compression_level = 6,
+    extension = "tar.gz",
+    mode = "0755",
+    package_dir = "/artifacts/bin",
+)
+
+genrule(
+    name = "copy_space-credmgr-svc",
+    srcs = ["//crates/apps/credential/mgr/svc"],
+    outs = ["space-credmgr-svc"],
+    cmd = "cp \"$(location //crates/apps/credential/mgr/svc:svc)\" \"$@\"",
+)
+
+pkg_tar(
+    name = "space-credmgr-svc_layer",
+    srcs = [":copy_space-credmgr-svc"],
+    compression_level = 6,
+    extension = "tar.gz",
+    mode = "0755",
+    package_dir = "/artifacts/bin",
+)
+
+genrule(
+    name = "copy_space-data-plane-svc",
+    srcs = ["//crates/apps/data/plane/svc"],
+    outs = ["space-data-plane-svc"],
+    cmd = "cp \"$(location //crates/apps/data/plane/svc:svc)\" \"$@\"",
+)
+
+pkg_tar(
+    name = "space-data-plane-svc_layer",
+    srcs = [":copy_space-data-plane-svc"],
+    compression_level = 6,
+    extension = "tar.gz",
+    mode = "0755",
+    package_dir = "/artifacts/bin",
+)
+
+genrule(
+    name = "copy_space-db-migrator",
+    srcs = ["//crates/apps/db/migrator"],
+    outs = ["space-db-migrator"],
+    cmd = "cp \"$(location //crates/apps/db/migrator:migrator)\" \"$@\"",
+)
+
+pkg_tar(
+    name = "space-db-migrator_layer",
+    srcs = [":copy_space-db-migrator"],
+    compression_level = 6,
+    extension = "tar.gz",
+    mode = "0755",
+    package_dir = "/artifacts/bin",
+)
+
+genrule(
+    name = "copy_space-internal-api-svc",
+    srcs = ["//crates/apps/internal/api/svc"],
+    outs = ["space-internal-api-svc"],
+    cmd = "cp \"$(location //crates/apps/internal/api/svc:svc)\" \"$@\"",
+)
+
+pkg_tar(
+    name = "space-internal-api-svc_layer",
+    srcs = [":copy_space-internal-api-svc"],
+    compression_level = 6,
+    extension = "tar.gz",
+    mode = "0755",
+    package_dir = "/artifacts/bin",
+)
+
+genrule(
+    name = "copy_space-mock-branching-key-provider-svc",
+    srcs = ["//crates/apps/mock/branching-key-provider/svc"],
+    outs = ["space-mock-branching-key-provider-svc"],
+    cmd = "cp \"$(location //crates/apps/mock/branching-key-provider/svc:svc)\" \"$@\"",
+)
+
+pkg_tar(
+    name = "space-mock-branching-key-provider-svc_layer",
+    srcs = [":copy_space-mock-branching-key-provider-svc"],
+    compression_level = 6,
+    extension = "tar.gz",
+    mode = "0755",
+    package_dir = "/artifacts/bin",
+)
+
+genrule(
+    name = "copy_space-netgtw-svc",
+    srcs = ["//crates/apps/net/gateway/svc"],
+    outs = ["space-netgtw-svc"],
+    cmd = "cp \"$(location //crates/apps/net/gateway/svc:svc)\" \"$@\"",
+)
+
+pkg_tar(
+    name = "space-netgtw-svc_layer",
+    srcs = [":copy_space-netgtw-svc"],
+    compression_level = 6,
+    extension = "tar.gz",
+    mode = "0755",
+    package_dir = "/artifacts/bin",
+)
+
+genrule(
+    name = "copy_space-node-api-svc",
+    srcs = ["//crates/apps/node/api/svc"],
+    outs = ["space-node-api-svc"],
+    cmd = "cp \"$(location //crates/apps/node/api/svc:svc)\" \"$@\"",
+)
+
+pkg_tar(
+    name = "space-node-api-svc_layer",
+    srcs = [":copy_space-node-api-svc"],
+    compression_level = 6,
+    extension = "tar.gz",
+    mode = "0755",
+    package_dir = "/artifacts/bin",
+)
+
+genrule(
+    name = "copy_space-nodectl",
+    srcs = ["//crates/apps/node/ctl/cli"],
+    outs = ["space-nodectl"],
+    cmd = "cp \"$(location //crates/apps/node/ctl/cli:cli)\" \"$@\"",
+)
+
+pkg_tar(
+    name = "space-nodectl_layer",
+    srcs = [":copy_space-nodectl"],
+    compression_level = 6,
+    extension = "tar.gz",
+    mode = "0755",
+    package_dir = "/artifacts/bin",
+)
+
+genrule(
+    name = "copy_space-nodectl-svc",
+    srcs = ["//crates/apps/node/ctl/svc"],
+    outs = ["space-nodectl-svc"],
+    cmd = "cp \"$(location //crates/apps/node/ctl/svc:svc)\" \"$@\"",
+)
+
+pkg_tar(
+    name = "space-nodectl-svc_layer",
+    srcs = [":copy_space-nodectl-svc"],
+    compression_level = 6,
+    extension = "tar.gz",
+    mode = "0755",
+    package_dir = "/artifacts/bin",
+)
+
+genrule(
+    name = "copy_space-nodemgr-svc",
+    srcs = ["//crates/apps/node/mgr/svc"],
+    outs = ["space-nodemgr-svc"],
+    cmd = "cp \"$(location //crates/apps/node/mgr/svc:svc)\" \"$@\"",
+)
+
+pkg_tar(
+    name = "space-nodemgr-svc_layer",
+    srcs = [":copy_space-nodemgr-svc"],
+    compression_level = 6,
+    extension = "tar.gz",
+    mode = "0755",
+    package_dir = "/artifacts/bin",
+)
+
+genrule(
+    name = "copy_space-rtmgr",
+    srcs = ["//crates/apps/node/runtime/manager/cli"],
+    outs = ["space-rtmgr"],
+    cmd = "cp \"$(location //crates/apps/node/runtime/manager/cli:cli)\" \"$@\"",
+)
+
+pkg_tar(
+    name = "space-rtmgr_layer",
+    srcs = [":copy_space-rtmgr"],
+    compression_level = 6,
+    extension = "tar.gz",
+    mode = "0755",
+    package_dir = "/artifacts/bin",
+)
+
+genrule(
+    name = "copy_space-rtmgr-svc",
+    srcs = ["//crates/apps/node/runtime/manager/svc"],
+    outs = ["space-rtmgr-svc"],
+    cmd = "cp \"$(location //crates/apps/node/runtime/manager/svc:svc)\" \"$@\"",
+)
+
+pkg_tar(
+    name = "space-rtmgr-svc_layer",
+    srcs = [":copy_space-rtmgr-svc"],
+    compression_level = 6,
+    extension = "tar.gz",
+    mode = "0755",
+    package_dir = "/artifacts/bin",
+)
+
+genrule(
+    name = "copy_space-runtime-supervisor-svc",
+    srcs = [":supervisor"],
+    outs = ["space-runtime-supervisor-svc"],
+    cmd = "cp \"$(location :supervisor)\" \"$@\"",
+)
+
+pkg_tar(
+    name = "space-runtime-supervisor-svc_layer",
+    srcs = [":copy_space-runtime-supervisor-svc"],
+    compression_level = 6,
+    extension = "tar.gz",
+    mode = "0755",
+    package_dir = "/artifacts/bin",
+)
+
+genrule(
+    name = "copy_space-sbxmgr",
+    srcs = ["//crates/apps/sbx/mgr/cli"],
+    outs = ["space-sbxmgr"],
+    cmd = "cp \"$(location //crates/apps/sbx/mgr/cli:cli)\" \"$@\"",
+)
+
+pkg_tar(
+    name = "space-sbxmgr_layer",
+    srcs = [":copy_space-sbxmgr"],
+    compression_level = 6,
+    extension = "tar.gz",
+    mode = "0755",
+    package_dir = "/artifacts/bin",
+)
+
+genrule(
+    name = "copy_space-sbxmgr-svc",
+    srcs = ["//crates/apps/sbx/mgr/svc"],
+    outs = ["space-sbxmgr-svc"],
+    cmd = "cp \"$(location //crates/apps/sbx/mgr/svc:svc)\" \"$@\"",
+)
+
+pkg_tar(
+    name = "space-sbxmgr-svc_layer",
+    srcs = [":copy_space-sbxmgr-svc"],
+    compression_level = 6,
+    extension = "tar.gz",
+    mode = "0755",
+    package_dir = "/artifacts/bin",
+)
+
+genrule(
+    name = "copy_space-spaced-host-svc",
+    srcs = ["//crates/apps/spaced/host/svc"],
+    outs = ["space-spaced-host-svc"],
+    cmd = "cp \"$(location //crates/apps/spaced/host/svc:svc)\" \"$@\"",
+)
+
+pkg_tar(
+    name = "space-spaced-host-svc_layer",
+    srcs = [":copy_space-spaced-host-svc"],
+    compression_level = 6,
+    extension = "tar.gz",
+    mode = "0755",
+    package_dir = "/artifacts/bin",
+)
+
+genrule(
+    name = "copy_space-template-publish",
+    srcs = ["//crates/apps/template/publish"],
+    outs = ["space-template-publish"],
+    cmd = "cp \"$(location //crates/apps/template/publish:publish)\" \"$@\"",
+)
+
+pkg_tar(
+    name = "space-template-publish_layer",
+    srcs = [":copy_space-template-publish"],
+    compression_level = 6,
+    extension = "tar.gz",
+    mode = "0755",
+    package_dir = "/artifacts/bin",
+)
+
+genrule(
+    name = "copy_space-tmplmgr",
+    srcs = ["//crates/apps/template/mgr/cli"],
+    outs = ["space-tmplmgr"],
+    cmd = "cp \"$(location //crates/apps/template/mgr/cli:cli)\" \"$@\"",
+)
+
+pkg_tar(
+    name = "space-tmplmgr_layer",
+    srcs = [":copy_space-tmplmgr"],
+    compression_level = 6,
+    extension = "tar.gz",
+    mode = "0755",
+    package_dir = "/artifacts/bin",
+)
+
+genrule(
+    name = "copy_space-tmplmgr-svc",
+    srcs = ["//crates/apps/template/mgr/svc"],
+    outs = ["space-tmplmgr-svc"],
+    cmd = "cp \"$(location //crates/apps/template/mgr/svc:svc)\" \"$@\"",
+)
+
+pkg_tar(
+    name = "space-tmplmgr-svc_layer",
+    srcs = [":copy_space-tmplmgr-svc"],
+    compression_level = 6,
+    extension = "tar.gz",
+    mode = "0755",
+    package_dir = "/artifacts/bin",
+)
+
+genrule(
+    name = "copy_space-volmgr",
+    srcs = ["//crates/apps/vol/mgr/cli"],
+    outs = ["space-volmgr"],
+    cmd = "cp \"$(location //crates/apps/vol/mgr/cli:cli)\" \"$@\"",
+)
+
+pkg_tar(
+    name = "space-volmgr_layer",
+    srcs = [":copy_space-volmgr"],
+    compression_level = 6,
+    extension = "tar.gz",
+    mode = "0755",
+    package_dir = "/artifacts/bin",
+)
+
+genrule(
+    name = "copy_space-volmgr-svc",
+    srcs = ["//crates/apps/vol/mgr/svc"],
+    outs = ["space-volmgr-svc"],
+    cmd = "cp \"$(location //crates/apps/vol/mgr/svc:svc)\" \"$@\"",
+)
+
+pkg_tar(
+    name = "space-volmgr-svc_layer",
+    srcs = [":copy_space-volmgr-svc"],
+    compression_level = 6,
+    extension = "tar.gz",
+    mode = "0755",
+    package_dir = "/artifacts/bin",
+)
+
+genrule(
+    name = "copy_spaced",
+    srcs = ["//crates/apps/spaced/guest/cli"],
+    outs = ["spaced"],
+    cmd = "cp \"$(location //crates/apps/spaced/guest/cli:cli)\" \"$@\"",
+)
+
+pkg_tar(
+    name = "spaced_layer",
+    srcs = [":copy_spaced"],
+    compression_level = 6,
+    extension = "tar.gz",
+    mode = "0755",
+    package_dir = "/artifacts/bin",
+)
+
+genrule(
+    name = "copy_spaced-svc",
+    srcs = ["//crates/apps/spaced/guest/svc"],
+    outs = ["spaced-svc"],
+    cmd = "cp \"$(location //crates/apps/spaced/guest/svc:svc)\" \"$@\"",
+)
+
+pkg_tar(
+    name = "spaced-svc_layer",
+    srcs = [":copy_spaced-svc"],
+    compression_level = 6,
+    extension = "tar.gz",
+    mode = "0755",
+    package_dir = "/artifacts/bin",
+)
+
+genrule(
+    name = "supervisor_compatibility",
+    srcs = [":copy_space-runtime-supervisor-svc"],
+    outs = ["space-runtime-supervisor-compatibility"],
+    cmd = "sha256sum \"$(location :copy_space-runtime-supervisor-svc)\" | cut -d \" \" -f 1 > \"$@\"",
+)
+
+pkg_tar(
+    name = "probe_layer",
+    srcs = [":probe_binary"],
+    compression_level = 6,
+    extension = "tar.gz",
+    mode = "0755",
+    package_dir = "/artifacts/bin",
+)
+
+pkg_tar(
+    name = "compatibility",
+    srcs = [":supervisor_compatibility"],
+    compression_level = 6,
+    extension = "tar.gz",
+    mode = "0644",
+    package_dir = "/artifacts/etc",
+)
+
+oci_image(
+    name = "image",
+    architecture = "amd64",
+    env = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
+    labels = {
+        "org.opencontainers.image.title": "space-rust-build-kind",
+        "org.opencontainers.image.description": "SPACE Rust build artifacts for the local kind stack: the union of every production artifact set from one build.",
+    },
+    os = "linux",
+    tars = [
+        ":space-api-svc_layer",
+        ":space-buildmgr_layer",
+        ":space-buildmgr-svc_layer",
+        ":space-cluster-controller_layer",
+        ":space-credmgr-svc_layer",
+        ":space-data-plane-svc_layer",
+        ":space-db-migrator_layer",
+        ":space-internal-api-svc_layer",
+        ":space-mock-branching-key-provider-svc_layer",
+        ":space-netgtw-svc_layer",
+        ":space-node-api-svc_layer",
+        ":space-nodectl_layer",
+        ":space-nodectl-svc_layer",
+        ":space-nodemgr-svc_layer",
+        ":space-rtmgr_layer",
+        ":space-rtmgr-svc_layer",
+        ":space-runtime-supervisor-svc_layer",
+        ":space-sbxmgr_layer",
+        ":space-sbxmgr-svc_layer",
+        ":space-spaced-host-svc_layer",
+        ":space-template-publish_layer",
+        ":space-tmplmgr_layer",
+        ":space-tmplmgr-svc_layer",
+        ":space-volmgr_layer",
+        ":space-volmgr-svc_layer",
+        ":spaced_layer",
+        ":spaced-svc_layer",
+        ":probe_layer",
+        ":compatibility",
+    ],
+    workdir = "/",
+)
+
+oci_load(
+    name = "load",
+    image = ":image",
+    repo_tags = ["space-rust-build-kind:local"],
+)
+
+filegroup(
+    name = "image_tarball",
+    srcs = [":load"],
+    output_group = "tarball",
+    visibility = ["//visibility:public"],
+)

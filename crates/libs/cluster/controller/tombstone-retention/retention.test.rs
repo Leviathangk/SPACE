@@ -7,7 +7,9 @@ use pplx_space_db_test_fixtures::{
 };
 use uuid::Uuid;
 
-use super::*;
+use pplx_space_cluster_controller_tombstone_retention::*;
+use pplx_space_common_core::sql;
+use std::time::Duration;
 
 use pplx_space_test_env::TestResult;
 
@@ -74,9 +76,9 @@ async fn tick_uses_configured_batch_and_retention() {
 fn config_defaults_to_bounded_retention() {
     let config = ReconcilerConfig::default();
 
-    assert_eq!(config.tick, DEFAULT_TICK);
-    assert_eq!(config.retention, DEFAULT_RETENTION);
-    assert_eq!(config.max_records_per_tick, DEFAULT_MAX_RECORDS_PER_TICK);
+    assert_eq!(config.tick, Duration::from_secs(300));
+    assert_eq!(config.retention, Duration::from_secs(7 * 24 * 60 * 60));
+    assert_eq!(config.max_records_per_tick, 1_000);
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -43,8 +43,8 @@ use crate::started_sandbox_repair;
 use crate::stuck_container_creating_gc;
 use crate::stuck_snapshot_reaper;
 use crate::suspended_execution_reaper;
-use crate::tombstone_retention;
 use crate::transient_lifecycle_sweeper;
+use pplx_space_cluster_controller_tombstone_retention as tombstone_retention;
 use pplx_space_common_svc::sql::sandbox_residency::{NODE_CENSUS_RESIDENCY_ENV, ResidencyEvidence};
 
 /// Bounded grace period for in-flight reconciler ticks to drain after the

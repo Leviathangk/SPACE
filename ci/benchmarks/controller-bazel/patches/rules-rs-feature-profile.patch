@@ -1,0 +1,115 @@
+diff --git a/rs/extensions.bzl b/rs/extensions.bzl
+--- a/rs/extensions.bzl
++++ b/rs/extensions.bzl
+@@ -327,6 +327,11 @@
+         internal_packages.add("@%s//:__subpackages__" % repo_name)
+     internal_packages = list(internal_packages)
+ 
++    profiled_targets = set([
++        "@%s//:%s" % (hub_name, _fq_crate(package["name"], package["version"]))
++        for package in packages
++        if "cargo-release-profile" in annotation_for(annotations, package["name"], package["version"], hub_name).tags
++    ])
+     for package in packages:
+         crate_name = package["name"]
+         version = package["version"]
+@@ -343,6 +348,9 @@
+         deps_select = _select(feature_resolutions.deps)
+         for triple, deps in annotation.deps_select.items():
+             deps_select[triple] = deps_select.get(triple, []) + deps
++
++        if "cargo-release-profile" in annotation.tags:
++            deps_select = {triple: [dep for dep in deps if dep in profiled_targets] for triple, deps in deps_select.items()}
+ 
+         if suggested_annotation:
+             print("""
+@@ -393,7 +401,8 @@
+             target_compatible_with_select = annotation.target_compatible_with_select,
+             aliases = feature_resolutions.aliases,
+             crate_features = annotation.crate_features,
+-            crate_features_select = _select(feature_resolutions.features_enabled),
++            # Benchmark oracle: captured Cargo release features, including empty sets.
++            crate_features_select = annotation.crate_features_select if "cargo-release-profile" in annotation.tags else _select(feature_resolutions.features_enabled),
+             use_legacy_rules_rust_platforms = use_legacy_rules_rust_platforms,
+         )
+ 
+diff --git a/rs/private/cargo_workspace_graph.bzl b/rs/private/cargo_workspace_graph.bzl
+--- a/rs/private/cargo_workspace_graph.bzl
++++ b/rs/private/cargo_workspace_graph.bzl
+@@ -623,7 +623,8 @@
+             for triple in match_info.matches:
+                 if not is_first_party_dep or materialize_workspace_members:
+                     workspace_dep_labels_by_triple[triple].add(":" + dep_name)
+-                feature_resolutions.features_enabled[triple].update(features)
++                if not dep.get("optional"):
++                    feature_resolutions.features_enabled[triple].update(features)
+ 
+     for crate, annotation_versions in annotations.items():
+         for version_key, annotation in annotation_versions.items():
+diff --git a/rs/private/cfg_parser.bzl b/rs/private/cfg_parser.bzl
+--- a/rs/private/cfg_parser.bzl
++++ b/rs/private/cfg_parser.bzl
+@@ -318,6 +318,8 @@
+ def _eval_eq(ctx, key, value, features):
+     if key == "feature":
+         return value in features
++    if key == "target_has_atomic" and ctx["target_arch"] == "x86_64":
++        return value in ["8", "16", "32", "64", "ptr"]
+     if key == "target_feature":
+         return _target_has_feature(ctx, value)
+     known = [
+diff --git a/rs/private/rust_crate.bzl b/rs/private/rust_crate.bzl
+--- a/rs/private/rust_crate.bzl
++++ b/rs/private/rust_crate.bzl
+@@ -1,3 +1,4 @@
++load("@@//ci/benchmarks/controller-bazel:units.bzl", "CARGO_UNITS", "HOST_PACKAGES", "PROC_MACROS", "TARGET_PACKAGES")
+ load("@package_metadata//rules:package_metadata.bzl", "package_metadata")
+ load(
+     "@rules_rust//rust/private:rust.bzl",
+@@ -49,6 +50,23 @@
+         rustc_env = {},
+         skip_deps_verification = False,
+         crate_visibility = ["//visibility:public"]):
++    if "cargo-release-profile" in tags:
++        unit = CARGO_UNITS[name + "-" + version]
++        host_features = unit.get("host", unit.get("target", []))
++        target_features = unit.get("target", host_features)
++        exec_config = "@@//ci/benchmarks/controller-bazel:exec_configuration"
++        if is_proc_macro:
++            crate_features = host_features
++            rustc_flags = rustc_flags + ["-Copt-level=0", "-Ccodegen-units=256", "-Cdebug-assertions=off", "-Cstrip=symbols"]
++        else:
++            crate_features = select({exec_config: host_features, "//conditions:default": target_features})
++        conditional_crate_features = {}
++        deps = select({
++            exec_config: [dep for dep in deps if str(dep).split("//:")[-1] in HOST_PACKAGES],
++            "//conditions:default": [dep for dep in deps if str(dep).split("//:")[-1] in TARGET_PACKAGES or str(dep).split("//:")[-1] in PROC_MACROS],
++        })
++        build_deps = [dep for dep in build_deps if str(dep).split("//:")[-1] in HOST_PACKAGES]
++
+     package_metadata(
+         name = name + "_package_metadata",
+         purl = purl,
+@@ -144,6 +162,22 @@
+                 tags = build_script_target_tags,
+             )
+ 
++        elif "cargo-release-profile" in tags:
++            # Freeze cfgs before the build-script executable transitions to exec.
++            # Its features describe the crate it builds, not its own platform.
++            for role, features, opt in [("target", target_features, "3"), ("host", host_features, "0")]:
++                role_kwargs = dict(build_script_kwargs)
++                role_kwargs["build_script_env"] = build_script_env | {"OPT_LEVEL": opt}
++                cargo_build_script(
++                    name = "_bs_" + role,
++                    crate_features = features,
++                    **role_kwargs
++                )
++            native.alias(
++                name = "_bs",
++                actual = select({exec_config: ":_bs_host", "//conditions:default": ":_bs_target"}),
++                tags = build_script_target_tags,
++            )
+         else:
+             cargo_build_script(
+                 name = "_bs",

@@ -1,0 +1,9 @@
+http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+
+http_file(
+    name = "benchmark_health_probe",
+    downloaded_file_path = "grpc_health_probe",
+    executable = True,
+    sha256 = "ceeacfc858929b223f90a823e7da46ab34605ec7c2a9ee1dd272fa9e4fedf5e6",
+    urls = ["https://github.com/grpc-ecosystem/grpc-health-probe/releases/download/v0.4.48/grpc_health_probe-linux-amd64"],
+)

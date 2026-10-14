@@ -256,7 +256,7 @@ where
                 "sandbox",
                 report.deleted_sandboxes_deleted,
             );
-            tracing::info!(
+            tracing::info!(target: "pplx_space_cluster_controller_server::tombstone_retention",
                 direct_nodes_deleted = report.direct_nodes_deleted,
                 templates_deleted = report.templates_deleted,
                 deleted_sandboxes_deleted = report.deleted_sandboxes_deleted,
@@ -271,7 +271,7 @@ pub async fn run<S>(config: ReconcilerConfig, sink: S, shutdown_token: Cancellat
 where
     S: RetentionSink,
 {
-    tracing::info!(
+    tracing::info!(target: "pplx_space_cluster_controller_server::tombstone_retention",
         tick_secs = config.tick.as_secs(),
         retention_secs = config.retention.as_secs(),
         max_records_per_tick = config.max_records_per_tick,
@@ -290,7 +290,7 @@ where
                 let started = Instant::now();
                 match reconciler.tick().await {
                     Ok(report) => {
-                        tracing::debug!(
+                        tracing::debug!(target: "pplx_space_cluster_controller_server::tombstone_retention",
                             direct_nodes_deleted = report.direct_nodes_deleted,
                             templates_deleted = report.templates_deleted,
                             deleted_sandboxes_deleted = report.deleted_sandboxes_deleted,
@@ -302,7 +302,7 @@ where
                         );
                     }
                     Err(error) => {
-                        tracing::warn!(error = %error, "tombstone-retention tick failed");
+                        tracing::warn!(target: "pplx_space_cluster_controller_server::tombstone_retention", error = %error, "tombstone-retention tick failed");
                     }
                 }
             }
@@ -321,6 +321,3 @@ pub fn run_with_pool(
 fn count_to_u64(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)
 }
-
-#[cfg(test)]
-mod tests;

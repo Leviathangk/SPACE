@@ -5208,6 +5208,7 @@ dependencies = [
  "pplx-space-aws-client",
  "pplx-space-cluster-pool",
  "pplx-space-cluster-reconciler",
+ "pplx-space-cluster-controller-tombstone-retention",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-common-svc",
@@ -5239,6 +5240,22 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "pplx-space-cluster-controller-tombstone-retention"
+version = "0.8.0"
+dependencies = [
+ "pplx-space-cluster-pool",
+ "pplx-space-common-core",
+ "pplx-space-db-test-fixtures",
+ "pplx-space-metrics",
+ "pplx-space-test-env",
+ "sqlx",
+ "tokio",
+ "tokio-util",
+ "tracing",
  "uuid",
 ]
 
