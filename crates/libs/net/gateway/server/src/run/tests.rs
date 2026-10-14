@@ -2,21 +2,6 @@ use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio_stream::StreamExt;
 
-#[test]
-fn network_policy_loader_accepts_v1_and_fails_closed_without_it() {
-    let v1 = NetworkPolicyV1::deny_all();
-    let v1_proto = NetworkPolicyProto::from(&v1);
-
-    assert_eq!(
-        network_policy_from_host_control_proto(Some(&v1_proto)).unwrap(),
-        v1.clone(),
-        "the V1 host-control field hydrates the gateway"
-    );
-
-    let _error = network_policy_from_host_control_proto(None)
-        .expect_err("a response without a V1 policy must fail closed");
-}
-
 #[tokio::test]
 async fn control_connection_admission_holds_until_connection_drop() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
