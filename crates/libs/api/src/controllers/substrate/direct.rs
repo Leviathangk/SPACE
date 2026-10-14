@@ -1820,7 +1820,8 @@ impl DirectSubstrate {
             (Some(vcpu), Some(memory_mib)) => Some(PooledExecutionPoolShape::new(
                 vcpu,
                 memory_mib,
-                pplx_space_common_core::types::DiskIoLimits::default(),
+                pplx_space_common_core::types::DiskIoLimits::configured_default()
+                    .map_err(|error| ControllerError::internal(error.to_string()))?,
             )),
             (None, None) => None,
             _ => {
@@ -3287,7 +3288,9 @@ impl SubstrateAdapter for DirectSubstrate {
                         vcpu,
                         memory_mib,
                         disk_mib: None,
-                        disk_io_limits: pplx_space_common_core::types::DiskIoLimits::default(),
+                        disk_io_limits:
+                            pplx_space_common_core::types::DiskIoLimits::configured_default()
+                                .map_err(|error| ControllerError::internal(error.to_string()))?,
                         active_node_id: Some(candidate.id),
                         route_identity: Some(route_identity),
                     };

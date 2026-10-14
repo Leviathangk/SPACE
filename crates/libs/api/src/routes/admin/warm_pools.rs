@@ -391,7 +391,28 @@ fn configured_disk_io_ceiling() -> Result<DiskIoLimits, ControllerError> {
             })
         })
         .transpose()
-        .map(Option::unwrap_or_default)
+        .and_then(|limits| {
+            limits.map(Ok).unwrap_or_else(|| {
+                DiskIoLimits::configured_default()
+                    .map_err(|error| ControllerError::internal(error.to_string()))
+            })
+        })
+}
+
+pub(crate) fn validate_disk_io_configuration() -> Result<(), ControllerError> {
+    if let Some(capability) = configured_disk_io_policy_capability()?.disk_io
+        && (capability.default_operations_per_sec > capability.max_operations_per_sec
+            || capability.default_bandwidth_mib_per_sec > capability.max_bandwidth_mib_per_sec)
+    {
+        tracing::warn!(
+            default_iops = capability.default_operations_per_sec,
+            maximum_override_iops = capability.max_operations_per_sec,
+            default_bandwidth_mib = capability.default_bandwidth_mib_per_sec,
+            maximum_override_bandwidth_mib = capability.max_bandwidth_mib_per_sec,
+            "disk I/O default exceeds the explicit-policy ceiling; inherited policies and resets use the default, not the ceiling"
+        );
+    }
+    Ok(())
 }
 
 fn configured_disk_io_policy_capability()
@@ -408,7 +429,8 @@ fn disk_io_policy_capability_from_values(
     let disk_io = match (operations, bandwidth) {
         (None, None) => None,
         (Some(operations), Some(bandwidth)) => {
-            let defaults = DiskIoLimits::default();
+            let defaults = DiskIoLimits::configured_default()
+                .map_err(|error| ControllerError::internal(error.to_string()))?;
             let limits = DiskIoLimits::try_new(
                 parse_positive_u64("SPACE_DISK_IO_SAFETY_MAX_OPERATIONS_PER_SEC", operations)?,
                 parse_positive_u64("SPACE_DISK_IO_SAFETY_MAX_BANDWIDTH_MIB_PER_SEC", bandwidth)?,

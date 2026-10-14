@@ -604,7 +604,11 @@ async fn resolve_cold_create_resources(
         restoring,
     } = input;
     if !capabilities.resolves_cold_create_shape || runtime != RuntimeKind::Firecracker {
-        return Ok((requested, DiskIoLimits::default()));
+        return Ok((
+            requested,
+            DiskIoLimits::configured_default()
+                .map_err(|error| ControllerError::internal(error.to_string()))?,
+        ));
     }
     if boot_mode == CreateBootMode::Fallthrough
         && let Some(pool_assignment) = resolve_kubernetes_pool_configured_resources(
@@ -625,14 +629,22 @@ async fn resolve_cold_create_resources(
         return Ok((pool_assignment.resources, pool_assignment.disk_io_limits));
     }
     if restoring || (requested.vcpu.is_some() && requested.memory_mib.is_some()) {
-        return Ok((requested, DiskIoLimits::default()));
+        return Ok((
+            requested,
+            DiskIoLimits::configured_default()
+                .map_err(|error| ControllerError::internal(error.to_string()))?,
+        ));
     }
     let shape =
         crate::template_inventory_store::release_build_shape(pool, template, content_hash, runtime)
             .await
             .map_err(|err| db_contention_error("failed to load template build shape", &err))?;
     let Some(shape) = shape else {
-        return Ok((requested, DiskIoLimits::default()));
+        return Ok((
+            requested,
+            DiskIoLimits::configured_default()
+                .map_err(|error| ControllerError::internal(error.to_string()))?,
+        ));
     };
     let resources = SandboxResources {
         vcpu: requested.vcpu.or(Some(shape.vcpu.get().get())),
@@ -648,7 +660,11 @@ async fn resolve_cold_create_resources(
         memory_mib = ?resources.memory_mib,
         "using the template's build shape for unset create resources"
     );
-    Ok((resources, DiskIoLimits::default()))
+    Ok((
+        resources,
+        DiskIoLimits::configured_default()
+            .map_err(|error| ControllerError::internal(error.to_string()))?,
+    ))
 }
 
 fn validate_inherited_pool_disk(disk_mib: Option<u32>) -> Result<(), ControllerError> {
