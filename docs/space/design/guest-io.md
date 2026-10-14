@@ -45,9 +45,67 @@ install, and uploads arrive in bursts.
 
 Every idle sandbox holds its credit, so many sandboxes spending it together
 load the host's page cache and disk at once. The per-sandbox limiter does not
-make a dense node fair: at hundreds of sandboxes each one's fair share is far
-below its limit. That takes a host-level backstop, such as cgroup I/O
-weights, which SPACE does not configure.
+make a dense node fair: at hundreds of sandboxes each one's fair share can be
+below its limit. Use the aggregate host disk budget below to bound physical
+I/O from all sandboxes together. This does not provide per-sandbox scheduling
+fairness or bound requests served from the host's page cache.
+
+## Host disk protection
+
+Node-manager can set `io.max` on the sandbox parent cgroup, `/sys/fs/cgroup/space`.
+Management processes outside that cgroup do not consume this budget. The feature
+is opt-in: an absent `enabled` leaves existing limits untouched; `enabled = false`
+clears limits on the currently resolved backing devices. Invalid capacity,
+unexpected device count, or failure to write a limit prevents node-manager from
+becoming ready. A write failure can leave some devices configured; correct the
+configuration and restart, or explicitly disable it. Removing the section alone
+does not undo an applied limit.
+
+For storage without a built-in profile, configure measured aggregate capacity in
+the node-manager TOML file (`--config`). This synthetic example describes two
+equally capable backing devices; replace the capacity values with measurements
+from the intended filesystem, read/write mix, and acceptable tail latency:
+
+```toml
+[disk_io_reservation]
+enabled = true
+target_path = "/space/cache"
+sandbox_capacity_percent = 70
+read_weight_percent = 50
+write_weight_percent = 50
+
+[disk_io_reservation.custom_capacity]
+expected_device_count = 2
+read_iops = 100000
+write_iops = 60000
+read_bandwidth_mib_per_sec = 1000
+write_bandwidth_mib_per_sec = 600
+```
+
+This example allows aggregate sandbox reads of 35,000 IOPS and 350 MiB/s,
+and writes of 21,000 IOPS and 210 MiB/s. Node-manager divides each aggregate
+limit equally across the resolved leaf devices, rounding down. Both weights
+must be positive and sum to 100; the sandbox percentage must be in `1..=100`.
+The device count is checked before writing any limits. Heterogeneous devices
+need a conservative capacity based on the slowest member; capacity percentages
+are a budgeting model, not a guarantee of management latency or reserved IOPS.
+Measure buffered-write attribution and writeback on the deployed kernel as well
+as direct I/O; the VM uses host-buffered disk I/O.
+
+`custom_capacity` is mutually exclusive with `capacity_profile` and makes no
+cloud metadata request. Built-in profiles `aws-r6id-metal` and `aws-m5d-metal`
+use published saturation capacity and expect four leaf devices. When enabled
+without either capacity setting, node-manager selects one of those profiles
+through AWS IMDSv2 and fails on unsupported instance types. No host capacity is
+assumed for an unconfigured deployment. Deploying the binary alone does not
+enable a parent cap.
+
+The parent cap bounds physical I/O reaching its backing devices, including
+concurrent guest bursts, but not CPU, memory pressure, or snapshot-memory faults
+served from cache. Validate foreground p95/p99 latency under concurrent read and
+write load, including after idle guests have accumulated burst credit. Track
+physical device I/O, cgroup `io.stat` and pressure, and lifecycle latency alongside
+guest throughput. Do not select a budget from device utilization alone.
 
 ## Uploads
 
@@ -199,4 +257,5 @@ hop.
 - Journal commits and buffered writeback reach the disk one page per request.
   A device that takes several segments per request would merge them; that is
   a Firecracker change.
-- Nothing bounds the combined bursts of many sandboxes on one host.
+- Combined physical disk traffic is unbounded unless a host budget is enabled.
+  A parent budget does not establish per-sandbox fairness or bound host-cache I/O.

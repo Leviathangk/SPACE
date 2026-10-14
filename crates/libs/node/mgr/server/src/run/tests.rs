@@ -30,6 +30,30 @@ fn configuration_precedence_and_owned_sections() {
     toml::from_str::<NodeConfig>("[network_pool]\ntarget = 1\ntarget_ready_slots = 2").unwrap_err();
 }
 
+#[test]
+fn custom_disk_capacity_reaches_startup_policy_without_a_cloud_profile() {
+    let config: NodeConfig = toml::from_str(
+        r#"
+        [disk_io_reservation]
+        enabled = true
+        [disk_io_reservation.custom_capacity]
+        expected_device_count = 2
+        read_iops = 100000
+        write_iops = 60000
+        read_bandwidth_mib_per_sec = 1000
+        write_bandwidth_mib_per_sec = 600
+        "#,
+    )
+    .unwrap();
+    let resolved = resolve_disk_io_reservation_config(config.disk_io_reservation).unwrap();
+    assert!(resolved.capacity_profile.is_none());
+    let capacity = resolved
+        .custom_capacity
+        .expect("startup must retain the measured capacity");
+    assert_eq!(capacity.expected_device_count.get(), 2);
+    assert_eq!(capacity.read_iops, 100000);
+}
+
 // Invoked in a separate test process by the handoff test; ordinary suite
 // runs have no probe path and do nothing. Uses the real flock boundary.
 #[test]

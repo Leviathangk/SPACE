@@ -1,10 +1,14 @@
 use std::future::Future;
 
 use pplx_space_common_core::types::SandboxId;
-use pplx_space_common_grpc::is_client_connect_failure;
+use pplx_space_common_grpc::client_connect_failure_cause;
+use pplx_space_metrics::grpc::ClientReplayOutcome;
 use tokio::time::Instant;
 
 use super::{ControllerError, RuntimeClient, Substrate, SubstrateAdapter};
+
+/// Tags `grpc.client.replay`, as the worker dials tag their connect spans.
+const SERVICE: &str = "worker-node-api";
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RuntimeRpcError {
@@ -28,6 +32,9 @@ impl RuntimeClient {
     /// Resolution and both attempts share `deadline`. A fresh probe may change
     /// the endpoint, so mutations must retain their execution-generation fence.
     /// Ambiguous failures remain the caller's responsibility to reconcile.
+    /// Each replay decision counts once in `grpc.client.replay`, with the
+    /// proof the first failure carried and what became of the replay; a call
+    /// its caller abandons midway counts nothing.
     pub(crate) async fn call<Req, T, F, Fut>(
         &mut self,
         substrate: &Substrate,
@@ -56,9 +63,20 @@ impl RuntimeClient {
             request.set_timeout(deadline.saturating_duration_since(Instant::now()));
             operation(client, request)
         };
-        tokio::time::timeout_at(deadline, async {
+        // Set once the first attempt proves it was never sent, then once the
+        // replay's fate is known; a replay the deadline cuts short leaves the
+        // outcome unset.
+        let mut replay_cause = None;
+        let mut replay_outcome = None;
+        let result = tokio::time::timeout_at(deadline, async {
             let status = match attempt(self.clone()).await {
-                Err(status) if is_client_connect_failure(&status) => status,
+                Err(status) => match client_connect_failure_cause(&status) {
+                    Some(cause) => {
+                        replay_cause = Some(cause);
+                        status
+                    }
+                    None => return Err(status.into()),
+                },
                 result => return result.map_err(Into::into),
             };
             if Instant::now() >= deadline {
@@ -69,17 +87,39 @@ impl RuntimeClient {
                 error = %status,
                 "runtime RPC was not transmitted; retrying on a fresh worker connection"
             );
-            let Some(client) = substrate.probe_runtime_client(sandbox_id).await? else {
-                return Err(status.into());
+            let client = match substrate.probe_runtime_client(sandbox_id).await {
+                Ok(Some(client)) => client,
+                Ok(None) => {
+                    replay_outcome = Some(ClientReplayOutcome::NoFreshClient);
+                    return Err(status.into());
+                }
+                Err(error) => {
+                    replay_outcome = Some(ClientReplayOutcome::NoFreshClient);
+                    return Err(error.into());
+                }
             };
             *self = client;
             if Instant::now() >= deadline {
                 return Err(expired());
             }
-            attempt(self.clone()).await.map_err(Into::into)
+            let replayed = attempt(self.clone()).await;
+            replay_outcome = Some(if replayed.is_ok() {
+                ClientReplayOutcome::ReplayedOk
+            } else {
+                ClientReplayOutcome::ReplayedError
+            });
+            replayed.map_err(Into::into)
         })
         .await
-        .unwrap_or_else(|_| Err(expired()))
+        .unwrap_or_else(|_| Err(expired()));
+        if let Some(cause) = replay_cause {
+            pplx_space_metrics::grpc::client_replay(
+                SERVICE,
+                cause.as_str(),
+                replay_outcome.unwrap_or(ClientReplayOutcome::DeadlineExpired),
+            );
+        }
+        result
     }
 }
 

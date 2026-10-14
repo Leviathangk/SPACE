@@ -449,10 +449,10 @@ fn assert_failed_at_handshake_bound(
 
 // A peer that accepts TCP but never answers the ClientHello fails the connect
 // with the TLS handshake bound's own cause, not as an abandoned attempt and not
-// at once. The bound outlasts the dial and name-resolution shares of the cap,
-// so the cap leaves room for it only by counting it. This waits out the real
-// bound: a paused clock could fire the cap before the loopback dial's
-// readiness is observed.
+// at once. The bound outlasts the dial and name-resolution shares of the cap
+// and its margin, so the cap leaves room for it only by counting it. This
+// waits out the real bound: a paused clock could fire the cap before the
+// loopback dial's readiness is observed.
 #[cfg(feature = "internal-tls")]
 #[tokio::test]
 async fn a_tls_peer_that_never_answers_fails_the_connect_at_its_handshake_bound() {
@@ -460,7 +460,7 @@ async fn a_tls_peer_that_never_answers_fails_the_connect_at_its_handshake_bound(
     let (address, silent_peer) = silent_tls_peer().await;
     let dir = tempfile::tempdir().unwrap();
     let ca = std::fs::read(write_test_ca(dir.path())).unwrap();
-    let handshake_bound = Duration::from_secs(4);
+    let handshake_bound = Duration::from_secs(5);
     let endpoint = tonic::transport::Endpoint::from_shared(format!("https://{address}"))
         .unwrap()
         .connect_timeout(Duration::from_millis(500))
@@ -526,7 +526,7 @@ async fn an_internal_rpc_connect_fails_at_its_transports_handshake_bound() {
     install_crypto_provider();
     let (address, silent_peer) = silent_tls_peer().await;
     let dir = tempfile::tempdir().unwrap();
-    let handshake_bound = Duration::from_secs(4);
+    let handshake_bound = Duration::from_secs(5);
     let endpoint = internal_rpc_connect_endpoint(address, dir.path(), handshake_bound).await;
 
     let started = tokio::time::Instant::now();
@@ -552,7 +552,7 @@ async fn a_watched_internal_rpc_connect_fails_at_its_transports_handshake_bound(
     install_crypto_provider();
     let (address, silent_peer) = silent_tls_peer().await;
     let dir = tempfile::tempdir().unwrap();
-    let handshake_bound = Duration::from_secs(4);
+    let handshake_bound = Duration::from_secs(5);
     let endpoint = internal_rpc_connect_endpoint(address, dir.path(), handshake_bound).await;
 
     let started = tokio::time::Instant::now();
@@ -584,7 +584,7 @@ async fn a_watched_dial_applies_tls_and_its_handshake_bound() {
     let (address, silent_peer) = silent_tls_peer().await;
     let dir = tempfile::tempdir().unwrap();
     let ca = std::fs::read(write_test_ca(dir.path())).unwrap();
-    let handshake_bound = Duration::from_secs(4);
+    let handshake_bound = Duration::from_secs(5);
     let endpoint = tonic::transport::Endpoint::from_shared(format!("https://{address}"))
         .unwrap()
         .connect_timeout(Duration::from_millis(500))
@@ -694,7 +694,8 @@ async fn an_unmarked_timed_out_dial_is_not_a_client_connect_failure() {
 }
 
 // A refused dial is a connect failure through either connector: the refusal
-// itself proves the dial failed.
+// itself proves the dial failed. SPACE's connector reports it as its own
+// connect-phase failure, tonic's as the refusal.
 #[tokio::test]
 async fn a_refused_dial_is_a_client_connect_failure_through_either_connector() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -704,16 +705,26 @@ async fn a_refused_dial_is_a_client_connect_failure_through_either_connector() {
         .unwrap()
         .connect_timeout(Duration::from_secs(1));
 
-    for (connector, channel) in [
+    for (connector, channel, cause) in [
         (
             "space",
             super::connect_tcp_channel_lazy(endpoint.clone(), None).unwrap(),
+            crate::ClientConnectFailureCause::ConnectPhase,
         ),
-        ("tonic", endpoint.connect_lazy()),
+        (
+            "tonic",
+            endpoint.connect_lazy(),
+            crate::ClientConnectFailureCause::Refused,
+        ),
     ] {
         let status = health_check_status(channel).await;
         assert!(
             crate::is_client_connect_failure(&status),
+            "{connector}: {status:?}"
+        );
+        assert_eq!(
+            crate::client_connect_failure_cause(&status),
+            Some(cause),
             "{connector}: {status:?}"
         );
     }

@@ -427,7 +427,8 @@ async fn interrupted_update_is_observed_not_resent() -> TestResult {
 // pod client's redial, before any bytes exist. SPACE's TCP connector marks
 // that failure, so it is untransmitted and `RuntimeClient::call` replays it
 // exactly once, on the fresh client the probe resolves, which reaches the
-// restarted worker; the access deadline update then applies.
+// restarted worker, and counts that replay with the connector's cause; the
+// access deadline update then applies.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "current_thread")]
 async fn a_blackholed_worker_redial_is_untransmitted_and_replayed_once() -> TestResult {
@@ -481,6 +482,7 @@ async fn a_blackholed_worker_redial_is_untransmitted_and_replayed_once() -> Test
     );
 
     let mut attempts = 0;
+    let capture = pplx_space_metrics::test_capture::capture_counters_guard();
     let state = client
         .clone()
         .call(
@@ -496,6 +498,27 @@ async fn a_blackholed_worker_redial_is_untransmitted_and_replayed_once() -> Test
         .await?
         .into_inner();
     assert_eq!(attempts, 2, "one attempt, then one replay");
+    let replays = capture
+        .finish()
+        .into_iter()
+        .filter(|counter| counter.name == "grpc.client.replay")
+        .map(|counter| {
+            let mut tags = counter.tags;
+            tags.sort();
+            (counter.value, tags)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        replays,
+        vec![(
+            1,
+            vec![
+                "cause:connect_phase".to_owned(),
+                "outcome:replayed_ok".to_owned(),
+                "service:worker-node-api".to_owned(),
+            ]
+        )]
+    );
     assert_eq!(state.sandboxes[0].execution_generation, Some(GENERATION));
 
     let until = timestamp(jiff::Timestamp::now().as_second() + 900);

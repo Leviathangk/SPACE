@@ -37,6 +37,7 @@ fn enabled_config() -> DiskIoReservationConfig {
         enabled: Some(true),
         target_path: PathBuf::from("/space/cache"),
         capacity_profile: Some("aws-r6id-metal".into()),
+        custom_capacity: None,
         sandbox_capacity_percent: Some(70),
         read_weight_percent: Some(50),
         write_weight_percent: Some(50),
@@ -69,12 +70,66 @@ async fn explicit_capacity_profile_override_skips_instance_type_lookup() {
         instance_type: Err("must not be called"),
         calls: AtomicUsize::new(0),
     };
-    let mut config = enabled_config();
-
-    config.resolve_capacity_profile(&provider).await.unwrap();
-
-    assert_eq!(config.capacity_profile.as_deref(), Some("aws-r6id-metal"));
+    for mut config in [enabled_config(), custom_config(2)] {
+        config.resolve_capacity_profile(&provider).await.unwrap();
+        config.resolve_policy().unwrap();
+    }
     assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
+}
+
+fn custom_config(device_count: usize) -> DiskIoReservationConfig {
+    DiskIoReservationConfig {
+        capacity_profile: None,
+        custom_capacity: Some(CustomDiskIoCapacity {
+            expected_device_count: std::num::NonZeroUsize::new(device_count).unwrap(),
+            read_iops: 100_003,
+            write_iops: 60_003,
+            read_bandwidth_mib_per_sec: 1_003,
+            write_bandwidth_mib_per_sec: 603,
+        }),
+        ..enabled_config()
+    }
+}
+
+#[test]
+fn custom_capacity_bounds_the_sum_across_backing_devices() {
+    for count in [1, 2, 3, 4] {
+        let mut writer = RecordingWriter::default();
+        let reservation = apply_to_devices(
+            &custom_config(count),
+            devices().into_iter().take(count).collect(),
+            &mut writer,
+        )
+        .unwrap();
+        let ParentDiskIoReservation::Enabled {
+            effective_aggregate_limits: aggregate,
+            per_device_limits: per_device,
+            ..
+        } = reservation
+        else {
+            panic!("expected enabled reservation");
+        };
+        // A 70% budget split equally between reads/writes must never exceed
+        // 35% of either measured capacity, including division rounding.
+        assert_eq!(writer.writes.len(), count);
+        for (total, each, budget) in [
+            (aggregate.read_iops, per_device.read_iops, 35_001),
+            (aggregate.write_iops, per_device.write_iops, 21_001),
+            (
+                aggregate.read_bandwidth_mib_per_sec,
+                per_device.read_bandwidth_mib_per_sec,
+                351,
+            ),
+            (
+                aggregate.write_bandwidth_mib_per_sec,
+                per_device.write_bandwidth_mib_per_sec,
+                211,
+            ),
+        ] {
+            assert_eq!(total, each * count as u64);
+            assert!(total <= budget && budget - total < count as u64);
+        }
+    }
 }
 
 #[tokio::test]
@@ -282,6 +337,26 @@ fn enabled_configuration_rejects_incomplete_or_invalid_relative_policy_before_wr
             .contains("sum to 100")
     );
     assert!(writer.writes.is_empty());
+
+    let mut conflicting = custom_config(4);
+    conflicting.capacity_profile = Some("aws-r6id-metal".into());
+    let mut zero = custom_config(4);
+    zero.custom_capacity.as_mut().unwrap().read_iops = 0;
+    let mut overflow = custom_config(4);
+    overflow
+        .custom_capacity
+        .as_mut()
+        .unwrap()
+        .write_bandwidth_mib_per_sec = u64::MAX;
+    let mut too_small = custom_config(4);
+    too_small.custom_capacity.as_mut().unwrap().read_iops = 4;
+    for config in [conflicting, zero, overflow, too_small, custom_config(2)] {
+        apply_to_devices(&config, devices(), &mut writer).unwrap_err();
+        assert!(
+            writer.writes.is_empty(),
+            "invalid policy must not partially apply"
+        );
+    }
 }
 
 #[test]

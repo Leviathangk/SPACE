@@ -351,8 +351,9 @@ where
 }
 
 /// The span fields a JSON log line inherits when the event does not set them:
-/// the identifiers a reader filters one sandbox's or one request's lines by.
-const CORRELATION_FIELDS: [&str; 2] = ["sandbox_id", "request_id"];
+/// the identifiers a reader filters one sandbox's, one request's or one
+/// public operation's lines by.
+const CORRELATION_FIELDS: [&str; 3] = ["sandbox_id", "request_id", "operation_id"];
 
 /// [`CORRELATION_FIELDS`] values a span carries, kept in its extensions by
 /// [`SpanCorrelationLayer`].
@@ -360,6 +361,7 @@ const CORRELATION_FIELDS: [&str; 2] = ["sandbox_id", "request_id"];
 struct SpanCorrelation {
     sandbox_id: Option<String>,
     request_id: Option<String>,
+    operation_id: Option<String>,
 }
 
 impl SpanCorrelation {
@@ -367,6 +369,7 @@ impl SpanCorrelation {
         match field {
             "sandbox_id" => Some(&mut self.sandbox_id),
             "request_id" => Some(&mut self.request_id),
+            "operation_id" => Some(&mut self.operation_id),
             _ => None,
         }
     }
@@ -375,6 +378,7 @@ impl SpanCorrelation {
         [
             ("sandbox_id", self.sandbox_id.as_deref()),
             ("request_id", self.request_id.as_deref()),
+            ("operation_id", self.operation_id.as_deref()),
         ]
     }
 
@@ -383,12 +387,16 @@ impl SpanCorrelation {
         let Self {
             sandbox_id,
             request_id,
+            operation_id,
         } = recorded;
         if sandbox_id.is_some() {
             self.sandbox_id = sandbox_id;
         }
         if request_id.is_some() {
             self.request_id = request_id;
+        }
+        if operation_id.is_some() {
+            self.operation_id = operation_id;
         }
     }
 
@@ -1204,6 +1212,54 @@ pub fn elapsed_ms(started_at: Instant) -> f64 {
 
 // gRPC trace-context propagation via W3C traceparent headers. Compiled only
 // when an OpenTelemetry pipeline is compiled; otherwise the stubs below are no-ops.
+/// Whether `value` is a W3C `traceparent` SPACE stores for later work: version
+/// `00`, a non-zero 32-hex-digit trace id, a non-zero 16-hex-digit parent id,
+/// and two hex digits of flags, in lowercase. Stored trace context is
+/// validated here rather than by a database constraint.
+pub fn is_storable_traceparent(value: &str) -> bool {
+    let lowercase_hex = |field: &str| {
+        field
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    let id = |field: &str, len: usize| {
+        field.len() == len && lowercase_hex(field) && field.bytes().any(|byte| byte != b'0')
+    };
+    let mut fields = value.split('-');
+    matches!(
+        (fields.next(), fields.next(), fields.next(), fields.next(), fields.next()),
+        (Some("00"), Some(trace_id), Some(parent_id), Some(flags), None)
+            if id(trace_id, 32) && id(parent_id, 16) && flags.len() == 2 && lowercase_hex(flags)
+    )
+}
+
+/// The valid traceparents among `traceparents`, sampled ones first, each group
+/// in the order given.
+///
+/// [`trace_propagation::link_root_to_origins`] links only the first
+/// [`MAX_ORIGIN_LINKS`], and a root is kept only when an origin it links to
+/// was sampled. Putting sampled origins first means that a root with any
+/// sampled origin always links one, however many unsampled origins precede it,
+/// so a kept request keeps the work it caused.
+pub fn sampled_origins_first<'a>(traceparents: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+    let (mut sampled, unsampled): (Vec<_>, Vec<_>) = traceparents
+        .into_iter()
+        .filter(|traceparent| is_storable_traceparent(traceparent))
+        .partition(|traceparent| {
+            traceparent
+                .rsplit('-')
+                .next()
+                .and_then(|flags| u8::from_str_radix(flags, 16).ok())
+                .is_some_and(|flags| flags & 0x01 == 0x01)
+        });
+    sampled.extend(unsampled);
+    sampled
+}
+
+/// The most origins [`trace_propagation::link_root_to_origins`] links to one
+/// span. A pass that serves more records how many it left out instead.
+pub const MAX_ORIGIN_LINKS: usize = 8;
+
 #[cfg(feature = "otel")]
 pub mod trace_propagation {
     use http::HeaderMap;
@@ -1366,6 +1422,75 @@ pub mod trace_propagation {
             .is_valid()
     }
 
+    /// Link a root span to the context of the work that caused it, such as
+    /// the request that persisted the intent the root applies, and make its
+    /// sampling follow that context.
+    ///
+    /// Call it after creating `span` with `parent: None` and before entering
+    /// it, creating a child of it, or reading its context: the sampler decides
+    /// when the span starts, and sees only the links and fields given to it by
+    /// then. The span must declare `origin_trace_id` and `origin_sampled`
+    /// (and `links.dropped`, when more origins than [`MAX_ORIGIN_LINKS`] can
+    /// arrive); recording a field the span does not declare does nothing.
+    ///
+    /// Origins are linked sampled first, then in the order given (see
+    /// [`super::sampled_origins_first`]), up to [`MAX_ORIGIN_LINKS`]. A value
+    /// that is not a valid W3C traceparent is skipped. `origin_trace_id` names
+    /// the first linked origin, so a search can find the root by the origin's
+    /// trace id; a link carries no attribute of its own. `origin_sampled` is true when any linked origin
+    /// was sampled: SPACE's samplers keep such a root and drop a root whose
+    /// origins were all unsampled. Returns how many origins were linked.
+    pub fn link_root_to_origins<'a>(
+        span: &tracing::Span,
+        traceparents: impl IntoIterator<Item = &'a str>,
+    ) -> usize {
+        let mut linked = 0_usize;
+        let mut dropped = 0_usize;
+        let mut sampled = false;
+        for traceparent in super::sampled_origins_first(traceparents) {
+            let Some(context) = span_context_from_traceparent(traceparent) else {
+                continue;
+            };
+            if linked == super::MAX_ORIGIN_LINKS {
+                dropped += 1;
+                continue;
+            }
+            if linked == 0 {
+                span.record("origin_trace_id", context.trace_id().to_string().as_str());
+            }
+            sampled |= context.is_sampled();
+            span.add_link(context);
+            linked += 1;
+        }
+        if linked > 0 {
+            span.record("origin_sampled", sampled);
+        }
+        if dropped > 0 {
+            span.record("links.dropped", i64::try_from(dropped).unwrap_or(i64::MAX));
+        }
+        linked
+    }
+
+    /// Set a string attribute on a span that did not declare it as a field,
+    /// such as a caller's span that a shared library annotates. Only the
+    /// exported span carries it: logs do not see it.
+    pub fn set_span_attribute(span: &tracing::Span, key: &'static str, value: &str) {
+        span.set_attribute(key, value.to_string());
+    }
+
+    fn span_context_from_traceparent(
+        traceparent: &str,
+    ) -> Option<opentelemetry::trace::SpanContext> {
+        use opentelemetry::trace::TraceContextExt;
+        let carrier =
+            std::collections::HashMap::from([("traceparent".to_string(), traceparent.to_string())]);
+        let cx = opentelemetry::global::get_text_map_propagator(|propagator| {
+            propagator.extract(&carrier)
+        });
+        let context = cx.span().span_context().clone();
+        context.is_valid().then_some(context)
+    }
+
     /// Serialize an explicit tracing span's OpenTelemetry context as W3C
     /// traceparent. This is useful when the child work happens on another task.
     pub fn traceparent_for_span(span: &tracing::Span) -> Option<String> {
@@ -1408,6 +1533,13 @@ pub mod trace_propagation {
     pub fn has_traced_current_span() -> bool {
         false
     }
+    pub fn set_span_attribute(_span: &tracing::Span, _key: &'static str, _value: &str) {}
+    pub fn link_root_to_origins<'a>(
+        _span: &tracing::Span,
+        _traceparents: impl IntoIterator<Item = &'a str>,
+    ) -> usize {
+        0
+    }
     pub fn traceparent_for_span(_span: &tracing::Span) -> Option<String> {
         None
     }
@@ -1424,3 +1556,6 @@ mod trace_parity_fixture;
 
 #[cfg(test)]
 mod log_filter_tests;
+
+#[cfg(test)]
+mod traceparent_tests;
