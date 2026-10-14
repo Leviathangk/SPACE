@@ -16,6 +16,7 @@ pub(crate) struct ServiceSettings {
     pub lifecycle_limiter: crate::lifecycle_limiter::LifecycleLimiter,
     pub runtime_paths: RuntimePaths,
     pub guest_console_logs: bool,
+    pub experiment_policy: ExperimentPolicy,
     pub memory_admission_sources: crate::memory_admission::MemoryAdmissionSources,
     pub runtime_supervisor: crate::runtime_supervisor_client::RuntimeSupervisorLazyClient,
     pub node_status_dirty: std::sync::Arc<dyn crate::node_state_sync::NodeStatusDirtySink>,
@@ -69,6 +70,13 @@ impl ServiceSettings {
                 ),
                 store: ArtifactStorePaths::default(),
             },
+            experiment_policy: match std::env::var("SPACE_EXECUTION_EXPERIMENTS") {
+                Ok(value) => value.parse().unwrap_or_else(|error| {
+                    tracing::error!(%error, "execution experiments disabled");
+                    ExperimentPolicy::Disabled
+                }),
+                Err(_) => ExperimentPolicy::Disabled,
+            },
             guest_console_logs: std::env::var("SPACE_ENABLE_GUEST_CONSOLE_LOGS").is_ok_and(
                 |value| {
                     matches!(
@@ -88,6 +96,7 @@ impl ServiceSettings {
         tracing::info!(
             disk_admission = ?settings.disk_admission,
             guest_console_logs = settings.guest_console_logs,
+            experiments = %settings.experiment_policy,
             "resolved startup-only node-manager host settings"
         );
         settings
@@ -101,4 +110,49 @@ fn path(name: &str, default: &str) -> PathBuf {
     };
     tracing::info!(setting = name, source, path = %path.display(), "resolved startup-only runtime path");
     path
+}
+
+/// Startup-only support and admission for the compiled benchmark environment.
+/// Retain must remain configured until all experimental work has been deleted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ExperimentPolicy {
+    #[default]
+    Disabled,
+    Admit,
+    Retain,
+}
+
+impl ExperimentPolicy {
+    pub fn retains(self) -> bool {
+        self != Self::Disabled
+    }
+    pub fn admits(self) -> bool {
+        self == Self::Admit
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "",
+            Self::Admit => "fc-1.17-linux-6.18",
+            Self::Retain => "retain:fc-1.17-linux-6.18",
+        }
+    }
+}
+impl std::fmt::Display for ExperimentPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[derive(Debug, thiserror::Error)]
+#[error("unsupported SPACE_EXECUTION_EXPERIMENTS value {0:?}")]
+pub(crate) struct UnknownExperimentPolicy(String);
+impl std::str::FromStr for ExperimentPolicy {
+    type Err = UnknownExperimentPolicy;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "" => Ok(Self::Disabled),
+            "fc-1.17-linux-6.18" => Ok(Self::Admit),
+            "retain:fc-1.17-linux-6.18" => Ok(Self::Retain),
+            _ => Err(UnknownExperimentPolicy(value.to_owned())),
+        }
+    }
 }

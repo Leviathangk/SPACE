@@ -228,9 +228,19 @@ pub(super) fn print_network_policy(mode: NetworkPolicyMode, source: Option<&str>
 pub(super) enum Commands {
     /// Create a new sandbox (copies rootfs, optionally starts it)
     Create {
-        /// Runtime: fc (the only runtime supported by Create)
+        /// Exact published template content digest.
         #[arg(long)]
-        runtime: String,
+        content_hash: Option<pplx_space_common_core::types::ContentHash>,
+        /// Exact environment; must match the template's immutable binding.
+        #[arg(long)]
+        environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+        /// Legacy runtime selector; an environment determines its own runtime.
+        #[arg(
+            long,
+            required_unless_present = "environment",
+            conflicts_with = "environment"
+        )]
+        runtime: Option<String>,
         #[arg(long)]
         template: String,
         /// Local operator sandbox owner label

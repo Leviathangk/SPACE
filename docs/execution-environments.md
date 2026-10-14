@@ -15,10 +15,10 @@ and Firecracker snapshot format 9.0.0. The runtime digest covers the pinned
 Firecracker and jailer binaries, not their download archive.
 
 The implementation includes domain types, protobuf messages, a versioned JSON
-codec, and explicit E0 seed/build binding. Node-manager resolves only verified
-compiled E0; this does not activate another environment, add policy tables, or
-change execution defaults. Experimental runtime/kernel selection follows this
-binding protocol.
+codec, and explicit seed/build binding. E0 remains the default. Designated nodes
+can additionally admit the compiled cold-boot experiment described below;
+installation alone never authorizes selection. Cluster policy tables and fleet
+selection are separate operations.
 
 ## Ownership and extension boundaries
 
@@ -125,8 +125,8 @@ publish, pull and boot remains the deployment acceptance test.
 
 `ResolveExecutionEnvironment` is a read-only node-local RPC with the node-status
 peer allowlist. An omitted reference requests compiled E0; an explicit reference
-must resolve to that same approved definition. Node-manager requires Linux and a
-non-overlapping managed-store layout, verifies E0 through the execution inventory,
+must resolve to an admitted compiled definition. Node-manager requires Linux and a
+non-overlapping managed-store layout, verifies that binding through the execution inventory,
 and returns the definition with matching execution observations. Prototype layouts
 that retain unverified external execution cannot produce this binding. The RPC
 is an observation, not a reservation or an activation operation; prepare and
@@ -134,13 +134,14 @@ launch resolve again. E0 artifacts remain protected from removal.
 
 The builder distinguishes verified bindings from legacy execution before resolution:
 
-- An unpinned scratch build on Linux/x86_64 resolves E0 and receives its runtime,
-  state format and kernel identity. Custom-kernel recipes and ARM scratch builds
-  retain their unbound contract and supplied kernel pin. Neither path scans for
+- An explicit scratch request resolves exactly its admitted environment; any
+  recipe kernel pin must agree. Without a selection, unpinned Linux/x86_64 scratch
+  builds resolve E0, while custom-kernel recipes and ARM scratch builds retain
+  their unbound contract and supplied kernel pin. Neither path scans for
   the newest runtime, and inherited selector variables are overwritten. Binding
   changes only the execution/schema fields, preserving seed image provenance.
 - Derived builds require readable base and actual sandbox execution metadata.
-  An inherited environment reference must resolve and match both observations.
+  An explicit or inherited environment reference must resolve and match both observations.
   Unbound bases remain unbound; missing kernel identity is not silently attributed
   to E0. Kind's bootstrap seed records the actual staged kernel digest so new
   seeds carry complete evidence. Missing execution metadata still fails closed.
@@ -173,10 +174,8 @@ For rollback, stop producing bound releases and use retained schema-2 releases
 with the old services. Keep compatible readers while bound templates or their
 sandbox/snapshot records remain in use: older JSON/protobuf readers outside the
 template schema gate can discard the new field. This change does not claim
-fleet-wide capability placement or snapshot-version negotiation. Experimental
-benchmarks must add their own node admission and isolate pools/caches by
-environment; cluster-wide provisioning can follow separately. Installing 1.17.0
-still does not select it.
+fleet-wide capability placement or snapshot-version negotiation. The local experiment below adds explicit admission; cluster-wide provisioning
+follows separately. Installing 1.17.0 still does not select it.
 
 ## Bounded audit of existing contracts
 
@@ -210,3 +209,63 @@ host-provided runtimes, firmware boot, guest release metadata and richer snapsho
 compatibility remain owned by their first real adapter/guest consumer. These
 follow-ups do not block this contract slice or expand it into a whole-platform
 schema redesign.
+
+## Local runtime experiments
+
+The production default remains E0. A second compiled Linux/x86_64 environment,
+`fc-1.17-linux-6.18`, binds Firecracker 1.17.0 to Linux 6.18.44:
+
+```text
+sha256:959f1181ac69f0dde7125fbc81be6fcd75b64e9e06e7a393f067b96eb6fb2ac4
+```
+
+Installing either artifact does not select it. On designated builder and worker
+nodes, node-manager's startup configuration `SPACE_EXECUTION_EXPERIMENTS` accepts:
+
+| Value | New experimental work | Existing experimental cold boots | Artifact retention |
+| --- | --- | --- | --- |
+| Absent or empty | Refused | Refused | E0 only |
+| `fc-1.17-linux-6.18` | Allowed after exact verification | Allowed | E0 and candidate |
+| `retain:fc-1.17-linux-6.18` | Refused | Allowed | E0 and candidate |
+
+Unknown settings disable experimental support with a diagnostic. Keep `retain:`
+configured until all candidate sandboxes and other references have been retired;
+removing that setting or downgrading the node executable is not an admission-only
+rollback. Retention survives service restarts through the deployment configuration.
+The candidate's release and kernel are verified from the managed store and its
+kernel is staged into the execution cache. Cache loss triggers reconstruction.
+Missing or corrupt candidate files cannot replace or withdraw E0.
+
+`StartBuild` and `Create` accept an additive environment input. It contains the
+reference and recipe or template; the environment determines the runtime. Legacy
+recipe/template/runtime fields are mutually exclusive with that input. An old
+builder sees no required recipe; an old sandbox manager sees no required runtime.
+Both reject before doing work, including after a capability preflight followed
+by a service restart. `GetExecutionCapabilities.environment_selection` advertises
+understanding of this protocol, **not support for every environment**. Successful
+selected responses must acknowledge the exact reference. Clients never retry a
+missing acknowledgement as an unselected request. A preflight on an old service
+returns a retryable availability error; rejection after a reconnect remains an
+explicit error, with no fallback. A timeout after submission is ambiguous: inspect
+the returned job/sandbox identity if available before retrying.
+
+Roll out readers first: node-manager, template-manager, sandbox-manager, then
+builder and operator clients. Ordinary unselected E0 traffic continues during
+mixed versions. Enable candidate admission only on the designated nodes after
+their readers are upgraded. Candidate work sent early fails explicitly; it does
+not require a cluster-wide outage. A queued selected build retains its reference
+in a versioned job payload. A downgraded worker cannot decode that payload as an
+ordinary build and silently substitute E0; such work must be inspected/resubmitted
+after upgrading, not treated as successful.
+
+An explicit selection must match the template's recorded environment. Without a
+selection, a bound template retains that environment, including its exact runtime
+on new cold boot and stop/start. No kernel-only or runtime-only substitution is
+allowed. Local selected creation is cold-only, without pool adoption, snapshots,
+or cluster-owned identities. Candidate memory-state operations are refused.
+Candidate inventory is omitted from cluster placement reports: fleet placement,
+policy distribution, snapshot compatibility and mixed-environment pools are later
+integrations. Use the node-local clients for this experiment.
+
+See the [runtime benchmark procedure](../scripts/benchmarks/README.md#runtime-environment-benchmark)
+for building distinct templates and checking the identities that actually ran.

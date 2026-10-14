@@ -52,6 +52,10 @@ pub(super) struct BuildExecutionBinding {
 }
 
 impl BuildExecutionBinding {
+    pub(super) fn reference(&self) -> EnvironmentReference {
+        self.definition.reference()
+    }
+
     /// Legacy bases keep their execution contract. Only a requested or inherited
     /// reference opts into the verified environment protocol.
     pub(super) async fn for_base(

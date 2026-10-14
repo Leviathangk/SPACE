@@ -44,6 +44,10 @@ enum Commands {
         #[arg(long)]
         base: Option<String>,
 
+        /// Exact compiled execution environment on this builder node.
+        #[arg(long)]
+        environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+
         /// Overwrite existing template
         #[arg(long)]
         force: bool,
@@ -78,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
             id,
             base,
             force,
+            environment,
             publish_tags,
             async_mode,
             org_id,
@@ -103,24 +108,33 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 None
             };
-            let response = client
-                .start_build(StartBuildRequest {
-                    system_publication_grant_id,
-                    recipe: Some(parsed_recipe),
-                    template_id: id,
-                    options: Some(BuildOptions {
-                        force,
-                        publish_tags,
-                    }),
-                    client: Some(ClientContext {
-                        source_path: recipe,
-                        cli_version: env!("CARGO_PKG_VERSION").to_string(),
-                        hostname: hostname(),
-                    }),
-                    org_id,
-                })
+            let mut request = StartBuildRequest {
+                environment: None,
+                system_publication_grant_id,
+                recipe: Some(parsed_recipe),
+                template_id: id,
+                options: Some(BuildOptions {
+                    force,
+                    publish_tags,
+                }),
+                client: Some(ClientContext {
+                    source_path: recipe,
+                    cli_version: env!("CARGO_PKG_VERSION").to_string(),
+                    hostname: hostname(),
+                }),
+                org_id,
+            };
+            let response = if let Some(reference) = environment {
+                pplx_space_build_mgr_client::environment::bind(&mut request, reference);
+                pplx_space_build_mgr_client::environment::start_build(
+                    &mut client,
+                    request,
+                    reference,
+                )
                 .await?
-                .into_inner();
+            } else {
+                client.start_build(request).await?.into_inner()
+            };
 
             println!("Build job submitted");
             println!("  Job id: {}", response.job_id);
