@@ -17,7 +17,42 @@ pub enum EnvironmentBindingError {
     BootComponents,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum EnvironmentRequirementsError {
+    #[error("invalid execution requirements: {0}")]
+    Metadata(#[from] ExecutionMetadataError),
+    #[error("invalid boot role: {0}")]
+    Role(#[from] ArtifactComponentRoleParseError),
+    #[error("invalid boot format: {0}")]
+    Format(#[from] ArtifactFormatParseError),
+}
+
 impl EnvironmentDefinition {
+    /// Construct a request for this binding. Only a verified node resolver can
+    /// turn these requirements into evidence that the environment is usable.
+    pub fn execution_requirements(
+        &self,
+    ) -> Result<ExecutionMetadata, EnvironmentRequirementsError> {
+        let spec = self.descriptor().spec();
+        let RuntimeBinding::ManagedRelease(release) = &spec.runtime;
+        let BootProfile::LinuxDirectV1 { kernel } = &spec.boot;
+        let ExecutionCompatibilityProfile::FirecrackerSnapshotV1 { state_format } =
+            &spec.compatibility;
+        Ok(ExecutionMetadata::new(
+            release.runtime.clone(),
+            spec.guest,
+            Some(state_format.clone()),
+            vec![ArtifactComponentMetadata {
+                kind: kernel.kind,
+                version: Some(kernel.version.clone()),
+                digest: Some(kernel.digest),
+                role: Some("boot".parse()?),
+                format: Some("vmlinux".parse()?),
+            }],
+        )?
+        .with_environment(self.reference()))
+    }
+
     /// Bind observations only after checking their complete supported shape.
     /// Kernel bytes take precedence over historical directory-name aliases,
     /// matching the existing runtime component resolver's identity semantics.

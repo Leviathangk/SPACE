@@ -40,9 +40,15 @@ fn sandbox_artifact_metadata(
     sandbox_id: &str,
 ) -> Result<Option<pplx_space_common_core::types::SandboxArtifactMetadata>, RuntimeArtifactReadError>
 {
-    let path = std::path::PathBuf::from(
-        pplx_space_common_core::host::linux::paths::sandbox_metadata_path(sandbox_id),
-    );
+    sandbox_artifact_metadata_in(std::path::Path::new(CACHE_DIR), sandbox_id)
+}
+
+fn sandbox_artifact_metadata_in(
+    cache_dir: &std::path::Path,
+    sandbox_id: &str,
+) -> Result<Option<pplx_space_common_core::types::SandboxArtifactMetadata>, RuntimeArtifactReadError>
+{
+    let path = cache_dir.join(sandbox_id).join("metadata.json");
     match std::fs::read(&path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .map(Some)
@@ -55,7 +61,14 @@ fn sandbox_artifact_metadata(
 pub(super) fn sandbox_execution_metadata(
     sandbox_id: &str,
 ) -> Result<pplx_space_common_core::types::ExecutionMetadata, RuntimeArtifactReadError> {
-    match sandbox_artifact_metadata(sandbox_id)? {
+    sandbox_execution_metadata_in(std::path::Path::new(CACHE_DIR), sandbox_id)
+}
+
+pub(super) fn sandbox_execution_metadata_in(
+    cache_dir: &std::path::Path,
+    sandbox_id: &str,
+) -> Result<pplx_space_common_core::types::ExecutionMetadata, RuntimeArtifactReadError> {
+    match sandbox_artifact_metadata_in(cache_dir, sandbox_id)? {
         Some(metadata) => Ok(metadata.execution),
         None => initial_firecracker_execution_metadata(),
     }

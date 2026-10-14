@@ -201,6 +201,7 @@ pub struct NodeManagerService {
     runtime_inventory: std::sync::Arc<ArcSwapOption<RuntimeInventory>>,
     runtime_inventory_refresh_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     runtime_paths: crate::config::RuntimePaths,
+    production: bool,
     guest_console_logs: bool,
     lifecycle_limiter: std::sync::Arc<crate::lifecycle_limiter::LifecycleLimiter>,
     disk_admission: std::sync::Arc<DiskAdmission>,
@@ -296,7 +297,37 @@ impl NodeManagerService {
     ) -> Result<Response<pplx_space_execution_common::proto::NodeExecutionInventory>, Status> {
         self.authorize_peer(&request, "GetExecutionInventory", ALLOW_NODE_STATUS)?;
         let inventory = self.runtime_inventory().await?;
-        Ok(Response::new(inventory.to_proto()))
+        let mut report = inventory.to_proto();
+        // The legacy placement projection does not express complete bindings.
+        // Keep non-default environments node-local until environment placement exists.
+        if !self.production
+            && let Ok(environments) = node_artifacts::non_default_environments()
+        {
+            let initial = node_artifacts::initial_environment()?;
+            for environment in environments {
+                // A non-default binding may share either artifact with E0.
+                if environment.release().release != initial.release().release {
+                    report.runtimes.retain(|entry| {
+                        !entry.runtime.as_ref().is_some_and(|runtime| {
+                            runtime.kind
+                                == pplx_space_execution_common::proto::RuntimeKind::from(
+                                    environment.release().release.kind,
+                                ) as i32
+                                && runtime.version == environment.release().release.version.as_str()
+                        })
+                    });
+                }
+                if environment.kernel().sha256 != initial.kernel().sha256 {
+                    report.components.retain(|entry| {
+                        !entry.component.as_ref().is_some_and(|component| {
+                            component.digest.as_deref()
+                                == Some(&environment.kernel().sha256.to_string())
+                        })
+                    });
+                }
+            }
+        }
+        Ok(Response::new(report))
     }
 
     pub(crate) async fn with_memory_admission_config_and_task_tracker(
@@ -377,6 +408,7 @@ impl NodeManagerService {
             runtime_inventory: std::sync::Arc::default(),
             runtime_inventory_refresh_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             runtime_paths: settings.runtime_paths,
+            production: settings.production,
             guest_console_logs: settings.guest_console_logs,
             lifecycle_limiter: std::sync::Arc::new(
                 settings
@@ -431,6 +463,7 @@ impl NodeManagerService {
             .await;
         let snapshot = self.runtime_inventory.clone();
         let paths = self.runtime_paths.clone();
+        let production = self.production;
         self.off_runtime("discover runtime inventory", move || {
             let _guard = guard;
             if let Some(inventory) = snapshot.load_full()
@@ -439,7 +472,8 @@ impl NodeManagerService {
                 return Ok(inventory);
             }
             snapshot.store(None);
-            let inventory = std::sync::Arc::new(node_artifacts::execution_inventory(&paths)?);
+            let inventory =
+                std::sync::Arc::new(node_artifacts::execution_inventory(&paths, production)?);
             snapshot.store(Some(inventory.clone()));
             Ok(inventory)
         })

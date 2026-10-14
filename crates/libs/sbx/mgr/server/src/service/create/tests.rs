@@ -22,7 +22,7 @@ fn create_request() -> CreateRequest {
 // cleanup episode: a stranded `Creating` row would need cleanup that no caller
 // requested. The Create RPC validates the request before it gets here, so only
 // refusals that depend on the resolved template or the resolved sandbox id are
-// listed. Successful creates need the fixed sandbox cache root.
+// listed. Successful logical creates use the test service’s cache root.
 #[tokio::test]
 async fn create_refusals_before_insert_persist_nothing() {
     let cases = [
@@ -68,6 +68,7 @@ async fn create_refusals_before_insert_persist_nothing() {
                 effective_mode: BootMode::Cold,
                 id: id.clone(),
                 template_dir,
+                execution: None,
                 snapshot_dir_resolved: None,
                 snapshot_vcpu: None,
                 content_hash_resolved: case.content_hash_resolved,

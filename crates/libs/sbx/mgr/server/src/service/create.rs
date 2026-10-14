@@ -4,7 +4,7 @@ use super::activation_support::{
     space_api_route_identity_for_runtime_activation, space_api_route_identity_from_create_request,
     space_api_route_identity_to_wire, spawn_restore_state_transition,
 };
-use super::cache_cleanup::ensure_sandbox_cache_root;
+use super::cache_cleanup::ensure_sandbox_cache_root_in;
 use super::cleanup_support::{
     ActivationCleanupSpec, CleanupCompletion, read_node_execution_fence, require_state_write,
 };
@@ -194,6 +194,26 @@ impl SandboxManagerService {
         })
     }
 
+    /// Execution evidence is committed before a VM is launched. Legacy rows
+    /// without it predate selected environments; filesystem cache loss cannot
+    /// erase a candidate's durable binding or turn it into legacy execution.
+    pub(super) fn ensure_memory_state_supported(
+        &self,
+        sandbox: &crate::db::SandboxRow,
+        operation: &'static str,
+    ) -> Result<(), Status> {
+        if sandbox
+            .execution_metadata
+            .as_ref()
+            .is_some_and(super::validation::requires_cold_creation)
+        {
+            return Err(Status::failed_precondition(format!(
+                "cannot {operation}: execution environment does not support memory-state operations"
+            )));
+        }
+        Ok(())
+    }
+
     pub(super) fn ensure_not_pool_sandbox_for_snapshots(
         &self,
         sandbox: &crate::db::SandboxRow,
@@ -275,6 +295,7 @@ impl SandboxManagerService {
             effective_mode,
             id,
             template_dir,
+            execution,
             snapshot_dir_resolved,
             snapshot_vcpu,
             content_hash_resolved,
@@ -391,6 +412,7 @@ impl SandboxManagerService {
                     req.autostart,
                 ),
                 open_route_activation.as_ref(),
+                execution,
             )
             .map_err(|e| Status::internal(format!("db insert failed: {e}")))?;
         }
@@ -406,7 +428,10 @@ impl SandboxManagerService {
             },
         )?;
 
-        if let Err(status) = ensure_sandbox_cache_root(&id) {
+        let cache_dir = std::path::Path::new(CACHE_DIR);
+        #[cfg(test)]
+        let cache_dir = self.create_cache_dir.as_deref().unwrap_or(cache_dir);
+        if let Err(status) = ensure_sandbox_cache_root_in(cache_dir, &id) {
             create_cleanup.cleanup_after_failure(
                 SandboxQuarantineReasonCode::CreateInterrupted,
                 status.message(),
@@ -569,6 +594,7 @@ impl SandboxManagerService {
             };
             let r = start_resp.into_inner();
             return Ok(Response::new(CreateResponse {
+                environment: None,
                 sandbox_id: id,
                 pid: Some(r.pid),
                 guest_ip: Some(r.guest_ip),

@@ -1011,6 +1011,7 @@ fn insert_armed_pool_clone(
         },
         None,
         None,
+        None,
     )
     .unwrap();
     (id, cleanup_id)
