@@ -3,6 +3,50 @@ use super::*;
 const TEST_SANDBOX_ID: &str = "019e31d9-79a6-7132-b90f-007f1c62ddea";
 
 #[test]
+fn recovered_assignments_use_deployment_defaults_only_for_legacy_metadata() {
+    use pplx_space_common_core::types::DiskIoLimits;
+    if !pplx_space_test_env::enter_test_process(&[
+        (
+            "SPACE_DISK_IO_DEFAULT_MAX_OPERATIONS_PER_SEC",
+            Some("2000".as_ref()),
+        ),
+        (
+            "SPACE_DISK_IO_DEFAULT_MAX_BANDWIDTH_MIB_PER_SEC",
+            Some("50".as_ref()),
+        ),
+    ]) {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("snapshot");
+    write_full_suspend_artifact(&path, TEST_SANDBOX_ID, LocalArtifactId::new(), b"state");
+    let mut metadata = suspended_snapshot_dir_metadata(&path).unwrap();
+    for (operations, bandwidth, expected) in [
+        (None, None, Some(DiskIoLimits::try_new(2_000, 50).unwrap())),
+        (
+            Some(1_000),
+            Some(100),
+            Some(DiskIoLimits::try_new(1_000, 100).unwrap()),
+        ),
+        (
+            Some(5_000),
+            Some(200),
+            Some(DiskIoLimits::try_new(5_000, 200).unwrap()),
+        ),
+        (Some(1_000), None, None),
+    ] {
+        metadata.source.disk_io_max_operations_per_sec = operations;
+        metadata.source.disk_io_max_bandwidth_mib_per_sec = bandwidth;
+        assert_eq!(
+            recovered_sandbox_row_fields(&metadata)
+                .ok()
+                .map(|row| row.disk_io_limits),
+            expected
+        );
+    }
+}
+
+#[test]
 fn publication_replaces_the_complete_snapshot_and_preserves_runtime_siblings() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let sandbox_dir = tmp.path();

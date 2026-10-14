@@ -1020,7 +1020,7 @@ impl KubernetesSubstrate {
                     node_group_placement: node_group_placement.placement(),
                 },
                 pod_create_context,
-            ),
+            )?,
         )
         .await;
         let (pod, created) = match pod_result {

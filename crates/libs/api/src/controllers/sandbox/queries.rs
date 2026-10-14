@@ -620,7 +620,12 @@ async fn resolve_cold_create_resources(
         restoring,
     } = input;
     if !capabilities.resolves_cold_create_shape || runtime != RuntimeKind::Firecracker {
-        return Ok((requested, DiskIoLimits::default(), None));
+        return Ok((
+            requested,
+            DiskIoLimits::configured_default()
+                .map_err(|error| ControllerError::internal(error.to_string()))?,
+            None,
+        ));
     }
     if boot_mode == CreateBootMode::Fallthrough
         && let Some(pool_assignment) = resolve_kubernetes_pool_configured_resources(
@@ -645,12 +650,18 @@ async fn resolve_cold_create_resources(
         ));
     }
     if restoring {
-        return Ok((requested, DiskIoLimits::default(), None));
+        return Ok((
+            requested,
+            DiskIoLimits::configured_default()
+                .map_err(|error| ControllerError::internal(error.to_string()))?,
+            None,
+        ));
     }
     if requested.vcpu.is_some() && requested.memory_mib.is_some() {
         return Ok((
             requested,
-            DiskIoLimits::default(),
+            DiskIoLimits::configured_default()
+                .map_err(|error| ControllerError::internal(error.to_string()))?,
             Some(CreateShapeSource::Request),
         ));
     }
@@ -661,7 +672,8 @@ async fn resolve_cold_create_resources(
     let Some(shape) = shape else {
         return Ok((
             requested,
-            DiskIoLimits::default(),
+            DiskIoLimits::configured_default()
+                .map_err(|error| ControllerError::internal(error.to_string()))?,
             Some(CreateShapeSource::Default),
         ));
     };
@@ -681,7 +693,8 @@ async fn resolve_cold_create_resources(
     );
     Ok((
         resources,
-        DiskIoLimits::default(),
+        DiskIoLimits::configured_default()
+            .map_err(|error| ControllerError::internal(error.to_string()))?,
         Some(CreateShapeSource::Build),
     ))
 }

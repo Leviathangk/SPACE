@@ -61,6 +61,29 @@ fn optional_wire_fields_are_paired() {
 }
 
 #[test]
+fn configured_defaults_require_a_complete_valid_pair() {
+    for (operations, bandwidth, expected) in [
+        (None, None, Some(DiskIoLimits::default())),
+        (
+            Some("2000"),
+            Some("50"),
+            Some(DiskIoLimits::try_new(2_000, 50).unwrap()),
+        ),
+        (Some("2000"), None, None),
+        (None, Some("50"), None),
+        (Some("0"), Some("50"), None),
+        (Some("2000"), Some("0"), None),
+        (Some("oops"), Some("50"), None),
+        (Some("2000"), Some("18446744073709551615"), None),
+    ] {
+        assert_eq!(
+            DiskIoLimits::default_from_values(operations, bandwidth).ok(),
+            expected
+        );
+    }
+}
+
+#[test]
 fn a_drive_limiter_keeps_the_sustained_rates_and_holds_a_burst_of_each() {
     let burst = std::num::NonZeroU32::new(5).unwrap();
     let limiter = RateLimiter::for_disk(DiskIoLimits::try_new(1_000, 100).unwrap(), burst);
