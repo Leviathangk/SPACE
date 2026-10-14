@@ -1684,7 +1684,11 @@ async fn postgres_pool_configured_resources_uses_enabled_release_shape() -> Test
     assert_eq!(resources.resources.vcpu, Some(2));
     assert_eq!(resources.resources.memory_mib, Some(8192));
     assert_eq!(resources.resources.disk_mib, Some(32768));
-    assert_eq!(resources.disk_io_limits, Default::default());
+    // The fixture is a legacy materialized config, not an inherited policy.
+    assert_eq!(
+        resources.disk_io_limits,
+        DiskIoLimits::try_new(1_000, 100).unwrap()
+    );
     sqlx::query(sql!(
         "UPDATE kubernetes_pool_configs SET disk_mib = 131073
          WHERE template_release_id = $1 AND vcpu = 2"
