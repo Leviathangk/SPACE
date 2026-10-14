@@ -1188,7 +1188,7 @@ async fn register_template_release_allows_no_storage_locations() -> TestResult {
 /// metadata is backfilled by a later registration that has it.
 #[tokio::test(flavor = "current_thread")]
 async fn register_template_release_persists_execution_metadata_write_once() -> TestResult {
-    use pplx_space_common_core::types::{Arch, ExecutionMetadata};
+    use pplx_space_common_core::types::{Arch, Digest, EnvironmentReference, ExecutionMetadata};
 
     let Some(fixture) = cluster_fixture().await? else {
         return Ok(());
@@ -1197,18 +1197,18 @@ async fn register_template_release_persists_execution_metadata_write_once() -> T
 
     let digest_a = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let digest_b = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    let x86 = ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![]);
+    let x86 = ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![])
+        .with_environment(EnvironmentReference::new(Digest::sha256([1; 32])));
     let arm = ExecutionMetadata::initial_firecracker(Arch::Aarch64, vec![]);
 
-    let stored_guest_arch = |hash: &str| {
+    let stored_execution = |hash: &str| {
         let pool = fixture.service.pool.clone();
         let hash = hash.to_string();
         async move {
-            sqlx::query_scalar::<_, Option<String>>(
-                "SELECT execution_metadata->'guest'->>'architecture'
-                 FROM template_releases
-                 WHERE template_name = 'code-runtime' AND hash = $1",
-            )
+            sqlx::query_scalar::<_, Option<serde_json::Value>>(sql!(
+                "SELECT execution_metadata FROM template_releases
+                 WHERE template_name = 'code-runtime' AND hash = $1"
+            ))
             .bind(hash)
             .fetch_one(&pool)
             .await
@@ -1218,27 +1218,27 @@ async fn register_template_release_persists_execution_metadata_write_once() -> T
     // First registration with metadata populates the row.
     register_release_with_execution(&fixture.service, digest_a, &x86).await?;
     assert_eq!(
-        stored_guest_arch(digest_a).await?.as_deref(),
-        Some("x86_64")
+        stored_execution(digest_a).await?,
+        Some(serde_json::to_value(&x86)?)
     );
 
     // Re-registering with different metadata must not overwrite.
     register_release_with_execution(&fixture.service, digest_a, &arm).await?;
     assert_eq!(
-        stored_guest_arch(digest_a).await?.as_deref(),
-        Some("x86_64"),
+        stored_execution(digest_a).await?,
+        Some(serde_json::to_value(&x86)?),
         "release execution metadata is write-once"
     );
 
     // A release registered without metadata stays NULL...
     register_release(&fixture.service, digest_b, &[digest_b], &[]).await?;
-    assert_eq!(stored_guest_arch(digest_b).await?, None);
+    assert_eq!(stored_execution(digest_b).await?, None);
 
     // ...and a later registration that carries metadata backfills it.
     register_release_with_execution(&fixture.service, digest_b, &arm).await?;
     assert_eq!(
-        stored_guest_arch(digest_b).await?.as_deref(),
-        Some("aarch64")
+        stored_execution(digest_b).await?,
+        Some(serde_json::to_value(&arm)?)
     );
 
     Ok(())

@@ -9,6 +9,12 @@ service NodeManager {
   rpc GetExecutionInventory(GetExecutionInventoryRequest)
       returns (space.execution.v1.NodeExecutionInventory);
 
+  // Resolve an approved binding against verified local artifacts. This is an
+  // artifact observation, not a reservation or proof of later host admission.
+  // Callers must require this RPC; old inventory is not equivalent evidence.
+  rpc ResolveExecutionEnvironment(ResolveExecutionEnvironmentRequest)
+      returns (ResolveExecutionEnvironmentResponse);
+
   // Lease a preprovisioned network slot, or provision a pod-network allocation.
   rpc Allocate(AllocateRequest) returns (AllocateResponse);
 
@@ -346,6 +352,17 @@ service NodeManager {
 }
 
 message GetExecutionInventoryRequest {}
+
+message ResolveExecutionEnvironmentRequest {
+  // Omission requests the compiled default. A supplied reference must match an
+  // approved environment exactly; it never changes the node default.
+  optional string reference = 1;
+}
+
+message ResolveExecutionEnvironmentResponse {
+  space.execution.v1.EnvironmentDefinition definition = 1;
+  space.execution.v1.ExecutionMetadata execution = 2;
+}
 
 enum NetworkProtocol {
   NETWORK_PROTOCOL_UNSPECIFIED = 0;

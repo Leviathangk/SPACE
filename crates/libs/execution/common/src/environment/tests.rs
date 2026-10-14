@@ -9,7 +9,7 @@ const E0_CANONICAL: &str = include_str!(concat!(
     "/../../../../proto/execution/v1/fixtures/e0.canonical"
 ));
 
-fn e0() -> EnvironmentDefinition {
+pub(super) fn e0() -> EnvironmentDefinition {
     let host = HostPlatform {
         os: HostOperatingSystem::Linux,
         architecture: Arch::X86_64,

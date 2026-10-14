@@ -684,6 +684,18 @@ impl NodeManager for LocalNodeManager {
         }))
     }
 
+    async fn resolve_execution_environment(
+        &self,
+        _request: Request<pplx_space_node_mgr_client::proto::ResolveExecutionEnvironmentRequest>,
+    ) -> Result<
+        Response<pplx_space_node_mgr_client::proto::ResolveExecutionEnvironmentResponse>,
+        Status,
+    > {
+        Err(Status::failed_precondition(
+            "verified execution environments require the Linux node-manager",
+        ))
+    }
+
     async fn get_execution_inventory(
         &self,
         _request: Request<GetExecutionInventoryRequest>,

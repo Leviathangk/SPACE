@@ -6,6 +6,9 @@ use pplx_space_common_core::types::*;
 
 use crate::{ExecutionProtoError, proto};
 
+mod binding;
+pub use binding::EnvironmentBindingError;
+
 pub const ENVIRONMENT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

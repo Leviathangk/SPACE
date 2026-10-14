@@ -123,8 +123,25 @@ fn release_execution_metadata_comes_from_digest_stable_manifest() {
         Arch::X86_64,
     );
     write_metadata(dir.path(), Arch::Aarch64);
-
-    let execution = loaded_execution(dir.path()).expect("v2 manifest must load");
+    let path = dir.path().join("manifest.json");
+    let mut manifest: pplx_space_common_core::types::TemplateManifest =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let reference = pplx_space_common_core::types::EnvironmentReference::new(
+        pplx_space_common_core::types::Digest::sha256([1; 32]),
+    );
+    manifest.set_execution_metadata(
+        manifest
+            .execution
+            .clone()
+            .unwrap()
+            .with_environment(reference),
+    );
+    std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let execution = loaded_execution(dir.path()).expect("bound manifest must load");
+    assert_eq!(
+        execution.environment.as_deref(),
+        Some(reference.to_string().as_str())
+    );
     assert_eq!(
         execution.guest.map(|guest| guest.architecture),
         Some(PROTO_X86_64),
@@ -313,7 +330,7 @@ fn registration_requests_carry_publication_authority() {
 }
 
 fn sample_release_request() -> RegisterRequest {
-    RegisterRequest::Release(RegisterTemplateReleaseRequest {
+    RegisterRequest::Release(Box::new(RegisterTemplateReleaseRequest {
         system_publication_grant_id: None,
         template_name: sample_template().as_str().to_string(),
         runtime: RUNTIME_FIRECRACKER_ALIAS.to_string(),
@@ -322,7 +339,7 @@ fn sample_release_request() -> RegisterRequest {
         storage_connection_strings: Vec::new(),
         org_id: None,
         execution: None,
-    })
+    }))
 }
 
 #[test]

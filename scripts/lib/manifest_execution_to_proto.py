@@ -17,6 +17,7 @@ seed-publish Job image) and `scripts/space-upload-template.sh`.
 """
 
 import json
+import re
 import sys
 
 RUNTIME = {
@@ -42,13 +43,13 @@ COMPONENT = {
     "guest_tools": "ARTIFACT_COMPONENT_KIND_GUEST_TOOLS",
 }
 
-# TEMPLATE_MANIFEST_SCHEMA_VERSION — only the v2 shape vouches for `execution`.
-MANIFEST_SCHEMA_VERSION = 2
+# Mirrors the legacy execution and environment-bound manifest schemas.
+MANIFEST_SCHEMA_VERSIONS = (2, 3)
 
 
 def main() -> None:
     manifest = json.load(open(sys.argv[1]))
-    if manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION:
+    if manifest.get("schema_version") not in MANIFEST_SCHEMA_VERSIONS:
         sys.exit(
             f"manifest schema_version {manifest.get('schema_version')!r} "
             "does not vouch for execution metadata"
@@ -56,6 +57,15 @@ def main() -> None:
     execution = manifest.get("execution")
     if execution is None:
         sys.exit("manifest carries no execution metadata")
+
+    environment = execution.get("environment")
+    if (manifest["schema_version"] == 3) != (environment is not None):
+        sys.exit("manifest schema and environment binding disagree")
+    if environment is not None and (
+        not isinstance(environment, str)
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", environment)
+    ):
+        sys.exit("invalid environment reference")
 
     out = {
         "runtime": {
@@ -67,6 +77,8 @@ def main() -> None:
             "architecture": ARCH[execution["guest"]["architecture"]],
         },
     }
+    if environment is not None:
+        out["environment"] = environment
     state_format = execution.get("state_format")
     if state_format is not None:
         out["state_format"] = {

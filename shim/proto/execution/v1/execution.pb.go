@@ -715,11 +715,14 @@ func (x *ArtifactComponent) GetFormat() string {
 }
 
 type ExecutionMetadata struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Runtime       *RuntimeIdentity       `protobuf:"bytes,1,opt,name=runtime,proto3" json:"runtime,omitempty"`
-	Guest         *GuestPlatform         `protobuf:"bytes,2,opt,name=guest,proto3" json:"guest,omitempty"`
-	StateFormat   *StateFormatIdentity   `protobuf:"bytes,3,opt,name=state_format,json=stateFormat,proto3,oneof" json:"state_format,omitempty"`
-	Components    []*ArtifactComponent   `protobuf:"bytes,4,rep,name=components,proto3" json:"components,omitempty"`
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	Runtime     *RuntimeIdentity       `protobuf:"bytes,1,opt,name=runtime,proto3" json:"runtime,omitempty"`
+	Guest       *GuestPlatform         `protobuf:"bytes,2,opt,name=guest,proto3" json:"guest,omitempty"`
+	StateFormat *StateFormatIdentity   `protobuf:"bytes,3,opt,name=state_format,json=stateFormat,proto3,oneof" json:"state_format,omitempty"`
+	Components  []*ArtifactComponent   `protobuf:"bytes,4,rep,name=components,proto3" json:"components,omitempty"`
+	// Complete immutable binding, when explicitly verified by an environment-aware
+	// resolver. Absence must not be interpreted as E0 or as peer support.
+	Environment   *string `protobuf:"bytes,5,opt,name=environment,proto3,oneof" json:"environment,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -780,6 +783,13 @@ func (x *ExecutionMetadata) GetComponents() []*ArtifactComponent {
 		return x.Components
 	}
 	return nil
+}
+
+func (x *ExecutionMetadata) GetEnvironment() string {
+	if x != nil && x.Environment != nil {
+		return *x.Environment
+	}
+	return ""
 }
 
 type StateFormatCapability struct {
@@ -1660,15 +1670,17 @@ const file_execution_v1_execution_proto_rawDesc = "" +
 	"\n" +
 	"\b_versionB\t\n" +
 	"\a_digestB\t\n" +
-	"\a_format\"\xb4\x02\n" +
+	"\a_format\"\xeb\x02\n" +
 	"\x11ExecutionMetadata\x12=\n" +
 	"\aruntime\x18\x01 \x01(\v2#.space.execution.v1.RuntimeIdentityR\aruntime\x127\n" +
 	"\x05guest\x18\x02 \x01(\v2!.space.execution.v1.GuestPlatformR\x05guest\x12O\n" +
 	"\fstate_format\x18\x03 \x01(\v2'.space.execution.v1.StateFormatIdentityH\x00R\vstateFormat\x88\x01\x01\x12E\n" +
 	"\n" +
 	"components\x18\x04 \x03(\v2%.space.execution.v1.ArtifactComponentR\n" +
-	"componentsB\x0f\n" +
-	"\r_state_format\"\x96\x01\n" +
+	"components\x12%\n" +
+	"\venvironment\x18\x05 \x01(\tH\x01R\venvironment\x88\x01\x01B\x0f\n" +
+	"\r_state_formatB\x0e\n" +
+	"\f_environment\"\x96\x01\n" +
 	"\x15StateFormatCapability\x12C\n" +
 	"\bidentity\x18\x01 \x01(\v2'.space.execution.v1.StateFormatIdentityR\bidentity\x12\x1d\n" +
 	"\n" +
