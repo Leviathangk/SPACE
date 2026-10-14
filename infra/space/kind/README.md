@@ -364,11 +364,11 @@ sbx=sbx_01a1324d-32be-7235-a41c-1586423506c8   # as the API returned it
 id=${sbx#sbx_}
 now=$(date +%s)
 
-# 1. Logs: every SPACE pod line for the sandbox, oldest first. A line written
-#    inside a sandbox's span carries its sandbox_id even when the message
-#    does not name it.
+# 1. Logs: every SPACE pod and node journal line for the sandbox, oldest
+#    first. A line written inside a sandbox's span carries its sandbox_id even
+#    when the message does not name it.
 curl -sG localhost:13101/loki/api/v1/query_range \
-  --data-urlencode "query={namespace=\"space\"} | json | sandbox_id=\"$id\"" \
+  --data-urlencode "query={namespace=~\"space|host\"} | json | sandbox_id=\"$id\"" \
   -d start=$((now - 3600))000000000 -d end=${now}000000000 \
   -d direction=forward -d limit=1000 \
   | jq -r '.data.result[] | .stream.service as $s | .values[] | "\($s) \(.[1])"'
@@ -389,9 +389,15 @@ curl -sG localhost:19090/api/v1/query \
   --data-urlencode 'query=histogram_count(sum by (op, result) (last_over_time(space_shim_operation_latency_milliseconds{k8s_node_name="NODE"}[15m])))'
 ```
 
-Each sandbox's net-gateway runs on the node and logs to its journal without a
-systemd unit, which the local log collection does not keep; read those lines
-with `docker exec NODE journalctl | grep "$id"`. Its spans reach Tempo.
+Each sandbox's net-gateway and spaced-host run on the node and log to its
+journal without a systemd unit, from the sandbox's cgroup; the local log
+collection keeps those lines by that cgroup, so step 1 finds them in
+`namespace` `host` under `service` `space-net-gateway` and
+`space-spaced-host`, except on builder nodes, whose sidecars stay
+uncollected. A logs release installed before this collection existed keeps it
+off until `logs/local.sh up` is passed the logs chart's `profiles/kind.yaml`;
+see [Collection and semantics](logs/README.md#collection-and-semantics).
+Their spans reach Tempo.
 
 For a native API request, the `x-request-id` response header (`req_...`) is
 the `request_id` attribute of its `http.server` span and a field of the log
