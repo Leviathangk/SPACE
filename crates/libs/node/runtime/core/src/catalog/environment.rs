@@ -27,7 +27,7 @@ pub enum ResolveEnvironmentError {
 }
 
 impl InitialEnvironment {
-    /// Phase-one qualification covers Linux/x86_64 E0 only. Existing artifact
+    /// Production qualification covers Linux/x86_64 E0 only. Existing artifact
     /// pins for other architectures retain their installation meaning.
     pub fn definition(&self) -> Result<EnvironmentDefinition, InitialEnvironmentDefinitionError> {
         if self.release.architecture != Arch::X86_64 {

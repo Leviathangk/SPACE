@@ -268,3 +268,22 @@ pub(super) fn reject_incompatible_template_spaced_compatibility(
         ))
     })
 }
+
+/// A bound request must be positively acknowledged before its response is
+/// persisted or used to launch. Older node-managers discard the optional field.
+pub(super) fn require_environment_acknowledgement(
+    requested: &pplx_space_common_core::types::ExecutionMetadata,
+    resolved: &pplx_space_common_core::types::ExecutionMetadata,
+) -> Result<(), Status> {
+    if let Some(expected) = requested.environment()
+        && resolved.environment() != Some(expected)
+    {
+        return Err(Status::failed_precondition(format!(
+            "node-manager did not acknowledge requested execution environment {expected}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;

@@ -1390,14 +1390,21 @@ pub(super) async fn ensure_template_release(
             ));
         }
         if let Some(metadata) = execution_metadata {
-            backfill_template_release_execution_metadata(tx, existing.id, metadata).await?;
+            check_template_release_execution_metadata(tx, existing.id, metadata).await?;
         }
         return Ok(existing);
     }
 
-    if let Some(inserted) =
-        insert_template_release_row(tx, template_name, runtime, hash, org_id, execution_metadata)
-            .await?
+    if let Some(inserted) = super::template_releases_store::insert_release(
+        &mut **tx,
+        template_name,
+        runtime,
+        hash,
+        org_id,
+        execution_metadata,
+    )
+    .await
+    .map_err(|error| Status::internal(format!("insert template release: {error}")))?
     {
         return Ok(inserted);
     }
@@ -1419,6 +1426,9 @@ pub(super) async fn ensure_template_release(
         return Err(Status::permission_denied(
             "release ownership does not match template ownership",
         ));
+    }
+    if let Some(metadata) = execution_metadata {
+        check_template_release_execution_metadata(tx, existing.id, metadata).await?;
     }
     Ok(existing)
 }
@@ -1458,60 +1468,33 @@ async fn find_template_release_row(
     .map_err(|err| Status::internal(format!("query template_release: {err}")))
 }
 
-async fn insert_template_release_row(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    template_name: &str,
-    runtime: &str,
-    hash: &str,
-    org_id: Option<OrgId>,
-    execution_metadata: Option<&serde_json::Value>,
-) -> Result<Option<TemplateReleaseRow>, Status> {
-    sqlx::query_as::<_, TemplateReleaseRow>(sql!(
-        "INSERT INTO template_releases (template_name, type, hash, org_id, execution_metadata)
-         SELECT $1, $2, $3, COALESCE($4, org_id), $5
-         FROM templates
-         WHERE name = $1
-         ON CONFLICT (template_name, hash) DO UPDATE
-             SET execution_metadata = COALESCE(template_releases.execution_metadata, EXCLUDED.execution_metadata)
-             WHERE template_releases.org_id IS NOT DISTINCT FROM EXCLUDED.org_id
-         RETURNING id, template_name, type, hash, org_id, created_at"
-    ))
-    .bind(template_name)
-    .bind(runtime)
-    .bind(hash)
-    .bind(org_id)
-    .bind(execution_metadata)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|err| Status::internal(format!("insert template_release: {err}")))
-}
-
-/// First-write-wins backfill: releases are immutable per `(template_name,
-/// hash)`, so stored execution metadata is never overwritten — only a row
-/// that has none yet is filled in. Rows that already carry metadata are
-/// filtered out by the WHERE scan and never locked, so idempotent
-/// re-registrations stay contention-free.
-async fn backfill_template_release_execution_metadata(
+/// Release identity is immutable. A row without evidence may be filled once;
+/// an identical retry is read-only, and contradictory evidence is never acknowledged.
+async fn check_template_release_execution_metadata(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     release_id: Uuid,
-    execution_metadata: &serde_json::Value,
+    execution: &serde_json::Value,
 ) -> Result<(), Status> {
-    sqlx::query(sql!(
-        "UPDATE template_releases
-         SET execution_metadata = $2
-         WHERE id = $1
-           AND execution_metadata IS NULL"
+    // Fence the check and backfill against node publication and other writers,
+    // including those that do not take the parent-template publication lock.
+    let existing: Option<serde_json::Value> = sqlx::query_scalar(sql!(
+        "SELECT execution_metadata FROM template_releases WHERE id = $1 FOR UPDATE"
     ))
     .bind(release_id)
-    .bind(execution_metadata)
-    .execute(&mut **tx)
+    .fetch_one(&mut **tx)
     .await
-    .map_err(|err| {
-        Status::internal(format!(
-            "backfill template_release execution metadata: {err}"
-        ))
-    })?;
-    Ok(())
+    .map_err(|error| Status::internal(format!("lock release execution metadata: {error}")))?;
+    match existing {
+        Some(existing) if &existing != execution => Err(Status::already_exists(
+            "template release already has different execution metadata",
+        )),
+        Some(_) => Ok(()),
+        None => super::template_releases_store::fill_execution_metadata(
+            &mut **tx, release_id, execution,
+        )
+        .await
+        .map_err(|error| Status::internal(format!("fill release execution metadata: {error}"))),
+    }
 }
 
 pub(super) async fn ensure_template_release_tag(

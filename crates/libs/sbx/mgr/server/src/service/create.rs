@@ -903,6 +903,10 @@ impl SandboxManagerService {
             let resolved_execution_metadata =
                 pplx_space_common_core::types::ExecutionMetadata::try_from(&resolved_execution)
                     .map_err(|error| Status::internal(error.to_string()))?;
+            super::validation::require_environment_acknowledgement(
+                &requested_execution,
+                &resolved_execution_metadata,
+            )?;
             {
                 let db = self.db_conn()?;
                 crate::db::upsert_sandbox_execution_metadata(&db, id, &resolved_execution_metadata)

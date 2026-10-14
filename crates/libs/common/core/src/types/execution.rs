@@ -295,6 +295,12 @@ pub enum ExecutionMetadataError {
 #[cfg_attr(feature = "serde", derive(Serialize))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionMetadata {
+    /// Immutable environment binding. Absence is legacy evidence, never approval.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    environment: Option<super::EnvironmentReference>,
     runtime: RuntimeIdentity,
     guest: GuestPlatform,
     #[cfg_attr(
@@ -326,11 +332,23 @@ impl ExecutionMetadata {
             }
         }
         Ok(Self {
+            environment: None,
             runtime,
             guest,
             state_format,
             components,
         })
+    }
+
+    pub const fn environment(&self) -> Option<super::EnvironmentReference> {
+        self.environment
+    }
+
+    /// Attach a binding after the owning resolver checks its definition against
+    /// these observations. This setter does not authorize execution.
+    pub fn with_environment(mut self, environment: super::EnvironmentReference) -> Self {
+        self.environment = Some(environment);
+        self
     }
 
     pub const fn runtime(&self) -> &RuntimeIdentity {
@@ -404,6 +422,8 @@ impl fmt::Display for DuplicateComponentRole {
 #[cfg(feature = "serde")]
 #[derive(Deserialize)]
 struct ExecutionMetadataWire {
+    #[serde(default)]
+    environment: Option<super::EnvironmentReference>,
     runtime: RuntimeIdentity,
     guest: GuestPlatform,
     #[serde(default)]
@@ -419,8 +439,10 @@ impl<'de> Deserialize<'de> for ExecutionMetadata {
         D: Deserializer<'de>,
     {
         let wire = ExecutionMetadataWire::deserialize(deserializer)?;
-        Self::new(wire.runtime, wire.guest, wire.state_format, wire.components)
-            .map_err(de::Error::custom)
+        let mut metadata = Self::new(wire.runtime, wire.guest, wire.state_format, wire.components)
+            .map_err(de::Error::custom)?;
+        metadata.environment = wire.environment;
+        Ok(metadata)
     }
 }
 

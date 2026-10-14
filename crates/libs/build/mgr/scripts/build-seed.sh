@@ -37,8 +37,6 @@ ARCH=""
 
 IMAGE_REF="docker.io/library/ubuntu:26.04@sha256:da6fc2be547864451aa253836dd926da33623312df4a9a243e35dc877c378a78"
 CTR_SNAPSHOTTER="${CTR_SNAPSHOTTER:-native}"
-DEFAULT_SEED_RUNTIME_VERSION="1.15.1"
-DEFAULT_SEED_STATE_FORMAT_VERSION="9.0.0"
 
 # Where the space-build-manager chart mounts the SPACE MITM root CA, and the
 # fixed path rootfs-builder.sh reads it from. Keep in sync with the chart's
@@ -240,63 +238,13 @@ done
 : "${SPACE_SEED_UBUNTU_VERSION:?SPACE_SEED_UBUNTU_VERSION is required}"
 : "${SPACE_SEED_UBUNTU_DATE:?SPACE_SEED_UBUNTU_DATE is required}"
 
-if [[ -n "${SPACE_SEED_RUNTIME_VERSION:-}" || -n "${SPACE_SEED_STATE_FORMAT_VERSION:-}" ]]; then
-  if [[ -z "${SPACE_SEED_RUNTIME_VERSION:-}" || -z "${SPACE_SEED_STATE_FORMAT_VERSION:-}" ]]; then
-    echo "ERROR: seed execution metadata requires both SPACE_SEED_RUNTIME_VERSION and SPACE_SEED_STATE_FORMAT_VERSION when overriding the defaults" >&2
-    exit 1
-  fi
-fi
-if [[ -z "${SPACE_SEED_RUNTIME_VERSION:-}" && -z "${SPACE_SEED_STATE_FORMAT_VERSION:-}" ]]; then
-  latest_firecracker_dir=""
-  while IFS= read -r candidate; do
-    if [[ -x "${candidate}/bin/firecracker" ]] &&
-      [[ -x "${candidate}/bin/jailer" ]] &&
-      [[ -f "${candidate}/kernel/vmlinux.bin" ]]; then
-      latest_firecracker_dir="$candidate"
-      break
-    fi
-  done < <(find /space/vendor/firecracker -mindepth 1 -maxdepth 1 -type d -name 'v[0-9]*' 2>/dev/null | sort -Vr)
-  if [[ -n "$latest_firecracker_dir" && -x "${latest_firecracker_dir}/bin/firecracker" ]]; then
-    detected_runtime_version="$("${latest_firecracker_dir}/bin/firecracker" --version | sed -n 's/^Firecracker v\([^[:space:]]*\).*$/\1/p' | head -n1)"
-    detected_state_format_version="$("${latest_firecracker_dir}/bin/firecracker" --snapshot-version | sed -n 's/^v\([0-9][^[:space:]]*\)$/\1/p' | head -n1)"
-    if [[ -z "$detected_runtime_version" || -z "$detected_state_format_version" ]]; then
-      echo "ERROR: could not inspect runtime metadata from ${latest_firecracker_dir}" >&2
-      exit 1
-    fi
-    SPACE_SEED_RUNTIME="${SPACE_SEED_RUNTIME:-firecracker}"
-    SPACE_SEED_RUNTIME_VERSION="${detected_runtime_version}"
-    SPACE_SEED_STATE_FORMAT_VERSION="${detected_state_format_version}"
-  else
-    SPACE_SEED_RUNTIME_VERSION="${DEFAULT_SEED_RUNTIME_VERSION}"
-    SPACE_SEED_STATE_FORMAT_VERSION="${DEFAULT_SEED_STATE_FORMAT_VERSION}"
-  fi
-fi
-SPACE_SEED_RUNTIME="${SPACE_SEED_RUNTIME:-firecracker}"
-
+: "${SPACE_SEED_RUNTIME:?builder-provided runtime is required}"
+: "${SPACE_SEED_RUNTIME_VERSION:?builder-provided runtime version is required}"
+: "${SPACE_SEED_STATE_FORMAT_VERSION:?builder-provided state format is required}"
 if [[ -n "${SPACE_SEED_KERNEL_VERSION:-}" && -z "${SPACE_SEED_KERNEL_DIGEST:-}" ]] ||
-  [[ -z "${SPACE_SEED_KERNEL_VERSION:-}" && -n "${SPACE_SEED_KERNEL_DIGEST:-}" ]]; then
-  echo "ERROR: seed execution metadata requires both SPACE_SEED_KERNEL_VERSION and SPACE_SEED_KERNEL_DIGEST when overriding the defaults" >&2
+   [[ -z "${SPACE_SEED_KERNEL_VERSION:-}" && -n "${SPACE_SEED_KERNEL_DIGEST:-}" ]]; then
+  echo "ERROR: seed execution metadata requires both SPACE_SEED_KERNEL_VERSION and SPACE_SEED_KERNEL_DIGEST" >&2
   exit 1
-fi
-
-default_kernel="/space/cache/firecracker/kernels/default/vmlinux.bin"
-if [[ ! -f "$default_kernel" ]]; then
-  default_kernel="/space/cache/firecracker/assets/default/kernel/vmlinux.bin"
-fi
-if [[ -f "$default_kernel" ]]; then
-  resolved_kernel="$(readlink -f "$default_kernel")"
-  kernel_digest="sha256:$(sha256sum "$default_kernel" | awk '{print $1}')"
-  case "$resolved_kernel" in
-    /space/cache/firecracker/kernels/*/vmlinux.bin)
-      kernel_version="$(basename "$(dirname "$resolved_kernel")")"
-      ;;
-    *)
-      kernel_hex="${kernel_digest#sha256:}"
-      kernel_version="legacy-${kernel_hex:0:12}"
-      ;;
-  esac
-  SPACE_SEED_KERNEL_VERSION="${SPACE_SEED_KERNEL_VERSION:-${kernel_version}}"
-  SPACE_SEED_KERNEL_DIGEST="${SPACE_SEED_KERNEL_DIGEST:-${kernel_digest}}"
 fi
 
 # The build container sources this file as root, so recipe and host values
