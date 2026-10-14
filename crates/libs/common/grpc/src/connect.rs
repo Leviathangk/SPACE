@@ -382,13 +382,13 @@ pub async fn connect_tcp_channel_with_retry(
 
 /// A failed TCP connect attempt that a retrying connect is about to redial.
 #[non_exhaustive]
-pub struct TcpConnectRetry<'a> {
+pub struct TcpConnectRetry<'a, E = TcpConnectError> {
     /// Attempts made so far, the failed one included.
     pub attempts: usize,
     /// Time since the first attempt started.
     pub elapsed: std::time::Duration,
     /// Why the attempt failed.
-    pub error: &'a dyn std::fmt::Display,
+    pub error: &'a E,
 }
 
 /// [`connect_tcp_channel_with_retry`] that also hands `on_retry` each failed
@@ -509,7 +509,7 @@ async fn retry_tcp_connect_observed<T, E, F, Fut>(
     retry_policy: GrpcRetryPolicy,
     attempt_cap: std::time::Duration,
     mut attempt: F,
-    mut on_retry: impl FnMut(&TcpConnectRetry<'_>),
+    mut on_retry: impl FnMut(&TcpConnectRetry<'_, E>),
 ) -> Result<T, E>
 where
     E: std::fmt::Display + From<TcpConnectError>,

@@ -1251,6 +1251,17 @@ impl WaitWarnings {
     }
 }
 
+/// `error` and its sources, outermost first, so a warning names the cause a
+/// transport error wraps. Layers that repeat the message beneath them are
+/// shown once.
+fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut messages: Vec<String> = std::iter::successors(Some(error), |error| error.source())
+        .map(ToString::to_string)
+        .collect();
+    messages.dedup();
+    messages.join(": ")
+}
+
 /// Connect the agent to its upstream authority, redialing for up to
 /// [`AGENT_UPSTREAM_CONNECT_WINDOW`] and warning while it waits. Returns `None`
 /// once shutdown is requested, so a wait longer than the pod's termination
@@ -1266,7 +1277,7 @@ async fn connect_agent_upstream(
                 elapsed_ms = retry.elapsed.as_millis(),
                 attempts = retry.attempts,
                 window = ?AGENT_UPSTREAM_CONNECT_WINDOW,
-                error = %retry.error,
+                error = %error_chain(retry.error),
                 "upstream credential authority not reachable yet; still retrying"
             );
         }

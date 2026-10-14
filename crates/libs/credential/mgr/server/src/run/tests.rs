@@ -552,3 +552,32 @@ fn still_waiting_warnings_are_spaced_by_the_interval() {
         "{due:?}"
     );
 }
+
+// The still-waiting warning names what a refused dial's transport error
+// wraps, rather than the bare "transport error", and says each layer's
+// message once though several layers repeat it.
+#[cfg(target_os = "linux")]
+#[tokio::test(start_paused = true)]
+async fn still_waiting_warnings_name_the_cause_a_transport_error_wraps() {
+    let ticker = tick_paused_clock();
+    let (_socket, endpoint) = refusing_authority();
+    let one_redial = pplx_space_common_grpc::GrpcRetryPolicy {
+        max_retries: 1,
+        ..AGENT_UPSTREAM_CONNECT_POLICY
+    };
+    let mut causes = Vec::new();
+    let _ = endpoint
+        .connect_with_retry(one_redial, |retry| causes.push(error_chain(retry.error)))
+        .await;
+    ticker.abort();
+
+    let refused =
+        std::io::Error::from_raw_os_error(nix::errno::Errno::ECONNREFUSED as i32).to_string();
+    let [cause] = causes.as_slice() else {
+        panic!("one redial: {causes:?}");
+    };
+    let layers: Vec<&str> = cause.split(": ").collect();
+    assert!(cause.ends_with(&refused), "{cause}");
+    assert!(layers.len() > 1, "{cause}");
+    assert!(layers.windows(2).all(|pair| pair[0] != pair[1]), "{cause}");
+}
