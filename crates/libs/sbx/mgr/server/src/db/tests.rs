@@ -1936,18 +1936,24 @@ fn insert_sandbox_persists_only_explicit_rootfs_size_override() {
 #[test]
 fn insert_sandbox_persists_effective_disk_io_limits() {
     let conn = crate::db::test_conn();
-    let expected = pplx_space_common_core::types::DiskIoLimits::try_new(5_000, 200).unwrap();
-
-    insert_test_sandbox(
-        &conn,
-        TestSandboxInsert {
-            disk_io_limits: expected,
-            ..TestSandboxInsert::new("disk-io", "diskio01", SandboxState::Creating)
-        },
-    );
-
-    let row = get_sandbox(&conn, "disk-io").unwrap().unwrap();
-    assert_eq!(row.disk_io_limits, expected);
+    use pplx_space_common_core::types::DiskIoLimits;
+    // New defaults must be bound explicitly instead of falling through to
+    // the legacy SQL default; explicit legacy assignments must survive too.
+    for (id, expected) in [
+        ("default", DiskIoLimits::default()),
+        ("legacy", DiskIoLimits::try_new(1_000, 100).unwrap()),
+        ("override", DiskIoLimits::try_new(5_000, 200).unwrap()),
+    ] {
+        insert_test_sandbox(
+            &conn,
+            TestSandboxInsert {
+                disk_io_limits: expected,
+                ..TestSandboxInsert::new(id, id, SandboxState::Creating)
+            },
+        );
+        let row = get_sandbox(&conn, id).unwrap().unwrap();
+        assert_eq!(row.disk_io_limits, expected);
+    }
 }
 
 #[test]

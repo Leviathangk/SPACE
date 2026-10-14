@@ -240,8 +240,8 @@ fn disk_io_capability_reports_cluster_ceiling_and_platform_defaults() {
             "disk_io": {
                 "max_operations_per_sec": 5_000,
                 "max_bandwidth_mib_per_sec": 200,
-                "default_operations_per_sec": 1_000,
-                "default_bandwidth_mib_per_sec": 100
+                "default_operations_per_sec": DiskIoLimits::default().max_operations_per_sec(),
+                "default_bandwidth_mib_per_sec": DiskIoLimits::default().max_bandwidth_mib_per_sec()
             }
         })
     );

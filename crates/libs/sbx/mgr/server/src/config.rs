@@ -48,6 +48,12 @@ impl SandboxConfig {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigLoadError {
+    #[error("cannot read SPACE_DISK_IO_BURST_SECS: {0}")]
+    BurstEnvironment(#[source] std::env::VarError),
+    #[error("SPACE_DISK_IO_BURST_SECS must be a positive u32: {0}")]
+    BurstValue(#[source] std::num::ParseIntError),
+    #[error("invalid deployment disk I/O default: {0}")]
+    DiskIoDefault(#[from] pplx_space_common_core::types::DiskIoLimitsError),
     #[error("cannot read sandbox configuration {path}: {source}")]
     Read {
         path: PathBuf,
@@ -67,7 +73,21 @@ pub enum ConfigLoadError {
 }
 
 pub fn load() -> Result<SandboxConfig, ConfigLoadError> {
-    load_from(Path::new(CONFIG_PATH))
+    load_with_environment(Path::new(CONFIG_PATH))
+}
+
+fn load_with_environment(path: &Path) -> Result<SandboxConfig, ConfigLoadError> {
+    pplx_space_common_core::types::DiskIoLimits::configured_default()?;
+    let mut config = load_from(path)?;
+    match std::env::var("SPACE_DISK_IO_BURST_SECS") {
+        Ok(raw) => {
+            config.disk_io_burst_secs =
+                Some(raw.trim().parse().map_err(ConfigLoadError::BurstValue)?);
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(source) => return Err(ConfigLoadError::BurstEnvironment(source)),
+    }
+    Ok(config)
 }
 
 fn load_from(path: &Path) -> Result<SandboxConfig, ConfigLoadError> {
