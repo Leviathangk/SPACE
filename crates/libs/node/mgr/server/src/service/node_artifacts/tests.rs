@@ -179,7 +179,7 @@ async fn compiled_environment_removal_is_refused_even_without_inventory() {
         .unwrap()
         .clone();
     Artifact::Release(candidate.release.clone(), candidate.digest())
-        .check_removal(&initial)
+        .check_removal(&initial, crate::config::ExperimentPolicy::Disabled)
         .unwrap();
 }
 
@@ -190,7 +190,7 @@ fn prototype_overlap_keeps_external_execution_but_refuses_mutations() {
     let (_fixture, mut paths) = installed_runtime();
     paths.store.releases = paths.vendor.clone();
     assert!(separate_store(&paths).is_err());
-    let inventory = execution_inventory(&paths).unwrap();
+    let inventory = execution_inventory(&paths, crate::config::ExperimentPolicy::Disabled).unwrap();
     let selected = inventory
         .resolve(
             None,
@@ -289,4 +289,40 @@ async fn environment_resolution_requires_authorization_and_verified_inventory() 
         .await
         .unwrap_err();
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+}
+
+#[test]
+fn experiment_admission_does_not_change_defaults_or_disable_existing_cold_boots() {
+    use pplx_space_common_core::types::{Digest, EnvironmentReference};
+    use pplx_space_node_runtime_core::catalog::BenchmarkEnvironment;
+    let initial = InitialEnvironment::for_architecture(Arch::X86_64).unwrap();
+    let candidate = BenchmarkEnvironment::for_architecture(Arch::X86_64)
+        .unwrap()
+        .unwrap();
+    let e0 = initial.definition().unwrap().reference();
+    let c = candidate.definition().unwrap().reference();
+    for enabled in [false, true] {
+        for (reference, mode, accepted) in [
+            (None, ExecutionSelectionMode::NewColdBoot, true),
+            (Some(e0), ExecutionSelectionMode::NewColdBoot, true),
+            (Some(c), ExecutionSelectionMode::NewColdBoot, enabled),
+            (Some(c), ExecutionSelectionMode::ExistingColdBoot, true),
+            (
+                Some(c),
+                ExecutionSelectionMode::PersistedStateRestore,
+                false,
+            ),
+            (
+                Some(EnvironmentReference::new(Digest::sha256([1; 32]))),
+                ExecutionSelectionMode::NewColdBoot,
+                false,
+            ),
+        ] {
+            let result = select_definition(&initial, Some(&candidate), enabled, reference, mode);
+            assert_eq!(result.is_ok(), accepted, "{enabled} {reference:?} {mode:?}");
+            if let Ok(definition) = result {
+                assert_eq!(definition.reference(), reference.unwrap_or(e0));
+            }
+        }
+    }
 }

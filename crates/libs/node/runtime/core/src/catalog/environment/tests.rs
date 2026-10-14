@@ -55,8 +55,51 @@ fn valid_but_unqualified_candidates_cannot_resolve() {
     let arm = InitialEnvironment::for_architecture(Arch::Aarch64).unwrap();
     assert!(matches!(
         arm.definition(),
-        Err(InitialEnvironmentDefinitionError::UnsupportedArchitecture(
+        Err(CompiledEnvironmentDefinitionError::UnsupportedArchitecture(
             Arch::Aarch64
         ))
     ));
+}
+
+#[test]
+fn compiled_benchmark_pair_has_a_distinct_complete_identity() {
+    let experiment = BenchmarkEnvironment::for_architecture(Arch::X86_64)
+        .unwrap()
+        .unwrap();
+    let definition = experiment.definition().unwrap();
+    let requirements = definition.execution_requirements().unwrap();
+    assert_eq!(requirements.runtime().version.as_str(), "1.17.0");
+    assert_eq!(
+        requirements.state_format().unwrap().version.as_str(),
+        "12.0.0"
+    );
+    assert_eq!(
+        requirements.components()[0]
+            .version
+            .as_ref()
+            .unwrap()
+            .as_str(),
+        "6.18.44"
+    );
+    assert_eq!(
+        requirements.components()[0].digest,
+        Some(experiment.kernel().sha256)
+    );
+    assert_ne!(
+        definition.reference(),
+        InitialEnvironment::for_architecture(Arch::X86_64)
+            .unwrap()
+            .definition()
+            .unwrap()
+            .reference()
+    );
+    assert!(
+        BenchmarkEnvironment::for_architecture(Arch::Aarch64)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        definition.reference().to_string(),
+        "sha256:959f1181ac69f0dde7125fbc81be6fcd75b64e9e06e7a393f067b96eb6fb2ac4"
+    );
 }

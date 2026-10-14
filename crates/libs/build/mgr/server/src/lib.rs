@@ -279,6 +279,7 @@ trait BuildBackend: Send + Sync {
         template_id: &str,
         job_id: &pplx_space_common_jobs::JobId,
         template_org: Option<TemplateOrg>,
+        environment: Option<pplx_space_common_core::types::EnvironmentReference>,
     ) -> Result<BuildOutcome, BuildError>;
 
     async fn publish(
@@ -314,8 +315,10 @@ impl BuildBackend for RuntimeBuildBackend {
         template_id: &str,
         job_id: &pplx_space_common_jobs::JobId,
         template_org: Option<TemplateOrg>,
+        environment: Option<pplx_space_common_core::types::EnvironmentReference>,
     ) -> Result<BuildOutcome, BuildError> {
         TemplateBuilder::new()
+            .with_environment(environment)
             .with_caller_org(template_org.map(TemplateOrg::org_id))
             .build_prepared(recipe_label, recipe, template_id, job_id)
             .await
@@ -357,7 +360,7 @@ impl JobExecutor for BuildExecutor {
         job: &Job,
         _cancellation: tokio_util::sync::CancellationToken,
     ) -> Result<i64, JobError> {
-        let payload: BuildJobPayload = job.payload_as()?;
+        let (payload, environment) = jobs::decode_payload(job)?;
         let proto_recipe =
             pplx_space_build_mgr_client::proto::Recipe::decode(payload.recipe_proto.as_slice())
                 .map_err(|error| {
@@ -446,6 +449,7 @@ impl JobExecutor for BuildExecutor {
                             &build_template_id,
                             &build_job_id,
                             template_org,
+                            environment,
                         )
                         .instrument(blocking_span);
                     runtime.block_on(AssertUnwindSafe(build_future).catch_unwind())
@@ -765,6 +769,26 @@ fn build_job_lease_config() -> LeaseConfig {
 
 #[async_trait::async_trait]
 impl BuildManager for BuildManagerDaemonService {
+    async fn get_execution_capabilities(
+        &self,
+        request: Request<pplx_space_build_mgr_client::proto::GetExecutionCapabilitiesRequest>,
+    ) -> Result<
+        Response<pplx_space_build_mgr_client::proto::GetExecutionCapabilitiesResponse>,
+        Status,
+    > {
+        request
+            .extensions()
+            .get::<pplx_space_common_svc::auth::build::BuildAuthenticatedCaller>()
+            .ok_or_else(|| {
+                Status::permission_denied("execution capabilities require authenticated authority")
+            })?;
+        Ok(Response::new(
+            pplx_space_build_mgr_client::proto::GetExecutionCapabilitiesResponse {
+                environment_selection: true,
+            },
+        ))
+    }
+
     async fn start_build(
         &self,
         request: Request<StartBuildRequest>,
@@ -774,6 +798,7 @@ impl BuildManager for BuildManagerDaemonService {
             request.get_ref().org_id.as_deref(),
         )?;
         let StartBuildRequest {
+            environment,
             system_publication_grant_id,
             recipe,
             template_id,
@@ -781,7 +806,24 @@ impl BuildManager for BuildManagerDaemonService {
             client,
             org_id,
         } = request.into_inner();
-        let inline = recipe.ok_or_else(|| Status::invalid_argument("recipe is required"))?;
+        let (inline, environment) = match (recipe, environment) {
+            (Some(recipe), None) => (recipe, None),
+            (None, Some(input)) => (
+                input
+                    .recipe
+                    .ok_or_else(|| Status::invalid_argument("environment recipe is required"))?,
+                Some(
+                    input
+                        .reference
+                        .parse::<pplx_space_common_core::types::EnvironmentReference>()
+                        .map_err(|error| Status::invalid_argument(error.to_string()))?,
+                ),
+            ),
+            (None, None) => return Err(Status::invalid_argument("recipe is required")),
+            (Some(_), Some(_)) => {
+                return Err(Status::invalid_argument("provide exactly one recipe input"));
+            }
+        };
         let recipe_proto = inline.clone();
         let _: Recipe = inline
             .clone()
@@ -828,12 +870,22 @@ impl BuildManager for BuildManagerDaemonService {
             template_org,
             system_publication_grant_id,
         };
-        // Every submission gets its own job (no dedup key); the worker's
-        // serialized-subjects lease claim queues same-template jobs FIFO
-        // instead of rejecting them.
-        let job_id =
+        // Both payload versions share the existing queue policy and accounting.
+        // Every submission gets its own job; staging is isolated by job ID.
+        let job_id = if let Some(environment) = environment {
+            self.worker.submit_json(
+                jobs::BUILD_JOB_KIND,
+                &jobs::VersionedBuildJobPayload::Environment {
+                    environment,
+                    build: payload,
+                },
+                Some(&template_id),
+                None,
+            )?
+        } else {
             self.worker
-                .submit_json(jobs::BUILD_JOB_KIND, &payload, Some(&template_id), None)?;
+                .submit_json(jobs::BUILD_JOB_KIND, &payload, Some(&template_id), None)?
+        };
         tracing::info!(
             job_id = %job_id,
             template_id = %template_id,
@@ -843,6 +895,7 @@ impl BuildManager for BuildManagerDaemonService {
 
         Ok(Response::new(StartBuildResponse {
             job_id: job_id.to_string(),
+            environment: environment.map(|reference| reference.to_string()),
         }))
     }
 
@@ -860,7 +913,7 @@ impl BuildManager for BuildManagerDaemonService {
             .get_job(&job_id)?
             .ok_or_else(|| Status::not_found("build job not found"))?;
 
-        let payload = job.payload_as::<BuildJobPayload>().map_err(|error| {
+        let (payload, _) = jobs::decode_payload(&job).map_err(|error| {
             Status::internal(format!(
                 "malformed persisted build job: {}",
                 error.message()

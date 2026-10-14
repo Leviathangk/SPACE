@@ -194,6 +194,70 @@ impl RuntimeInventory {
         Ok(inventory)
     }
 
+    /// Include only the pinned experimental pair; never change new/legacy defaults.
+    /// Missing or invalid experiment bytes withdraw that pair, not E0.
+    pub fn include_benchmark(
+        &mut self,
+        store: &ArtifactStore,
+        experiment: &crate::catalog::BenchmarkEnvironment,
+        kernels: &Path,
+    ) -> Result<(), RuntimeInventoryError> {
+        let release = experiment.release();
+        let kernel = experiment.kernel();
+        self.runtimes
+            .retain(|entry| entry.runtime != release.release);
+        self.components
+            .retain(|entry| entry.metadata.digest != Some(kernel.sha256));
+        let release_root = store.releases_root().join(managed_release_directory(
+            &release.release,
+            release.digest(),
+        ));
+        let kernel_root = store
+            .kernels_root()
+            .join(managed_kernel_directory(&kernel.version, kernel.sha256));
+        let cache_parent = kernels
+            .parent()
+            .ok_or_else(|| RuntimeInventoryError::ParentlessKernelRoot(kernels.to_path_buf()))?;
+        let cached_kernel = cache_parent
+            .join("managed/kernels")
+            .join(managed_kernel_directory(&kernel.version, kernel.sha256))
+            .join(KERNEL_IMAGE);
+        let watched = vec![
+            release_root.join("bin/firecracker"),
+            release_root.join("bin/jailer"),
+            kernel_root.join(KERNEL_IMAGE),
+            cached_kernel,
+        ];
+        let result = (|| {
+            store.verify_release(release)?;
+            let cache = store.prepare_execution_cache(cache_parent)?;
+            let staged = store.stage_kernel(kernel, &cache)?;
+            let installation = FirecrackerDriver
+                .inspect_installation(release_root, release.release.version.clone())?;
+            let component = kernel_installation(
+                kernel_metadata(kernel.version.clone(), kernel.sha256)?,
+                staged.path.join(KERNEL_IMAGE),
+                false,
+                false,
+            );
+            self.runtimes.push(installation);
+            self.components.push(component);
+            Ok::<_, RuntimeInventoryError>(())
+        })();
+        if let Err(error) = result {
+            tracing::warn!(%error, "benchmark environment unavailable");
+            let error = self.binding_error(error);
+            self.unavailable.push(UnavailableArtifact::Runtime {
+                identity: release.release.clone(),
+                error,
+            });
+        }
+        let previous = std::mem::take(&mut self.fingerprints);
+        self.remember_paths(watched);
+        self.fingerprints.extend(previous);
+        Ok(())
+    }
+
     fn binding_error(
         &mut self,
         error: RuntimeInventoryError,

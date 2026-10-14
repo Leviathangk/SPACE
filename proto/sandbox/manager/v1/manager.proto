@@ -9,6 +9,9 @@ import "net/policy/v1/policy.proto";
 import "spaced/operations/v1/operations.proto";
 
 service SandboxManager {
+  // Advisory readiness only. The environment input also fails closed on old readers.
+  rpc GetExecutionCapabilities(GetExecutionCapabilitiesRequest) returns (GetExecutionCapabilitiesResponse);
+
   // Create a new sandbox (allocate resources, prepare filesystem) without starting the VM.
   rpc Create(CreateRequest) returns (CreateResponse);
 
@@ -357,9 +360,12 @@ message AutoLifecycleStatus {
 }
 
 message CreateRequest {
+  // Mutually exclusive with template and runtime. Old readers see no required
+  // runtime and reject before any template lookup or sandbox mutation.
+  EnvironmentCreateInput environment = 30;
   string template = 1;
   string owner = 2;
-  string runtime = 3;            // Required: "fc" (the only runtime supported by Create).
+  string runtime = 3;            // Required for legacy input: "fc". Absent with environment.
   bool snapshots_enabled = 4;    // Enable rolling btrfs snapshots when started
   bool autostart = 5;            // If true, start the sandbox after creation
   optional string pool_template = 6; // Internal: mark this sandbox as a pool member for the given template
@@ -394,6 +400,8 @@ message CreateRequest {
 }
 
 message CreateResponse {
+  // Exact template binding admitted and retained in the sandbox metadata.
+  optional string environment = 10;
   string sandbox_id = 1;
   optional uint32 pid = 2;
   optional string guest_ip = 3;
@@ -1700,4 +1708,15 @@ message WaitTemplateAppsRequest { string sandbox_id = 1; }
 message WaitTemplateAppsResponse {
   // Best-effort apps that failed or exhausted their startup budget; no tenant output.
   repeated string warnings = 1;
+}
+
+message GetExecutionCapabilitiesRequest {}
+message GetExecutionCapabilitiesResponse {
+  // Protocol support only; each exact environment still requires admission.
+  bool environment_selection = 1;
+}
+
+message EnvironmentCreateInput {
+  string reference = 1;
+  string template = 2;
 }
