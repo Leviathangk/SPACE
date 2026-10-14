@@ -447,6 +447,7 @@ pub(super) fn create_response_for_existing_sandbox(
 ) -> CreateResponse {
     let has_process = existing.pid.is_some();
     CreateResponse {
+        environment: None,
         sandbox_id: existing.id.clone(),
         pid: existing.pid,
         guest_ip: has_process.then(|| GUEST_IP.to_string()),

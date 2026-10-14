@@ -684,6 +684,7 @@ pub(super) mod service_tests {
                 },
             },
             guest_console_logs: false,
+            experiment_policy: crate::config::ExperimentPolicy::Disabled,
             lifecycle_limiter: std::sync::Arc::new(
                 crate::lifecycle_limiter::tests::default_limiter(),
             ),

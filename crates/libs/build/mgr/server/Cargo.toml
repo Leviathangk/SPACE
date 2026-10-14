@@ -28,6 +28,7 @@ datadog = [
 datadog-otel = ["otel", "datadog"]
 
 [dependencies]
+pplx-space-common-core = { workspace = true, features = ["serde"] }
 async-trait = { workspace = true }
 futures-util = { workspace = true }
 prost = { workspace = true }
