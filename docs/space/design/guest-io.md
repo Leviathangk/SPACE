@@ -32,9 +32,15 @@ as a virtio block device.
 ## The drive limiter
 
 Every sandbox's root drive has a Firecracker rate limiter with two token
-buckets: operations (requests) and bandwidth (bytes). The defaults are 1,000
+buckets: operations (requests) and bandwidth (bytes). The defaults are 10,000
 operations/s and 100 MiB/s; a warm pool can assign other limits, and each
 sandbox carries its own.
+
+The operations budget counts guest requests even when the host serves them from
+page cache. At 4 KiB per request, 1,000 operations/s restricts a busy guest to
+about 3.9 MiB/s despite the separate 100 MiB/s bandwidth allowance. The higher
+default reduces this small-file bottleneck; it is not a promise of 100 MiB/s for
+every request size or of latency under arbitrary host contention.
 
 Each bucket holds `disk_io_burst_secs` (sandbox-manager configuration, default
 30) seconds of its sustained rate and refills at that rate. The sustained
@@ -49,6 +55,43 @@ make a dense node fair: at hundreds of sandboxes each one's fair share can be
 below its limit. Use the aggregate host disk budget below to bound physical
 I/O from all sandboxes together. This does not provide per-sandbox scheduling
 fairness or bound requests served from the host's page cache.
+
+### Upgrading the default allowance
+
+The 10,000-operations/s default applies to new unassigned sandboxes in direct,
+Kubernetes, and node-local creation paths, and to warm-pool policies whose disk
+I/O fields are absent. It requires updated API, pool-controller, and worker
+binaries; rebuilding a guest image or template alone does not change the limit.
+Bandwidth and the source default of 30 seconds of burst credit are unchanged.
+At the new rate the operations bucket holds 300,000 requests, so validate the
+combined post-idle burst as well as sustained load. Older binaries may use a
+different burst duration; inspect the actual root-drive limiter during rollout.
+
+| Existing state | Upgrade behavior |
+| --- | --- |
+| Running or persisted sandbox with an assigned limit | Keeps its limit on start, restore, and ordinary lifecycle operations. |
+| Rolling warm-pool policy with omitted I/O fields | Reconciliation materializes the new default. Old slots with a different assignment are ineligible for the new configuration and are replaced through normal reconciliation. |
+| Explicit rolling policy | Keeps its stored limit. Update it deliberately through the rolling-policy Admin API. |
+| Existing manually managed pool configuration | Keeps its stored limit, including when editing pool size. The manual-pool API does not expose I/O overrides; newly created configurations use the current default. |
+| Legacy writer omitting database columns | Retains the historical SQL fallback. Current writers bind effective limits explicitly; no schema or data backfill is required. |
+| Mixed old/new services or old materialized pool configuration | New creates can receive different defaults until all writers and pools converge. Inspect the saved assignment rather than assuming upgrade completion. |
+
+Provision and validate a host budget before increasing a dense deployment's
+guest allowance. Upgrade workers before control-plane writers, then verify both
+cold creates and warm claims. Existing Firecracker drive APIs accept explicit
+limits from new callers, but omitted legacy wire fields resolve at the receiving
+binary's default. Do not rewrite every stored 1,000-IOPS value: it may be an
+intentional assignment. Existing sandboxes need replacement to receive a new
+creation allowance.
+
+`SPACE_DISK_IO_SAFETY_MAX_OPERATIONS_PER_SEC` and
+`SPACE_DISK_IO_SAFETY_MAX_BANDWIDTH_MIB_PER_SEC` bound explicit Admin API policy
+overrides; they do not cap the platform default, inherited policies, or running
+VMs. Review lower configured ceilings before upgrading. Without a ceiling
+override, explicit policy validation uses the platform default. To retain a
+smaller allowance for a workload, assign both policy fields explicitly. A binary
+rollback changes future defaults and inherited-policy reconciliation, but does
+not lower already persisted assignments or clear the parent cgroup budget.
 
 ## Host disk protection
 
