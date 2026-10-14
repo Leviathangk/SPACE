@@ -9,9 +9,11 @@ use pplx_space_net_common::{DenyReason, DomainName, EgressDecision, NetworkPolic
 
 use crate::dns::DnsAllowCache;
 
+mod evidence;
 mod tcp;
 mod tracker;
-pub(crate) use tcp::{AdmittedTcp, TcpAdmissionDenial, admit_tcp, missing_client_hello};
+pub(crate) use evidence::{AdmittedTcp, TcpAdmissionEvidence};
+pub(crate) use tcp::{TcpAdmissionDenial, admit_tcp, missing_client_hello, revalidate_tcp};
 pub use tracker::DnsAttributedTcpTracker;
 
 /// Transport an egress decision applies to.

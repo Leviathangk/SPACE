@@ -5,11 +5,11 @@ use std::sync::Arc;
 use pplx_space_net_common::{EgressDecision, NetworkPolicyV1};
 
 use crate::egress::{
-    AdmittedTcp, EgressContext, EgressProtocol, TcpAdmissionDenial, evaluate_egress,
+    AdmittedTcp, EgressContext, EgressProtocol, TcpAdmissionDenial, TcpAdmissionEvidence,
+    evaluate_egress,
 };
-use crate::sniff::MissingClientHello;
 use crate::state::TrafficPolicy;
-use crate::tls_sni::ClientHelloScan;
+use crate::tls_sni::{ClientHelloScan, MissingClientHello};
 
 impl TcpProxy {
     /// Apply normal destination admission before interpreting traffic to a
@@ -78,7 +78,7 @@ impl TcpProxy {
         destination: SocketAddr,
         scan: &ClientHelloScan,
         policy: &NetworkPolicyV1,
-    ) -> Result<AdmittedTcp, TcpAdmissionDenial> {
+    ) -> Result<TcpAdmissionEvidence, TcpAdmissionDenial> {
         crate::egress::admit_tcp(
             destination,
             scan,

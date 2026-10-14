@@ -469,14 +469,14 @@ impl TcpProxy {
             }
         };
 
-        let admitted = match self.admit(dst, &scan, &policy) {
+        let admission = match self.admit(dst, &scan, &policy) {
             Ok(admitted) => admitted,
             Err(reason) => {
                 inspection.finish(
                     accounting::Outcome::Denied,
                     inspection_admission_reason(&scan, missing_sni_detail, reason),
                 );
-                if missing_client_hello == sniff::MissingClientHello::Denied
+                if missing_client_hello == crate::tls_sni::MissingClientHello::Denied
                     && matches!(scan, crate::tls_sni::ClientHelloScan::Incomplete)
                 {
                     self.warn_client_hello_missing(dst, missing_sni_detail, peek_elapsed);
@@ -484,16 +484,14 @@ impl TcpProxy {
                 return (host, FlowOutcome::Rejected(Rejection::Admission(reason)));
             }
         };
+        let admitted = admission.route();
+        let interception_mode = admission.interception_mode();
         // Register before the final current-policy check so a concurrent
         // update either rejects this handoff or sees the flow in its resweep.
-        let connection = self.network_state.tcp_connections().register(
-            admitted.destination(),
-            scan.clone(),
-            &policy,
-            self.network_state.dns_allow_cache(),
-            shutdown.clone(),
-        );
-        let interception_mode = connection.interception_mode;
+        let connection = self
+            .network_state
+            .tcp_connections()
+            .register(admission, shutdown.clone());
         if let Err(reason) = self.validate_admission_policy(&policy) {
             inspection.finish(accounting::Outcome::Cancelled, reason.label());
             return (host, FlowOutcome::Rejected(Rejection::Admission(reason)));

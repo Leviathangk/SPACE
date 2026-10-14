@@ -150,7 +150,17 @@ impl DnsAllowCache {
     }
 
     /// Returns whether the response supplied cacheable attribution evidence.
-    pub fn observe_response(&self, packet: &[u8], policy: &NetworkPolicyV1) -> bool {
+    #[cfg(test)]
+    pub(crate) fn observe_response(&self, packet: &[u8], policy: &NetworkPolicyV1) -> bool {
+        self.observe_current_response(packet, policy, &tokio_util::sync::CancellationToken::new())
+    }
+
+    pub(super) fn observe_current_response(
+        &self,
+        packet: &[u8],
+        policy: &NetworkPolicyV1,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> bool {
         let Some(response) = DnsResponse::parse(packet) else {
             return false;
         };
@@ -207,6 +217,11 @@ impl DnsAllowCache {
             .write_lock
             .lock()
             .expect("DNS allow-cache lock poisoned");
+        // Install cancels before taking this lock to prune. An old observation
+        // either inserts before that prune or sees cancellation here.
+        if cancellation.is_cancelled() {
+            return false;
+        }
         let mut inner = self.inner.load().as_ref().clone();
         let before_expiry_prune = total_entries(&inner);
         inner.retain(|_, entries| {
@@ -222,7 +237,7 @@ impl DnsAllowCache {
             // not logged raw: a sandbox can encode arbitrary data in a valid
             // hostname and exfiltrate it to the log sink, and the address is
             // sensitive connection metadata. Log bounded, non-sensitive fields.
-            debug!(
+            debug!(target: "pplx_space_net_gateway::dns",
                 domain_len = domain.len(),
                 address_family = if ip.is_ipv6() { "ipv6" } else { "ipv4" },
                 "cached DNS domain allow"

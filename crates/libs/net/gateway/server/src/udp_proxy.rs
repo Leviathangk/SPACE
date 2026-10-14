@@ -806,7 +806,11 @@ impl UdpProxy {
             if reply.is_empty() || policy_cancellation.is_cancelled() {
                 return;
             }
-            let accepted = dns_allow_cache.observe_response(&reply, policy.as_ref());
+            let accepted = dns_allow_cache.observe_current_response(
+                &reply,
+                policy.as_ref(),
+                &policy_cancellation,
+            );
             pplx_space_metrics::gateway::dns_attribution_cache_observation(
                 DnsAttributionCacheObservationSource::ReservedDns,
                 accepted,

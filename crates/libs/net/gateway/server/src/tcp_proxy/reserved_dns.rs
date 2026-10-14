@@ -84,7 +84,7 @@ where
         let accepted = proxy
             .network_state
             .dns_allow_cache()
-            .observe_response(&reply, admitted_policy);
+            .observe_current_response(&reply, admitted_policy, shutdown);
         pplx_space_metrics::gateway::dns_attribution_cache_observation(
             DnsAttributionCacheObservationSource::ReservedDns,
             accepted,

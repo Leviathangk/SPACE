@@ -25,14 +25,21 @@ fn example_ip() -> IpAddr {
 }
 
 #[test]
-fn observes_allowed_a_record() {
+fn observes_allowed_a_record_only_for_current_operation() {
     let policy = domain_allow_policy(vec![]);
-    let cache = DnsAllowCache::default();
     let packet = dns_a_response("example.com", [93, 184, 216, 34], 60);
-
-    cache.observe_response(&packet, &policy);
-
-    assert!(cache.allows_ip(example_ip(), &policy));
+    for cancelled in [false, true] {
+        let cache = DnsAllowCache::default();
+        let operation = tokio_util::sync::CancellationToken::new();
+        if cancelled {
+            operation.cancel();
+        }
+        assert_eq!(
+            cache.observe_current_response(&packet, &policy, &operation),
+            !cancelled
+        );
+        assert_eq!(cache.allows_ip(example_ip(), &policy), !cancelled);
+    }
 }
 
 #[test]

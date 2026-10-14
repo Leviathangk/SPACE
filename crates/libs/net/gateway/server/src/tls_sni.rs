@@ -21,6 +21,15 @@ use std::io::Cursor;
 /// ClientHello and is rejected without invoking the parser.
 const TLS_HANDSHAKE_CONTENT_TYPE: u8 = 0x16;
 
+/// What admission does with a flow whose ClientHello never arrives.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MissingClientHello {
+    /// The flow proceeds without SNI, so waiting only delays it.
+    Proceeds,
+    /// The flow is denied, so a late first segment must not read as none.
+    Denied,
+}
+
 /// Verdict of scanning the head of a TCP flow for a TLS ClientHello SNI.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClientHelloScan {

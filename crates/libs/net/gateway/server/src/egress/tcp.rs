@@ -7,14 +7,12 @@ use pplx_space_net_common::{
     DenyReason, DomainName, EgressDecision, NetworkPolicyV1, TlsInterception,
 };
 
-use super::tracker::DnsAttributedConnection;
 use super::{
-    EgressContext, EgressProtocol, authorize_domain, dns_allow_required, record_decision,
-    record_latency,
+    AdmittedTcp, EgressContext, EgressProtocol, TcpAdmissionEvidence, authorize_domain,
+    dns_allow_required, record_decision, record_latency,
 };
 use crate::dns::DnsAllowCache;
-use crate::sniff::MissingClientHello;
-use crate::tls_sni::ClientHelloScan;
+use crate::tls_sni::{ClientHelloScan, MissingClientHello};
 
 pub(crate) fn dns_attributed_host<'a>(
     destination: SocketAddr,
@@ -23,20 +21,6 @@ pub(crate) fn dns_attributed_host<'a>(
 ) -> Option<&'a DomainName> {
     scan.server_name()
         .filter(|host| dns_allow_cache.contains_host_binding(destination.ip(), host.as_str()))
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum AdmittedTcp {
-    Tunnel(SocketAddr),
-    HostBoundHttp(SocketAddr),
-}
-
-impl AdmittedTcp {
-    pub(crate) const fn destination(self) -> SocketAddr {
-        match self {
-            Self::Tunnel(destination) | Self::HostBoundHttp(destination) => destination,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -76,7 +60,7 @@ pub(crate) fn admit_tcp(
     scan: &ClientHelloScan,
     policy: &NetworkPolicyV1,
     dns_allow_cache: &DnsAllowCache,
-) -> Result<AdmittedTcp, TcpAdmissionDenial> {
+) -> Result<TcpAdmissionEvidence, TcpAdmissionDenial> {
     let dns_allowed = dns_allow_cache.allows_ip(destination.ip(), policy);
     let attributed_host = dns_attributed_host(destination, scan, dns_allow_cache);
     let context = EgressContext::Admission(EgressProtocol::Tcp);
@@ -90,37 +74,44 @@ pub(crate) fn admit_tcp(
         attributed_host,
     );
     record_tcp_decision(context, started_at, &result, policy);
-    result.map_err(TcpAdmissionDenial::DnsAttribution)
+    result
+        .map(|(route, interception)| {
+            let exempt_host = if !policy.tls_interception.is_off() && interception.is_off() {
+                attributed_host.cloned()
+            } else {
+                None
+            };
+            TcpAdmissionEvidence::new(route, scan.clone(), interception, exempt_host)
+        })
+        .map_err(TcpAdmissionDenial::DnsAttribution)
 }
 
-pub(super) fn revalidate_tcp(
-    connection: &DnsAttributedConnection,
+pub(crate) fn revalidate_tcp(
+    admission: &TcpAdmissionEvidence,
     policy: &NetworkPolicyV1,
     dns_allow_cache: &DnsAllowCache,
 ) -> bool {
     // Exemption evidence survives DNS expiry for an established connection.
-    let attributed_host = connection
-        .admitted_exempt_host
-        .as_ref()
-        .or_else(|| dns_attributed_host(connection.destination, &connection.scan, dns_allow_cache));
-    let interception = policy.tls_interception_for(connection.destination.ip(), attributed_host);
+    let attributed_host = admission.exempt_host().or_else(|| {
+        dns_attributed_host(admission.destination(), admission.scan(), dns_allow_cache)
+    });
+    let interception = policy.tls_interception_for(admission.destination().ip(), attributed_host);
     // Opaque TLS cannot become inspected on the same transport.
-    if connection.scan != ClientHelloScan::NotTls
-        && connection.admitted_tls_interception.is_off()
+    if *admission.scan() != ClientHelloScan::NotTls
+        && admission.interception_mode().is_off()
         && interception == TlsInterception::On
     {
         return false;
     }
-    let dns_allowed = dns_allow_cache.allows_ip(connection.destination.ip(), policy)
-        || connection
-            .admitted_exempt_host
-            .as_ref()
+    let dns_allowed = dns_allow_cache.allows_ip(admission.destination().ip(), policy)
+        || admission
+            .exempt_host()
             .is_some_and(|host| policy.explicitly_allows_domain_name(host));
     let started_at = Instant::now();
     let result = check_tcp(
         EgressContext::Resweep,
-        connection.destination,
-        &connection.scan,
+        admission.destination(),
+        admission.scan(),
         policy,
         dns_allowed,
         attributed_host,
@@ -132,7 +123,7 @@ pub(super) fn revalidate_tcp(
 fn record_tcp_decision(
     context: EgressContext,
     started_at: Instant,
-    result: &Result<AdmittedTcp, DenyReason>,
+    result: &Result<(AdmittedTcp, TlsInterception), DenyReason>,
     policy: &NetworkPolicyV1,
 ) {
     let decision = match result {
@@ -150,7 +141,7 @@ fn check_tcp(
     policy: &NetworkPolicyV1,
     dns_allowed: bool,
     attributed_host: Option<&DomainName>,
-) -> Result<AdmittedTcp, DenyReason> {
+) -> Result<(AdmittedTcp, TlsInterception), DenyReason> {
     let decision = policy.egress_decision_for_socket(destination, dns_allowed);
     let interception = policy.tls_interception_for(destination.ip(), attributed_host);
     let explicit_domain_deny = scan
@@ -172,7 +163,7 @@ fn check_tcp(
         return Err(reason);
     }
     let Some(fail_closed_reason) = dns_allow_required(destination, policy) else {
-        return Ok(AdmittedTcp::Tunnel(destination));
+        return Ok((AdmittedTcp::Tunnel(destination), interception));
     };
     let (evidence, outcome, result) = match scan {
         ClientHelloScan::ServerName(host) => {
@@ -218,5 +209,8 @@ fn check_tcp(
     if matches!(context, EgressContext::Admission(_)) {
         pplx_space_metrics::gateway::domain_binding("tcp", evidence, outcome, None);
     }
-    result
+    result.map(|route| (route, interception))
 }
+
+#[cfg(test)]
+mod tests;

@@ -52,9 +52,9 @@ impl GatewayNetworkState {
     pub(super) fn reconcile_policy(&self, policy: &NetworkPolicyV1) {
         self.reserved_dns_cancellation.cancel_in_flight();
         self.dns_allow_cache.retain_relevant_to_policy(policy);
-        let cancelled = self
-            .tcp_connections
-            .cancel_denied(policy, &self.dns_allow_cache);
+        let cancelled = self.tcp_connections.cancel_where(|admission| {
+            !crate::egress::revalidate_tcp(admission, policy, &self.dns_allow_cache)
+        });
         if cancelled > 0 {
             info!(
                 dns_attributed_cancelled_tcp_connections = cancelled,
