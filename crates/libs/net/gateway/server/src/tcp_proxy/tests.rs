@@ -12,6 +12,7 @@ use pplx_space_observability::test_capture::{CapturedEvent, CapturedEventsLayer,
 use tracing::instrument::WithSubscriber as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 
+mod lifecycle;
 mod tls_interception;
 
 fn dns_attribution_denied(reason: DenyReason) -> TcpAdmissionDenial {

@@ -17,6 +17,7 @@ use pplx_space_net_common::DomainName;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -68,6 +69,9 @@ pub struct TcpProxyConfig {
 /// proxy and the per-connection tasks it spawns. `&'static str` mirrors that the
 /// gateway is a per-sandbox process: the id is set once at startup and lives
 /// until process exit.
+///
+/// Shutdown joins accepted connection tasks, aborting those that exceed the
+/// shared grace period. Dropping this future aborts its connection tasks.
 pub async fn run(config: TcpProxyConfig) -> io::Result<()> {
     let TcpProxyConfig {
         sandbox_id,
@@ -85,7 +89,8 @@ pub async fn run(config: TcpProxyConfig) -> io::Result<()> {
     } = config;
 
     let proxy_shutdown_token = shutdown_token.child_token();
-    let result = TcpProxy {
+    let _cancel_on_drop = proxy_shutdown_token.clone().drop_guard();
+    TcpProxy {
         sandbox_id,
         stats,
         network_state,
@@ -96,21 +101,19 @@ pub async fn run(config: TcpProxyConfig) -> io::Result<()> {
         reserved_dns_cancellation,
         known_egress_state,
         debug_state,
-        shutdown_token: proxy_shutdown_token.clone(),
+        shutdown_token: proxy_shutdown_token,
         refusal_warnings: Arc::default(),
     }
     .accept_loop(listener)
-    .await;
-
-    proxy_shutdown_token.cancel();
-    result
+    .await
 }
 
-/// Per-sandbox proxy state, cloned into each connection task.
 /// Minimum gap between interception refusal warnings for one cause. Matches
 /// the listener accept-error budget so operators see a consistent cadence.
 const REFUSAL_WARNING_INTERVAL: Duration = Duration::from_secs(30);
+const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Per-sandbox proxy state, cloned into each connection task.
 #[derive(Clone)]
 struct TcpProxy {
     sandbox_id: &'static str,
@@ -180,6 +183,23 @@ struct Accepted {
     /// Where the guest was going. TPROXY preserves it as our local address.
     dst: SocketAddr,
     permit: OwnedSemaphorePermit,
+}
+
+// Resource accounting must be released even if an aborted future never reaches
+// `record`; dropping a task does not establish its terminal protocol outcome.
+struct ActiveConnection<'a>(&'a ProxyStats);
+
+impl<'a> ActiveConnection<'a> {
+    fn new(stats: &'a ProxyStats) -> Self {
+        stats.tcp_active.fetch_add(1, Ordering::Relaxed);
+        Self(stats)
+    }
+}
+
+impl Drop for ActiveConnection<'_> {
+    fn drop(&mut self) {
+        self.0.tcp_active.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// What happened to one connection. Handled once, in [`TcpProxy::record`].
@@ -274,13 +294,44 @@ impl TcpProxy {
 
         let limit = Arc::new(Semaphore::new(MAX_ACTIVE_TCP_CONNECTIONS));
         let mut accept_errors = AcceptErrors::default();
+        let mut connections = JoinSet::new();
 
-        while let Some(accepted) = self.accept(&listener, &limit, &mut accept_errors).await? {
-            tokio::spawn(self.clone().serve(accepted));
-        }
+        let result = 'accept: loop {
+            // Reaping a connection must not restart an accept backoff or lose
+            // our place in the admission semaphore's wait queue.
+            let accepted = self.accept(&listener, &limit, &mut accept_errors);
+            tokio::pin!(accepted);
+            loop {
+                tokio::select! {
+                    biased;
+                    () = self.shutdown_token.cancelled() => break 'accept Ok(()),
+                    Some(result) = connections.join_next(), if !connections.is_empty() => {
+                        report_connection_task(self.sandbox_id, result);
+                    }
+                    result = &mut accepted => {
+                        match result {
+                            Ok(Some(accepted)) => {
+                                connections.spawn(self.clone().serve(accepted));
+                                break;
+                            }
+                            Ok(None) => break 'accept Ok(()),
+                            Err(error) => break 'accept Err(error),
+                        }
+                    }
+                }
+            }
+        };
 
+        drop(listener);
         info!(sandbox_id = self.sandbox_id, "TCP proxy shutting down");
-        Ok(())
+        drain_connections(
+            self.sandbox_id,
+            &mut connections,
+            &self.shutdown_token,
+            tokio::time::Instant::now() + CONNECTION_DRAIN_TIMEOUT,
+        )
+        .await;
+        result
     }
 
     /// The next connection to serve, or `None` once shutting down. Recoverable
@@ -373,7 +424,7 @@ impl TcpProxy {
         } = accepted;
         let _permit = permit;
 
-        self.stats.tcp_active.fetch_add(1, Ordering::Relaxed);
+        let _active = ActiveConnection::new(&self.stats);
         let shutdown = self.shutdown_token.child_token();
         // Biased, with the connection polled first: on shutdown both arms are
         // ready, and an unbiased select would pick between them at random, so
@@ -387,7 +438,6 @@ impl TcpProxy {
             _ = shutdown.cancelled() => (None, FlowOutcome::Cancelled),
         };
         self.record(dst, host.as_ref(), outcome);
-        self.stats.tcp_active.fetch_sub(1, Ordering::Relaxed);
     }
 
     async fn handle(
@@ -763,6 +813,42 @@ impl TcpProxy {
             }
         }
         reported
+    }
+}
+
+async fn drain_connections(
+    sandbox_id: &str,
+    connections: &mut JoinSet<()>,
+    shutdown: &CancellationToken,
+    deadline: tokio::time::Instant,
+) {
+    shutdown.cancel();
+    let drained = tokio::time::timeout_at(deadline, async {
+        while let Some(result) = connections.join_next().await {
+            report_connection_task(sandbox_id, result);
+        }
+    })
+    .await;
+    if drained.is_err() {
+        warn!(
+            sandbox_id,
+            connection_tasks = connections.len(),
+            "TCP connection tasks did not drain before deadline; aborting"
+        );
+        connections.abort_all();
+        // Aborting only requests cancellation. Joining waits for the async
+        // connection's sockets, permits and other guards to be released.
+        while let Some(result) = connections.join_next().await {
+            report_connection_task(sandbox_id, result);
+        }
+    }
+}
+
+fn report_connection_task(sandbox_id: &str, result: Result<(), JoinError>) {
+    if let Err(error) = result
+        && !error.is_cancelled()
+    {
+        warn!(sandbox_id, %error, "TCP connection task failed");
     }
 }
 
