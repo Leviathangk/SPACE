@@ -16,6 +16,7 @@ pub(crate) struct ServiceSettings {
     pub lifecycle_limiter: crate::lifecycle_limiter::LifecycleLimiter,
     pub runtime_paths: RuntimePaths,
     pub guest_console_logs: bool,
+    pub experiment_policy: ExperimentPolicy,
     pub memory_admission_sources: crate::memory_admission::MemoryAdmissionSources,
     pub runtime_supervisor: crate::runtime_supervisor_client::RuntimeSupervisorLazyClient,
     pub node_status_dirty: std::sync::Arc<dyn crate::node_state_sync::NodeStatusDirtySink>,
@@ -53,7 +54,7 @@ impl Default for ArtifactStorePaths {
 }
 
 impl ServiceSettings {
-    pub fn from_env() -> Self {
+    pub fn from_env() -> Result<Self, ExperimentPolicyError> {
         let settings = Self {
             disk_admission: CacheDiskAdmissionConfig::from_env(),
             lifecycle_limiter: crate::lifecycle_limiter::LifecycleLimiter::from_env(),
@@ -69,6 +70,9 @@ impl ServiceSettings {
                 ),
                 store: ArtifactStorePaths::default(),
             },
+            experiment_policy: ExperimentPolicy::from_setting(
+                std::env::var_os("SPACE_EXECUTION_EXPERIMENTS").as_deref(),
+            )?,
             guest_console_logs: std::env::var("SPACE_ENABLE_GUEST_CONSOLE_LOGS").is_ok_and(
                 |value| {
                     matches!(
@@ -88,9 +92,10 @@ impl ServiceSettings {
         tracing::info!(
             disk_admission = ?settings.disk_admission,
             guest_console_logs = settings.guest_console_logs,
+            experiments = %settings.experiment_policy,
             "resolved startup-only node-manager host settings"
         );
-        settings
+        Ok(settings)
     }
 }
 
@@ -102,3 +107,65 @@ fn path(name: &str, default: &str) -> PathBuf {
     tracing::info!(setting = name, source, path = %path.display(), "resolved startup-only runtime path");
     path
 }
+
+/// Startup-only support and admission for the compiled benchmark environment.
+/// Retain must remain configured until all experimental work has been deleted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ExperimentPolicy {
+    #[default]
+    Disabled,
+    Admit,
+    Retain,
+}
+
+impl ExperimentPolicy {
+    fn from_setting(value: Option<&std::ffi::OsStr>) -> Result<Self, ExperimentPolicyError> {
+        match value {
+            None => Ok(Self::Disabled),
+            Some(value) => value
+                .to_str()
+                .ok_or(ExperimentPolicyError::NonUnicode)?
+                .parse(),
+        }
+    }
+
+    pub fn retains(self) -> bool {
+        self != Self::Disabled
+    }
+    pub fn admits(self) -> bool {
+        self == Self::Admit
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "",
+            Self::Admit => "fc-1.17-linux-6.18",
+            Self::Retain => "retain:fc-1.17-linux-6.18",
+        }
+    }
+}
+impl std::fmt::Display for ExperimentPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[derive(Debug, thiserror::Error)]
+pub enum ExperimentPolicyError {
+    #[error("unsupported SPACE_EXECUTION_EXPERIMENTS value {0:?}")]
+    Unknown(String),
+    #[error("SPACE_EXECUTION_EXPERIMENTS must contain Unicode text")]
+    NonUnicode,
+}
+impl std::str::FromStr for ExperimentPolicy {
+    type Err = ExperimentPolicyError;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "" => Ok(Self::Disabled),
+            "fc-1.17-linux-6.18" => Ok(Self::Admit),
+            "retain:fc-1.17-linux-6.18" => Ok(Self::Retain),
+            _ => Err(ExperimentPolicyError::Unknown(value.to_owned())),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

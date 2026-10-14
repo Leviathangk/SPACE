@@ -94,6 +94,7 @@ use pplx_space_common_core::types::TemplateMetadata;
 
 pub struct TemplateBuilder {
     caller_org: Option<OrgId>,
+    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
 }
 
 struct ScratchScriptBundle {
@@ -508,6 +509,7 @@ fn build_vm_create_request(
     rootfs_size_mb: Option<u32>,
 ) -> CreateRequest {
     CreateRequest {
+        environment: None,
         template: base_template_name,
         owner: BUILDER_SANDBOX_OWNER.to_string(),
         runtime: "fc".to_string(),
@@ -574,7 +576,18 @@ impl Default for TemplateBuilder {
 
 impl TemplateBuilder {
     pub fn new() -> Self {
-        Self { caller_org: None }
+        Self {
+            caller_org: None,
+            environment: None,
+        }
+    }
+
+    pub fn with_environment(
+        mut self,
+        environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    ) -> Self {
+        self.environment = environment;
+        self
     }
 
     pub fn with_caller_org(mut self, caller_org: Option<OrgId>) -> Self {
@@ -728,7 +741,8 @@ impl TemplateBuilder {
             .ok_or(BuildExecutionBindingError::Missing(
                 "base execution metadata",
             ))?;
-        let execution_binding = BuildExecutionBinding::for_base(None, base_execution).await?;
+        let execution_binding =
+            BuildExecutionBinding::for_base(self.environment, base_execution).await?;
 
         println!("  Resolved base: {}", resolved_base.resolved_reference);
         if !std::path::Path::new(&resolved_base.rootfs_path).exists() {
@@ -768,16 +782,30 @@ impl TemplateBuilder {
 
         // Register the build sandbox before materializing its rootfs.
         let sandbox_id = build_phase(template_id, BuildPhase::CreateBuildVm, async {
+            let mut request = build_vm_create_request(
+                resolved_base.build_id.template().as_str().to_string(),
+                resolved_base.build_id.content_hash().to_string(),
+                Some(build_rootfs_size_mib),
+            );
+            // Experimental bases must not reach an old sandbox manager through
+            // the unselected wire path. E0 builds preserve rolling compatibility.
+            if self.environment.is_some()
+                || base_execution.runtime().version.as_str()
+                    != pplx_space_common_core::types::INITIAL_FIRECRACKER_RUNTIME_VERSION
+            {
+                let reference = execution_binding
+                    .as_ref()
+                    .ok_or(BuildExecutionBindingError::Missing("base environment"))?
+                    .reference();
+                pplx_space_sbx_mgr_client::environment::bind(&mut request, reference);
+            }
             Ok::<String, BuildError>(
-                sbx.create(build_vm_create_request(
-                    resolved_base.build_id.template().as_str().to_string(),
-                    resolved_base.build_id.content_hash().to_string(),
-                    Some(build_rootfs_size_mib),
-                ))
-                .await
-                .map_err(|e| BuildError::message(format!("sandbox create failed: {e}")))?
-                .into_inner()
-                .sandbox_id,
+                pplx_space_sbx_mgr_client::environment::create(&mut sbx, request)
+                    .await
+                    .map_err(|error| {
+                        BuildError::message(format!("sandbox create failed: {error}"))
+                    })?
+                    .sandbox_id,
             )
         })
         .await?;
@@ -1337,7 +1365,7 @@ impl TemplateBuilder {
         cmd.env("SPACE_SEED_GUEST_BIN_DIR", &guest_bin_dir);
         cmd.env("SPACE_SEED_ROOTFS_BUILDER_SCRIPT", &rootfs_builder_path);
         let execution_binding = BuildExecutionBinding::for_scratch(
-            None,
+            self.environment,
             guest_kernel.as_ref(),
             std::env::consts::ARCH
                 .parse()

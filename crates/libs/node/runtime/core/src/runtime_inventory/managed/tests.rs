@@ -514,3 +514,134 @@ fn legacy_asset_alias_retains_e0_boot_and_restore() {
         )
         .unwrap_err();
 }
+
+#[test]
+fn experimental_inventory_preserves_e0_and_recovers_only_the_exact_pair() {
+    use crate::catalog::BenchmarkEnvironment;
+    let fixture = Fixture::new();
+    let initial = synthetic_initial_environment();
+    let experiment = BenchmarkEnvironment::for_test(
+        pin("1.17.0", 7),
+        PinnedKernel {
+            version: "6.18.44".parse().unwrap(),
+            runtime: RuntimeKind::Firecracker,
+            runtime_line: "1.17".parse().unwrap(),
+            architecture: Arch::X86_64,
+            size: 4096,
+            sha256: sha256(&binary(44)),
+        },
+    );
+    let cache = fixture._dir.path().join("cache/firecracker");
+    std::fs::create_dir_all(&cache).unwrap();
+    for (job, kernel, fill) in [
+        ("initial", initial.kernel(), 42),
+        ("candidate", experiment.kernel(), 44),
+    ] {
+        let source = fixture
+            .staging
+            .join("firecracker/kernels")
+            .join(job)
+            .join(kernel.version.as_str())
+            .join(KERNEL_IMAGE);
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(source, binary(fill)).unwrap();
+        fixture.store.publish_kernel(kernel, &staged(job)).unwrap();
+    }
+    let discover = || {
+        let mut inventory = RuntimeInventory::discover_with_store(
+            &fixture.store,
+            &initial,
+            &fixture._dir.path().join("vendor"),
+            &cache.join("assets"),
+            &cache.join("kernels"),
+        )
+        .unwrap();
+        inventory
+            .include_benchmark(&fixture.store, &experiment, &cache.join("kernels"))
+            .unwrap();
+        inventory
+    };
+    let definition = experiment.definition().unwrap();
+    let requirements = definition.execution_requirements().unwrap();
+    // Inventory inspection uses the test host architecture. The compiled
+    // x86-only descriptor itself is tested independently in catalog tests.
+    let requested = ExecutionMetadata::new(
+        requirements.runtime().clone(),
+        GuestPlatform {
+            os: GuestOperatingSystem::Linux,
+            architecture: host_arch().unwrap(),
+        },
+        requirements.state_format().cloned(),
+        requirements.components().to_vec(),
+    )
+    .unwrap()
+    .with_environment(definition.reference());
+    let resolve = |inventory: &RuntimeInventory| {
+        inventory.resolve(
+            Some(&requested),
+            RuntimeKind::Firecracker,
+            ExecutionSelectionMode::NewColdBoot,
+        )
+    };
+    let assert_default = |inventory: &RuntimeInventory| {
+        assert_eq!(
+            inventory
+                .resolve(
+                    None,
+                    RuntimeKind::Firecracker,
+                    ExecutionSelectionMode::NewColdBoot
+                )
+                .unwrap()
+                .execution
+                .runtime(),
+            &initial.release().release
+        );
+    };
+    let missing = discover();
+    assert_default(&missing);
+    assert!(
+        resolve(&missing).is_err(),
+        "candidate kernel alone cannot produce E0/C hybrid"
+    );
+    fixture.place_release("1.17.0", 7);
+    let ready = discover();
+    assert_default(&ready);
+    let resolved = resolve(&ready).unwrap();
+    assert_eq!(resolved.execution.runtime(), &experiment.release().release);
+    assert_eq!(
+        resolved.components[0].metadata.digest,
+        Some(experiment.kernel().sha256)
+    );
+    std::fs::remove_dir_all(cache.join("managed")).unwrap();
+    assert!(!ready.check_files_unchanged());
+    let recovered = discover();
+    assert_eq!(resolve(&recovered).unwrap().execution, resolved.execution);
+    let image = resolve(&recovered).unwrap().components[0].path.clone();
+    std::fs::write(&image, binary(99)).unwrap();
+    let bad_kernel = discover();
+    assert_default(&bad_kernel);
+    resolve(&bad_kernel).unwrap_err();
+    assert!(bad_kernel.unavailable.iter().any(|artifact| {
+        matches!(artifact, UnavailableArtifact::Kernel { digest, .. } if *digest == experiment.kernel().sha256)
+    }));
+    assert!(!bad_kernel.unavailable.iter().any(|artifact| {
+        matches!(artifact, UnavailableArtifact::Runtime { identity, .. } if identity == &experiment.release().release)
+    }));
+    std::fs::write(&image, binary(44)).unwrap();
+    assert!(
+        !bad_kernel.check_files_unchanged(),
+        "repairing cached bytes must invalidate the failure"
+    );
+    resolve(&discover()).unwrap();
+    std::fs::write(
+        fixture.release_path("1.17.0", 7).join("bin/firecracker"),
+        binary(99),
+    )
+    .unwrap();
+    let invalid = discover();
+    assert_default(&invalid);
+    assert!(
+        resolve(&invalid).is_err(),
+        "corrupt candidate cannot disable or substitute E0"
+    );
+}

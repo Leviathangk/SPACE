@@ -78,13 +78,7 @@ impl RuntimeInventory {
         let cache_parent = kernels
             .parent()
             .ok_or_else(|| RuntimeInventoryError::ParentlessKernelRoot(kernels.to_path_buf()))?;
-        let cached_kernel = cache_parent
-            .join("managed/kernels")
-            .join(managed_kernel_directory(
-                &initial.kernel().version,
-                initial.kernel().sha256,
-            ))
-            .join(KERNEL_IMAGE);
+        let cached_kernel = ArtifactStore::execution_kernel_path(cache_parent, initial.kernel());
         let mut watched = vec![
             store.releases_root().to_path_buf(),
             store.kernels_root().to_path_buf(),
@@ -192,6 +186,90 @@ impl RuntimeInventory {
         }
         inventory.remember_paths(watched);
         Ok(inventory)
+    }
+
+    /// Candidate execution only uses verified managed releases, never external fallback.
+    pub fn exclude_benchmark_runtime(&mut self) {
+        self.runtimes.retain(|entry| {
+            entry.runtime.kind != RuntimeKind::Firecracker
+                || entry.runtime.version.as_str()
+                    != crate::catalog::BenchmarkEnvironment::RUNTIME_VERSION
+        });
+    }
+
+    /// Include only the pinned experimental pair; never change new/legacy defaults.
+    /// Missing or invalid experiment bytes withdraw that pair, not E0.
+    pub fn include_benchmark(
+        &mut self,
+        store: &ArtifactStore,
+        experiment: &crate::catalog::BenchmarkEnvironment,
+        kernels: &Path,
+    ) -> Result<(), RuntimeInventoryError> {
+        let release = experiment.release();
+        let kernel = experiment.kernel();
+        self.runtimes
+            .retain(|entry| entry.runtime != release.release);
+        self.components
+            .retain(|entry| entry.metadata.digest != Some(kernel.sha256));
+        let release_root = store.releases_root().join(managed_release_directory(
+            &release.release,
+            release.digest(),
+        ));
+        let kernel_root = store
+            .kernels_root()
+            .join(managed_kernel_directory(&kernel.version, kernel.sha256));
+        let cache_parent = kernels
+            .parent()
+            .ok_or_else(|| RuntimeInventoryError::ParentlessKernelRoot(kernels.to_path_buf()))?;
+        let mut watched = vec![
+            release_root.join("bin/firecracker"),
+            release_root.join("bin/jailer"),
+            kernel_root.join(KERNEL_IMAGE),
+            ArtifactStore::execution_kernel_path(cache_parent, kernel),
+        ];
+        let runtime = (|| {
+            store.verify_release(release)?;
+            FirecrackerDriver.inspect_installation(release_root, release.release.version.clone())
+        })();
+        match runtime {
+            Ok(installation) => self.runtimes.push(installation),
+            Err(error) => {
+                tracing::warn!(%error, "benchmark runtime unavailable");
+                let error = self.binding_error(error);
+                self.unavailable.push(UnavailableArtifact::Runtime {
+                    identity: release.release.clone(),
+                    error,
+                });
+            }
+        }
+        let component = (|| {
+            let cache = store.prepare_execution_cache(cache_parent)?;
+            let staged = store.stage_kernel(kernel, &cache)?;
+            let image = staged.path.join(KERNEL_IMAGE);
+            watched.push(image.clone());
+            Ok::<_, RuntimeInventoryError>(kernel_installation(
+                kernel_metadata(kernel.version.clone(), kernel.sha256)?,
+                image,
+                false,
+                false,
+            ))
+        })();
+        match component {
+            Ok(component) => self.components.push(component),
+            Err(error) => {
+                tracing::warn!(%error, "benchmark kernel unavailable");
+                let error = self.binding_error(error);
+                self.unavailable.push(UnavailableArtifact::Kernel {
+                    digest: kernel.sha256,
+                    legacy: false,
+                    error,
+                });
+            }
+        }
+        let previous = std::mem::take(&mut self.fingerprints);
+        self.remember_paths(watched);
+        self.fingerprints.extend(previous);
+        Ok(())
     }
 
     fn binding_error(

@@ -69,9 +69,6 @@ pub(super) enum SandboxCreateIntent {
 pub(super) fn validate_create_request(
     req: &CreateRequest,
 ) -> Result<(BootMode, Option<Uuid>), Status> {
-    let boot_mode = BootMode::try_from(req.boot_mode).map_err(|_| {
-        Status::invalid_argument(format!("unknown boot_mode value {}", req.boot_mode))
-    })?;
     if req.runtime.is_empty() {
         return Err(Status::invalid_argument("runtime is required"));
     }
@@ -81,6 +78,16 @@ pub(super) fn validate_create_request(
             req.runtime
         )));
     }
+    validate_create_request_fields(req)
+}
+
+/// Validate inputs independent of the runtime resolved from an environment.
+pub(super) fn validate_create_request_fields(
+    req: &CreateRequest,
+) -> Result<(BootMode, Option<Uuid>), Status> {
+    let boot_mode = BootMode::try_from(req.boot_mode).map_err(|_| {
+        Status::invalid_argument(format!("unknown boot_mode value {}", req.boot_mode))
+    })?;
     if let Some(size_mib) = req.rootfs_size_mb {
         pplx_space_common_core::sandbox_storage::validate_rootfs_mib(size_mib)
             .map_err(|error| Status::invalid_argument(format!("rootfs_size_mb: {error}")))?;
@@ -447,6 +454,7 @@ pub(super) fn create_response_for_existing_sandbox(
 ) -> CreateResponse {
     let has_process = existing.pid.is_some();
     CreateResponse {
+        environment: None,
         sandbox_id: existing.id.clone(),
         pid: existing.pid,
         guest_ip: has_process.then(|| GUEST_IP.to_string()),

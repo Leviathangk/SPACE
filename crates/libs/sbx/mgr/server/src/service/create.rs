@@ -194,6 +194,26 @@ impl SandboxManagerService {
         })
     }
 
+    /// Execution evidence is committed before a VM is launched. Legacy rows
+    /// without it predate selected environments; filesystem cache loss cannot
+    /// erase a candidate's durable binding or turn it into legacy execution.
+    pub(super) fn ensure_memory_state_supported(
+        &self,
+        sandbox: &crate::db::SandboxRow,
+        operation: &'static str,
+    ) -> Result<(), Status> {
+        if sandbox
+            .execution_metadata
+            .as_ref()
+            .is_some_and(super::validation::is_experimental_execution)
+        {
+            return Err(Status::failed_precondition(format!(
+                "cannot {operation}: experimental environments do not support memory-state operations"
+            )));
+        }
+        Ok(())
+    }
+
     pub(super) fn ensure_not_pool_sandbox_for_snapshots(
         &self,
         sandbox: &crate::db::SandboxRow,
@@ -569,6 +589,7 @@ impl SandboxManagerService {
             };
             let r = start_resp.into_inner();
             return Ok(Response::new(CreateResponse {
+                environment: None,
                 sandbox_id: id,
                 pid: Some(r.pid),
                 guest_ip: Some(r.guest_ip),

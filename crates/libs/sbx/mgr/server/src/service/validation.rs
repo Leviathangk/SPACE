@@ -287,3 +287,60 @@ pub(super) fn require_environment_acknowledgement(
 
 #[cfg(test)]
 mod tests;
+
+/// Explicit selection cannot relabel a template. Experiments remain local and
+/// cold-only until cluster placement and memory-state compatibility are qualified.
+pub(super) fn validate_environment_create(
+    request: &crate::proto::CreateRequest,
+    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    execution: &pplx_space_common_core::types::ExecutionMetadata,
+) -> Result<bool, tonic::Status> {
+    if environment.is_some() && environment != execution.environment() {
+        return Err(tonic::Status::failed_precondition(
+            "requested environment differs from the template binding",
+        ));
+    }
+    let experimental = is_experimental_execution(execution);
+    if (experimental || environment.is_some())
+        && (request.sandbox_id.is_some()
+            || request.route_identity.is_some()
+            || request.pool_template.is_some()
+            || request.snapshots_enabled
+            || request.boot_mode != crate::proto::BootMode::Cold as i32)
+    {
+        return Err(tonic::Status::failed_precondition(
+            "experimental environments require node-local cold creation without pools, snapshots, or cluster-owned identity",
+        ));
+    }
+    Ok(experimental)
+}
+
+/// Decode the additive input before normal admission. Both legacy inputs must
+/// be absent so an old server cannot ignore selection and execute default work.
+pub(super) fn normalize_environment_input(
+    request: &mut crate::proto::CreateRequest,
+) -> Result<Option<pplx_space_common_core::types::EnvironmentReference>, Status> {
+    let Some(input) = request.environment.take() else {
+        return Ok(None);
+    };
+    if !request.template.is_empty() || !request.runtime.is_empty() {
+        return Err(Status::invalid_argument("provide exactly one create input"));
+    }
+    let reference = input.reference.parse().map_err(
+        |error: pplx_space_common_core::types::DigestParseError| {
+            Status::invalid_argument(error.to_string())
+        },
+    )?;
+    request.template = input.template;
+    Ok(Some(reference))
+}
+
+/// Selected non-default runtimes are cold-only until their memory-state
+/// compatibility has been qualified. Keep admission and capture on one policy.
+pub(super) fn is_experimental_execution(
+    execution: &pplx_space_common_core::types::ExecutionMetadata,
+) -> bool {
+    execution.environment().is_some()
+        && execution.runtime().version.as_str()
+            != pplx_space_common_core::types::INITIAL_FIRECRACKER_RUNTIME_VERSION
+}

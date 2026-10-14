@@ -157,6 +157,7 @@ impl TemplateBuildSubmission {
         grant: Option<SystemPublicationGrantId>,
     ) -> StartBuildRequest {
         StartBuildRequest {
+            environment: None,
             system_publication_grant_id: grant.map(|grant| grant.to_string()),
             recipe: Some(self.recipe),
             template_id: self.target.template_name().to_string(),
@@ -404,6 +405,7 @@ impl TemplateController {
             })?;
 
         Ok(StartBuildResponse {
+            environment: None,
             job_id: job_id.to_string(),
         })
     }

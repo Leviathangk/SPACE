@@ -64,7 +64,9 @@ fn id_prefix_for_selected_scope_requires_id_or_all() {
 fn local_create_and_start_delegate_direct_identity_to_sandbox_manager() {
     let create = local_create_request(
         CreateCommandInput {
-            runtime: "fc".to_string(),
+            environment: None,
+            content_hash: None,
+            runtime: Some("fc".to_string()),
             template: "seed".to_string(),
             user: None,
             snapshots: false,

@@ -118,6 +118,8 @@ pub struct NodeMgrRunConfig {
 /// variable, or value that was misread.
 #[derive(Debug, thiserror::Error)]
 pub enum RunNodeMgrError {
+    #[error(transparent)]
+    ExperimentPolicy(#[from] crate::config::ExperimentPolicyError),
     #[error("failed to read node config {path}: {source}")]
     ReadConfig {
         path: PathBuf,
@@ -576,7 +578,7 @@ pub async fn run(
     let memory_admission_config = resolve_memory_admission_config(&cli, &file.memory_admission)?;
     let mut disk_io_reservation_config =
         resolve_disk_io_reservation_config(file.disk_io_reservation)?;
-    let service_settings = crate::config::ServiceSettings::from_env();
+    let service_settings = crate::config::ServiceSettings::from_env()?;
     let disk_metrics_config = crate::service::node_disk_metrics::NodeDiskMetricsConfig::default();
     let cgroup_reclaim_interval = crate::service::cgroup_reclaim::RECLAIM_INTERVAL;
     let btrfs_balance_enabled = crate::service::btrfs_balance::enabled_from_env();
