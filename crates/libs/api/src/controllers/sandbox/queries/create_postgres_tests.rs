@@ -717,6 +717,10 @@ impl SubstrateAdapter for RetryingPoolSubstrate {
         "k8s"
     }
 
+    fn capabilities(&self) -> SubstrateCapabilities {
+        SubstrateCapabilities::KUBERNETES
+    }
+
     async fn create_execution(
         &self,
         _request: CreateExecutionRequest<'_>,
@@ -1047,6 +1051,10 @@ struct NodeRpcStubbedKubernetes {
 impl SubstrateAdapter for NodeRpcStubbedKubernetes {
     fn managed_by(&self) -> &'static str {
         self.inner.managed_by()
+    }
+
+    fn capabilities(&self) -> SubstrateCapabilities {
+        self.inner.capabilities()
     }
 
     async fn create_execution(
@@ -1757,11 +1765,13 @@ async fn postgres_kubernetes_create_fills_unset_resources_from_the_template_shap
     let release_id = insert_template_release(&db.pool, "app-runtime", "sha256:shape").await?;
     insert_inventory_shape(&db.pool, "builder", "sha256:shape", (4, 4096), 0).await?;
     let template = TemplateName::parse("app-runtime").unwrap();
-    let resolve_with = |managed_by, boot_mode, requested, restoring| {
+    let k8s = SubstrateCapabilities::KUBERNETES;
+    let space = SubstrateCapabilities::DIRECT;
+    let resolve_with = |substrate, boot_mode, requested, restoring| {
         resolve_cold_create_resources(
             &db.pool,
             ColdCreateShapeInput {
-                managed_by,
+                capabilities: substrate,
                 runtime: RuntimeKind::Firecracker,
                 boot_mode,
                 template: &template,
@@ -1773,7 +1783,7 @@ async fn postgres_kubernetes_create_fills_unset_resources_from_the_template_shap
         )
     };
     let resolve =
-        |managed_by, boot_mode, requested| resolve_with(managed_by, boot_mode, requested, false);
+        |substrate, boot_mode, requested| resolve_with(substrate, boot_mode, requested, false);
     let unset = || SandboxResources {
         vcpu: None,
         memory_mib: None,
@@ -1782,7 +1792,7 @@ async fn postgres_kubernetes_create_fills_unset_resources_from_the_template_shap
     let shape =
         |resources: &SandboxResources| (resources.vcpu, resources.memory_mib, resources.disk_mib);
 
-    let (resources, _) = resolve("k8s", CreateBootMode::Fallthrough, unset()).await?;
+    let (resources, _) = resolve(k8s, CreateBootMode::Fallthrough, unset()).await?;
     assert_eq!(
         shape(&resources),
         (Some(4), Some(4096), None),
@@ -1790,7 +1800,7 @@ async fn postgres_kubernetes_create_fills_unset_resources_from_the_template_shap
     );
 
     let (resources, _) = resolve(
-        "k8s",
+        k8s,
         CreateBootMode::Cold,
         SandboxResources {
             vcpu: None,
@@ -1805,14 +1815,14 @@ async fn postgres_kubernetes_create_fills_unset_resources_from_the_template_shap
         "requested values win; only unset ones come from the template"
     );
 
-    let (resources, _) = resolve("space", CreateBootMode::Fallthrough, unset()).await?;
+    let (resources, _) = resolve(space, CreateBootMode::Fallthrough, unset()).await?;
     assert_eq!(
         shape(&resources),
         (None, None, None),
         "direct creates keep the node's snapshot or metadata shape"
     );
 
-    let (resources, _) = resolve_with("k8s", CreateBootMode::Cold, unset(), true).await?;
+    let (resources, _) = resolve_with(k8s, CreateBootMode::Cold, unset(), true).await?;
     assert_eq!(
         shape(&resources),
         (None, None, None),
@@ -1830,7 +1840,7 @@ async fn postgres_kubernetes_create_fills_unset_resources_from_the_template_shap
     .bind(release_id)
     .execute(&db.pool)
     .await?;
-    let (resources, _) = resolve("k8s", CreateBootMode::Fallthrough, unset()).await?;
+    let (resources, _) = resolve(k8s, CreateBootMode::Fallthrough, unset()).await?;
     assert_eq!(
         shape(&resources),
         (Some(2), Some(8192), Some(32768)),

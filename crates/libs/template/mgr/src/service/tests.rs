@@ -344,7 +344,7 @@ fn template_import_manifest_identity_detects_conflicts() {
         "name": "code-runtime",
         "runtime": "firecracker",
         "arch": "x86_64",
-        "metadata": {"ignored": true}
+        "build_date": "2026-06-01T00:00:00Z"
     });
     let different_arch = serde_json::json!({
         "name": "code-runtime",
@@ -1637,6 +1637,8 @@ fn refresh_register_existing_expanded_build_rejects_hash_mismatch() {
         error.message()
     );
 }
+
+mod import_rpc;
 
 #[test]
 fn rootfs_size_mb_from_metadata_returns_disk_size_for_template_build() {
