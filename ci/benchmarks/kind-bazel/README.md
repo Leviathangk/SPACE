@@ -99,6 +99,58 @@ do not make an individual recovery deadline or backoff interval shorter. Full
 coverage still requires every target, including the encrypted restore scenario's
 device-mapper prerequisites.
 
+## Compare warm scheduling against fixed shards
+
+`scheduling.py` prepares fresh isolated stacks for each arm, then runs the same
+scenario/API-surface inventory with equal worker counts. The fixed arm uses the
+existing duration-balanced shard assignments and sequential per-scenario
+commands. The candidate uses actual Bazel test scheduling. Both use the same
+fixture adapter, source archive, and artifact image, and run serially on one host.
+This isolates scheduling; it does not exactly reproduce the old bulk-suite Python
+process or a four-runner CI topology.
+
+```sh
+uv --no-config run --frozen --python 3.11 python ci/benchmarks/kind-bazel/scheduling.py \
+  --workers 2 --source-archive /tmp/space-kind-fixture/source.tar \
+  --artifact-archive /absolute/path/to/artifact/tarball.tar \
+  --output /tmp/space-kind-scheduling-trial
+```
+
+Use `--plan-only` to inspect coverage without creating containers. Any deliberate
+subset must use `--exclude SCENARIO_ID --exclusion-reason REASON`; exclusions are
+recorded and never count as passes. Full coverage requires a host with all
+scenario prerequisites, including device-mapper crypt/snapshot targets.
+
+The report separates bootstrap, warm target execution, and cleanup. Candidate
+execution includes Bazel startup/analysis overhead. A failed or incomplete arm
+stops the comparison without claiming a speedup. Each arm gets new stacks and
+native volumes; it does not inherit the other arm's live test state. Repeat with
+`--dynamic-first` and a new output directory to examine order/cache effects.
+A single paired trial is exploratory, not a variance estimate.
+
+## Run on a self-hosted agent
+
+Use a Linux amd64 worker with writable KVM, privileged Docker, and enough Docker
+storage for the whole pool. Two stacks exhausted a roughly 158 GiB hosted disk
+in an earlier incomplete run; a 500 GiB Docker disk provides more room without
+lowering the suite's storage admission thresholds. Verify free space from a
+Docker volume, since the checkout and Docker data may use different disks.
+
+Keep the agent on an isolated queue and invoke this experiment manually. Preserve
+Bazel outputs and downloaded image layers between jobs. The pool still creates
+fresh live stacks for each invocation; it does not implement cluster persistence
+across jobs.
+
+When Docker runs in a sidecar, inspect the ancestor cgroup limits rather than
+relying on `docker info` CPU counts. Pass `--cgroup-parent /absolute/host/cgroup`
+to `scheduling.py` or `pool.py run` to place all workers below the assigned
+allocation. The supplied parent must delegate memory and CPU controllers; a
+process-bearing coordinator cgroup may not provide both. This mode moves the
+worker init processes into a leaf and enables controllers before starting Docker.
+It also uses private cgroup namespaces so nested Docker cannot
+place ordinary child containers outside that hierarchy. Verify the resulting
+containers' parent cgroup and namespace mode before accepting timings.
+
 ## Reproduce the whole-image comparison
 
 Capture a new reference in a disposable source snapshot. This builds Cargo once

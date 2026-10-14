@@ -17,6 +17,21 @@ if [[ "$1" == bootstrap ]]; then
   for tool in docker ip kind kubectl helm tilt go uv curl jq lsof ssh-keygen timeout git tar; do
     command -v "$tool" >/dev/null || { echo "Missing Kind worker prerequisite: $tool" >&2; exit 2; }
   done
+  if [[ "${SPACE_KIND_BAZEL_DELEGATE_CGROUP:-0}" == 1 ]]; then
+    [[ "$(awk -F: '$1 == "0" {print $3}' /proc/self/cgroup)" == / ]] || {
+      echo "Cgroup delegation requires a private cgroup v2 namespace" >&2
+      exit 2
+    }
+    # Domain controllers require an empty root. Keep PID 1 and exec processes in
+    # a leaf so nested Kind nodes can delegate memory to systemd and kubelet.
+    mkdir -p /sys/fs/cgroup/init
+    mapfile -t root_pids </sys/fs/cgroup/cgroup.procs
+    for pid in "${root_pids[@]}"; do
+      echo "$pid" >/sys/fs/cgroup/init/cgroup.procs
+    done
+    sed -e 's/ / +/g' -e 's/^/+/' /sys/fs/cgroup/cgroup.controllers \
+      >/sys/fs/cgroup/cgroup.subtree_control
+  fi
   ip link add space-docker0 type bridge
   ip addr add 172.30.0.1/16 dev space-docker0
   ip link set space-docker0 up
@@ -45,6 +60,10 @@ if [[ "$1" == bootstrap ]]; then
   chmod 0600 "$SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE"
   # Package installation is done once per stack, outside scenario execution.
   uv sync --frozen --python 3.11
+  while read -r node; do
+    echo "Builder storage: $node"
+    docker exec "${node#node/}" df -B1 /var/lib/containerd /space/cache
+  done < <(kubectl --context kind-space-local get nodes -l space.pplx.net/node-pool=builder -o name)
   exit 0
 fi
 

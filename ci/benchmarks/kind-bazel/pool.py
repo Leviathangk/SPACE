@@ -2,13 +2,16 @@
 """Lease invocation-owned Kind workers to independently scheduled Bazel tests."""
 
 import argparse
+import concurrent.futures
 import fcntl
 import hashlib
 import json
 import os
 import signal
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -41,12 +44,23 @@ def stop_worker(name, owner):
 
 
 def bootstrap(config, name, log):
+    cgroup = (
+        [
+            "--cgroup-parent",
+            config["cgroup_parent"],
+            "--cgroupns=private",
+            "--env",
+            "SPACE_KIND_BAZEL_DELEGATE_CGROUP=1",
+        ]
+        if config.get("cgroup_parent")
+        else ["--cgroupns=host"]
+    )
     command(
         "docker",
         "run",
         "--detach",
         "--privileged",
-        "--cgroupns=host",
+        *cgroup,
         "--device",
         "/dev/kvm",
         "--name",
@@ -101,7 +115,13 @@ def scenario(surface, scenario_id):
             raise SystemExit(
                 "Kind fixture bootstrap failed; inspect the worker bootstrap log"
             )
-        for slot in range(config["workers"]):
+        assignments = config.get("assignments")
+        slots = (
+            [assignments[surface + ":" + scenario_id]]
+            if assignments
+            else range(config["workers"])
+        )
+        for slot in slots:
             with (pool / f"worker-{slot}.lock").open("a") as lock:
                 try:
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -170,6 +190,58 @@ def scenario(surface, scenario_id):
         time.sleep(0.1)
 
 
+def target_pair(target):
+    prefix = "//ci/benchmarks/kind-bazel:"
+    if not target.startswith(prefix):
+        raise ValueError("Fixed plans require explicit Kind scenario labels")
+    surface, scenario_id = target.removeprefix(prefix).split("__", 1)
+    if surface not in ("ecw", "native") or not scenario_id.replace("_", "").isalnum():
+        raise ValueError("Invalid scenario target")
+    return surface, scenario_id.replace("__", ".")
+
+
+def fixed_tests(args, environment, partitions):
+    failed = threading.Event()
+
+    def partition(slot, targets):
+        for target in targets:
+            if failed.is_set():
+                return 1
+            surface, scenario_id = target_pair(target)
+            log = args.output / "targets" / (target.split(":")[-1] + ".log")
+            with log.open("w") as stream:
+                try:
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            str(Path(__file__).resolve()),
+                            "scenario",
+                            surface,
+                            scenario_id,
+                        ],
+                        env=environment,
+                        stdout=stream,
+                        stderr=subprocess.STDOUT,
+                        check=False,
+                        timeout=3600,
+                    )
+                    code = result.returncode
+                except subprocess.TimeoutExpired:
+                    code = 124
+            print(
+                json.dumps({"target": target, "worker": slot, "returncode": code}),
+                flush=True,
+            )
+            if code:
+                failed.set()
+                return 1
+        return 0
+
+    (args.output / "targets").mkdir()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+        return max(executor.map(lambda item: partition(*item), enumerate(partitions)))
+
+
 def run(args):
     if not Path("/dev/kvm").exists():
         raise SystemExit("This suite needs a Linux KVM worker; /dev/kvm is unavailable")
@@ -184,6 +256,7 @@ def run(args):
             "owner": owner,
             "workers": args.workers,
             "runner_image": args.runner_image,
+            "cgroup_parent": args.cgroup_parent,
             "source_archive": str(args.source_archive.resolve()),
             "artifact_archive": str(args.artifact_archive.resolve()),
             "source_sha256": digest(args.source_archive),
@@ -196,6 +269,23 @@ def run(args):
             raise SystemExit(
                 "Source/image fixture digest mismatch; regenerate with fixture.py"
             )
+        partitions = None
+        if args.fixed_plan:
+            partitions = json.loads(args.fixed_plan.read_text())
+            flattened = [target for targets in partitions for target in targets]
+            if (
+                len(partitions) != args.workers
+                or len(flattened) != len(set(flattened))
+                or set(flattened) != set(args.targets)
+            ):
+                raise SystemExit(
+                    "Fixed plan must cover each selected target exactly once"
+                )
+            config["assignments"] = {
+                ":".join(target_pair(target)): slot
+                for slot, targets in enumerate(partitions)
+                for target in targets
+            }
         (pool / "config.json").write_text(json.dumps(config))
         environment = os.environ | {"SPACE_KIND_BAZEL_POOL": str(pool)}
         # Every selected scenario must execute, even when a previous invocation
@@ -214,7 +304,12 @@ def run(args):
             "--test_env=DOCKER_HOST",
             "--test_env=DOCKER_CONTEXT",
         ]
+        if args.stop_on_failure:
+            argv.append("--notest_keep_going")
         process = None
+        returncode = None
+        setup_finished = None
+        tests_finished = None
 
         def interrupted(signum, frame):
             if process is not None:
@@ -226,8 +321,27 @@ def run(args):
         }
         started = time.monotonic()
         try:
-            process = subprocess.Popen(argv, env=environment)
-            returncode = process.wait()
+            if args.prewarm:
+
+                def prepare(slot):
+                    bootstrap(
+                        config,
+                        f"space-bazel-{owner}-{slot}",
+                        pool / f"worker-{slot}.bootstrap.log",
+                    )
+                    (pool / f"worker-{slot}.ready").touch()
+
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=args.workers
+                ) as executor:
+                    list(executor.map(prepare, range(args.workers)))
+            setup_finished = time.monotonic()
+            if partitions is not None:
+                returncode = fixed_tests(args, environment, partitions)
+            else:
+                process = subprocess.Popen(argv, env=environment)
+                returncode = process.wait()
+            tests_finished = time.monotonic()
             return returncode
         finally:
             if process is not None and process.poll() is None:
@@ -273,10 +387,20 @@ def run(args):
                 json.dumps(
                     {
                         "seconds": time.monotonic() - started,
-                        "returncode": process.returncode
-                        if process is not None
+                        "returncode": returncode,
+                        "schedule": "fixed" if partitions is not None else "dynamic",
+                        "prewarmed": args.prewarm,
+                        "bootstrap_seconds": setup_finished - started
+                        if args.prewarm and setup_finished
+                        else None,
+                        "execution_seconds": tests_finished - setup_finished
+                        if tests_finished
+                        else None,
+                        "cleanup_seconds": time.monotonic() - tests_finished
+                        if tests_finished
                         else None,
                         "workers": args.workers,
+                        "cgroup_parent": args.cgroup_parent,
                         "targets": args.targets,
                         "source_sha256": config["source_sha256"],
                         "artifact_sha256": config["artifact_sha256"],
@@ -296,6 +420,21 @@ def main():
     suite = subparsers.add_parser("run")
     suite.add_argument("--bazel", default="bazel")
     suite.add_argument("--workers", type=int, default=1)
+    suite.add_argument(
+        "--prewarm",
+        action="store_true",
+        help="Prepare every stack before timing target execution",
+    )
+    suite.add_argument(
+        "--fixed-plan",
+        type=Path,
+        help="JSON partitions for the fixed-assignment comparison adapter",
+    )
+    suite.add_argument("--stop-on-failure", action="store_true")
+    suite.add_argument(
+        "--cgroup-parent",
+        help="Host cgroup containing every worker; use private cgroup namespaces to retain inherited limits",
+    )
     suite.add_argument("--runner-image", default="space-bazel-kind-runner:local")
     suite.add_argument("--source-archive", type=Path, required=True)
     suite.add_argument("--artifact-archive", type=Path, required=True)
