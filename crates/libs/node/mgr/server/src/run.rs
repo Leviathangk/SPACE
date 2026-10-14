@@ -118,6 +118,12 @@ pub struct NodeMgrRunConfig {
 /// variable, or value that was misread.
 #[derive(Debug, thiserror::Error)]
 pub enum RunNodeMgrError {
+    #[error("invalid disk I/O environment setting {name}: {source}")]
+    DiskIoEnvironment {
+        name: &'static str,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     #[error("failed to read node config {path}: {source}")]
     ReadConfig {
         path: PathBuf,
@@ -206,6 +212,7 @@ struct DiskIoReservationFileConfig {
     enabled: Option<bool>,
     target_path: Option<PathBuf>,
     capacity_profile: Option<String>,
+    custom_capacity: Option<crate::disk_io_reservation::CustomDiskIoCapacity>,
     sandbox_capacity_percent: Option<u64>,
     read_weight_percent: Option<u64>,
     write_weight_percent: Option<u64>,
@@ -460,6 +467,14 @@ fn resolve_disk_io_reservation_config(
     file: DiskIoReservationFileConfig,
 ) -> Result<DiskIoReservationConfig, RunNodeMgrError> {
     let defaults = DiskIoReservationConfig::default();
+    let custom_capacity = disk_io_environment::<String>("SPACE_NODEMGR_DISK_IO_CUSTOM_CAPACITY")?
+        .map(|raw| {
+            serde_json::from_str(&raw).map_err(|source| RunNodeMgrError::DiskIoEnvironment {
+                name: "SPACE_NODEMGR_DISK_IO_CUSTOM_CAPACITY",
+                source: Box::new(source),
+            })
+        })
+        .transpose()?;
     Ok(DiskIoReservationConfig {
         enabled: setting(
             "disk_io_reservation.enabled",
@@ -478,32 +493,60 @@ fn resolve_disk_io_reservation_config(
         capacity_profile: setting(
             "disk_io_reservation.capacity_profile",
             None,
-            None,
+            disk_io_environment::<String>("SPACE_NODEMGR_DISK_IO_CAPACITY_PROFILE")?.map(Some),
             file.capacity_profile.map(Some),
             defaults.capacity_profile,
         ),
+        // Environment wins over the file for the same setting. A named profile
+        // and measured capacity remain mutually exclusive across both sources.
+        custom_capacity: custom_capacity.or(file.custom_capacity),
         sandbox_capacity_percent: setting(
             "disk_io_reservation.sandbox_capacity_percent",
             None,
-            None,
+            disk_io_environment::<u64>("SPACE_NODEMGR_DISK_IO_SANDBOX_CAPACITY_PERCENT")?.map(Some),
             file.sandbox_capacity_percent.map(Some),
             Some(DISK_IO_SANDBOX_CAPACITY_PERCENT),
         ),
         read_weight_percent: setting(
             "disk_io_reservation.read_weight_percent",
             None,
-            None,
+            disk_io_environment::<u64>("SPACE_NODEMGR_DISK_IO_READ_WEIGHT_PERCENT")?.map(Some),
             file.read_weight_percent.map(Some),
             Some(DISK_IO_READ_WEIGHT_PERCENT),
         ),
         write_weight_percent: setting(
             "disk_io_reservation.write_weight_percent",
             None,
-            None,
+            disk_io_environment::<u64>("SPACE_NODEMGR_DISK_IO_WRITE_WEIGHT_PERCENT")?.map(Some),
             file.write_weight_percent.map(Some),
             Some(DISK_IO_WRITE_WEIGHT_PERCENT),
         ),
     })
+}
+
+fn disk_io_environment<T: std::str::FromStr>(
+    name: &'static str,
+) -> Result<Option<T>, RunNodeMgrError>
+where
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    let raw = match std::env::var(name) {
+        Ok(raw) => raw,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(source) => {
+            return Err(RunNodeMgrError::DiskIoEnvironment {
+                name,
+                source: Box::new(source),
+            });
+        }
+    };
+    raw.trim()
+        .parse()
+        .map(Some)
+        .map_err(|source| RunNodeMgrError::DiskIoEnvironment {
+            name,
+            source: Box::new(source),
+        })
 }
 
 async fn resolve_disk_io_capacity_profile(

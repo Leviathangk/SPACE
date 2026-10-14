@@ -35,6 +35,18 @@ pub struct DiskIoLimits {
     pub write_bandwidth_mib_per_sec: u64,
 }
 
+/// Measured aggregate capacity of the devices backing the sandbox filesystem.
+/// Supplying this avoids cloud metadata and supports non-AWS storage.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CustomDiskIoCapacity {
+    pub expected_device_count: std::num::NonZeroUsize,
+    pub read_iops: u64,
+    pub write_iops: u64,
+    pub read_bandwidth_mib_per_sec: u64,
+    pub write_bandwidth_mib_per_sec: u64,
+}
+
 #[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DiskIoCapacityProfile {
@@ -210,6 +222,9 @@ pub struct DiskIoReservationConfig {
     /// Optional override for non-EC2 tests and emergency operation. Enabled
     /// EC2 nodes normally derive this from their IMDS instance type.
     pub capacity_profile: Option<String>,
+    /// Operator-measured capacity, mutually exclusive with `capacity_profile`.
+    /// The budget is divided equally across the expected backing devices.
+    pub custom_capacity: Option<CustomDiskIoCapacity>,
     /// Total normalized hardware capacity available to sandbox reads and
     /// writes together. The remainder stays outside the sandbox parent cgroup.
     pub sandbox_capacity_percent: Option<u64>,
@@ -226,6 +241,7 @@ impl Default for DiskIoReservationConfig {
             enabled: None,
             target_path: PathBuf::from(DEFAULT_TARGET_PATH),
             capacity_profile: None,
+            custom_capacity: None,
             sandbox_capacity_percent: None,
             read_weight_percent: None,
             write_weight_percent: None,
@@ -239,7 +255,10 @@ impl DiskIoReservationConfig {
         &mut self,
         provider: &dyn AwsInstanceTypeProvider,
     ) -> Result<(), String> {
-        if self.enabled != Some(true) || self.capacity_profile.is_some() {
+        if self.enabled != Some(true)
+            || self.capacity_profile.is_some()
+            || self.custom_capacity.is_some()
+        {
             return Ok(());
         }
         let instance_type = provider.instance_type().await?;
@@ -251,11 +270,27 @@ impl DiskIoReservationConfig {
     fn resolve_policy(&self) -> Result<ResolvedDiskIoPolicy, String> {
         let missing =
             |field: &str| format!("disk_io_reservation.{field} is required when enabled is true");
-        let profile = DiskIoCapacityProfile::named(
-            self.capacity_profile
-                .as_deref()
-                .ok_or_else(|| missing("capacity_profile"))?,
-        )?;
+        let profile = match (&self.capacity_profile, self.custom_capacity) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    "disk_io_reservation.capacity_profile and custom_capacity are mutually exclusive"
+                        .into(),
+                );
+            }
+            (Some(name), None) => DiskIoCapacityProfile::named(name)?,
+            (None, Some(custom)) => DiskIoCapacityProfile {
+                name: "custom",
+                expected_device_count: custom.expected_device_count.get(),
+                capacity: DiskIoLimits {
+                    read_iops: custom.read_iops,
+                    write_iops: custom.write_iops,
+                    read_bandwidth_mib_per_sec: custom.read_bandwidth_mib_per_sec,
+                    write_bandwidth_mib_per_sec: custom.write_bandwidth_mib_per_sec,
+                }
+                .validate()?,
+            },
+            (None, None) => return Err(missing("capacity_profile")),
+        };
         let sandbox_percent = self
             .sandbox_capacity_percent
             .ok_or_else(|| missing("sandbox_capacity_percent"))?;
