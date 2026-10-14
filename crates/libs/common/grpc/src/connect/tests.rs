@@ -449,10 +449,10 @@ fn assert_failed_at_handshake_bound(
 
 // A peer that accepts TCP but never answers the ClientHello fails the connect
 // with the TLS handshake bound's own cause, not as an abandoned attempt and not
-// at once. The bound outlasts the dial and name-resolution shares of the cap,
-// so the cap leaves room for it only by counting it. This waits out the real
-// bound: a paused clock could fire the cap before the loopback dial's
-// readiness is observed.
+// at once. The bound outlasts the dial and name-resolution shares of the cap
+// and its margin, so the cap leaves room for it only by counting it. This
+// waits out the real bound: a paused clock could fire the cap before the
+// loopback dial's readiness is observed.
 #[cfg(feature = "internal-tls")]
 #[tokio::test]
 async fn a_tls_peer_that_never_answers_fails_the_connect_at_its_handshake_bound() {
@@ -460,7 +460,7 @@ async fn a_tls_peer_that_never_answers_fails_the_connect_at_its_handshake_bound(
     let (address, silent_peer) = silent_tls_peer().await;
     let dir = tempfile::tempdir().unwrap();
     let ca = std::fs::read(write_test_ca(dir.path())).unwrap();
-    let handshake_bound = Duration::from_secs(4);
+    let handshake_bound = Duration::from_secs(5);
     let endpoint = tonic::transport::Endpoint::from_shared(format!("https://{address}"))
         .unwrap()
         .connect_timeout(Duration::from_millis(500))
@@ -526,7 +526,7 @@ async fn an_internal_rpc_connect_fails_at_its_transports_handshake_bound() {
     install_crypto_provider();
     let (address, silent_peer) = silent_tls_peer().await;
     let dir = tempfile::tempdir().unwrap();
-    let handshake_bound = Duration::from_secs(4);
+    let handshake_bound = Duration::from_secs(5);
     let endpoint = internal_rpc_connect_endpoint(address, dir.path(), handshake_bound).await;
 
     let started = tokio::time::Instant::now();
@@ -552,7 +552,7 @@ async fn a_watched_internal_rpc_connect_fails_at_its_transports_handshake_bound(
     install_crypto_provider();
     let (address, silent_peer) = silent_tls_peer().await;
     let dir = tempfile::tempdir().unwrap();
-    let handshake_bound = Duration::from_secs(4);
+    let handshake_bound = Duration::from_secs(5);
     let endpoint = internal_rpc_connect_endpoint(address, dir.path(), handshake_bound).await;
 
     let started = tokio::time::Instant::now();
@@ -584,7 +584,7 @@ async fn a_watched_dial_applies_tls_and_its_handshake_bound() {
     let (address, silent_peer) = silent_tls_peer().await;
     let dir = tempfile::tempdir().unwrap();
     let ca = std::fs::read(write_test_ca(dir.path())).unwrap();
-    let handshake_bound = Duration::from_secs(4);
+    let handshake_bound = Duration::from_secs(5);
     let endpoint = tonic::transport::Endpoint::from_shared(format!("https://{address}"))
         .unwrap()
         .connect_timeout(Duration::from_millis(500))
