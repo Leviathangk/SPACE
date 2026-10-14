@@ -217,12 +217,12 @@ async fn only_a_dns_attributed_fail_closed_destination_waits_for_a_late_client_h
 
     assert_eq!(
         proxy.missing_client_hello(attributed, &ready),
-        sniff::MissingClientHello::Denied,
+        crate::tls_sni::MissingClientHello::Denied,
         "a resolved allowed domain's address is decided by its ClientHello"
     );
     assert_eq!(
         proxy.missing_client_hello(unattributed, &ready),
-        sniff::MissingClientHello::Proceeds,
+        crate::tls_sni::MissingClientHello::Proceeds,
         "an address with no DNS evidence is refused whatever the ClientHello says"
     );
     assert_eq!(
@@ -230,7 +230,7 @@ async fn only_a_dns_attributed_fail_closed_destination_waits_for_a_late_client_h
             attributed,
             &TrafficPolicy::NotReady(PolicyNotReady::PendingPolicyTimeout)
         ),
-        sniff::MissingClientHello::Proceeds,
+        crate::tls_sni::MissingClientHello::Proceeds,
         "without a policy nothing is admitted on the ClientHello"
     );
 }
@@ -266,7 +266,7 @@ async fn an_address_refused_before_its_client_hello_is_read_does_not_wait_for_on
     for destination in [denied, guardrailed] {
         assert_eq!(
             proxy.missing_client_hello(destination, &ready),
-            sniff::MissingClientHello::Proceeds,
+            crate::tls_sni::MissingClientHello::Proceeds,
             "{destination} is refused whatever its ClientHello says"
         );
     }
@@ -289,7 +289,7 @@ async fn tls_interception_waits_for_a_late_client_hello_on_an_allowed_destinatio
             destination,
             &with_interception(pplx_space_net_common::TlsInterception::On)
         ),
-        sniff::MissingClientHello::Denied,
+        crate::tls_sni::MissingClientHello::Denied,
         "interception refuses a flow without SNI, so it must wait out a retransmit"
     );
     assert_eq!(
@@ -297,7 +297,7 @@ async fn tls_interception_waits_for_a_late_client_hello_on_an_allowed_destinatio
             destination,
             &with_interception(pplx_space_net_common::TlsInterception::Off)
         ),
-        sniff::MissingClientHello::Proceeds,
+        crate::tls_sni::MissingClientHello::Proceeds,
         "without interception the flow proceeds without SNI, so waiting only delays it"
     );
 
@@ -318,13 +318,13 @@ async fn tls_interception_waits_for_a_late_client_hello_on_an_allowed_destinatio
             destination,
             &TrafficPolicy::Ready(Arc::new(explicit_deny.clone()))
         ),
-        sniff::MissingClientHello::Proceeds,
+        crate::tls_sni::MissingClientHello::Proceeds,
         "an explicitly denied address is refused whatever its ClientHello says"
     );
     explicit_deny.tls_interception = pplx_space_net_common::TlsInterception::Off;
     assert_eq!(
         proxy.missing_client_hello(destination, &TrafficPolicy::Ready(Arc::new(explicit_deny))),
-        sniff::MissingClientHello::Proceeds,
+        crate::tls_sni::MissingClientHello::Proceeds,
     );
 }
 
@@ -418,10 +418,13 @@ async fn failed_policy_refresh_cancels_established_tcp_connections() {
     // Leaving one uncancelled leaves that established tunnel open.
     let dns_attributed_shutdown = CancellationToken::new();
     let _dns_attributed_connection = dns_attributed_connections.register(
-        "192.0.2.44:443".parse().unwrap(),
-        ClientHelloScan::NoServerName,
-        &NetworkPolicyV1::allow_all(),
-        &DnsAllowCache::default(),
+        crate::egress::admit_tcp(
+            "192.0.2.44:443".parse().unwrap(),
+            &ClientHelloScan::NoServerName,
+            &NetworkPolicyV1::allow_all(),
+            &DnsAllowCache::default(),
+        )
+        .unwrap(),
         dns_attributed_shutdown.clone(),
     );
     let failed_loader: crate::state::PolicyLoader =
@@ -627,7 +630,9 @@ async fn tcp_admission_returns_the_authorized_route_or_deny() {
 
     for case in cases {
         assert_eq!(
-            proxy.admit(destination, &case.scan, case.policy),
+            proxy
+                .admit(destination, &case.scan, case.policy)
+                .map(|admission| admission.route()),
             case.expected,
             "{}",
             case.name,
@@ -668,7 +673,9 @@ async fn tcp_admission_returns_the_authorized_route_or_deny() {
         ClientHelloScan::NoServerName,
     ] {
         assert_eq!(
-            proxy.admit(uncached, &scan, &NetworkPolicyV1::allow_all()),
+            proxy
+                .admit(uncached, &scan, &NetworkPolicyV1::allow_all())
+                .map(|admission| admission.route()),
             Ok(AdmittedTcp::Tunnel(uncached)),
             "independent default permission preserves raw and server-first protocols",
         );
@@ -693,16 +700,12 @@ async fn tcp_handoff_allows_current_and_rejects_replaced_policy() {
         refusal_warnings: Arc::default(),
     };
     let destination = "192.0.2.44:443".parse().unwrap();
-    let admitted = proxy
+    let admission = proxy
         .admit(destination, &ClientHelloScan::NotTls, &current_policy)
         .unwrap();
-    let connection = proxy.dns_attributed_connections.register(
-        admitted.destination(),
-        ClientHelloScan::NotTls,
-        &current_policy,
-        &proxy.dns_allow_cache,
-        CancellationToken::new(),
-    );
+    let connection = proxy
+        .dns_attributed_connections
+        .register(admission.clone(), CancellationToken::new());
     assert_eq!(proxy.validate_admission_policy(&current_policy), Ok(()));
     drop(connection);
 
@@ -712,13 +715,9 @@ async fn tcp_handoff_allows_current_and_rejects_replaced_policy() {
         "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     )
     .await;
-    let _connection = proxy.dns_attributed_connections.register(
-        admitted.destination(),
-        ClientHelloScan::NotTls,
-        &current_policy,
-        &proxy.dns_allow_cache,
-        CancellationToken::new(),
-    );
+    let _connection = proxy
+        .dns_attributed_connections
+        .register(admission, CancellationToken::new());
     assert_eq!(
         proxy.validate_admission_policy(&current_policy),
         Err(TcpAdmissionDenial::PolicyChanged)

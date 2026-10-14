@@ -412,10 +412,13 @@ async fn policy_install_reconciles_dns_and_connections_on_self_hydration() {
     let cancellation = state.reserved_dns_cancellation.operation_token();
     let shutdown = CancellationToken::new();
     let _connection = state.tcp_connections.register(
-        "192.0.2.10:443".parse().unwrap(),
-        crate::tls_sni::ClientHelloScan::NotTls,
-        &NetworkPolicyV1::allow_all(),
-        &state.dns_allow_cache,
+        crate::egress::admit_tcp(
+            "192.0.2.10:443".parse().unwrap(),
+            &crate::tls_sni::ClientHelloScan::NotTls,
+            &NetworkPolicyV1::allow_all(),
+            &state.dns_allow_cache,
+        )
+        .unwrap(),
         shutdown.clone(),
     );
     let policy_ref = test_policy_ref();

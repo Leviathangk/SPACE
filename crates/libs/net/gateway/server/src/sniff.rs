@@ -14,7 +14,8 @@ use tracing::{debug, info};
 
 use crate::debug::GatewayDebugState;
 use crate::tls_sni::{
-    ClientAlpnOffer, ClientHelloParseDetail, ClientHelloScan, scan_client_hello_with_detail,
+    ClientAlpnOffer, ClientHelloParseDetail, ClientHelloScan, MissingClientHello,
+    scan_client_hello_with_detail,
 };
 
 /// Bytes peeked looking for a ClientHello. This covers a maximum-size legal
@@ -51,24 +52,6 @@ const FAIL_CLOSED_FIRST_BYTES_TIMEOUT: Duration = Duration::from_secs(5);
 /// retransmit.
 const COMPLETION_DEADLINE: Duration = Duration::from_secs(1);
 
-/// What admission does with a flow whose ClientHello never arrives, which
-/// decides how long the peek waits for one.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MissingClientHello {
-    /// The flow proceeds without SNI, so waiting only delays it.
-    Proceeds,
-    /// The flow is denied, so a late first segment must not read as none.
-    Denied,
-}
-
-impl MissingClientHello {
-    const fn first_bytes_timeout(self) -> Duration {
-        match self {
-            Self::Proceeds => FIRST_BYTES_TIMEOUT,
-            Self::Denied => FAIL_CLOSED_FIRST_BYTES_TIMEOUT,
-        }
-    }
-}
 const PEEK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -125,7 +108,11 @@ pub(crate) async fn client_hello_with_detail(
     missing: MissingClientHello,
 ) -> ClientHelloObservation {
     let started_at = Instant::now();
-    let mut observation = scan_stream(client, missing.first_bytes_timeout()).await;
+    let first_bytes_timeout = match missing {
+        MissingClientHello::Proceeds => FIRST_BYTES_TIMEOUT,
+        MissingClientHello::Denied => FAIL_CLOSED_FIRST_BYTES_TIMEOUT,
+    };
+    let mut observation = scan_stream(client, first_bytes_timeout).await;
     observation.elapsed = started_at.elapsed();
     observation
 }
