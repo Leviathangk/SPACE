@@ -1540,6 +1540,75 @@ fn refresh_register_existing_expanded_build_preserves_rootfs_bytes() {
     assert_eq!(build.artifact_size_bytes, original_bytes.len() as u64);
 }
 
+#[tokio::test]
+async fn register_refresh_cannot_add_remove_or_replace_a_retained_binding() {
+    use pplx_space_common_core::types::{
+        Arch, Digest, EnvironmentReference, ExecutionMetadata, TemplateManifest, TemplateMetadata,
+    };
+    let first = EnvironmentReference::new(Digest::sha256([1; 32]));
+    let second = EnvironmentReference::new(Digest::sha256([2; 32]));
+    for (retained, incoming, accepted) in [
+        (None, None, true),
+        (Some(first), Some(first), true),
+        (None, Some(first), false),
+        (Some(first), None, false),
+        (Some(first), Some(second), false),
+    ] {
+        let execution = |binding| {
+            let metadata = ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![]);
+            match binding {
+                Some(reference) => metadata.with_environment(reference),
+                None => metadata,
+            }
+        };
+        let mut manifest = TemplateManifest::default();
+        manifest.set_execution_metadata(execution(retained));
+        let mut metadata = TemplateMetadata::default();
+        metadata.set_execution_metadata(execution(incoming));
+        let validation = validate_retained_environment_binding(&manifest, &metadata);
+        assert_eq!(validation.is_ok(), accepted);
+        if accepted {
+            continue;
+        }
+        let (temp, content_hash, rootfs) = expanded_test_rootfs_setup();
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        std::fs::write(temp.path().join("manifest.json"), &manifest_bytes).unwrap();
+        let old_metadata = std::fs::read(temp.path().join("metadata.json")).unwrap();
+        let service = TemplateManagerService::new(crate::db::test_conn()).unwrap();
+        let error = service
+            .refresh_register_existing_expanded_build(
+                "register-refresh-test",
+                &content_hash,
+                temp.path().to_str().unwrap(),
+                Some(&serde_json::to_vec(&metadata).unwrap()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::AlreadyExists);
+        assert_eq!(
+            std::fs::read(temp.path().join("metadata.json")).unwrap(),
+            old_metadata
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("manifest.json")).unwrap(),
+            manifest_bytes
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("rootfs.ext4")).unwrap(),
+            rootfs
+        );
+        assert!(
+            crate::db::get_build(
+                &service.db.lock().unwrap(),
+                "register-refresh-test",
+                &content_hash
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+}
+
 #[test]
 fn refresh_register_existing_expanded_build_rejects_hash_mismatch() {
     let (temp, _content_hash, _original_bytes) = expanded_test_rootfs_setup();
