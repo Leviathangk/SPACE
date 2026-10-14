@@ -57,43 +57,13 @@ where
         }
         let upgrade = handshake.map(|handshake| (handshake, request.on_upgrade()));
         let mut forwarding = Attempt::forwarding(protocol.as_str(), "request");
-        let sender = match self.upstream.sender(protocol).await {
-            Ok(sender) => sender,
-            Err(error) => {
-                forwarding.finish(Outcome::Error, "origin_setup");
-                error.record("upstream_setup");
-                return self.refuse(protocol, error.as_str(), StatusCode::BAD_GATEWAY);
-            }
+        let response = match self.dispatch(request, &mut forwarding).await {
+            Ok(response) => response,
+            Err(response) => return *response,
         };
-        let sender = match sender.ready().await {
-            Ok(sender) => sender,
-            Err(error) => {
-                forwarding.finish(Outcome::Error, "upstream_http");
-                self.draining.cancel();
-                HttpError::Protocol(error).record("upstream_request");
-                return self.refuse(protocol, "upstream_http_error", StatusCode::BAD_GATEWAY);
-            }
-        };
-
-        // Origin setup and sender readiness can outlive a policy update. This
-        // is the final fence before request headers can leave the gateway.
-        let headers = match credential_headers(&self.lease, &request) {
-            Ok(headers) => headers,
-            Err(error) => {
-                forwarding.finish(Outcome::Cancelled, error.as_str());
-                return self.refuse(protocol, error.as_str(), error.status());
-            }
-        };
-        inject(&mut request, headers);
-        if sender.is_http1() {
-            translate_to_http1(&mut request);
-        }
-        let request =
-            request.map(|body| Either::Left(Self::forwarding_body(protocol, body, "request_body")));
-        let response = sender.send(request).await;
 
         match response {
-            Ok(mut response)
+            mut response
                 if upgrade
                     .as_ref()
                     .is_some_and(|(handshake, _)| handshake.accepts(&response)) =>
@@ -119,22 +89,95 @@ where
                 forwarding.finish(Outcome::Success, "response_headers");
                 response.map(|_| Either::Right(Empty::new()))
             }
-            Ok(response) if response.status() != StatusCode::SWITCHING_PROTOCOLS => {
+            response if response.status() != StatusCode::SWITCHING_PROTOCOLS => {
                 Self::record(protocol, "allowed", response.status());
                 forwarding.finish(Outcome::Success, "response_headers");
                 response.map(|body| {
                     Either::Left(Self::forwarding_body(protocol, body, "response_body"))
                 })
             }
-            Ok(_) => {
+            _ => {
                 forwarding.finish(Outcome::Error, "unexpected_upgrade");
                 self.refuse(protocol, "unexpected_upgrade", StatusCode::BAD_GATEWAY)
             }
+        }
+    }
+
+    /// Wait for the origin, recheck policy, and submit request headers.
+    pub(super) async fn dispatch(
+        &self,
+        mut request: SanitizedRequest<Incoming>,
+        forwarding: &mut Attempt,
+    ) -> Result<Response<Incoming>, Box<Response<Body>>> {
+        let protocol = HttpProtocol::of(request.version());
+        let connect = request.method() == http::Method::CONNECT;
+        let refuse = |reason, status| Box::new(self.refuse(protocol, reason, status));
+        let sender = match self.upstream.sender(protocol).await {
+            Ok(sender) => sender,
+            Err(error) => {
+                forwarding.finish(Outcome::Error, "origin_setup");
+                error.record(if connect {
+                    "connect_proxy_setup"
+                } else {
+                    "upstream_setup"
+                });
+                return Err(refuse(error.as_str(), StatusCode::BAD_GATEWAY));
+            }
+        };
+        let sender = match sender.ready().await {
+            Ok(sender) => sender,
+            Err(error) => {
+                if !connect {
+                    forwarding.finish(Outcome::Error, "upstream_http");
+                    self.draining.cancel();
+                }
+                HttpError::Protocol(error).record(if connect {
+                    "connect_proxy_ready"
+                } else {
+                    "upstream_request"
+                });
+                return Err(refuse("upstream_http_error", StatusCode::BAD_GATEWAY));
+            }
+        };
+
+        // Origin setup and sender readiness can outlive a policy update. This
+        // is the final fence before request headers can leave the gateway.
+        if connect {
+            if !sender.is_http1() {
+                return Err(refuse("invalid_connect", StatusCode::FORBIDDEN));
+            }
+            if !self.lease.is_usable() {
+                forwarding.finish(Outcome::Cancelled, "lease_invalidated");
+                return Err(refuse("lease_invalidated", StatusCode::FORBIDDEN));
+            }
+        } else {
+            let headers = match credential_headers(&self.lease, &request) {
+                Ok(headers) => headers,
+                Err(error) => {
+                    forwarding.finish(Outcome::Cancelled, error.as_str());
+                    return Err(refuse(error.as_str(), error.status()));
+                }
+            };
+            inject(&mut request, headers);
+            if sender.is_http1() {
+                translate_to_http1(&mut request);
+            }
+        }
+        let request =
+            request.map(|body| Either::Left(Self::forwarding_body(protocol, body, "request_body")));
+        match sender.send(request).await {
+            Ok(response) => Ok(response),
             Err(error) => {
                 forwarding.finish(Outcome::Error, "upstream_http");
-                self.draining.cancel();
-                HttpError::Protocol(error).record("upstream_request");
-                self.refuse(protocol, "upstream_http_error", StatusCode::BAD_GATEWAY)
+                if !connect {
+                    self.draining.cancel();
+                }
+                HttpError::Protocol(error).record(if connect {
+                    "connect_proxy_request"
+                } else {
+                    "upstream_request"
+                });
+                Err(refuse("upstream_http_error", StatusCode::BAD_GATEWAY))
             }
         }
     }
