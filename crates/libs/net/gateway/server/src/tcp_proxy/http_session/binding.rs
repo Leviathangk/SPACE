@@ -76,6 +76,8 @@ impl HostBinding {
             upstream::Error::Tls(_) | upstream::Error::Cancelled => ("setup", None),
         };
         tracing::debug!(
+            // The plaintext entry's event; keep its established target.
+            target: "pplx_space_net_gateway::tcp_proxy::http_host",
             sandbox_id = self.sandbox_id,
             dst_port = self.destination.port(),
             address_family = if self.destination.is_ipv6() {

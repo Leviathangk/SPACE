@@ -194,6 +194,7 @@ impl Mode {
             }
             RequestError::Setup(error) => error.record("upstream_setup"),
             RequestError::Upstream(error) => tracing::info!(
+                target: super::LOG_TARGET,
                 http_reason = http_reason(error),
                 "HTTP request forwarding failed"
             ),
