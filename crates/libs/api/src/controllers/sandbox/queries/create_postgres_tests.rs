@@ -1684,7 +1684,11 @@ async fn postgres_pool_configured_resources_uses_enabled_release_shape() -> Test
     assert_eq!(resources.resources.vcpu, Some(2));
     assert_eq!(resources.resources.memory_mib, Some(8192));
     assert_eq!(resources.resources.disk_mib, Some(32768));
-    assert_eq!(resources.disk_io_limits, Default::default());
+    // The fixture is a legacy materialized config, not an inherited policy.
+    assert_eq!(
+        resources.disk_io_limits,
+        DiskIoLimits::try_new(1_000, 100).unwrap()
+    );
     sqlx::query(sql!(
         "UPDATE kubernetes_pool_configs SET disk_mib = 131073
          WHERE template_release_id = $1 AND vcpu = 2"
@@ -1761,6 +1765,18 @@ async fn postgres_template_build_shape_prefers_the_builder_inventory() -> TestRe
 
 #[tokio::test(flavor = "current_thread")]
 async fn postgres_kubernetes_create_fills_unset_resources_from_the_template_shape() -> TestResult {
+    if !pplx_space_test_env::enter_test_process(&[
+        (
+            "SPACE_DISK_IO_DEFAULT_MAX_OPERATIONS_PER_SEC",
+            Some("2000".as_ref()),
+        ),
+        (
+            "SPACE_DISK_IO_DEFAULT_MAX_BANDWIDTH_MIB_PER_SEC",
+            Some("50".as_ref()),
+        ),
+    ]) {
+        return Ok(());
+    }
     let db = pg_test_db().await?;
     let release_id = insert_template_release(&db.pool, "app-runtime", "sha256:shape").await?;
     insert_inventory_shape(&db.pool, "builder", "sha256:shape", (4, 4096), 0).await?;
@@ -1791,6 +1807,13 @@ async fn postgres_kubernetes_create_fills_unset_resources_from_the_template_shap
     };
     let shape =
         |resources: &SandboxResources| (resources.vcpu, resources.memory_mib, resources.disk_mib);
+
+    for substrate in [k8s, space] {
+        for boot_mode in [CreateBootMode::Cold, CreateBootMode::Fallthrough] {
+            let (_, limits) = resolve(substrate, boot_mode, unset()).await?;
+            assert_eq!(limits, DiskIoLimits::try_new(2_000, 50)?);
+        }
+    }
 
     let (resources, _) = resolve(k8s, CreateBootMode::Fallthrough, unset()).await?;
     assert_eq!(

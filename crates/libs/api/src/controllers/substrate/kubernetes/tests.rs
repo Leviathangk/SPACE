@@ -7064,17 +7064,19 @@ mod kubernetes_tests {
                 PodCreateContext::Restore(RestoreContext::UserRestore { .. }) => "user-restore",
                 PodCreateContext::Restore(RestoreContext::Evacuation { .. }) => "evacuation",
             };
-            let request = substrate.sandbox_pod_request(
-                &sandbox,
-                &execution,
-                crate::controllers::substrate::kubernetes::pod_ops::SandboxPodRequestInputs {
-                    sandbox_owner: &owner,
-                    auto_lifecycle_json,
-                    network_policy_json,
-                    node_group_placement: Some(&placement),
-                },
-                context,
-            );
+            let request = substrate
+                .sandbox_pod_request(
+                    &sandbox,
+                    &execution,
+                    crate::controllers::substrate::kubernetes::pod_ops::SandboxPodRequestInputs {
+                        sandbox_owner: &owner,
+                        auto_lifecycle_json,
+                        network_policy_json,
+                        node_group_placement: Some(&placement),
+                    },
+                    context,
+                )
+                .unwrap();
             let pod = build_sandbox_pod(&sandbox_pod_config(&substrate.k8s), request);
             assert_eq!(
                 pod.metadata.annotations.as_ref().unwrap().get(

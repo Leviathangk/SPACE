@@ -64,6 +64,7 @@ mod templates;
 #[cfg(test)]
 mod test_fixtures;
 mod warm_pools;
+pub(crate) use warm_pools::validate_disk_io_configuration;
 
 /// Build the shared-host admin API surface.
 pub fn shared_host_router(state: AppState) -> Router<AppState> {

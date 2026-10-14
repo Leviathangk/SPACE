@@ -659,31 +659,73 @@ async fn autoscale_configs_prepares_new_release_without_observed_demand() -> Tes
 
 #[tokio::test(flavor = "current_thread")]
 async fn autoscale_configs_materializes_warm_pool_disk_io_policy() -> TestResult {
+    use pplx_space_common_core::sql;
+    use pplx_space_common_core::types::DiskIoLimits;
+
+    if !pplx_space_test_env::enter_test_process(&[
+        (
+            "SPACE_DISK_IO_DEFAULT_MAX_OPERATIONS_PER_SEC",
+            Some("2000".as_ref()),
+        ),
+        (
+            "SPACE_DISK_IO_DEFAULT_MAX_BANDWIDTH_MIB_PER_SEC",
+            Some("50".as_ref()),
+        ),
+    ]) {
+        return Ok(());
+    }
+
     let fixture = postgres_fixture().await?;
     let (release_id, _content_hash) = seed_release(&fixture.pool, "custom-runtime", 0x46).await?;
     upsert_warm_pool_policy(&fixture.pool, "custom-runtime", 2, 10, 1).await?;
-    sqlx::query(
-        "UPDATE warm_pool_policies
+
+    // Inherited policies must resolve in both cold-create selection and
+    // materialization; an explicit legacy allowance must stay explicit.
+    for override_limits in [
+        None,
+        Some(DiskIoLimits::try_new(1_000, 100).unwrap()),
+        Some(DiskIoLimits::try_new(5_000, 200).unwrap()),
+        None,
+    ] {
+        sqlx::query(sql!(
+            "UPDATE warm_pool_policies
          SET disk_mib = 32768,
-             disk_io_max_operations_per_sec = 5000,
-             disk_io_max_bandwidth_mib_per_sec = 200
+             disk_io_max_operations_per_sec = $1,
+             disk_io_max_bandwidth_mib_per_sec = $2
          WHERE template_name = 'custom-runtime'",
-    )
-    .execute(&fixture.pool)
-    .await?;
+        ))
+        .bind(override_limits.map(|limits| limits.max_operations_per_sec() as i64))
+        .bind(override_limits.map(|limits| limits.max_bandwidth_mib_per_sec() as i64))
+        .execute(&fixture.pool)
+        .await?;
 
-    fixture.store.autoscale_configs("sandboxes").await?;
+        let expected = override_limits.unwrap_or(DiskIoLimits::try_new(2_000, 50)?);
+        let assignment = fixture
+            .store
+            .preferred_enabled_policy_assignment("custom-runtime")
+            .await?
+            .unwrap();
+        assert_eq!(assignment.disk_io_limits, expected);
+        fixture.store.autoscale_configs("sandboxes").await?;
 
-    let limits = sqlx::query_as::<_, (Option<i32>, i64, i64)>(
-        "SELECT disk_mib, disk_io_max_operations_per_sec,
+        let limits = sqlx::query_as::<_, (Option<i32>, i64, i64)>(sql!(
+            "SELECT disk_mib, disk_io_max_operations_per_sec,
                 disk_io_max_bandwidth_mib_per_sec
          FROM kubernetes_pool_configs
          WHERE template_release_id = $1",
-    )
-    .bind(release_id)
-    .fetch_one(&fixture.pool)
-    .await?;
-    assert_eq!(limits, (Some(32768), 5_000, 200));
+        ))
+        .bind(release_id)
+        .fetch_one(&fixture.pool)
+        .await?;
+        assert_eq!(
+            limits,
+            (
+                Some(32768),
+                expected.max_operations_per_sec() as i64,
+                expected.max_bandwidth_mib_per_sec() as i64
+            )
+        );
+    }
 
     Ok(())
 }
@@ -2105,6 +2147,70 @@ async fn store_manual_upsert_fences_encryptable_partition() -> TestResult {
             .await?;
     assert_eq!(rows, 0, "no encryptable row may be persisted");
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn manual_pool_disk_io_defaults_on_insert_and_survives_updates() -> TestResult {
+    use pplx_space_common_core::{sql, types::DiskIoLimits};
+
+    if !pplx_space_test_env::enter_test_process(&[
+        (
+            "SPACE_DISK_IO_DEFAULT_MAX_OPERATIONS_PER_SEC",
+            Some("2000".as_ref()),
+        ),
+        (
+            "SPACE_DISK_IO_DEFAULT_MAX_BANDWIDTH_MIB_PER_SEC",
+            Some("50".as_ref()),
+        ),
+    ]) {
+        return Ok(());
+    }
+
+    let fixture = postgres_fixture().await?;
+    let (release_id, _) = seed_release(&fixture.pool, "custom-runtime", 0x47).await?;
+    let spec = ManualPoolConfigSpec {
+        vcpu: 2,
+        memory_mib: 2048,
+        disk_mib: None,
+        reset_disk_to_template_default: false,
+        target_ready_slots: 2,
+        refill_per_tick: 1,
+        max_warming_slots: 1,
+        namespace: "sandboxes",
+        enabled: true,
+        encryptable: false,
+    };
+    let mut tx = fixture.pool.begin().await?;
+    let id = WarmPoolStore::upsert_manual_config(&mut tx, release_id, &spec).await?;
+    tx.commit().await?;
+    let configs = fixture.store.enabled_configs().await?;
+    assert_eq!(configs[0].disk_io_limits, DiskIoLimits::try_new(2_000, 50)?);
+
+    for (operations, bandwidth) in [(1_000_i64, 100_i64), (5_000, 200)] {
+        sqlx::query(sql!(
+            "UPDATE kubernetes_pool_configs
+             SET disk_io_max_operations_per_sec = $2,
+                 disk_io_max_bandwidth_mib_per_sec = $3
+             WHERE id = $1"
+        ))
+        .bind(id)
+        .bind(operations)
+        .bind(bandwidth)
+        .execute(&fixture.pool)
+        .await?;
+        let mut tx = fixture.pool.begin().await?;
+        assert_eq!(
+            WarmPoolStore::upsert_manual_config(&mut tx, release_id, &spec).await?,
+            id
+        );
+        tx.commit().await?;
+        let configs = fixture.store.enabled_configs().await?;
+        assert_eq!(
+            configs[0].disk_io_limits,
+            DiskIoLimits::try_new(operations.try_into()?, bandwidth.try_into()?)?
+        );
+    }
     Ok(())
 }
 

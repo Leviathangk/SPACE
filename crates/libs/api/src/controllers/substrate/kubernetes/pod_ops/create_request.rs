@@ -126,7 +126,7 @@ impl KubernetesSubstrate {
         execution: &'a SandboxExecutionRow,
         inputs: SandboxPodRequestInputs<'a>,
         pod_create_context: PodCreateContext<'a>,
-    ) -> SandboxPodRequest<'a> {
+    ) -> Result<SandboxPodRequest<'a>, SubstrateError> {
         let SandboxPodRequestInputs {
             sandbox_owner,
             auto_lifecycle_json,
@@ -139,6 +139,7 @@ impl KubernetesSubstrate {
             .and_then(|(operations, bandwidth)| {
                 pplx_space_common_core::types::DiskIoLimits::try_new(operations, bandwidth).ok()
             })
+            .map(Ok)
             .unwrap_or_else(|| {
                 tracing::warn!(
                     sandbox_id = %sandbox.id,
@@ -146,8 +147,12 @@ impl KubernetesSubstrate {
                     bandwidth_mib_per_sec = sandbox.disk_io_max_bandwidth_mib_per_sec,
                     "invalid persisted sandbox disk I/O limits; using platform defaults"
                 );
-                pplx_space_common_core::types::DiskIoLimits::default()
-            });
+                pplx_space_common_core::types::DiskIoLimits::configured_default().map_err(|error| {
+                    SubstrateError::Failed {
+                        message: error.to_string(),
+                    }
+                })
+            })?;
         let runtime = SandboxRuntimePodMetadata {
             sandbox_owner,
             user_id: sandbox.user_id,
@@ -180,7 +185,7 @@ impl KubernetesSubstrate {
         // which renders no node-group constraints at all. It is recomputed from
         // the current template visibility and the sandbox's owning org at every
         // build, never replayed from a snapshot taken at create time.
-        match pod_create_context {
+        Ok(match pod_create_context {
             // The reconcile/materialization path has no create request in hand,
             // and the pool pin is create-time-only (not persisted), so a pod
             // rebuilt here carries no pin.
@@ -265,7 +270,7 @@ impl KubernetesSubstrate {
                 extra_tolerations,
                 extra_required_affinity,
             },
-        }
+        })
     }
 
     pub(super) async fn pod_create_context_for_claim<'a>(

@@ -655,7 +655,7 @@ impl KubernetesSubstrate {
                         node_group_placement: node_group_placement.placement(),
                     },
                     cross_node_context,
-                ),
+                )?,
             )
             .await
             {

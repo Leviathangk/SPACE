@@ -71,6 +71,8 @@ pub struct ClusterControllerConfig {
 /// caller decides what a non-zero exit means for its own supervisor.
 #[derive(Debug, thiserror::Error)]
 pub enum RunClusterControllerError {
+    #[error("invalid deployment disk I/O default: {0}")]
+    DiskIoDefault(#[from] pplx_space_common_core::types::DiskIoLimitsError),
     #[error("invalid TLS interception exemptions: {0}")]
     TlsInterceptionExemptions(#[from] TlsInterceptionExemptionsConfigError),
     #[error("failed to initialize the cluster-controller space_user pool: {0}")]
@@ -101,6 +103,7 @@ pub async fn run(
     config: ClusterControllerConfig,
     shutdown_token: CancellationToken,
 ) -> Result<(), RunClusterControllerError> {
+    pplx_space_common_core::types::DiskIoLimits::configured_default()?;
     // Validate on standbys too, before leader election can mark a replica Ready.
     let tls_interception_exemptions = TlsInterceptionExemptions::from_env()?;
     let pool = pplx_space_common_svc::sql::connect_space_user_pool_lazy(

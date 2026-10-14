@@ -97,6 +97,10 @@ impl std::fmt::Debug for ApiRunConfig {
 /// log and continue past.
 #[derive(Debug, thiserror::Error)]
 pub enum RunApiError {
+    #[error("invalid disk I/O policy configuration: {0}")]
+    DiskIoPolicy(#[source] crate::controllers::ControllerError),
+    #[error("invalid deployment disk I/O default: {0}")]
+    DiskIoDefault(#[from] pplx_space_common_core::types::DiskIoLimitsError),
     #[error("invalid or missing SPACE API route signing configuration: {0}")]
     RouteSigningConfiguration(
         #[source] pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Error,
@@ -158,6 +162,8 @@ fn drain_before_shutdown(
 /// Serve the configured API surface until `shutdown` fires or a fatal
 /// condition ends it. Telemetry must already be initialized by the caller.
 pub async fn run(config: ApiRunConfig, shutdown: CancellationToken) -> Result<(), RunApiError> {
+    pplx_space_common_core::types::DiskIoLimits::configured_default()?;
+    crate::routes::admin::validate_disk_io_configuration().map_err(RunApiError::DiskIoPolicy)?;
     let service_name = config.surface.service_name();
     let route_ed25519_authority = match config.surface {
         ApiSurface::Admin => None,
