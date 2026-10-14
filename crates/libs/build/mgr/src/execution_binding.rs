@@ -2,7 +2,9 @@
 //! process environment variables and from downloadable artifact catalog entries.
 use std::path::Path;
 
-use pplx_space_common_core::types::{EnvironmentReference, ExecutionMetadata, TemplateMetadata};
+use pplx_space_common_core::types::{
+    Digest, EnvironmentReference, ExecutionMetadata, TemplateMetadata,
+};
 use pplx_space_execution_common::{
     ExecutionProtoError,
     environment::{EnvironmentBindingError, EnvironmentDecodeError, EnvironmentDefinition},
@@ -10,6 +12,15 @@ use pplx_space_execution_common::{
 use pplx_space_node_mgr_client::proto::{
     ResolveExecutionEnvironmentRequest, ResolveExecutionEnvironmentResponse,
 };
+
+// The legacy Create protocol implies the immutable stock E0 binding. This is
+// compatibility evidence, not an approval or selection of another environment.
+const LEGACY_CREATE_ENVIRONMENT: EnvironmentReference =
+    EnvironmentReference::new(Digest::sha256([
+        0x31, 0x68, 0xc9, 0x6b, 0x57, 0x19, 0xce, 0x62, 0x54, 0x3a, 0xe5, 0x3e, 0x66, 0x41, 0xa4,
+        0xeb, 0x80, 0x41, 0x6a, 0x9f, 0x01, 0xe5, 0x58, 0x5f, 0x6f, 0x76, 0xc3, 0xc7, 0x01, 0x11,
+        0xfa, 0x0b,
+    ]));
 
 #[derive(Debug, thiserror::Error)]
 pub enum BuildExecutionBindingError {
@@ -52,8 +63,19 @@ pub(super) struct BuildExecutionBinding {
 }
 
 impl BuildExecutionBinding {
-    /// Legacy bases keep their execution contract. Only a requested or inherited
-    /// reference opts into the verified environment protocol.
+    pub(super) fn reference(&self) -> EnvironmentReference {
+        self.definition.reference()
+    }
+
+    /// Ordinary inherited E0 work remains compatible during reader rollout.
+    /// Every explicit request or other complete binding requires acknowledgement.
+    pub(super) fn create_environment(&self, explicit: bool) -> Option<EnvironmentReference> {
+        (explicit || self.reference() != LEGACY_CREATE_ENVIRONMENT).then(|| self.reference())
+    }
+
+    /// Legacy bases keep their execution contract. Requested and inherited
+    /// references use verified node resolution; wire compatibility for implicit
+    /// E0 remains a separate decision.
     pub(super) async fn for_base(
         reference: Option<EnvironmentReference>,
         execution: &ExecutionMetadata,

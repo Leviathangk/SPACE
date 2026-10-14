@@ -136,6 +136,23 @@ async fn create_checks_auto_lifecycle_authority_before_template_lookup() {
             auto_lifecycle_authority: case.authority,
             ..Default::default()
         });
+        if !case.looks_up_template {
+            let mut selected = request.get_ref().clone();
+            pplx_space_sbx_mgr_client::environment::bind(
+                &mut selected,
+                "sha256:959f1181ac69f0dde7125fbc81be6fcd75b64e9e06e7a393f067b96eb6fb2ac4"
+                    .parse()
+                    .unwrap(),
+            );
+            let mut selected = Request::new(selected);
+            selected.extensions_mut().insert(case.peer.clone());
+            let error = service.create(selected).await.expect_err(case.name);
+            assert_eq!(error.code(), case.code, "selected {}: {error}", case.name);
+            assert!(
+                node_manager.calls().is_empty(),
+                "invalid selection must not dial node-manager"
+            );
+        }
         request.extensions_mut().insert(case.peer);
 
         let error = service.create(request).await.expect_err(case.name);

@@ -142,6 +142,7 @@ impl SandboxManagerService {
 
         let sandbox = self.lookup_sandbox(&context.sandbox_id)?;
         self.ensure_teardown_suspend_owner_for_durability(&sandbox.id, context.durability)?;
+        self.ensure_memory_state_supported(&sandbox, "suspend")?;
         self.ensure_not_pool_sandbox_for_snapshots(&sandbox, "suspend")?;
         self.ensure_no_plaintext_pool_cow_for_snapshots(&sandbox, "suspend")?;
         self.ensure_snapshot_restore_supported("suspend")?;
@@ -268,6 +269,7 @@ impl SandboxManagerService {
             ));
         };
         let sandbox = self.lookup_sandbox(&context.sandbox_id)?;
+        self.ensure_memory_state_supported(&sandbox, "suspend")?;
         self.ensure_not_pool_sandbox_for_snapshots(&sandbox, "suspend")?;
         self.ensure_no_plaintext_pool_cow_for_snapshots(&sandbox, "suspend")?;
         let local_artifact_id = LocalArtifactId::new();

@@ -21,6 +21,7 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
+	SandboxManager_GetExecutionCapabilities_FullMethodName               = "/space.sandbox.manager.v1.SandboxManager/GetExecutionCapabilities"
 	SandboxManager_Create_FullMethodName                                 = "/space.sandbox.manager.v1.SandboxManager/Create"
 	SandboxManager_Start_FullMethodName                                  = "/space.sandbox.manager.v1.SandboxManager/Start"
 	SandboxManager_Stop_FullMethodName                                   = "/space.sandbox.manager.v1.SandboxManager/Stop"
@@ -105,6 +106,8 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type SandboxManagerClient interface {
+	// Advisory readiness only. The environment input also fails closed on old readers.
+	GetExecutionCapabilities(ctx context.Context, in *GetExecutionCapabilitiesRequest, opts ...grpc.CallOption) (*GetExecutionCapabilitiesResponse, error)
 	// Create a new sandbox (allocate resources, prepare filesystem) without starting the VM.
 	Create(ctx context.Context, in *CreateRequest, opts ...grpc.CallOption) (*CreateResponse, error)
 	// Start a sandbox: fresh boot, or restore from checkpoint/suspend state.
@@ -291,6 +294,16 @@ type sandboxManagerClient struct {
 
 func NewSandboxManagerClient(cc grpc.ClientConnInterface) SandboxManagerClient {
 	return &sandboxManagerClient{cc}
+}
+
+func (c *sandboxManagerClient) GetExecutionCapabilities(ctx context.Context, in *GetExecutionCapabilitiesRequest, opts ...grpc.CallOption) (*GetExecutionCapabilitiesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetExecutionCapabilitiesResponse)
+	err := c.cc.Invoke(ctx, SandboxManager_GetExecutionCapabilities_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *sandboxManagerClient) Create(ctx context.Context, in *CreateRequest, opts ...grpc.CallOption) (*CreateResponse, error) {
@@ -1161,6 +1174,8 @@ func (c *sandboxManagerClient) ResolveSandboxMemory(ctx context.Context, in *Res
 // All implementations must embed UnimplementedSandboxManagerServer
 // for forward compatibility.
 type SandboxManagerServer interface {
+	// Advisory readiness only. The environment input also fails closed on old readers.
+	GetExecutionCapabilities(context.Context, *GetExecutionCapabilitiesRequest) (*GetExecutionCapabilitiesResponse, error)
 	// Create a new sandbox (allocate resources, prepare filesystem) without starting the VM.
 	Create(context.Context, *CreateRequest) (*CreateResponse, error)
 	// Start a sandbox: fresh boot, or restore from checkpoint/suspend state.
@@ -1349,6 +1364,9 @@ type SandboxManagerServer interface {
 // pointer dereference when methods are called.
 type UnimplementedSandboxManagerServer struct{}
 
+func (UnimplementedSandboxManagerServer) GetExecutionCapabilities(context.Context, *GetExecutionCapabilitiesRequest) (*GetExecutionCapabilitiesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetExecutionCapabilities not implemented")
+}
 func (UnimplementedSandboxManagerServer) Create(context.Context, *CreateRequest) (*CreateResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Create not implemented")
 }
@@ -1602,6 +1620,24 @@ func RegisterSandboxManagerServer(s grpc.ServiceRegistrar, srv SandboxManagerSer
 		t.testEmbeddedByValue()
 	}
 	s.RegisterService(&SandboxManager_ServiceDesc, srv)
+}
+
+func _SandboxManager_GetExecutionCapabilities_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetExecutionCapabilitiesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxManagerServer).GetExecutionCapabilities(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxManager_GetExecutionCapabilities_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxManagerServer).GetExecutionCapabilities(ctx, req.(*GetExecutionCapabilitiesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
 }
 
 func _SandboxManager_Create_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -2915,6 +2951,10 @@ var SandboxManager_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "space.sandbox.manager.v1.SandboxManager",
 	HandlerType: (*SandboxManagerServer)(nil),
 	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "GetExecutionCapabilities",
+			Handler:    _SandboxManager_GetExecutionCapabilities_Handler,
+		},
 		{
 			MethodName: "Create",
 			Handler:    _SandboxManager_Create_Handler,

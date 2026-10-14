@@ -15,10 +15,11 @@ and Firecracker snapshot format 9.0.0. The runtime digest covers the pinned
 Firecracker and jailer binaries, not their download archive.
 
 The implementation includes domain types, protobuf messages, a versioned JSON
-codec, and explicit E0 seed/build binding. Node-manager resolves only verified
-compiled E0; this does not activate another environment, add policy tables, or
-change execution defaults. Experimental runtime/kernel selection follows this
-binding protocol.
+codec, and explicit seed/build binding. E0 remains the default. Designated nodes
+can select other approved compiled bindings through the regular APIs in
+non-production deployments;
+installation alone never authorizes selection. Cluster policy tables and fleet
+selection are separate operations.
 
 ## Ownership and extension boundaries
 
@@ -125,8 +126,8 @@ publish, pull and boot remains the deployment acceptance test.
 
 `ResolveExecutionEnvironment` is a read-only node-local RPC with the node-status
 peer allowlist. An omitted reference requests compiled E0; an explicit reference
-must resolve to that same approved definition. Node-manager requires Linux and a
-non-overlapping managed-store layout, verifies E0 through the execution inventory,
+must resolve to an admitted compiled definition. Node-manager requires Linux and a
+non-overlapping managed-store layout, verifies that binding through the execution inventory,
 and returns the definition with matching execution observations. Prototype layouts
 that retain unverified external execution cannot produce this binding. The RPC
 is an observation, not a reservation or an activation operation; prepare and
@@ -134,13 +135,14 @@ launch resolve again. E0 artifacts remain protected from removal.
 
 The builder distinguishes verified bindings from legacy execution before resolution:
 
-- An unpinned scratch build on Linux/x86_64 resolves E0 and receives its runtime,
-  state format and kernel identity. Custom-kernel recipes and ARM scratch builds
-  retain their unbound contract and supplied kernel pin. Neither path scans for
+- An explicit scratch request resolves exactly its admitted environment; any
+  recipe kernel pin must agree. Without a selection, unpinned Linux/x86_64 scratch
+  builds resolve E0, while custom-kernel recipes and ARM scratch builds retain
+  their unbound contract and supplied kernel pin. Neither path scans for
   the newest runtime, and inherited selector variables are overwritten. Binding
   changes only the execution/schema fields, preserving seed image provenance.
 - Derived builds require readable base and actual sandbox execution metadata.
-  An inherited environment reference must resolve and match both observations.
+  An explicit or inherited environment reference must resolve and match both observations.
   Unbound bases remain unbound; missing kernel identity is not silently attributed
   to E0. Kind's bootstrap seed records the actual staged kernel digest so new
   seeds carry complete evidence. Missing execution metadata still fails closed.
@@ -173,10 +175,8 @@ For rollback, stop producing bound releases and use retained schema-2 releases
 with the old services. Keep compatible readers while bound templates or their
 sandbox/snapshot records remain in use: older JSON/protobuf readers outside the
 template schema gate can discard the new field. This change does not claim
-fleet-wide capability placement or snapshot-version negotiation. Experimental
-benchmarks must add their own node admission and isolate pools/caches by
-environment; cluster-wide provisioning can follow separately. Installing 1.17.0
-still does not select it.
+fleet-wide capability placement or snapshot-version negotiation. Explicit environment selection adds local admission; cluster-wide provisioning
+follows separately. Installing 1.17.0 still does not select it.
 
 ## Bounded audit of existing contracts
 
@@ -192,7 +192,7 @@ of existing data.
 | `RuntimeIdentity`, `RuntimeInstallation`, `NodeExecutionInventory`; PostgreSQL `node_runtime_installations` keyed by `(node_id, runtime, runtime_version)` and its dependent projections | **Keep** release metadata. **Replace with first consumer** its use as sufficient environment capability: observations need complete environment reference plus host/usability evidence. This PR adds the separate definition/reference, not a renamed installation row. | Execution-common owns definitions; node-ctl publication and cluster storage own the later provisioning projection; placement migration follows publication. | Preserve old inventory for old readers during rollout. New admission requires new evidence. Remove the old admission dependency only after every reader migrates; old release diagnostics may remain useful. |
 | `GuestOperatingSystem`, `GuestPlatform`, `ArtifactComponentKind` | **Keep** their current meanings. **Replace now** missing host identity with separate `HostPlatform`; do not infer host OS from guest OS. | Common-core/execution-common, this contract. Template owner adds distribution/release with its first guest-image consumer. | Additive messages preserve old guest fields and enum numbers. There is no guest-field migration/removal in this change. |
 | Runtime-manager `AvailableArtifact.architecture` and `ExecutionArtifact.architecture` | **Keep** legacy architecture evidence; it is not a full target or placement requirement. **Replace now** in new descriptors with explicit host target for runtime bytes and guest platform for the direct-boot kernel. | Execution-common owns descriptor targets now; runtime-manager owns richer diagnostic target fields with the first additional installer/target. | Do not silently change the old strings' meaning. Retire their placement use when consumers use typed targets; keep diagnostic evidence as needed. |
-| `ExecutionMetadata`, node `requested_execution`, string runtime selectors and CLI `--runtime fc` | **Keep** current adapter selection/recorded metadata. **Replace with first consumer** as complete selection authority: explicit environment references and actual resolved execution metadata through seed/build, then benchmark launch. | Template/build and node-manager owners: E0 binding is implemented here; explicit candidate selection requires opt-in benchmark admission. | Validate legacy aliases and reject contradictory old/new selectors at the consuming boundary. Unbound legacy paths remain unchanged until stock-image attribution is implemented; removal requires migrated writers/readers and durable records. |
+| `ExecutionMetadata`, node `requested_execution`, string runtime selectors and CLI `--runtime fc` | **Keep** current adapter selection/recorded metadata. **Replace with first consumer** as complete selection authority: explicit environment references and actual resolved execution metadata through seed/build, then benchmark launch. | Template/build and node-manager owners: E0 binding is implemented here; explicit selection uses the compiled catalog and deployment admission. | Validate legacy aliases and reject contradictory old/new selectors at the consuming boundary. Unbound legacy paths remain unchanged until stock-image attribution is implemented; removal requires migrated writers/readers and durable records. |
 | Runtime-manager SQLite `operation_results`, shared `jobs`, `InstallOperation` JSON and dedupe | **Keep** `install_kernel`, `uninstall_kernel`, `install_release`, `uninstall_release` as accurate existing operations. Environment policy does not change their identity or replay semantics. | Runtime-manager owns the first new operation kind and any versioned payload migration. | Preserve retained-job decode/replay and `(action, artifact identity)` dedupe; policy revision is correlation only. Verify deployed migration level before evolution. The historical prototype reset is not a future migration strategy. |
 | Firecracker paths, sources, local catalog JSON and POSIX protection configuration | **Keep** inside the Linux/Firecracker installer/store adapter. Portable policy references approved environments, not paths or arbitrary hashes. New identity has no ENV selection authority. | Node-manager/runtime-manager own adapter configuration; provisioning/source integration owns managed-store/bootstrap precedence. | Existing configuration keeps its semantics in this PR. The first replacement must define precedence and remove old knobs only after bootstrap, restart and rollback consumers migrate. |
 
@@ -210,3 +210,81 @@ host-provided runtimes, firmware boot, guest release metadata and richer snapsho
 compatibility remain owned by their first real adapter/guest consumer. These
 follow-ups do not block this contract slice or expand it into a whole-platform
 schema redesign.
+
+## Explicit environment selection
+
+The compiled execution catalog approves complete runtime, kernel and
+compatibility bindings independently of downloadable artifact pins. It includes
+E0 (Firecracker 1.15.1 / Linux 6.1.155) and a second Linux/x86_64 binding
+(Firecracker 1.17.0 / Linux 6.18.44):
+
+```text
+sha256:959f1181ac69f0dde7125fbc81be6fcd75b64e9e06e7a393f067b96eb6fb2ac4
+```
+
+Installation does not select an environment. Node-manager uses the existing
+`SPACE_ENV` deployment identity for its production restriction: explicit
+`dev`, `development`, `local`, `kind-local`, `test`, `testing`, `staging` and
+well-formed `local-*` identities may select any compiled binding; production, missing, malformed and
+unrecognized identities restrict explicit selection to E0. This adds no
+experiment-specific configuration, API, or stored policy.
+
+Artifacts belonging to compiled bindings are removal-protected independently of
+deployment mode, installation state and service restarts. Retiring a binding will
+require reference-aware fleet and node guards. Keep compatible readers while
+bound templates and sandbox records remain. Changing deployment identity is not
+a workload retirement operation.
+
+Node-manager verifies each environment's release and kernel from the managed
+store and stages its kernel into the execution cache. Cache loss triggers
+reconstruction. Missing or corrupt non-default artifacts cannot replace or
+withdraw E0. Each compiled binding records its qualified lifecycle support; the
+1.17.0 / 6.18.44 binding currently supports cold execution only.
+
+`StartBuild` and `Create` accept an additive environment input. It contains the
+reference and recipe or template; the environment determines the runtime. Legacy
+recipe/template/runtime fields are mutually exclusive with that input. An old
+builder sees no required recipe; an old sandbox manager sees no required runtime.
+Both reject before doing work, including after a capability preflight followed
+by a service restart. `GetExecutionCapabilities.environment_selection` advertises
+understanding of this protocol, **not support for every environment**. Successful
+selected responses must acknowledge the exact reference. Clients never retry a
+missing acknowledgement as an unselected request. A preflight on an old service
+returns a retryable availability error; rejection after a reconnect remains an
+explicit error, with no fallback. A timeout after submission is ambiguous: inspect
+the returned job/sandbox identity if available before retrying.
+
+Roll out readers first: node-manager, template-manager, sandbox-manager, then
+builder and operator clients. Ordinary unselected E0 traffic continues during
+mixed versions. Submit non-default work only after compatible readers are
+deployed on the target non-production nodes. Work sent early fails explicitly; it does
+not require a cluster-wide outage. A queued selected build retains its reference
+in a versioned job payload. A downgraded worker cannot decode that payload as an
+ordinary build and silently substitute E0; such work must be inspected/resubmitted
+after upgrading, not treated as successful.
+
+An explicit selection must match the template's recorded environment. An unbound
+legacy template may acquire a binding for this creation only after its recorded
+runtime, guest, state format and kernel digest match the node-verified definition;
+its stored template metadata is not rewritten. Create commits the verified execution
+binding with the sandbox and cleanup intent before acknowledging success. First
+Start, service restarts, and later starts preserve it; conflicting or missing
+artifact evidence fails closed. Without a selection, a bound template retains
+that environment, including its exact runtime on new cold boot and stop/start.
+Unbound derived builds keep the legacy request path regardless of runtime version.
+Ordinary builds inheriting the immutable E0 binding also retain that compatible
+path; explicit E0 requests and every inherited non-default binding require exact
+protocol acknowledgement. The distinction uses complete environment identity,
+never the runtime version alone. No kernel-only or runtime-only substitution is
+allowed. Local selected creation is cold-only, without pool adoption, snapshots,
+or cluster-owned identities. This creation restriction also covers explicit E0
+requests; later snapshot and suspend operations independently check memory-state
+qualification, which E0 already has. Unqualified memory-state operations are refused.
+Managed non-default bindings are omitted from the legacy cluster placement
+projection. Historical external runtime and kernel installations remain available
+to legacy execution and placement. Fleet placement for complete environments,
+policy distribution, snapshot compatibility and mixed-environment pools are later
+integrations. Use the node-local clients for explicit non-default selection.
+
+See the [runtime benchmark procedure](../scripts/benchmarks/README.md#runtime-environment-benchmark)
+for building distinct templates and checking the identities that actually ran.

@@ -1904,6 +1904,7 @@ pub(crate) mod service_tests {
                     crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::ClusterFenced,
                 )
                 .as_ref(),
+                None,
             )
             .unwrap();
             assert!(

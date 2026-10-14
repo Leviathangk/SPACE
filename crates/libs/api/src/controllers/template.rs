@@ -156,6 +156,7 @@ impl TemplateBuildSubmission {
 
     fn into_start_build_request(self, grant: Option<PublicationGrant>) -> StartBuildRequest {
         StartBuildRequest {
+            environment: None,
             system_publication_grant_id: grant
                 .and_then(PublicationGrant::system)
                 .map(|grant| grant.to_string()),
@@ -487,6 +488,7 @@ impl TemplateController {
             })?;
 
         Ok(StartBuildResponse {
+            environment: None,
             job_id: job_id.to_string(),
         })
     }

@@ -285,5 +285,121 @@ pub(super) fn require_environment_acknowledgement(
     Ok(())
 }
 
+/// Explicit selection cannot relabel a template. Non-default bindings remain local and
+/// cold-only until cluster placement and memory-state compatibility are qualified.
+pub(super) fn validate_environment_create(
+    request: &crate::proto::CreateRequest,
+    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    execution: &pplx_space_common_core::types::ExecutionMetadata,
+) -> Result<bool, tonic::Status> {
+    if environment.is_some() && environment != execution.environment() {
+        return Err(tonic::Status::failed_precondition(
+            "requested environment differs from the template binding",
+        ));
+    }
+    let non_default = is_non_default_execution(execution);
+    if non_default || environment.is_some() {
+        validate_environment_create_fields(request)?;
+    }
+    Ok(non_default)
+}
+
+/// Selected creation is a node-local cold protocol, including qualified E0.
+/// Later memory operations independently check the environment's qualification.
+pub(super) fn validate_environment_create_fields(
+    request: &crate::proto::CreateRequest,
+) -> Result<(), Status> {
+    if request.sandbox_id.is_some()
+        || request.route_identity.is_some()
+        || request.pool_template.is_some()
+        || request.snapshots_enabled
+        || request.boot_mode != crate::proto::BootMode::Cold as i32
+    {
+        return Err(Status::failed_precondition(
+            "selected environments require node-local cold creation without pools, snapshots, or cluster-owned identity",
+        ));
+    }
+    Ok(())
+}
+
+/// Decode the additive input before normal admission. Both legacy inputs must
+/// be absent so an old server cannot ignore selection and execute default work.
+pub(super) fn normalize_environment_input(
+    request: &mut crate::proto::CreateRequest,
+) -> Result<Option<pplx_space_common_core::types::EnvironmentReference>, Status> {
+    let Some(input) = request.environment.take() else {
+        return Ok(None);
+    };
+    if !request.template.is_empty() || !request.runtime.is_empty() {
+        return Err(Status::invalid_argument("provide exactly one create input"));
+    }
+    let reference = input.reference.parse().map_err(
+        |error: pplx_space_common_core::types::DigestParseError| {
+            Status::invalid_argument(error.to_string())
+        },
+    )?;
+    request.template = input.template;
+    Ok(Some(reference))
+}
+
+fn initial_environment_reference() -> Option<pplx_space_common_core::types::EnvironmentReference> {
+    use pplx_space_common_core::types::Arch;
+    use pplx_space_node_runtime_core::catalog::InitialEnvironment;
+    static INITIAL: std::sync::OnceLock<
+        Option<pplx_space_common_core::types::EnvironmentReference>,
+    > = std::sync::OnceLock::new();
+    *INITIAL.get_or_init(
+        || match InitialEnvironment::for_architecture(Arch::X86_64) {
+            Ok(initial) => match initial.definition() {
+                Ok(definition) => Some(definition.reference()),
+                Err(error) => {
+                    tracing::warn!(%error, "initial environment definition unavailable");
+                    None
+                }
+            },
+            Err(error) => {
+                tracing::warn!(%error, "initial environment pins unavailable");
+                None
+            }
+        },
+    )
+}
+
+/// Fleet placement and pool identity must understand a complete binding before
+/// a non-default template can use those paths, independently of snapshot support.
+pub(super) fn is_non_default_execution(
+    execution: &pplx_space_common_core::types::ExecutionMetadata,
+) -> bool {
+    execution
+        .environment()
+        .is_some_and(|reference| Some(reference) != initial_environment_reference())
+}
+
+/// Bound environments require qualified memory-state support before any
+/// capture or warm creation. Legacy records retain their existing contract.
+pub(super) fn requires_cold_creation(
+    execution: &pplx_space_common_core::types::ExecutionMetadata,
+) -> bool {
+    let Some(reference) = execution.environment() else {
+        return false;
+    };
+    use pplx_space_common_core::types::{Arch, EnvironmentReference};
+    use pplx_space_node_runtime_core::catalog::CompiledEnvironment;
+    static MEMORY_STATE: std::sync::OnceLock<Vec<EnvironmentReference>> =
+        std::sync::OnceLock::new();
+    let supported = MEMORY_STATE.get_or_init(|| match CompiledEnvironment::for_architecture(Arch::X86_64) {
+        Ok(environments) => environments.into_iter()
+            .filter(|entry| entry.supports_memory_state())
+            .map(|entry| entry.definition().reference())
+            .collect(),
+        Err(error) => {
+            tracing::warn!(%error, "additional environment catalog unavailable; retaining initial memory-state support");
+            // The initial binding's qualification does not depend on additional pins.
+            initial_environment_reference().into_iter().collect()
+        }
+    });
+    !supported.contains(&reference)
+}
+
 #[cfg(test)]
 mod tests;

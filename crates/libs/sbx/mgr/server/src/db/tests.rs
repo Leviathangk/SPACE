@@ -58,6 +58,7 @@ fn node_execution_cleanup_acknowledgements_are_retryable_and_fenced() {
         },
         None,
         None,
+        None,
     )
     .unwrap();
     let staged = node_execution_fence(&conn, &id).unwrap().unwrap();
@@ -10029,3 +10030,5 @@ mod state_write_table;
 mod thin_writer_coverage;
 mod update_state_from;
 mod update_state_matrix;
+
+mod execution_binding;

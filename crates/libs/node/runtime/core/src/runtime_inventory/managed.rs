@@ -78,13 +78,7 @@ impl RuntimeInventory {
         let cache_parent = kernels
             .parent()
             .ok_or_else(|| RuntimeInventoryError::ParentlessKernelRoot(kernels.to_path_buf()))?;
-        let cached_kernel = cache_parent
-            .join("managed/kernels")
-            .join(managed_kernel_directory(
-                &initial.kernel().version,
-                initial.kernel().sha256,
-            ))
-            .join(KERNEL_IMAGE);
+        let cached_kernel = ArtifactStore::execution_kernel_path(cache_parent, initial.kernel());
         let mut watched = vec![
             store.releases_root().to_path_buf(),
             store.kernels_root().to_path_buf(),
@@ -192,6 +186,107 @@ impl RuntimeInventory {
         }
         inventory.remember_paths(watched);
         Ok(inventory)
+    }
+
+    /// Include a complete pinned environment; never change new/legacy defaults.
+    /// Missing or invalid environment bytes withdraw that binding, not E0.
+    pub fn include_environment(
+        &mut self,
+        store: &ArtifactStore,
+        environment: &crate::catalog::CompiledEnvironment,
+        kernels: &Path,
+    ) -> Result<(), RuntimeInventoryError> {
+        let release = environment.release();
+        let kernel = environment.kernel();
+        let shared_runtime = self
+            .runtimes
+            .iter()
+            .find(|entry| {
+                entry.runtime == release.release && self.defaults.contains(&entry.runtime)
+            })
+            .cloned();
+        let shared_kernel = self
+            .components
+            .iter()
+            .find(|entry| entry.default_for_new && entry.metadata.digest == Some(kernel.sha256))
+            .cloned();
+        let release_root = store.releases_root().join(managed_release_directory(
+            &release.release,
+            release.digest(),
+        ));
+        let kernel_root = store
+            .kernels_root()
+            .join(managed_kernel_directory(&kernel.version, kernel.sha256));
+        let cache_parent = kernels
+            .parent()
+            .ok_or_else(|| RuntimeInventoryError::ParentlessKernelRoot(kernels.to_path_buf()))?;
+        let mut watched = vec![
+            release_root.join("bin/firecracker"),
+            release_root.join("bin/jailer"),
+            kernel_root.join(KERNEL_IMAGE),
+            ArtifactStore::execution_kernel_path(cache_parent, kernel),
+        ];
+        let runtime = match shared_runtime {
+            Some(runtime) => Ok(runtime),
+            None => {
+                let runtime = (|| {
+                    store.verify_release(release)?;
+                    FirecrackerDriver
+                        .inspect_installation(release_root, release.release.version.clone())
+                })();
+                runtime.map_err(|error| {
+                    tracing::warn!(%error, "environment runtime unavailable");
+                    let error = self.binding_error(error);
+                    self.unavailable.push(UnavailableArtifact::Runtime {
+                        identity: release.release.clone(),
+                        error: error.clone(),
+                    });
+                    error
+                })
+            }
+        };
+        let component = match shared_kernel {
+            Some(kernel) => Ok(kernel),
+            None => {
+                let component = (|| {
+                    let cache = store.prepare_execution_cache(cache_parent)?;
+                    let staged = store.stage_kernel(kernel, &cache)?;
+                    let image = staged.path.join(KERNEL_IMAGE);
+                    watched.push(image.clone());
+                    Ok::<_, RuntimeInventoryError>(kernel_installation(
+                        kernel_metadata(kernel.version.clone(), kernel.sha256)?,
+                        image,
+                        false,
+                        false,
+                    ))
+                })();
+                component.map_err(|error| {
+                    tracing::warn!(%error, "environment kernel unavailable");
+                    let error = self.binding_error(error);
+                    self.unavailable.push(UnavailableArtifact::Kernel {
+                        digest: kernel.sha256,
+                        legacy: false,
+                        error: error.clone(),
+                    });
+                    error
+                })
+            }
+        };
+        // A failed managed binding cannot remove or borrow a legacy installation.
+        // Keep a failed entry too, so explicit requests cannot fall back to it.
+        let installed = match (runtime, component) {
+            (Ok(runtime), Ok(component)) => Ok(InstalledEnvironment {
+                runtime,
+                components: vec![component],
+            }),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        };
+        self.environments
+            .insert(environment.definition().reference(), installed);
+        let previous = std::mem::take(&mut self.fingerprints);
+        self.remember_paths(watched);
+        self.fingerprints.extend(previous);
+        Ok(())
     }
 
     fn binding_error(

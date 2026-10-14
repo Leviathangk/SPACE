@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 
 use pplx_space_common_core::types::{
     Arch, ArtifactComponentKind, ArtifactComponentMetadata, ArtifactComponentRole, ArtifactFormat,
-    ArtifactVersion, Digest, ExecutionMetadata, ExecutionMetadataError, FIRECRACKER_STATE_FORMAT,
-    GuestOperatingSystem, GuestPlatform, RuntimeIdentity, RuntimeKind, RuntimeVersion,
-    StateFormatIdentity, StateFormatName, StateFormatVersion,
+    ArtifactVersion, Digest, EnvironmentReference, ExecutionMetadata, ExecutionMetadataError,
+    FIRECRACKER_STATE_FORMAT, GuestOperatingSystem, GuestPlatform, RuntimeIdentity, RuntimeKind,
+    RuntimeVersion, StateFormatIdentity, StateFormatName, StateFormatVersion,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -94,6 +94,10 @@ impl RuntimeInstallationFiles {
         }
     }
 
+    pub fn paths(&self) -> impl Iterator<Item = &Path> {
+        self.files.values().map(PathBuf::as_path)
+    }
+
     pub fn path(&self, role: RuntimeFileRole) -> Option<&Path> {
         self.files.get(&role).map(PathBuf::as_path)
     }
@@ -133,6 +137,13 @@ impl ResolvedExecutionEnvironment {
     }
 }
 
+/// Artifacts verified for one explicit binding, separate from legacy discovery.
+#[derive(Clone, Debug)]
+struct InstalledEnvironment {
+    runtime: RuntimeInstallation,
+    components: Vec<ArtifactComponentInstallation>,
+}
+
 #[derive(Clone, Debug)]
 pub struct RuntimeInventory {
     runtimes: Vec<RuntimeInstallation>,
@@ -141,6 +152,10 @@ pub struct RuntimeInventory {
     /// layout's default for the bounded legacy execution path.
     defaults: Vec<RuntimeIdentity>,
     fingerprints: Vec<(PathBuf, PathFingerprint)>,
+    environments: BTreeMap<
+        EnvironmentReference,
+        Result<InstalledEnvironment, std::sync::Arc<RuntimeInventoryError>>,
+    >,
     #[cfg(feature = "artifact-store")]
     unavailable: Vec<UnavailableArtifact>,
     retry_after: Option<tokio::time::Instant>,
@@ -814,6 +829,19 @@ impl RuntimeInventory {
             .iter()
             .flat_map(|entry| entry.files.files.values().map(PathBuf::as_path))
             .chain(self.components.iter().map(|entry| entry.path.as_path()))
+            .chain(
+                self.environments
+                    .values()
+                    .filter_map(|entry| entry.as_ref().ok())
+                    .flat_map(|environment| {
+                        environment.runtime.files.paths().chain(
+                            environment
+                                .components
+                                .iter()
+                                .map(|entry| entry.path.as_path()),
+                        )
+                    }),
+            )
     }
 
     /// Blocking validation of root-controlled file metadata and, for external
@@ -943,6 +971,7 @@ impl RuntimeInventory {
             components: kernels,
             defaults,
             fingerprints: Vec::new(),
+            environments: BTreeMap::new(),
             #[cfg(feature = "artifact-store")]
             unavailable: Vec::new(),
             retry_after: None,
@@ -955,15 +984,21 @@ impl RuntimeInventory {
         Ok(inventory)
     }
 
+    /// Look up the exact installed runtime identity, without default selection
+    /// or compatibility substitution.
+    pub fn runtime_installation(&self, identity: &RuntimeIdentity) -> Option<&RuntimeInstallation> {
+        self.runtimes
+            .iter()
+            .find(|installation| &installation.runtime == identity)
+    }
+
     /// The installed release a runtime's `default` alias names.
     fn default_installation(&self, runtime: RuntimeKind) -> Option<&RuntimeInstallation> {
         let default = self
             .defaults
             .iter()
             .find(|default| default.kind == runtime)?;
-        self.runtimes
-            .iter()
-            .find(|installation| installation.runtime == *default)
+        self.runtime_installation(default)
     }
 
     /// Restore may use the selected loader or another compatible installed
@@ -1042,6 +1077,26 @@ impl RuntimeInventory {
         runtime: RuntimeKind,
         mode: ExecutionSelectionMode,
     ) -> Result<ResolvedExecutionEnvironment, RuntimeInventoryError> {
+        let binding = requested
+            .and_then(|metadata| metadata.environment())
+            .and_then(|reference| self.environments.get(&reference))
+            .map(|entry| {
+                entry
+                    .as_ref()
+                    .map_err(|error| RuntimeInventoryError::UnavailableBinding(error.clone()))
+            })
+            .transpose()?;
+        let runtimes = binding
+            .map(|environment| std::slice::from_ref(&environment.runtime))
+            .unwrap_or(&self.runtimes);
+        let components = binding
+            .map(|environment| environment.components.as_slice())
+            .unwrap_or(&self.components);
+        let find_runtime = |identity: &RuntimeIdentity| {
+            runtimes
+                .iter()
+                .find(|installation| &installation.runtime == identity)
+        };
         let driver = DRIVERS.get(runtime)?;
         if requested.is_none() && mode != ExecutionSelectionMode::NewColdBoot {
             return Err(RuntimeInventoryError::MissingRequestedExecution(mode));
@@ -1060,7 +1115,7 @@ impl RuntimeInventory {
                     return Err(RuntimeInventoryError::NoCompatibleRuntime { runtime });
                 }
                 match mode {
-                    ExecutionSelectionMode::NewColdBoot => {
+                    ExecutionSelectionMode::NewColdBoot if requested.environment().is_none() => {
                         let selected = self
                             .default_installation(runtime)
                             .ok_or(RuntimeInventoryError::NoCompatibleRuntime { runtime })?;
@@ -1069,11 +1124,9 @@ impl RuntimeInventory {
                         }
                         selected
                     }
-                    ExecutionSelectionMode::ExistingColdBoot => {
-                        let installation = self
-                            .runtimes
-                            .iter()
-                            .find(|installation| installation.runtime == *requested.runtime())
+                    ExecutionSelectionMode::ExistingColdBoot
+                    | ExecutionSelectionMode::NewColdBoot => {
+                        let installation = find_runtime(requested.runtime())
                             .ok_or(RuntimeInventoryError::NoCompatibleRuntime { runtime })?;
                         if !driver.can_execute(installation, requested, mode)? {
                             return Err(RuntimeInventoryError::NoCompatibleRuntime { runtime });
@@ -1081,17 +1134,16 @@ impl RuntimeInventory {
                         installation
                     }
                     ExecutionSelectionMode::PersistedStateRestore => {
-                        let exact = self
-                            .runtimes
-                            .iter()
-                            .find(|installation| installation.runtime == *requested.runtime());
+                        let exact = find_runtime(requested.runtime());
                         if let Some(installation) = exact
                             && driver.can_execute(installation, requested, mode)?
                         {
                             installation
-                        } else {
+                        } else if binding.is_none() {
                             self.default_or_first_compatible(driver, runtime, requested, mode)?
                                 .ok_or(RuntimeInventoryError::NoCompatibleRuntime { runtime })?
+                        } else {
+                            return Err(RuntimeInventoryError::NoCompatibleRuntime { runtime });
                         }
                     }
                 }
@@ -1102,8 +1154,7 @@ impl RuntimeInventory {
         let mut selected_components = Vec::new();
         if let Some(requested) = requested {
             for component in requested.components() {
-                match self
-                    .components
+                match components
                     .iter()
                     .find(|installed| component_matches(&installed.metadata, component))
                 {
@@ -1132,25 +1183,25 @@ impl RuntimeInventory {
         let kernel = if let Some(requested_kernel) = requested_kernel
             && mode != ExecutionSelectionMode::PersistedStateRestore
         {
-            self.components
+            components
                 .iter()
                 .find(|installed| component_matches(&installed.metadata, requested_kernel))
         } else if let Some(requested_kernel) = requested_kernel {
-            self.components
+            components
                 .iter()
                 .find(|installed| component_matches(&installed.metadata, requested_kernel))
                 .or_else(|| {
-                    self.components.iter().find(|installed| {
+                    components.iter().find(|installed| {
                         installed.metadata.kind == ArtifactComponentKind::Kernel
                             && installed.legacy_default
                     })
                 })
         } else if mode != ExecutionSelectionMode::NewColdBoot {
-            self.components.iter().find(|installed| {
+            components.iter().find(|installed| {
                 installed.metadata.kind == ArtifactComponentKind::Kernel && installed.legacy_default
             })
         } else {
-            self.components.iter().find(|installed| {
+            components.iter().find(|installed| {
                 installed.metadata.kind == ArtifactComponentKind::Kernel
                     && installed.default_for_new
             })
@@ -1186,6 +1237,8 @@ impl RuntimeInventory {
         })
     }
 
+    /// Legacy placement evidence. Additional environment-only artifacts are
+    /// available through explicit resolution, never as unselected capacity.
     pub fn to_proto(&self) -> pplx_space_execution_common::proto::NodeExecutionInventory {
         use pplx_space_execution_common::proto;
 

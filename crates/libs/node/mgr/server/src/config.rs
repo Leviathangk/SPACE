@@ -16,6 +16,7 @@ pub(crate) struct ServiceSettings {
     pub lifecycle_limiter: crate::lifecycle_limiter::LifecycleLimiter,
     pub runtime_paths: RuntimePaths,
     pub guest_console_logs: bool,
+    pub production: bool,
     pub memory_admission_sources: crate::memory_admission::MemoryAdmissionSources,
     pub runtime_supervisor: crate::runtime_supervisor_client::RuntimeSupervisorLazyClient,
     pub node_status_dirty: std::sync::Arc<dyn crate::node_state_sync::NodeStatusDirtySink>,
@@ -69,6 +70,9 @@ impl ServiceSettings {
                 ),
                 store: ArtifactStorePaths::default(),
             },
+            production: deployment_is_production(
+                std::env::var_os(pplx_space_observability::logging::SPACE_ENV).as_deref(),
+            ),
             guest_console_logs: std::env::var("SPACE_ENABLE_GUEST_CONSOLE_LOGS").is_ok_and(
                 |value| {
                     matches!(
@@ -88,6 +92,7 @@ impl ServiceSettings {
         tracing::info!(
             disk_admission = ?settings.disk_admission,
             guest_console_logs = settings.guest_console_logs,
+            production = settings.production,
             "resolved startup-only node-manager host settings"
         );
         settings
@@ -102,3 +107,25 @@ fn path(name: &str, default: &str) -> PathBuf {
     tracing::info!(setting = name, source, path = %path.display(), "resolved startup-only runtime path");
     path
 }
+
+/// Only explicit non-production deployment identities relax the E0 restriction.
+/// Missing, malformed, or unfamiliar deployment identities retain production admission.
+fn deployment_is_production(value: Option<&std::ffi::OsStr>) -> bool {
+    !value
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            normalized.strip_prefix("local-").is_some_and(|suffix| {
+                !suffix.is_empty()
+                    && suffix.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                    })
+            }) || matches!(
+                normalized.as_str(),
+                "dev" | "development" | "local" | "kind-local" | "test" | "testing" | "staging"
+            )
+        })
+}
+
+#[cfg(test)]
+mod tests;

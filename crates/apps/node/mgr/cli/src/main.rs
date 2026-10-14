@@ -128,6 +128,11 @@ struct Cli {
 
 #[derive(clap::Subcommand)]
 enum Commands {
+    /// Resolve and verify an execution environment on this node; JSON output.
+    Environment {
+        #[arg(long)]
+        reference: Option<pplx_space_common_core::types::EnvironmentReference>,
+    },
     /// Show allocated network slots and health
     Status {
         /// Filter by sandbox ID(s)
@@ -305,6 +310,44 @@ async fn run(cli: Cli) -> Result<(), String> {
         })?;
 
     match cli.command {
+        Commands::Environment { reference } => {
+            let response = client
+                .resolve_execution_environment(
+                    pplx_space_node_mgr_client::proto::ResolveExecutionEnvironmentRequest {
+                        reference: reference.map(|value| value.to_string()),
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())?
+                .into_inner();
+            let definition =
+                pplx_space_execution_common::environment::EnvironmentDefinition::try_from(
+                    response.definition.as_ref().ok_or("missing definition")?,
+                )
+                .map_err(|error| error.to_string())?;
+            let execution = pplx_space_common_core::types::ExecutionMetadata::try_from(
+                response.execution.as_ref().ok_or("missing execution")?,
+            )
+            .map_err(|error| error.to_string())?;
+            if reference.is_some_and(|reference| reference != definition.reference())
+                || execution.environment() != Some(definition.reference())
+            {
+                return Err("node did not acknowledge the requested environment".into());
+            }
+            let execution = definition
+                .bind_execution(execution)
+                .map_err(|error| error.to_string())?;
+            let document: serde_json::Value = serde_json::from_str(
+                &definition
+                    .to_document()
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            println!(
+                "{}",
+                serde_json::json!({"definition": document, "execution": execution})
+            );
+        }
         Commands::Status { sandbox_ids } => {
             let pool = client
                 .get_network_pool_status(NetworkPoolStatusRequest {})

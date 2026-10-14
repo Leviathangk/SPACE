@@ -164,17 +164,65 @@ impl SandboxManagerService {
         Ok(())
     }
 
+    /// Resolve and verify the exact environment within 30 seconds, including connect.
+    async fn resolve_create_environment(
+        &self,
+        reference: pplx_space_common_core::types::EnvironmentReference,
+    ) -> Result<pplx_space_execution_common::environment::EnvironmentDefinition, Status> {
+        let response = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let mut node = connect_node(&self.node_manager)
+                .await
+                .map_err(|error| Status::unavailable(error.to_string()))?;
+            node.resolve_execution_environment(
+                pplx_space_node_mgr_client::proto::ResolveExecutionEnvironmentRequest {
+                    reference: Some(reference.to_string()),
+                },
+            )
+            .await
+        })
+        .await
+        .map_err(|_| Status::deadline_exceeded("environment admission timed out"))??
+        .into_inner();
+        let definition = pplx_space_execution_common::environment::EnvironmentDefinition::try_from(
+            response.definition.as_ref().ok_or_else(|| {
+                Status::failed_precondition("node did not return environment definition")
+            })?,
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        let actual = pplx_space_common_core::types::ExecutionMetadata::try_from(
+            response.execution.as_ref().ok_or_else(|| {
+                Status::failed_precondition("node did not acknowledge execution environment")
+            })?,
+        )
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        if definition.reference() != reference || actual.environment() != Some(reference) {
+            return Err(Status::failed_precondition(
+                "node returned a different or missing environment binding",
+            ));
+        }
+        definition
+            .bind_execution(actual)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        Ok(definition)
+    }
+
     pub(super) async fn create(
         &self,
         request: Request<CreateRequest>,
     ) -> Result<Response<CreateResponse>, Status> {
         let peer = self.authorize_peer(&request, "Create", ALLOW_SANDBOX_OPERATOR_OR_TMPLMGR)?;
+        let mut request = request;
+        let environment = super::validation::normalize_environment_input(request.get_mut())?;
         let span = tracing::info_span!("sbxmgr.create", template = %request.get_ref().template);
         let publish_node_state = !should_skip_node_publish(&request);
-        let result = async move {
+        let mut result = async move {
             let req = request.get_ref();
             let sandbox_owner = Self::authorize_create_sandbox_owner(&peer, req)?;
-            let (requested_boot_mode, requested_id) = validate_create_request(req)?;
+            let (requested_boot_mode, requested_id) = if environment.is_some() {
+                validate_create_request_fields(req)?
+            } else {
+                validate_create_request(req)?
+            };
             if req.network_policy.is_some() {
                 let authority = crate::db::PolicyAuthority::try_from(
                     req.network_policy_authority,
@@ -188,12 +236,22 @@ impl SandboxManagerService {
                         .map_err(|error| Status::invalid_argument(error.to_string()))?;
                 require_local_authority_peer(peer.principal(), authority)?;
             }
+            if environment.is_some() {
+                super::validation::validate_environment_create_fields(req)?;
+            }
+            let verified = if let Some(reference) = environment {
+                let definition = self.resolve_create_environment(reference).await?;
+                let pplx_space_common_core::types::RuntimeBinding::ManagedRelease(release) = &definition.descriptor().spec().runtime;
+                request.get_mut().runtime = release.runtime.kind.alias().to_owned();
+                Some(definition)
+            } else { None };
+            let req = request.get_ref();
             let template = &req.template;
             let runtime = &req.runtime;
 
             // Resolve template to content-addressed paths via template-manager.
             // If caller pinned a content_hash, use it; otherwise resolve newest.
-            let resolved_template = resolve_template_paths(
+            let mut resolved_template = resolve_template_paths(
                 self.template_resolver.as_ref(),
                 pplx_space_template_mgr_client::proto::TemplateRef {
                     name: template.to_string(),
@@ -202,6 +260,21 @@ impl SandboxManagerService {
                 },
             )
             .await?;
+            if let Some(definition) = &verified {
+                resolved_template.execution = definition.bind_execution(resolved_template.execution)
+                    .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            }
+            let non_default = super::validation::validate_environment_create(
+                req, environment, &resolved_template.execution,
+            )?;
+            if non_default || environment.is_some() {
+                let reference = resolved_template.execution.environment().ok_or_else(|| Status::failed_precondition("explicit selection requires a bound template"))?;
+                if verified.is_none() {
+                    let definition = self.resolve_create_environment(reference).await?;
+                    resolved_template.execution = definition.bind_execution(resolved_template.execution)
+                        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+                }
+            }
             if let Some(policy) = template_network_policy_from_proto(
                 req.template_network_policy.as_ref(),
                 req.template_network_policy_generation,
@@ -280,6 +353,7 @@ impl SandboxManagerService {
                     let log_path = format!("{RUN_DIR}/{}/fc.log", sbx_id);
                     let namespace = format!("sns-{}", sandbox.uuid8);
                     return Ok(Response::new(CreateResponse {
+                        environment: None,
                         sandbox_id: sbx_id,
                         pid: sandbox.pid,
                         guest_ip: Some("169.254.0.21".to_string()),
@@ -437,6 +511,10 @@ impl SandboxManagerService {
                         effective_mode,
                         id: requested_id.to_string(),
                         template_dir: &resolved_template.template_dir,
+                        execution: resolved_template
+                            .execution
+                            .environment()
+                            .map(|_| &resolved_template.execution),
                         snapshot_dir_resolved: resolved_template.snapshot_dir.as_deref(),
                         snapshot_vcpu: resolved_template.snapshot_vcpu,
                         content_hash_resolved: resolved_template.content_hash.as_deref(),
@@ -454,6 +532,10 @@ impl SandboxManagerService {
                 effective_mode,
                 id: Uuid::now_v7().to_string(),
                 template_dir: &resolved_template.template_dir,
+                execution: resolved_template
+                    .execution
+                    .environment()
+                    .map(|_| &resolved_template.execution),
                 snapshot_dir_resolved: resolved_template.snapshot_dir.as_deref(),
                 snapshot_vcpu: resolved_template.snapshot_vcpu,
                 content_hash_resolved: resolved_template.content_hash.as_deref(),
@@ -465,6 +547,9 @@ impl SandboxManagerService {
         }
         .instrument(span)
         .await;
+        if let Ok(response) = result.as_mut() {
+            response.get_mut().environment = environment.map(|reference| reference.to_string());
+        }
         if publish_node_state && let Ok(response) = result.as_ref() {
             mark_sandbox_dirty(&self.db, &response.get_ref().sandbox_id);
         }

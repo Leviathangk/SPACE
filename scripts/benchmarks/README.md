@@ -181,3 +181,66 @@ cannot check that. Quiet runs are report-only.
 
 The harness does not yet collect the fio probe (F2), balloon statistics,
 per-VM memory, or disk and btrfs metrics.
+
+## Runtime environment benchmark
+
+`bench-runtime-environments.py` compares A (E0: Firecracker 1.15.1 / Linux
+6.1.155) with C (Firecracker 1.17.0 / Linux 6.18.44). It measures create latency,
+cold start to guest readiness, and a stop/start cycle. This is a local Linux/KVM
+operator workflow; it neither deploys services nor launches a VMM directly.
+Arm B (new Firecracker with the old kernel) is not enabled.
+
+1. Roll out the environment-aware services and clients to the designated builder
+   and worker nodes. Ordinary E0 work can continue across mixed revisions. The
+   environment input fails closed on older services. Use the **same completed
+   SPACE revision** for both measured arms to avoid confounding the comparison.
+2. Install both compiled pairs through runtime-manager on both nodes. Configure
+   the existing deployment identity as non-production (`local`, `kind-local`,
+   `dev`, `development`, `test`, `testing`, `staging`, or a `local-*` identity).
+   Kind's default `local-<hostname>` and SaaS `local-kind-<owner>-<devbox>`
+   identities are supported. Node-manager restricts
+   production explicit selection to E0. Verify both references using `space-nodemgr environment --reference REF`. Installation and
+   a capability flag alone are not evidence that a pair is usable.
+3. Build two separately named, tenant-owned scratch templates through `space-buildmgr build
+   --recipe FILE --id NAME --environment REF --org-id ORG`. Keep the base image, source pins,
+   guest agent, userspace steps, vCPU and memory defaults identical. Change only
+   the explicit guest-kernel pin to the selected environment's version and digest.
+   The production seed recipe may intentionally name a custom kernel; make two
+   benchmark recipe files, rather than relabeling or modifying that seed. A pin
+   that differs from the selected environment is rejected. Use normal publication
+   and template-manager distribution, with distinct template names and immutable
+   content hashes; do not share a pool or base snapshot between arms. Derived
+   recipes inherit their base environment and cannot change it.
+4. Record the two recipe hashes, image/agent input identities, publication content
+   hashes, builder revision and kernel pins in a local JSON file. Pass it as
+   `--base-inputs`. Keep the common userspace recipe as `--recipe`. Do not put
+   credentials or private service configuration in either file.
+5. Run on one otherwise controlled worker, as root, with Python 3.11+, curl and
+   the new node-local CLIs. For example (replace the hash variables with the
+   published immutable template hashes):
+
+   ```bash
+   python3 scripts/benchmarks/bench-runtime-environments.py \
+     --baseline-template bench-e0 --baseline-hash "$BASELINE_HASH" \
+     --candidate-template bench-c --candidate-hash "$CANDIDATE_HASH" \
+     --vcpu 2 --memory-mib 1024 --iterations 20 \
+     --space-revision "$SPACE_REVISION" --recipe common-userspace.toml \
+     --base-inputs benchmark-inputs.json --cache-state warm \
+     --output runtime-comparison.json
+   ```
+
+`--vcpu` and `--memory-mib` are the expected template defaults, checked against
+both running VMs. The harness alternates A/C and C/A order, forces cold boot,
+and deletes only the sandboxes it creates. It records host kernel and CPU,
+declared SPACE/input provenance, requested references, resolved definitions,
+sandbox execution metadata, VMM API version, running executable hash, jailed
+kernel hash, guest `uname -r`, and machine configuration. Any identity/resource
+mismatch invalidates the result. This procedure leaves cache state under operator
+control; it does not prune shared caches. A terminated harness may leave its
+sandbox behind; use the recorded IDs and normal operator cleanup.
+
+Keep compatible services while templates or sandbox records refer to either
+binding. Compiled environment artifacts remain protected across restarts and
+deployment-mode changes; stopping benchmark submissions does not retire them.
+These measurements qualify cold boot and stop/start. Memory-state operations,
+production placement, and other VMMs require their own qualification.

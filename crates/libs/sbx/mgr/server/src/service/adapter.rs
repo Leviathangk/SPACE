@@ -3,6 +3,22 @@ use crate::proto::{CleanupTargetBatch, ScanCleanupTargetsRequest};
 
 #[tonic::async_trait]
 impl SandboxManager for SandboxManagerService {
+    async fn get_execution_capabilities(
+        &self,
+        request: Request<crate::proto::GetExecutionCapabilitiesRequest>,
+    ) -> Result<Response<crate::proto::GetExecutionCapabilitiesResponse>, Status> {
+        self.authorize_peer(
+            &request,
+            "GetExecutionCapabilities",
+            ALLOW_SANDBOX_OPERATOR_OR_TMPLMGR,
+        )?;
+        Ok(Response::new(
+            crate::proto::GetExecutionCapabilitiesResponse {
+                environment_selection: true,
+            },
+        ))
+    }
+
     type SpacedListStream = BoxedStatusStream<SpacedFileInfo>;
     type SpacedReadStream = BoxedStatusStream<SpacedFileChunk>;
     type SpacedWatchStream = BoxedStatusStream<SpacedFileEvent>;

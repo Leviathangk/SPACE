@@ -17,7 +17,7 @@ test-support = []
 serde_json = { workspace = true }
 prost = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "time"] }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
 

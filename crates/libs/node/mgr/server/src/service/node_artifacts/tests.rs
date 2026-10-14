@@ -178,9 +178,13 @@ async fn compiled_environment_removal_is_refused_even_without_inventory() {
         .find(|pin| pin.release.version.as_str() == "1.17.0")
         .unwrap()
         .clone();
-    Artifact::Release(candidate.release.clone(), candidate.digest())
-        .check_removal(&initial)
-        .unwrap();
+    let result =
+        Artifact::Release(candidate.release.clone(), candidate.digest()).check_removal(&initial);
+    if host_arch().unwrap() == Arch::X86_64 {
+        result.unwrap_err();
+    } else {
+        result.unwrap();
+    }
 }
 
 #[test]
@@ -190,7 +194,7 @@ fn prototype_overlap_keeps_external_execution_but_refuses_mutations() {
     let (_fixture, mut paths) = installed_runtime();
     paths.store.releases = paths.vendor.clone();
     assert!(separate_store(&paths).is_err());
-    let inventory = execution_inventory(&paths).unwrap();
+    let inventory = execution_inventory(&paths, true).unwrap();
     let selected = inventory
         .resolve(
             None,
@@ -289,4 +293,251 @@ async fn environment_resolution_requires_authorization_and_verified_inventory() 
         .await
         .unwrap_err();
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+}
+
+#[test]
+fn production_admission_restricts_selection_without_changing_defaults() {
+    use pplx_space_common_core::types::{Digest, EnvironmentReference};
+    use pplx_space_node_runtime_core::catalog::CompiledEnvironment;
+    let initial = InitialEnvironment::for_architecture(Arch::X86_64).unwrap();
+    let environments = CompiledEnvironment::for_architecture(Arch::X86_64).unwrap();
+    let candidate = &environments[1];
+    let e0 = initial.definition().unwrap().reference();
+    let c = candidate.definition().reference();
+    for production in [false, true] {
+        for (reference, mode, accepted) in [
+            (None, ExecutionSelectionMode::NewColdBoot, true),
+            (Some(e0), ExecutionSelectionMode::NewColdBoot, true),
+            (Some(c), ExecutionSelectionMode::NewColdBoot, !production),
+            (
+                Some(c),
+                ExecutionSelectionMode::ExistingColdBoot,
+                !production,
+            ),
+            (
+                Some(c),
+                ExecutionSelectionMode::PersistedStateRestore,
+                false,
+            ),
+            (
+                Some(EnvironmentReference::new(Digest::sha256([1; 32]))),
+                ExecutionSelectionMode::NewColdBoot,
+                false,
+            ),
+        ] {
+            let result =
+                select_definition(&initial, || Ok(&environments), production, reference, mode);
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "{production} {reference:?} {mode:?}"
+            );
+            if let Ok(definition) = result {
+                assert_eq!(definition.reference(), reference.unwrap_or(e0));
+            }
+        }
+    }
+}
+
+#[test]
+fn candidate_catalog_failure_does_not_change_initial_selection() {
+    let initial = InitialEnvironment::for_architecture(Arch::X86_64).unwrap();
+    let e0 = initial.definition().unwrap().reference();
+    for reference in [None, Some(e0)] {
+        let selected = select_definition(
+            &initial,
+            || Err(Status::failed_precondition("candidate pins missing")),
+            true,
+            reference,
+            ExecutionSelectionMode::NewColdBoot,
+        )
+        .unwrap();
+        assert_eq!(selected.reference(), e0);
+    }
+    select_definition(
+        &initial,
+        || Err(Status::failed_precondition("candidate pins missing")),
+        true,
+        Some(pplx_space_common_core::types::EnvironmentReference::new(
+            pplx_space_common_core::types::Digest::sha256([8; 32]),
+        )),
+        ExecutionSelectionMode::NewColdBoot,
+    )
+    .unwrap_err();
+}
+
+#[tokio::test]
+async fn legacy_custom_kernels_survive_managed_runtime_migration() {
+    use crate::service::tests::service_tests::{installed_runtime, service_for_unit_tests};
+    use pplx_space_common_core::types::{Digest, ExecutionMetadata, RuntimeKind};
+    use pplx_space_node_runtime_core::runtime_inventory::{
+        RuntimeInstallationRoot, RuntimeInventory,
+    };
+    use std::os::unix::fs::symlink;
+    use std::sync::Arc;
+
+    for managed in [true, false] {
+        let (_fixture, paths) = installed_runtime();
+        let runtime_root = if managed {
+            &paths.store.releases
+        } else {
+            &paths.vendor
+        };
+        std::fs::create_dir_all(runtime_root).unwrap();
+        std::fs::rename(paths.vendor.join("v1.16.0"), runtime_root.join("v1.15.1")).unwrap();
+        std::fs::remove_file(paths.vendor.join("default")).unwrap();
+        symlink("v1.15.1", runtime_root.join("default")).unwrap();
+        // Inject a discovered snapshot to isolate service admission. Core
+        // store tests cover byte verification.
+        for (root, version) in [(&paths.vendor, "1.16.0"), (&paths.store.releases, "1.17.0")] {
+            let bin = root.join(format!("v{version}/bin"));
+            std::fs::create_dir_all(&bin).unwrap();
+            for name in ["firecracker", "jailer"] {
+                std::fs::copy(runtime_root.join("v1.15.1/bin").join(name), bin.join(name)).unwrap();
+            }
+        }
+        let inventory = Arc::new(
+            RuntimeInventory::discover(
+                [
+                    RuntimeInstallationRoot::new(RuntimeKind::Firecracker, &paths.vendor),
+                    RuntimeInstallationRoot::new(RuntimeKind::Firecracker, &paths.store.releases),
+                ],
+                &paths.assets,
+                &paths.kernels,
+            )
+            .unwrap(),
+        );
+        let legacy = inventory
+            .resolve(
+                None,
+                RuntimeKind::Firecracker,
+                ExecutionSelectionMode::NewColdBoot,
+            )
+            .unwrap()
+            .execution;
+        assert_eq!(legacy.runtime().version.as_str(), "1.15.1");
+        assert_ne!(
+            legacy.components()[0].digest,
+            Some(initial_environment().unwrap().kernel().sha256)
+        );
+        let mut service = service_for_unit_tests().await;
+        service.runtime_paths = paths;
+        service.runtime_inventory.store(Some(inventory));
+        for mode in [
+            ExecutionSelectionMode::NewColdBoot,
+            ExecutionSelectionMode::ExistingColdBoot,
+            ExecutionSelectionMode::PersistedStateRestore,
+        ] {
+            let resolved = service
+                .resolve_bound_execution(Some(&legacy), RuntimeKind::Firecracker, mode)
+                .await
+                .unwrap_or_else(|error| panic!("managed={managed} {mode:?}: {error}"));
+            assert_eq!(resolved.execution, legacy);
+        }
+        // A restore retains its recorded boot-kernel evidence even when those
+        // bytes are absent; only the compatible snapshot loader is required.
+        let mut absent_components = legacy.components().to_vec();
+        absent_components[0].digest = Some(Digest::sha256([99; 32]));
+        let absent = ExecutionMetadata::new(
+            legacy.runtime().clone(),
+            legacy.guest(),
+            legacy.state_format().cloned(),
+            absent_components,
+        )
+        .unwrap();
+        let restored = service
+            .resolve_bound_execution(
+                Some(&absent),
+                RuntimeKind::Firecracker,
+                ExecutionSelectionMode::PersistedStateRestore,
+            )
+            .await
+            .unwrap();
+        assert_eq!(restored.execution.components(), absent.components());
+        service
+            .resolve_bound_execution(
+                Some(&absent),
+                RuntimeKind::Firecracker,
+                ExecutionSelectionMode::ExistingColdBoot,
+            )
+            .await
+            .unwrap_err();
+
+        for version in ["1.16.0", "1.17.0"] {
+            let requested = ExecutionMetadata::new(
+                pplx_space_common_core::types::RuntimeIdentity {
+                    kind: RuntimeKind::Firecracker,
+                    version: version.parse().unwrap(),
+                },
+                legacy.guest(),
+                Some(pplx_space_common_core::types::StateFormatIdentity {
+                    format: "firecracker-snapshot".parse().unwrap(),
+                    version: if version == "1.16.0" {
+                        "10.0.0"
+                    } else {
+                        "12.0.0"
+                    }
+                    .parse()
+                    .unwrap(),
+                }),
+                legacy.components().to_vec(),
+            )
+            .unwrap();
+            for mode in [
+                ExecutionSelectionMode::NewColdBoot,
+                ExecutionSelectionMode::ExistingColdBoot,
+                ExecutionSelectionMode::PersistedStateRestore,
+            ] {
+                let result = service
+                    .resolve_bound_execution(Some(&requested), RuntimeKind::Firecracker, mode)
+                    .await;
+                if version == "1.16.0" {
+                    result.unwrap();
+                } else {
+                    assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[tokio::test]
+async fn legacy_runtime_placement_is_not_hidden_by_a_compiled_environment() {
+    use crate::service::tests::service_tests::{
+        installed_runtime, root_request, service_for_unit_tests,
+    };
+    use pplx_space_common_core::types::RuntimeKind;
+    use pplx_space_node_runtime_core::runtime_inventory::{
+        RuntimeInstallationRoot, RuntimeInventory,
+    };
+    use std::sync::Arc;
+    let (_fixture, paths) = installed_runtime();
+    std::fs::rename(paths.vendor.join("v1.16.0"), paths.vendor.join("v1.17.0")).unwrap();
+    std::fs::remove_file(paths.vendor.join("default")).unwrap();
+    std::os::unix::fs::symlink("v1.17.0", paths.vendor.join("default")).unwrap();
+    let inventory = RuntimeInventory::discover(
+        [RuntimeInstallationRoot::new(
+            RuntimeKind::Firecracker,
+            &paths.vendor,
+        )],
+        &paths.assets,
+        &paths.kernels,
+    )
+    .unwrap();
+    let mut service = service_for_unit_tests().await;
+    service.production = false;
+    service.runtime_paths = paths;
+    service.runtime_inventory.store(Some(Arc::new(inventory)));
+    let report = service
+        .get_execution_inventory(root_request(crate::proto::GetExecutionInventoryRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(report.runtimes.iter().any(|entry| {
+        entry
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.version == "1.17.0")
+    }));
 }

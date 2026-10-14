@@ -354,7 +354,7 @@ falling back to a newer local build.
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `SPACE_ENV` | unset | Deployment environment for telemetry identity. |
+| `SPACE_ENV` | unset | Deployment identity for telemetry and node-manager execution admission. Recognized development identities, including `local-*`, permit approved non-default environments; missing or unrecognized identities restrict explicit selection to E0. |
 | `SPACE_SERVICE_NAME`, `SPACE_VERSION` | unset | SPACE identity tier: outrank `OTEL_SERVICE_NAME`/`OTEL_RESOURCE_ATTRIBUTES` and `DD_*`. |
 | `SPACE_K8S_POD_NAME` | unset | Reported as `k8s.pod.name` on the metrics resource. |
 | `SPACE_LOG_FORMAT` | auto | `json`, `compact`, `pretty` or `text`. |

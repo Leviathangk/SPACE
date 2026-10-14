@@ -212,6 +212,7 @@ fn inventory(runtimes: Vec<RuntimeInstallation>) -> RuntimeInventory {
         components: vec![kernel("vmlinux-6.1.158", 0x42, true, true)],
         defaults: Vec::new(),
         fingerprints: Vec::new(),
+        environments: BTreeMap::new(),
         #[cfg(feature = "artifact-store")]
         unavailable: Vec::new(),
         retry_after: None,
@@ -390,6 +391,7 @@ fn pinned_starts_select_the_exact_kernel_digest() {
             ],
             defaults: Vec::new(),
             fingerprints: Vec::new(),
+            environments: BTreeMap::new(),
             #[cfg(feature = "artifact-store")]
             unavailable: Vec::new(),
             retry_after: None,
@@ -427,6 +429,7 @@ fn digest_matches_even_when_kernel_labels_differ() {
         components: vec![kernel("legacy-424242424242", 0x42, true, true)],
         defaults: Vec::new(),
         fingerprints: Vec::new(),
+        environments: BTreeMap::new(),
         #[cfg(feature = "artifact-store")]
         unavailable: Vec::new(),
         retry_after: None,
@@ -462,6 +465,7 @@ fn persisted_restore_does_not_require_the_recorded_kernel_to_be_installed() {
         components: vec![kernel("vmlinux-6.1.158", 0x42, true, true)],
         defaults: Vec::new(),
         fingerprints: Vec::new(),
+        environments: BTreeMap::new(),
         #[cfg(feature = "artifact-store")]
         unavailable: Vec::new(),
         retry_after: None,
@@ -523,6 +527,7 @@ fn runtime_and_component_inventories_are_independent() {
         ],
         defaults: Vec::new(),
         fingerprints: Vec::new(),
+        environments: BTreeMap::new(),
         #[cfg(feature = "artifact-store")]
         unavailable: Vec::new(),
         retry_after: None,
@@ -552,6 +557,7 @@ fn legacy_metadata_uses_the_pinned_legacy_kernel() {
         ],
         defaults: Vec::new(),
         fingerprints: Vec::new(),
+        environments: BTreeMap::new(),
         #[cfg(feature = "artifact-store")]
         unavailable: Vec::new(),
         retry_after: None,
@@ -1072,4 +1078,49 @@ fn restore_directory_metadata(path: &Path, before: &std::fs::Metadata) {
     let after = std::fs::metadata(path).unwrap();
     assert_eq!(after.len(), before.len());
     assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+}
+
+#[test]
+fn bound_cold_boot_uses_the_recorded_runtime_and_never_the_node_default() {
+    let component = kernel("6.18.44", 0x61, false, false);
+    let candidate = requested("1.17.0", "12.0.0", vec![component.metadata.clone()])
+        .with_environment(pplx_space_common_core::types::EnvironmentReference::new(
+            Digest::sha256([8; 32]),
+        ));
+    for candidate_present in [true, false] {
+        let mut inventory = inventory(vec![installation("1.15.1", "9.0.0")]);
+        inventory.defaults = vec![installation("1.15.1", "9.0.0").runtime];
+        inventory.components.push(component.clone());
+        if candidate_present {
+            inventory.runtimes.push(installation("1.17.0", "12.0.0"));
+        }
+        for mode in [
+            ExecutionSelectionMode::NewColdBoot,
+            ExecutionSelectionMode::ExistingColdBoot,
+        ] {
+            let result = inventory.resolve(Some(&candidate), RuntimeKind::Firecracker, mode);
+            assert_eq!(result.is_ok(), candidate_present);
+            if let Ok(resolved) = result {
+                assert_eq!(resolved.execution.runtime(), candidate.runtime());
+                assert_eq!(
+                    resolved.components[0].metadata.digest,
+                    component.metadata.digest
+                );
+            }
+        }
+        assert_eq!(
+            inventory
+                .resolve(
+                    None,
+                    RuntimeKind::Firecracker,
+                    ExecutionSelectionMode::NewColdBoot
+                )
+                .unwrap()
+                .execution
+                .runtime()
+                .version
+                .as_str(),
+            "1.15.1"
+        );
+    }
 }
