@@ -1,4 +1,5 @@
 use super::*;
+use crate::service::activation_support::internal_request;
 use pplx_space_common_core::types::{
     ExecutionGeneration, NodeManagedBy, RouteGeneration, SandboxId, SandboxRuntimeLabel,
 };
@@ -132,4 +133,58 @@ async fn full_snapshot_capture_serializes_resume_on_wake_lock() {
         .expect("resume must proceed after full snapshot publication releases its locks")
         .unwrap();
     resume_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn candidate_snapshot_admission_uses_durable_execution_before_checkpointing() {
+    use crate::service::tests::service_tests::insert_test_sandbox;
+    use pplx_space_common_core::types::{
+        Arch, Digest, EnvironmentReference, ExecutionMetadata, RuntimeIdentity, RuntimeKind,
+        SandboxOwnerKind,
+    };
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    insert_test_sandbox(&conn, &id, SandboxState::Paused);
+    conn.execute(
+        "UPDATE sandboxes SET user = ?1 WHERE id = ?2",
+        rusqlite::params![
+            SandboxOwnerKind::TemplateManager
+                .reserved_owner_label()
+                .unwrap(),
+            id
+        ],
+    )
+    .unwrap();
+    let execution = ExecutionMetadata::new(
+        RuntimeIdentity {
+            kind: RuntimeKind::Firecracker,
+            version: "1.17.0".parse().unwrap(),
+        },
+        ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![]).guest(),
+        None,
+        vec![],
+    )
+    .unwrap()
+    .with_environment(EnvironmentReference::new(Digest::sha256([8; 32])));
+    crate::db::upsert_sandbox_execution_metadata(&conn, &id, &execution).unwrap();
+    // A regression must stop before filesystem staging or dialing a host service.
+    conn.execute_batch("CREATE TEMP TRIGGER refuse_checkpoint BEFORE UPDATE OF state ON sandboxes WHEN NEW.state = 'checkpointing' BEGIN SELECT RAISE(ABORT, 'test checkpoint fence'); END;").unwrap();
+    let service = SandboxManagerService::for_test(conn);
+    let sandbox = service.lookup_sandbox(&id).unwrap();
+    service
+        .ensure_memory_state_supported(&sandbox, "snapshot")
+        .expect_err("durable candidate evidence must win when metadata.json is absent");
+    let error = service
+        .create_template_base_snapshot(internal_request(CreateTemplateBaseSnapshotRequest {
+            sandbox_id: id.clone(),
+            vcpu: 1,
+            memory_mib: 128,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        service.lookup_sandbox(&id).unwrap().state,
+        SandboxState::Paused
+    );
 }

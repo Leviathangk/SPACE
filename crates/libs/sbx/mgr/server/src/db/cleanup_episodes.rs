@@ -155,6 +155,7 @@ pub(crate) fn insert_sandbox_with_cleanup_episode_and_route_evidence(
     episode: CleanupEpisodeSpec,
     route_evidence: Option<crate::auto_lifecycle_delete_receipts::RouteEvidence>,
     open_route_activation: Option<&crate::route_activation_claims::OpenRouteActivationClaim>,
+    execution: Option<&ExecutionMetadata>,
 ) -> std::result::Result<(), InsertSandboxWithCleanupEpisodeError> {
     if params.state != episode.activation_state {
         return Err(
@@ -167,6 +168,9 @@ pub(crate) fn insert_sandbox_with_cleanup_episode_and_route_evidence(
     let sandbox_id = params.id.to_string();
     let tx = immediate_transaction(conn)?;
     insert_sandbox(&tx, params)?;
+    if let Some(execution) = execution {
+        upsert_sandbox_execution_metadata_in_transaction(&tx, &sandbox_id, execution)?;
+    }
     if let Some(route_evidence) = route_evidence {
         crate::auto_lifecycle_delete_receipts::db::record_retained_route_evidence(
             &tx,

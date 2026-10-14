@@ -53,6 +53,7 @@ fn build_vm_create_request_pins_resolved_base_hash() {
         "code-runtime".to_string(),
         HASH.to_string(),
         Some(20 * 1024),
+        None,
     );
 
     assert_eq!(request.template, "code-runtime");

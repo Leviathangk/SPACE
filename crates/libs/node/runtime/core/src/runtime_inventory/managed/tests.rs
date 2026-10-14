@@ -514,3 +514,157 @@ fn legacy_asset_alias_retains_e0_boot_and_restore() {
         )
         .unwrap_err();
 }
+
+#[test]
+fn nondefault_inventory_preserves_e0_and_recovers_only_the_exact_pair() {
+    use crate::catalog::CompiledEnvironment;
+    let fixture = Fixture::new();
+    let initial = synthetic_initial_environment();
+    let environment = CompiledEnvironment::for_test(
+        pin("1.17.0", 7),
+        PinnedKernel {
+            version: "6.18.44".parse().unwrap(),
+            runtime: RuntimeKind::Firecracker,
+            runtime_line: "1.17".parse().unwrap(),
+            architecture: Arch::X86_64,
+            size: 4096,
+            sha256: sha256(&binary(44)),
+        },
+        "12.0.0",
+        false,
+    );
+    let cache = fixture._dir.path().join("cache/firecracker");
+    std::fs::create_dir_all(&cache).unwrap();
+    for (job, kernel, fill) in [
+        ("initial", initial.kernel(), 42),
+        ("candidate", environment.kernel(), 44),
+    ] {
+        let source = fixture
+            .staging
+            .join("firecracker/kernels")
+            .join(job)
+            .join(kernel.version.as_str())
+            .join(KERNEL_IMAGE);
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(source, binary(fill)).unwrap();
+        fixture.store.publish_kernel(kernel, &staged(job)).unwrap();
+    }
+    let discover = || {
+        let mut inventory = RuntimeInventory::discover_with_store(
+            &fixture.store,
+            &initial,
+            &fixture._dir.path().join("vendor"),
+            &cache.join("assets"),
+            &cache.join("kernels"),
+        )
+        .unwrap();
+        inventory
+            .include_environment(&fixture.store, &environment, &cache.join("kernels"))
+            .unwrap();
+        inventory
+    };
+    let definition = environment.definition();
+    let requirements = definition.execution_requirements().unwrap();
+    // Inventory inspection uses the test host architecture. The compiled
+    // x86-only descriptor itself is tested independently in catalog tests.
+    let requested = ExecutionMetadata::new(
+        requirements.runtime().clone(),
+        GuestPlatform {
+            os: GuestOperatingSystem::Linux,
+            architecture: host_arch().unwrap(),
+        },
+        requirements.state_format().cloned(),
+        requirements.components().to_vec(),
+    )
+    .unwrap()
+    .with_environment(definition.reference());
+    let resolve = |inventory: &RuntimeInventory| {
+        inventory.resolve(
+            Some(&requested),
+            RuntimeKind::Firecracker,
+            ExecutionSelectionMode::NewColdBoot,
+        )
+    };
+    let assert_default = |inventory: &RuntimeInventory| {
+        assert_eq!(
+            inventory
+                .resolve(
+                    None,
+                    RuntimeKind::Firecracker,
+                    ExecutionSelectionMode::NewColdBoot
+                )
+                .unwrap()
+                .execution
+                .runtime(),
+            &initial.release().release
+        );
+    };
+    let missing = discover();
+    assert_default(&missing);
+    assert!(
+        resolve(&missing).is_err(),
+        "candidate kernel alone cannot produce E0/C hybrid"
+    );
+    fixture.place_release("1.17.0", 7);
+    let ready = discover();
+    assert_default(&ready);
+    let resolved = resolve(&ready).unwrap();
+    assert_eq!(resolved.execution.runtime(), &environment.release().release);
+    assert_eq!(
+        resolved.components[0].metadata.digest,
+        Some(environment.kernel().sha256)
+    );
+    // Storage reuse is independent of the guest-boot qualification of a pairing.
+    // An additional binding must not clear a shared artifact's default flags.
+    let shared_kernel = CompiledEnvironment::for_test(
+        environment.release().clone(),
+        initial.kernel().clone(),
+        "12.0.0",
+        false,
+    );
+    let shared_runtime = CompiledEnvironment::for_test(
+        initial.release().clone(),
+        environment.kernel().clone(),
+        "9.0.0",
+        false,
+    );
+    let mut shared = ready.clone();
+    for binding in [&shared_kernel, &shared_runtime] {
+        shared
+            .include_environment(&fixture.store, binding, &cache.join("kernels"))
+            .unwrap();
+        assert_default(&shared);
+    }
+    std::fs::remove_dir_all(cache.join("managed")).unwrap();
+    assert!(!ready.check_files_unchanged());
+    let recovered = discover();
+    assert_eq!(resolve(&recovered).unwrap().execution, resolved.execution);
+    let image = resolve(&recovered).unwrap().components[0].path.clone();
+    std::fs::write(&image, binary(99)).unwrap();
+    let bad_kernel = discover();
+    assert_default(&bad_kernel);
+    resolve(&bad_kernel).unwrap_err();
+    assert!(bad_kernel.unavailable.iter().any(|artifact| {
+        matches!(artifact, UnavailableArtifact::Kernel { digest, .. } if *digest == environment.kernel().sha256)
+    }));
+    assert!(!bad_kernel.unavailable.iter().any(|artifact| {
+        matches!(artifact, UnavailableArtifact::Runtime { identity, .. } if identity == &environment.release().release)
+    }));
+    std::fs::write(&image, binary(44)).unwrap();
+    assert!(
+        !bad_kernel.check_files_unchanged(),
+        "repairing cached bytes must invalidate the failure"
+    );
+    resolve(&discover()).unwrap();
+    std::fs::write(
+        fixture.release_path("1.17.0", 7).join("bin/firecracker"),
+        binary(99),
+    )
+    .unwrap();
+    let invalid = discover();
+    assert_default(&invalid);
+    assert!(
+        resolve(&invalid).is_err(),
+        "corrupt candidate cannot disable or substitute E0"
+    );
+}

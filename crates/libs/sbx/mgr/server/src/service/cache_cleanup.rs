@@ -87,10 +87,6 @@ fn durable_inventory_reason(
     }
 }
 
-pub(super) fn ensure_sandbox_cache_root(sandbox_id: &str) -> Result<(), Status> {
-    ensure_sandbox_cache_root_in(Path::new(CACHE_DIR), sandbox_id)
-}
-
 pub(super) fn ensure_sandbox_cache_root_in(
     cache_dir: &Path,
     sandbox_id: &str,

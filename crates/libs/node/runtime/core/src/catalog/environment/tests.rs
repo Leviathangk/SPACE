@@ -51,12 +51,70 @@ fn valid_but_unqualified_candidates_cannot_resolve() {
         Err(ResolveEnvironmentError::UnknownReference(_))
     ));
     // The old aarch64 pins still exist; they do not implicitly qualify a new
-    // descriptor on an architecture outside this milestone's qualification.
+    // descriptor on an architecture outside the qualified platforms.
     let arm = InitialEnvironment::for_architecture(Arch::Aarch64).unwrap();
+    let legacy_arm = ExecutionMetadata::initial_firecracker(
+        Arch::Aarch64,
+        vec![ArtifactComponentMetadata {
+            kind: ArtifactComponentKind::Kernel,
+            role: Some("boot".parse().unwrap()),
+            version: Some(arm.kernel().version.clone()),
+            digest: Some(arm.kernel().sha256),
+            format: None,
+        }],
+    );
+    arm.verify_legacy_execution(legacy_arm).unwrap();
+
     assert!(matches!(
         arm.definition(),
-        Err(InitialEnvironmentDefinitionError::UnsupportedArchitecture(
+        Err(CompiledEnvironmentDefinitionError::UnsupportedArchitecture(
             Arch::Aarch64
         ))
     ));
+}
+
+#[test]
+fn compiled_environments_have_complete_distinct_bindings_and_operation_support() {
+    let environments = CompiledEnvironment::for_architecture(Arch::X86_64).unwrap();
+    let initial = InitialEnvironment::for_architecture(Arch::X86_64)
+        .unwrap()
+        .definition()
+        .unwrap();
+    let references: std::collections::BTreeSet<_> = environments
+        .iter()
+        .map(|entry| entry.definition().reference())
+        .collect();
+    assert_eq!(references.len(), environments.len());
+    for (environment, (runtime, kernel, state, memory_state)) in environments.iter().zip([
+        ("1.15.1", "6.1.155", "9.0.0", true),
+        ("1.17.0", "6.18.44", "12.0.0", false),
+    ]) {
+        let definition = environment.definition();
+        let requirements = definition.execution_requirements().unwrap();
+        assert_eq!(requirements.runtime().version.as_str(), runtime);
+        assert_eq!(requirements.state_format().unwrap().version.as_str(), state);
+        assert_eq!(
+            requirements.components()[0]
+                .version
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            kernel
+        );
+        assert_eq!(
+            requirements.components()[0].digest,
+            Some(environment.kernel().sha256)
+        );
+        assert_eq!(environment.supports_memory_state(), memory_state);
+    }
+    assert_eq!(environments[0].definition(), &initial);
+    assert_eq!(
+        environments[1].definition().reference().to_string(),
+        "sha256:959f1181ac69f0dde7125fbc81be6fcd75b64e9e06e7a393f067b96eb6fb2ac4"
+    );
+    assert!(
+        CompiledEnvironment::for_architecture(Arch::Aarch64)
+            .unwrap()
+            .is_empty()
+    );
 }

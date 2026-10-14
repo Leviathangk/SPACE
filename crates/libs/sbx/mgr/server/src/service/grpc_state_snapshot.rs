@@ -1130,6 +1130,7 @@ impl SandboxManagerService {
             .artifact_publication_locks(&sandbox.id, artifact_kind)
             .await;
         let sandbox = self.lookup_sandbox(&sandbox.id)?;
+        self.ensure_memory_state_supported(&sandbox, "create snapshot")?;
         self.ensure_not_pool_sandbox_for_snapshots(&sandbox, "create snapshot")?;
         self.ensure_no_plaintext_pool_cow_for_snapshots(&sandbox, "create snapshot")?;
         let id = &sandbox.id;
@@ -1425,6 +1426,7 @@ impl SandboxManagerService {
 
         let validate_source = || -> Result<OperationSnapshotPlan, Status> {
             let sandbox = self.lookup_sandbox(&sandbox_id)?;
+            self.ensure_memory_state_supported(&sandbox, "create operation snapshot")?;
             self.ensure_not_pool_sandbox_for_snapshots(&sandbox, "create operation snapshot")?;
             self.ensure_no_plaintext_pool_cow_for_snapshots(&sandbox, "create operation snapshot")?;
             if sandbox.volume_encryption {
@@ -1776,6 +1778,7 @@ impl SandboxManagerService {
                     sandbox.state.as_str()
                 )));
             }
+            self.ensure_memory_state_supported(&sandbox, "create template base snapshot")?;
             let content_hash = sandbox.template_hash.clone().ok_or_else(|| {
                 Status::failed_precondition("template-owned sandbox is missing content_hash")
             })?;

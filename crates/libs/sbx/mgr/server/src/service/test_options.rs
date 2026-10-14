@@ -73,6 +73,7 @@ impl SandboxManagerServiceOptions {
                 &scratch.join("absent-template-manager.sock"),
             ),
             cleanup_run_dir: Some(scratch.to_owned()),
+            create_cache_dir: Some(scratch.join("cache")),
         }
     }
 }
