@@ -6,8 +6,9 @@ use pplx_space_net_common::TlsInterception as PolicyTlsInterception;
 use tokio::time::Instant;
 
 use crate::certificates::{CERTIFICATE_REQUEST_BACKSTOP, CertificateLease};
+use crate::http_protocol::HttpProtocol;
 use crate::sniff::MissingSniDetail;
-use crate::tls_sni::{ClientHelloScan, HttpAlpn};
+use crate::tls_sni::ClientHelloScan;
 
 mod admission;
 
@@ -72,7 +73,7 @@ impl TlsInterception {
         self
     }
 
-    pub(crate) fn upstream_config(&self, protocols: &[HttpAlpn]) -> Arc<rustls::ClientConfig> {
+    pub(crate) fn upstream_config(&self, protocols: &[HttpProtocol]) -> Arc<rustls::ClientConfig> {
         let mut config = (*self.upstream.config).clone();
         config.alpn_protocols = protocols
             .iter()

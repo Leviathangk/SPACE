@@ -1,13 +1,11 @@
 //! Compose certificate-bound TLS transport with inspected HTTP.
-use super::http_host::{HostBinding, MeteredIo};
+use super::http_session::{HostBinding, HttpError};
 use super::tls::TlsTransportError;
-use super::tls_http::{HttpError, HttpProtocol};
-use super::{TcpProxy, tls, tls_http, transport};
+use super::transport::MeteredIo;
+use super::{TcpProxy, http_session, tls, transport};
 use crate::{
-    certificates::CertificateLease,
-    egress::AdmittedTcp,
-    stats::ProxyStats,
-    tls_sni::{ClientAlpnOffer, HttpAlpn},
+    certificates::CertificateLease, egress::AdmittedTcp, http_protocol::HttpProtocol,
+    stats::ProxyStats, tls_sni::ClientAlpnOffer,
 };
 use std::sync::{
     Arc,
@@ -49,13 +47,12 @@ impl TcpProxy {
             }
             let accounting = WireAccounting::new(self.stats.clone());
             let operation = async {
-                // ALPN is telemetry here. `tls_http::serve` detects the
+                // ALPN is telemetry here. `http_session::serve_inspected` detects the
                 // version from the guest's first bytes and records `protocol`
                 // once the first request arrives.
                 let (downstream, negotiated) =
                     tls::accept(client, &lease, &self.tls_interception).await?;
-                tracing::Span::current()
-                    .record("negotiated", HttpProtocol::from(negotiated).as_str());
+                tracing::Span::current().record("negotiated", negotiated.as_str());
                 let binding = HostBinding::new(
                     self.sandbox_id,
                     destination,
@@ -77,10 +74,9 @@ impl TcpProxy {
                     let offer = upstream_alpn_offer(client_alpn, guest_protocol);
                     tls::connect(origin, &upstream_lease, &interception, offer)
                         .await
-                        .map(|(io, alpn)| (io, alpn.into()))
                         .map_err(Into::into)
                 };
-                tls_http::serve(downstream, binding, lease.clone(), connect).await
+                http_session::serve_inspected(downstream, binding, lease.clone(), connect).await
             };
             let result = tokio::select! {
                 biased;
@@ -116,7 +112,7 @@ pub(super) fn upstream_alpn_offer(
     client_alpn: ClientAlpnOffer,
     guest_protocol: HttpProtocol,
 ) -> ClientAlpnOffer {
-    if guest_protocol == HttpProtocol::Http1 && client_alpn.supports(HttpAlpn::Http2) {
+    if guest_protocol == HttpProtocol::Http1 && client_alpn.supports(HttpProtocol::Http2) {
         ClientAlpnOffer::Http1
     } else {
         client_alpn

@@ -41,15 +41,21 @@ fn classifies_client_alpn_without_affecting_sni() {
 fn exposes_only_supported_http_protocols_in_guest_order() {
     for (offer, expected) in [
         (ClientAlpnOffer::NoAlpn, Some([].as_slice())),
-        (ClientAlpnOffer::Http1, Some([HttpAlpn::Http1].as_slice())),
-        (ClientAlpnOffer::Http2, Some([HttpAlpn::Http2].as_slice())),
+        (
+            ClientAlpnOffer::Http1,
+            Some([HttpProtocol::Http1].as_slice()),
+        ),
+        (
+            ClientAlpnOffer::Http2,
+            Some([HttpProtocol::Http2].as_slice()),
+        ),
         (
             ClientAlpnOffer::Http2ThenHttp1,
-            Some([HttpAlpn::Http2, HttpAlpn::Http1].as_slice()),
+            Some([HttpProtocol::Http2, HttpProtocol::Http1].as_slice()),
         ),
         (
             ClientAlpnOffer::Http1ThenHttp2,
-            Some([HttpAlpn::Http1, HttpAlpn::Http2].as_slice()),
+            Some([HttpProtocol::Http1, HttpProtocol::Http2].as_slice()),
         ),
         (ClientAlpnOffer::Unsupported, None),
         (ClientAlpnOffer::Unavailable, None),

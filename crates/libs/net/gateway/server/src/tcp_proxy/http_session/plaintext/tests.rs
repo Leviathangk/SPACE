@@ -1,3 +1,4 @@
+use crate::{dns::DnsAllowCache, state::GatewayNetworkState};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -332,7 +333,7 @@ async fn validates_every_host_on_a_keep_alive_connection() {
         }
     });
     let relay = tokio::spawn(serve(guest, binding, move |_| async move {
-        Ok::<_, super::super::transport::Error>(upstream)
+        Ok::<_, crate::tcp_proxy::transport::Error>(upstream)
     }));
 
     let (mut sender, guest_connection) =
@@ -485,7 +486,7 @@ async fn an_unsolicited_upstream_protocol_upgrade_fails_and_closes() {
             .await;
     });
     let relay = tokio::spawn(serve(guest, binding, move |_| async move {
-        Ok::<_, super::super::transport::Error>(upstream)
+        Ok::<_, crate::tcp_proxy::transport::Error>(upstream)
     }));
     let (mut sender, guest_connection) =
         client::handshake::<_, Empty<hyper::body::Bytes>>(TokioIo::new(guest_peer))
@@ -529,7 +530,7 @@ async fn a_dead_upstream_returns_one_retryable_close() {
     let (upstream, upstream_peer) = duplex(PIPE);
     drop(upstream_peer);
     let relay = tokio::spawn(serve(guest, binding, move |_| async move {
-        Ok::<_, super::super::transport::Error>(upstream)
+        Ok::<_, crate::tcp_proxy::transport::Error>(upstream)
     }));
     let (mut sender, guest_connection) =
         client::handshake::<_, Empty<hyper::body::Bytes>>(TokioIo::new(guest_peer))

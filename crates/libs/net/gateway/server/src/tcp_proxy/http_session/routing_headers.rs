@@ -18,7 +18,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, Uri, V
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::client::conn::{http1, http2};
 
-use super::tls_http::HttpProtocol;
+use crate::http_protocol::HttpProtocol;
 
 #[cfg(test)]
 mod tests;

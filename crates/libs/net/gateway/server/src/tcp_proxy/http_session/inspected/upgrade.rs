@@ -10,9 +10,9 @@ use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
 use tokio_util::sync::CancellationToken;
 
-use super::super::accounting::{Attempt, Outcome};
-use super::super::relay::{self, RelayFault};
 use super::SanitizedRequest;
+use crate::tcp_proxy::accounting::{Attempt, Outcome};
+use crate::tcp_proxy::relay::{self, RelayFault};
 
 pub(super) enum Handshake {
     WebSocket { accept: HeaderValue },
@@ -161,7 +161,7 @@ pub(super) fn relay(
                 };
                 if let HandoffError::Downstream(error) | HandoffError::Upstream(error) = &error {
                     tracing::info!(
-                        http_reason = super::http_reason(error),
+                        http_reason = super::super::error::http_reason(error),
                         "HTTP upgrade handoff failed"
                     );
                 }

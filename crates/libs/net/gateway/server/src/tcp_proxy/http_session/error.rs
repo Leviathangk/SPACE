@@ -1,5 +1,5 @@
 //! Preserve the error returned by HTTP setup or serving without interpreting opaque sources.
-use super::super::tls::TlsTransportError;
+use crate::tcp_proxy::tls::TlsTransportError;
 
 #[derive(Debug, thiserror::Error)]
 pub(in crate::tcp_proxy) enum HttpError {
@@ -35,7 +35,7 @@ impl HttpError {
 
 /// Only Hyper's documented predicates are stable; native codes behind its
 /// opaque source chain remain unavailable.
-pub(in crate::tcp_proxy) fn http_reason(error: &hyper::Error) -> &'static str {
+pub(super) fn http_reason(error: &hyper::Error) -> &'static str {
     if error.is_parse() {
         "parse"
     } else if error.is_timeout() {
@@ -56,3 +56,6 @@ pub(in crate::tcp_proxy) fn http_reason(error: &hyper::Error) -> &'static str {
         "other"
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -56,3 +56,6 @@ fn connect_in_progress(error: &io::Error) -> bool {
         Some(libc::EINPROGRESS) | Some(libc::EALREADY)
     ) || error.kind() == io::ErrorKind::WouldBlock
 }
+
+mod metered;
+pub(super) use metered::MeteredIo;

@@ -21,20 +21,18 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::Instrument;
 
-use super::accounting::{Attempt, Outcome};
-use super::http_host::HostBinding;
+use super::binding::HostBinding;
+use super::error::HttpError;
 use super::routing_headers::SanitizedRequest;
-#[cfg(test)]
-use super::tls::TlsTransportError;
 use super::upstream::{self, Upstream};
 use crate::certificates::CertificateLease;
-use crate::tls_sni::HttpAlpn;
-pub(super) use error::HttpError;
-pub(super) use error::http_reason;
+use crate::http_protocol::HttpProtocol;
+use crate::tcp_proxy::accounting::{Attempt, Outcome};
+#[cfg(test)]
+use crate::tcp_proxy::tls::TlsTransportError;
 
 mod connect;
 mod credentials;
-mod error;
 mod forward;
 mod upgrade;
 
@@ -125,7 +123,7 @@ struct Session<F> {
 ///
 /// Protocol detection has no timeout; hyper's timers apply after it completes.
 /// `connect` lazily opens the origin with the detected guest protocol.
-pub(super) async fn serve<C, F, Fut, U>(
+pub(in crate::tcp_proxy) async fn serve<C, F, Fut, U>(
     guest: C,
     binding: HostBinding,
     lease: Arc<CertificateLease>,
@@ -251,37 +249,3 @@ where
 
 #[cfg(test)]
 mod tests;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum HttpProtocol {
-    Http1,
-    Http2,
-}
-
-impl HttpProtocol {
-    /// The protocol hyper actually parsed a request with. This, not the ALPN
-    /// result, decides how the request is forwarded.
-    pub(super) fn of(version: http::Version) -> Self {
-        if version == http::Version::HTTP_2 {
-            Self::Http2
-        } else {
-            Self::Http1
-        }
-    }
-
-    pub(super) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Http1 => "http1",
-            Self::Http2 => "http2",
-        }
-    }
-}
-
-impl From<HttpAlpn> for HttpProtocol {
-    fn from(protocol: HttpAlpn) -> Self {
-        match protocol {
-            HttpAlpn::Http1 => Self::Http1,
-            HttpAlpn::Http2 => Self::Http2,
-        }
-    }
-}

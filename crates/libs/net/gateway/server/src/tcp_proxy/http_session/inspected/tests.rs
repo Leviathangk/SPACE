@@ -964,7 +964,7 @@ async fn connect_relays_private_ca_tls_without_inspecting_the_inner_request() {
         let stream = TokioIo::new(hyper::upgrade::on(&mut response).await.unwrap());
         phase = "inner TLS";
         let mut stream = tokio_rustls::TlsConnector::from(
-            guest_trust.upstream_config(&[crate::tls_sni::HttpAlpn::Http1]),
+            guest_trust.upstream_config(&[crate::http_protocol::HttpProtocol::Http1]),
         )
         .connect("allowed.test".try_into().unwrap(), stream)
         .await

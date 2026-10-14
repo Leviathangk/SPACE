@@ -33,15 +33,12 @@ use crate::tls_interception::{TlsInterception, TlsInterceptionError};
 
 mod accounting;
 mod admission;
-mod http_host;
+mod http_session;
 mod inspected;
 mod relay;
 mod reserved_dns;
-mod routing_headers;
 pub(crate) mod tls;
-mod tls_http;
 mod transport;
-mod upstream;
 
 use crate::egress::DnsAttributedTcpTracker;
 use crate::egress::{AdmittedTcp, TcpAdmissionDenial};
@@ -249,10 +246,10 @@ enum Rejection {
 /// Where relaying failed, named for the phase.
 enum RelayFailure {
     Connect(transport::Error),
-    Plaintext(http_host::Failure),
+    Plaintext(http_session::PlaintextError),
     /// Connected, then the byte stream failed (e.g. reset, broken pipe).
     Transfer(io::Error),
-    Inspected(tls_http::HttpError),
+    Inspected(http_session::HttpError),
 }
 
 /// How the bytes were carried.
@@ -619,13 +616,13 @@ impl TcpProxy {
         Fut: Future<Output = Result<U, transport::Error>> + Send + 'static,
         U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let binding = http_host::HostBinding::new(
+        let binding = http_session::HostBinding::new(
             self.sandbox_id,
             dst,
             self.network_state.clone(),
             self.dns_allow_cache.clone(),
         );
-        match http_host::serve(client, binding, connect).await {
+        match http_session::serve_plaintext(client, binding, connect).await {
             Ok(served) => FlowOutcome::Relayed(Relay::HostBoundHttp {
                 requests: served.requests,
                 forwarded: served.forwarded,
@@ -678,22 +675,7 @@ impl TcpProxy {
                     "handled policy-gated TCP DNS connection"
                 );
             }
-            FlowOutcome::RelayFailed(RelayFailure::Plaintext(error)) => match error {
-                http_host::Failure::Setup(error)
-                    if matches!(error.as_ref(), upstream::Error::Connect(_)) => {}
-                http_host::Failure::Setup(_) => pplx_space_metrics::gateway::domain_binding(
-                    "tcp",
-                    "http_host",
-                    "upstream_http_failed",
-                    None,
-                ),
-                http_host::Failure::GuestHttp(_) => pplx_space_metrics::gateway::domain_binding(
-                    "tcp",
-                    "http_host",
-                    "guest_http_failed",
-                    None,
-                ),
-            },
+            FlowOutcome::RelayFailed(RelayFailure::Plaintext(error)) => error.record(),
             FlowOutcome::Rejected(Rejection::PolicyMissing(reason)) => {
                 debug!(
                     sandbox_id = self.sandbox_id,

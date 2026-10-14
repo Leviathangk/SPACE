@@ -12,6 +12,8 @@
 //! interception. The bytes are attacker-controlled guest traffic, and the
 //! scanner returns a typed verdict without consuming the forwarded stream.
 
+use crate::http_protocol::HttpProtocol;
+
 use pplx_space_net_common::DomainName;
 use rustls::{Error as TlsError, InvalidMessage, PeerMisbehaved, server::Acceptor};
 use std::io::Cursor;
@@ -65,30 +67,6 @@ impl ClientHelloScan {
     }
 }
 
-/// An HTTP application protocol that the interception proxy can terminate.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum HttpAlpn {
-    Http2,
-    Http1,
-}
-
-impl HttpAlpn {
-    pub(crate) fn from_wire(value: &[u8]) -> Option<Self> {
-        match value {
-            b"h2" => Some(Self::Http2),
-            b"http/1.1" => Some(Self::Http1),
-            _ => None,
-        }
-    }
-
-    pub(crate) const fn wire_value(self) -> &'static [u8] {
-        match self {
-            Self::Http2 => b"h2",
-            Self::Http1 => b"http/1.1",
-        }
-    }
-}
-
 /// Ordered HTTP protocols offered in a TLS ClientHello after clamping the
 /// guest's list to the protocols the interception proxy can terminate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -115,18 +93,18 @@ impl ClientAlpnOffer {
         }
     }
 
-    pub(crate) const fn supported(self) -> Option<&'static [HttpAlpn]> {
+    pub(crate) const fn supported(self) -> Option<&'static [HttpProtocol]> {
         match self {
             Self::Unavailable | Self::Unsupported => None,
             Self::NoAlpn => Some(&[]),
-            Self::Http1 => Some(&[HttpAlpn::Http1]),
-            Self::Http2 => Some(&[HttpAlpn::Http2]),
-            Self::Http2ThenHttp1 => Some(&[HttpAlpn::Http2, HttpAlpn::Http1]),
-            Self::Http1ThenHttp2 => Some(&[HttpAlpn::Http1, HttpAlpn::Http2]),
+            Self::Http1 => Some(&[HttpProtocol::Http1]),
+            Self::Http2 => Some(&[HttpProtocol::Http2]),
+            Self::Http2ThenHttp1 => Some(&[HttpProtocol::Http2, HttpProtocol::Http1]),
+            Self::Http1ThenHttp2 => Some(&[HttpProtocol::Http1, HttpProtocol::Http2]),
         }
     }
 
-    pub(crate) fn supports(self, protocol: HttpAlpn) -> bool {
+    pub(crate) fn supports(self, protocol: HttpProtocol) -> bool {
         self.supported()
             .is_some_and(|offered| offered.contains(&protocol))
     }
@@ -234,7 +212,7 @@ fn client_alpn_offer<'a>(protocols: Option<impl Iterator<Item = &'a [u8]>>) -> C
     let mut first = None;
     let mut second = None;
     for protocol in protocols {
-        let supported = HttpAlpn::from_wire(protocol);
+        let supported = HttpProtocol::from_wire(protocol);
         let Some(supported) = supported else {
             continue;
         };
@@ -245,10 +223,10 @@ fn client_alpn_offer<'a>(protocols: Option<impl Iterator<Item = &'a [u8]>>) -> C
         }
     }
     match (first, second) {
-        (Some(HttpAlpn::Http1), None) => ClientAlpnOffer::Http1,
-        (Some(HttpAlpn::Http2), None) => ClientAlpnOffer::Http2,
-        (Some(HttpAlpn::Http2), Some(HttpAlpn::Http1)) => ClientAlpnOffer::Http2ThenHttp1,
-        (Some(HttpAlpn::Http1), Some(HttpAlpn::Http2)) => ClientAlpnOffer::Http1ThenHttp2,
+        (Some(HttpProtocol::Http1), None) => ClientAlpnOffer::Http1,
+        (Some(HttpProtocol::Http2), None) => ClientAlpnOffer::Http2,
+        (Some(HttpProtocol::Http2), Some(HttpProtocol::Http1)) => ClientAlpnOffer::Http2ThenHttp1,
+        (Some(HttpProtocol::Http1), Some(HttpProtocol::Http2)) => ClientAlpnOffer::Http1ThenHttp2,
         (None, None) => ClientAlpnOffer::Unsupported,
         (None, Some(_)) | (Some(_), Some(_)) => ClientAlpnOffer::Unsupported,
     }

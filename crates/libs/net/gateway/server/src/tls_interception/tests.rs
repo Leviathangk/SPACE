@@ -5,11 +5,11 @@ fn upstream_config_preserves_typed_http_alpn_order() {
     let interception = TlsInterception::default();
     for (offered, expected) in [
         (
-            [HttpAlpn::Http2, HttpAlpn::Http1].as_slice(),
+            [HttpProtocol::Http2, HttpProtocol::Http1].as_slice(),
             [b"h2".as_slice(), b"http/1.1".as_slice()].as_slice(),
         ),
         (
-            [HttpAlpn::Http1, HttpAlpn::Http2].as_slice(),
+            [HttpProtocol::Http1, HttpProtocol::Http2].as_slice(),
             [b"http/1.1".as_slice(), b"h2".as_slice()].as_slice(),
         ),
     ] {

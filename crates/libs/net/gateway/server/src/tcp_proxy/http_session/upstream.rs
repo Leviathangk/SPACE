@@ -1,9 +1,10 @@
 //! One lazy origin connection per downstream connection. Waiters never own setup.
+use crate::http_protocol::HttpProtocol;
+use crate::tcp_proxy::{tls::TlsTransportError, transport};
+
 use super::{
+    error::http_reason,
     routing_headers::{SanitizedBody, SanitizedRequest},
-    tls::TlsTransportError,
-    tls_http::{HttpProtocol, http_reason},
-    transport,
 };
 use http::Response;
 use hyper::{
@@ -29,7 +30,7 @@ const MAX_HEADERS: usize = 128;
 const MAX_HEADER_BYTES: u32 = 32 * 1024;
 
 #[derive(Debug, thiserror::Error)]
-pub(super) enum Error {
+pub(in crate::tcp_proxy) enum Error {
     #[error("origin TCP connect failed: {0}")]
     Connect(#[from] transport::Error),
     #[error("origin TLS setup failed: {0}")]

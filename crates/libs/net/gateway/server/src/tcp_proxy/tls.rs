@@ -14,10 +14,11 @@ use tracing::Instrument;
 use super::accounting::{Attempt, Outcome};
 use super::transport;
 use crate::certificates::{CertificateError, CertificateLease};
+use crate::http_protocol::HttpProtocol;
 use crate::tls_interception::{
     Admission, HandshakePermit, Refused, TlsHandshakeLeg, TlsInterception,
 };
-use crate::tls_sni::{ClientAlpnOffer, HttpAlpn};
+use crate::tls_sni::ClientAlpnOffer;
 
 const HANDSHAKE_BUDGET: Duration = Duration::from_secs(10);
 
@@ -130,32 +131,34 @@ impl TlsFailure {
     }
 }
 
-fn negotiated(alpn: Option<&[u8]>) -> Result<HttpAlpn, TlsTransportError> {
+fn negotiated(alpn: Option<&[u8]>) -> Result<HttpProtocol, TlsTransportError> {
     match selected_alpn(alpn)? {
         // TLS clients predating ALPN still use HTTP/1.1. Hyper parses their
         // application bytes; this never selects an opaque relay.
-        None | Some(HttpAlpn::Http1) => Ok(HttpAlpn::Http1),
-        Some(HttpAlpn::Http2) => Ok(HttpAlpn::Http2),
+        None | Some(HttpProtocol::Http1) => Ok(HttpProtocol::Http1),
+        Some(HttpProtocol::Http2) => Ok(HttpProtocol::Http2),
     }
 }
 
 fn negotiated_upstream(
     client_alpn: ClientAlpnOffer,
-    selected: Option<HttpAlpn>,
-) -> Result<HttpAlpn, TlsTransportError> {
+    selected: Option<HttpProtocol>,
+) -> Result<HttpProtocol, TlsTransportError> {
     match selected {
         Some(protocol) if client_alpn.supports(protocol) => Ok(protocol),
         // An origin that ignores ALPN is legacy HTTP/1.1 only when the
         // guest advertised that fallback or sent no ALPN itself.
-        None if client_alpn == ClientAlpnOffer::NoAlpn || client_alpn.supports(HttpAlpn::Http1) => {
-            Ok(HttpAlpn::Http1)
+        None if client_alpn == ClientAlpnOffer::NoAlpn
+            || client_alpn.supports(HttpProtocol::Http1) =>
+        {
+            Ok(HttpProtocol::Http1)
         }
         _ => Err(TlsTransportError::Protocol),
     }
 }
 
-fn selected_alpn(alpn: Option<&[u8]>) -> Result<Option<HttpAlpn>, TlsTransportError> {
-    alpn.map(|protocol| HttpAlpn::from_wire(protocol).ok_or(TlsTransportError::Protocol))
+fn selected_alpn(alpn: Option<&[u8]>) -> Result<Option<HttpProtocol>, TlsTransportError> {
+    alpn.map(|protocol| HttpProtocol::from_wire(protocol).ok_or(TlsTransportError::Protocol))
         .transpose()
 }
 
@@ -164,7 +167,7 @@ pub(super) async fn accept<S>(
     stream: S,
     lease: &CertificateLease,
     interception: &TlsInterception,
-) -> Result<(TlsIo<tokio_rustls::server::TlsStream<S>>, HttpAlpn), TlsTransportError>
+) -> Result<(TlsIo<tokio_rustls::server::TlsStream<S>>, HttpProtocol), TlsTransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -216,7 +219,7 @@ pub(super) async fn connect<S>(
     lease: &CertificateLease,
     interception: &TlsInterception,
     client_alpn: ClientAlpnOffer,
-) -> Result<(TlsIo<tokio_rustls::client::TlsStream<S>>, HttpAlpn), TlsTransportError>
+) -> Result<(TlsIo<tokio_rustls::client::TlsStream<S>>, HttpProtocol), TlsTransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {

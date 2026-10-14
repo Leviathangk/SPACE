@@ -3,6 +3,7 @@ pub mod control;
 pub mod debug;
 pub mod dns;
 pub mod egress;
+mod http_protocol;
 pub mod ingress;
 pub mod inherited;
 pub mod known_egress;
