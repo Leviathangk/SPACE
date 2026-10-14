@@ -107,6 +107,8 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_NODEMGR_DISK_IO_CUSTOM_CAPACITY` | unset | JSON object with `expected_device_count`, `read_iops`, `write_iops`, `read_bandwidth_mib_per_sec`, and `write_bandwidth_mib_per_sec`; replaces the corresponding TOML setting. |
 | `SPACE_NODEMGR_DISK_IO_SANDBOX_CAPACITY_PERCENT` | 70 | Aggregate capacity percentage available to sandboxes. |
 | `SPACE_NODEMGR_DISK_IO_READ_WEIGHT_PERCENT`, `SPACE_NODEMGR_DISK_IO_WRITE_WEIGHT_PERCENT` | 50 / 50 | Positive read/write weights summing to 100. Environment overrides TOML; malformed values fail startup. |
+| `SPACE_DISK_IO_DEFAULT_MAX_OPERATIONS_PER_SEC`, `SPACE_DISK_IO_DEFAULT_MAX_BANDWIDTH_MIB_PER_SEC` | 1000 / 100 | Set both or neither, consistently on API, controller, and sandbox-manager. Controls new unassigned limits, inherited pools, and missing legacy metadata; saved assignments remain unchanged. Invalid values fail startup. |
+| `SPACE_DISK_IO_BURST_SECS` | 30 | Sandbox-manager: positive bucket duration in seconds; overrides `disk_io_burst_secs` in its TOML file. Applies on subsequent activation, including restore. |
 | `SPACE_DISK_IO_SAFETY_MAX_OPERATIONS_PER_SEC`, `SPACE_DISK_IO_SAFETY_MAX_BANDWIDTH_MIB_PER_SEC` | unset | Set both or neither. |
 | `SPACE_NODE_DISK_ADMISSION_MIN_AVAILABLE_BYTES` | 50 GiB | Hard free-space floor. Lower it on small disks. |
 | `SPACE_BUILDER_BLOB_MIN_AVAILABLE_BYTES` | 50 GiB | |

@@ -245,6 +245,8 @@ fn rootfs_size_mb(cache_dir: &Path, sandbox_id: &str) -> Option<u32> {
 pub(super) enum OrphanedSandboxRowMaterializationError {
     #[error("cache-only orphan inspection must precede database materialization")]
     MissingCacheInspection,
+    #[error(transparent)]
+    DiskIoDefault(#[from] pplx_space_common_core::types::DiskIoLimitsError),
     #[error("cannot inspect sandbox filesystem evidence: {0}")]
     Filesystem(#[from] std::io::Error),
     #[error(transparent)]
@@ -286,6 +288,7 @@ impl OrphanedSandboxRowMaterializationError {
             | Self::Publication(_)
             | Self::Validation(_)
             | Self::RestoreProvenance(_)
+            | Self::DiskIoDefault(_)
             | Self::MissingCacheInspection
             | Self::Filesystem(_) => false,
         }
@@ -587,7 +590,7 @@ fn insert_orphaned_sandbox_row_in_transaction(
                         runtime: RuntimeKind::Firecracker.alias(),
                         snapshots_enabled: false,
                         rootfs_size_mb,
-                        disk_io_limits: Default::default(),
+                        disk_io_limits: pplx_space_common_core::types::DiskIoLimits::configured_default()?,
                         pool_template: None,
                         volume_encryption: false,
                         process_env: &BTreeMap::new(),
@@ -624,7 +627,7 @@ fn insert_orphaned_sandbox_row_in_transaction(
             runtime: runtime.alias(),
             snapshots_enabled: false,
             rootfs_size_mb,
-            disk_io_limits: Default::default(),
+            disk_io_limits: pplx_space_common_core::types::DiskIoLimits::configured_default()?,
             pool_template: None,
             volume_encryption: false,
             process_env: &BTreeMap::new(),

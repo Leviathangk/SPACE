@@ -34,6 +34,18 @@ use crate::service::tests::service_tests::insert_test_sandbox;
 
 #[test]
 fn orphan_materialization_requires_observed_authority_without_overwriting_a_new_owner() {
+    if !pplx_space_test_env::enter_test_process(&[
+        (
+            "SPACE_DISK_IO_DEFAULT_MAX_OPERATIONS_PER_SEC",
+            Some("2000".as_ref()),
+        ),
+        (
+            "SPACE_DISK_IO_DEFAULT_MAX_BANDWIDTH_MIB_PER_SEC",
+            Some("50".as_ref()),
+        ),
+    ]) {
+        return;
+    }
     for (live, authority, row_appears) in [
         (false, Ok(None), false),
         (true, Ok(None), false),
@@ -44,6 +56,7 @@ fn orphan_materialization_requires_observed_authority_without_overwriting_a_new_
         ),
         (true, Err(Status::unavailable("receiver restarting")), false),
         (false, inventory_execution_for_test(SandboxId::new()), false),
+        (true, inventory_execution_for_test(SandboxId::new()), false),
         (false, inventory_execution_for_test(SandboxId::new()), true),
     ] {
         let db = Mutex::new(crate::db::test_conn());
@@ -94,7 +107,19 @@ fn orphan_materialization_requires_observed_authority_without_overwriting_a_new_
             assert!(report.changed_ids().is_empty());
         } else {
             assert_eq!(report.changed_ids(), vec![id]);
-            assert_eq!(row.unwrap().state, SandboxState::Quarantined);
+            let row = row.unwrap();
+            assert_eq!(
+                row.state,
+                if live {
+                    SandboxState::CleanupRequired
+                } else {
+                    SandboxState::Quarantined
+                }
+            );
+            assert_eq!(
+                row.disk_io_limits,
+                pplx_space_common_core::types::DiskIoLimits::try_new(2000, 50).unwrap()
+            );
             let fence = crate::db::node_execution_fence(&conn, &id.to_string())
                 .unwrap()
                 .unwrap();

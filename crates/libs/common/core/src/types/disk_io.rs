@@ -1,12 +1,16 @@
 use std::num::NonZeroU32;
 
-/// Default per-sandbox disk operation rate used when a warm-pool configuration
-/// has no explicit assignment.
+/// Default per-sandbox disk operation rate for new unassigned sandboxes.
+/// Small-file workloads consume thousands of guest requests even when the
+/// backing image is hot in the host cache. Physical host protection belongs
+/// at the parent cgroup, where cache hits do not spend device I/O capacity.
 pub const DEFAULT_DISK_IO_MAX_OPERATIONS_PER_SEC: u64 = 1_000;
 
-/// Default per-sandbox disk bandwidth used when a warm-pool configuration has
-/// no explicit assignment.
+/// Default per-sandbox disk bandwidth for new unassigned sandboxes.
 pub const DEFAULT_DISK_IO_MAX_BANDWIDTH_MIB_PER_SEC: u64 = 100;
+
+const DEFAULT_OPERATIONS_ENV: &str = "SPACE_DISK_IO_DEFAULT_MAX_OPERATIONS_PER_SEC";
+const DEFAULT_BANDWIDTH_ENV: &str = "SPACE_DISK_IO_DEFAULT_MAX_BANDWIDTH_MIB_PER_SEC";
 
 /// Default seconds of its sustained rates a sandbox drive's buckets hold.
 /// Guest disk requests are mostly one 4 KiB page (the virtio disk takes one
@@ -64,8 +68,20 @@ pub struct DiskIoLimits {
     max_bandwidth_mib_per_sec: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum DiskIoLimitsError {
+    #[error("cannot read disk I/O default {name}: {source}")]
+    Environment {
+        name: &'static str,
+        #[source]
+        source: std::env::VarError,
+    },
+    #[error("disk I/O default {name} must be a positive integer: {source}")]
+    ParseEnvironment {
+        name: &'static str,
+        #[source]
+        source: std::num::ParseIntError,
+    },
     #[error("disk I/O {field} must be greater than zero")]
     Zero { field: &'static str },
     #[error("disk I/O {field} value {value} exceeds the supported maximum {maximum}")]
@@ -79,6 +95,57 @@ pub enum DiskIoLimitsError {
 }
 
 impl DiskIoLimits {
+    /// Deployment default for new assignments and legacy metadata without an
+    /// assignment. Set both environment values or neither, on every writer and
+    /// worker. Unlike `Default`, this boundary is fallible and honors operator
+    /// configuration. Explicit persisted limits never pass through it.
+    pub fn configured_default() -> Result<Self, DiskIoLimitsError> {
+        let read = |name| match std::env::var(name) {
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(source) => Err(DiskIoLimitsError::Environment { name, source }),
+        };
+        Self::default_from_values(
+            read(DEFAULT_OPERATIONS_ENV)?.as_deref(),
+            read(DEFAULT_BANDWIDTH_ENV)?.as_deref(),
+        )
+    }
+
+    /// Validate and report the deployment default once during service startup.
+    pub fn configured_default_at_startup() -> Result<Self, DiskIoLimitsError> {
+        let limits = Self::configured_default()?;
+        let source = if std::env::var_os(DEFAULT_OPERATIONS_ENV).is_some() {
+            "environment"
+        } else {
+            "shipped"
+        };
+        tracing::info!(
+            max_operations_per_sec = limits.max_operations_per_sec(),
+            max_bandwidth_mib_per_sec = limits.max_bandwidth_mib_per_sec(),
+            source,
+            "resolved deployment disk I/O default"
+        );
+        Ok(limits)
+    }
+
+    fn default_from_values(
+        operations: Option<&str>,
+        bandwidth: Option<&str>,
+    ) -> Result<Self, DiskIoLimitsError> {
+        let parse = |name, raw: &str| {
+            raw.trim()
+                .parse()
+                .map_err(|source| DiskIoLimitsError::ParseEnvironment { name, source })
+        };
+        match (operations, bandwidth) {
+            (None, None) => Ok(Self::default()),
+            (Some(operations), Some(bandwidth)) => Self::try_new(
+                parse(DEFAULT_OPERATIONS_ENV, operations)?,
+                parse(DEFAULT_BANDWIDTH_ENV, bandwidth)?,
+            ),
+            _ => Err(DiskIoLimitsError::PartialPair),
+        }
+    }
     pub fn try_new(
         max_operations_per_sec: u64,
         max_bandwidth_mib_per_sec: u64,
@@ -109,7 +176,7 @@ impl DiskIoLimits {
         max_bandwidth_mib_per_sec: Option<u64>,
     ) -> Result<Self, DiskIoLimitsError> {
         match (max_operations_per_sec, max_bandwidth_mib_per_sec) {
-            (None, None) => Ok(Self::default()),
+            (None, None) => Self::configured_default(),
             (Some(operations), Some(bandwidth)) => Self::try_new(operations, bandwidth),
             _ => Err(DiskIoLimitsError::PartialPair),
         }

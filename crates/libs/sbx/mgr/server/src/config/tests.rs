@@ -1,6 +1,31 @@
 use super::*;
 
 #[test]
+fn deployment_burst_overrides_file_and_absent_config() {
+    if !pplx_space_test_env::enter_test_process(&[("SPACE_DISK_IO_BURST_SECS", Some("1".as_ref()))])
+    {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sandbox.toml");
+    assert_eq!(
+        load_with_environment(&path)
+            .unwrap()
+            .disk_io_burst_secs()
+            .get(),
+        1
+    );
+    std::fs::write(&path, "disk_io_burst_secs = 9").unwrap();
+    assert_eq!(
+        load_with_environment(&path)
+            .unwrap()
+            .disk_io_burst_secs()
+            .get(),
+        1
+    );
+}
+
+#[test]
 fn only_an_absent_config_uses_defaults() {
     let directory = tempfile::tempdir().unwrap();
     let missing = directory.path().join("absent.toml");

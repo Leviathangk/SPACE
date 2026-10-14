@@ -32,9 +32,15 @@ as a virtio block device.
 ## The drive limiter
 
 Every sandbox's root drive has a Firecracker rate limiter with two token
-buckets: operations (requests) and bandwidth (bytes). The defaults are 1,000
+buckets: operations (requests) and bandwidth (bytes). The shipped defaults are 1,000
 operations/s and 100 MiB/s; a warm pool can assign other limits, and each
 sandbox carries its own.
+
+The operations budget counts guest requests even when the host serves them from
+page cache. At 4 KiB per request, 1,000 operations/s restricts a busy guest to
+about 3.9 MiB/s despite the separate 100 MiB/s bandwidth allowance. A higher
+configured allowance reduces this small-file bottleneck; it is not a promise of
+100 MiB/s for every request size or of latency under arbitrary host contention.
 
 Each bucket holds `disk_io_burst_secs` (sandbox-manager configuration, default
 30) seconds of its sustained rate and refills at that rate. The sustained
@@ -49,6 +55,84 @@ make a dense node fair: at hundreds of sandboxes each one's fair share can be
 below its limit. Use the aggregate host disk budget below to bound physical
 I/O from all sandboxes together. This does not provide per-sandbox scheduling
 fairness or bound requests served from the host's page cache.
+
+### Upgrading the default allowance
+
+Set `SPACE_DISK_IO_DEFAULT_MAX_OPERATIONS_PER_SEC` and
+`SPACE_DISK_IO_DEFAULT_MAX_BANDWIDTH_MIB_PER_SEC` together on API (including the
+Admin API), controller, and sandbox-manager processes to hold or change the
+creation default independently of a binary upgrade. Unset retains the shipped
+`1000` / `100`. After host and concurrent-burst qualification, `10000` and `100`
+select the higher allowance without rebuilding binaries. The shipped rate is
+unchanged until that qualification supports a default increase.
+Partial, malformed, zero, or overflowing pairs fail startup. The same resolver
+handles unassigned cold creates, inherited policies, new manual pools, and legacy
+wire/snapshot metadata with both limits absent. Explicit and saved assignments
+are never clamped or rewritten by this setting. Configure all writers and workers
+consistently; a partial rollout can assign different defaults.
+
+Sandbox-manager also accepts `SPACE_DISK_IO_BURST_SECS` (positive u32), overriding
+`disk_io_burst_secs` in its TOML file. Set it to the verified existing duration
+while qualifying a rate change. Existing running VMs are not patched by changing
+configuration, but subsequent cold starts and snapshot restores rebuild the
+limiter from the saved rate and the receiving worker's burst duration. Thus a
+saved 1,000-IOPS sandbox can acquire a 30,000-token bucket without changing its
+saved rate. A 10,000-IOPS sandbox with 30-second bursts has 300,000 tokens. Test
+many fully credited guests starting I/O together, including lifecycle latency,
+not only a steady-state victim under background load.
+
+The configured creation default applies to new unassigned sandboxes in direct,
+Kubernetes, and node-local creation paths, and to warm-pool policies whose disk
+I/O fields are absent. It requires updated API, pool-controller, and worker
+binaries; rebuilding a guest image or template alone does not change the limit.
+The shipped bandwidth and 30-second burst duration are unchanged.
+At a configured 10,000-IOPS rate the operations bucket holds 300,000 requests, so
+validate the combined post-idle burst as well as sustained load. Older binaries may use a
+different burst duration; inspect the actual root-drive limiter during rollout.
+
+| Existing state | Upgrade behavior |
+| --- | --- |
+| Running or persisted sandbox with an assigned limit | Keeps its limit on start, restore, and ordinary lifecycle operations. |
+| Rolling warm-pool policy with omitted I/O fields | Reconciliation rewrites the config to the configured default. All slots with the old assignment immediately become unclaimable; mismatched warming/ready slots are deleted before bounded refill. This can empty the pool. |
+| Explicit rolling policy | Keeps its stored limit. Update it deliberately through the rolling-policy Admin API. |
+| Existing manually managed pool configuration | Keeps its stored limit, including when editing pool size. The manual-pool API does not expose I/O overrides; newly created configurations use the current default. |
+| Legacy snapshot or transfer metadata omitting both I/O fields | Reconstructing its sandbox row uses the receiving worker's configured default; present pairs are preserved, partial pairs are rejected. |
+| Legacy writer omitting database columns | Retains the historical SQL fallback. Current writers bind effective limits explicitly; no schema migration or limit backfill is required. Historical migration comments describe the defaults at their creation, not the current deployment default. |
+| Mixed old/new services or old materialized pool configuration | New creates can receive different defaults until all writers and pools converge. Inspect the saved assignment rather than assuming upgrade completion. |
+
+Before changing the default or upgrading writers that change it, inventory
+inherited policies and pin each to its verified current effective pair through
+the Admin API. Do not assume every
+policy currently means 1,000 / 100. Verify that materialized configs and ready
+slots still match, and keep the pins through mixed-version operation and rollback.
+Then change one policy at a time after host qualification. Changing its assignment
+still invalidates that policy's old slots; larger refill budgets can shorten but
+cannot eliminate the cold-create interval and increase refill pressure.
+
+The reconciler retries nominally every five seconds with bounded creation
+concurrency and warming budgets. Delete errors can leave unclaimable rows until
+retry; missing placement or repeated create failures can prevent refill
+indefinitely. Monitor ready/claimable counts, misses, reconciliation failures,
+and create/restore tails. Binary rollback or old-controller leadership can
+invalidate an inheriting pool again. Raising a default is not a rolling pool
+migration; do not rely on spare old slots remaining claimable during refill.
+
+Provision and validate a host budget before increasing a dense deployment's
+guest allowance. Upgrade workers before control-plane writers, then verify both
+cold creates and warm claims. Existing Firecracker drive APIs accept explicit
+limits from new callers, but omitted legacy wire fields resolve at the receiving
+binary's default. Do not rewrite every stored 1,000-IOPS value: it may be an
+intentional assignment. Existing sandboxes need replacement to receive a new
+creation allowance.
+
+`SPACE_DISK_IO_SAFETY_MAX_OPERATIONS_PER_SEC` and
+`SPACE_DISK_IO_SAFETY_MAX_BANDWIDTH_MIB_PER_SEC` bound explicit Admin API policy
+overrides; they do not cap the platform default, inherited policies, or running
+VMs. API startup warns if the configured default exceeds an explicit-policy ceiling. Review those ceilings before upgrading. Without a ceiling
+override, explicit policy validation uses the platform default. To retain a
+smaller allowance for a workload, assign both policy fields explicitly. A binary
+rollback changes future defaults and inherited-policy reconciliation, but does
+not lower already persisted assignments or clear the parent cgroup budget.
 
 ## Host disk protection
 
