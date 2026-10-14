@@ -1,27 +1,18 @@
-//! The gateway's DNS-attribution egress decision point.
-//!
-//! TCP admission, UDP forwarding, and established-flow resweeps
-//! route their decisions through [`evaluate_egress`]:
-//!
-//! * the TCP accept path ([`crate::tcp_proxy`]),
-//! * the UDP forward path ([`crate::udp_proxy`]), and
-//! * the live-connection sweep that re-evaluates established TCP flows when a
-//!   new policy is installed
-//!   ([`crate::tcp_proxy::DnsAttributedTcpTracker::cancel_denied`]).
-//!
-//! Within the DNS-attribution paths, centralizing the decision keeps policy
-//! evaluation and metric emission out of the individual proxies. The installed
-//! [`NetworkPolicyV1`] always applies explicit denies before allows.
-//!
-//! The DNS allow cache is deliberately **not** owned here. The caller supplies
-//! whether the destination IP has current DNS allow evidence; the evaluator
-//! combines that input with the network policy to reach a verdict.
+//! Gateway egress authorization. Protocol adapters supply parsed facts;
+//! this module owns policy decisions and established-connection revalidation.
 
 use std::fmt;
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use pplx_space_net_common::{DenyReason, EgressDecision, NetworkPolicyV1};
+use pplx_space_net_common::{DenyReason, DomainName, EgressDecision, NetworkPolicyV1};
+
+use crate::dns::DnsAllowCache;
+
+mod tcp;
+mod tracker;
+pub(crate) use tcp::{AdmittedTcp, TcpAdmissionDenial, admit_tcp, missing_client_hello};
+pub use tracker::DnsAttributedTcpTracker;
 
 /// Transport an egress decision applies to.
 ///
@@ -120,52 +111,16 @@ impl EgressContext {
 /// given whether its IP has current DNS allow evidence, and record the egress
 /// decision metrics tagged by `context` (transport + admission/resweep phase).
 ///
-/// This is the decision point for DNS-attribution admission and resweeps.
-/// Explicit denies always take precedence over overlapping allows.
+/// Reserved-resolver transports use this without DNS evidence. Other
+/// transports use the complete protocol decisions in this module.
 pub fn evaluate_egress(
     context: EgressContext,
     destination: SocketAddr,
     dns_allowed: bool,
     policy: &NetworkPolicyV1,
 ) -> EgressDecision {
-    evaluate_egress_with_post_policy(
-        context,
-        destination,
-        dns_allowed,
-        policy,
-        std::convert::identity,
-    )
-}
-
-/// Evaluate tenant policy, then let a protocol-specific gate refine the result
-/// before the single enforced decision is metered. The gate may turn an allow
-/// into a deny or refine a default deny to an explicit rule deny, but it must
-/// preserve explicit address denies and platform guardrails.
-pub(crate) fn evaluate_egress_with_post_policy(
-    context: EgressContext,
-    destination: SocketAddr,
-    dns_allowed: bool,
-    policy: &NetworkPolicyV1,
-    post_policy: impl FnOnce(EgressDecision) -> EgressDecision,
-) -> EgressDecision {
     let started_at = Instant::now();
-    let policy_decision = evaluate_egress_unmetered(destination, dns_allowed, policy);
-    let decision = post_policy(policy_decision);
-    debug_assert!(
-        policy_decision.is_allowed()
-            || decision == policy_decision
-            || matches!(
-                (policy_decision, decision),
-                (
-                    EgressDecision::Deny {
-                        reason: DenyReason::Default,
-                    },
-                    EgressDecision::Deny {
-                        reason: DenyReason::Rule,
-                    },
-                )
-            )
-    );
+    let decision = evaluate_egress_unmetered(destination, dns_allowed, policy);
     // Measured before emitting the decision counter so the latency reflects
     // the policy evaluation and protocol gate, but not the metric plumbing
     // around them.
@@ -173,6 +128,85 @@ pub(crate) fn evaluate_egress_with_post_policy(
     record_decision(context, decision, policy.tls_interception);
 
     decision
+}
+
+/// UDP cannot bind a payload to the hostname that supplied DNS permission.
+pub(crate) fn admit_udp(
+    cache: &DnsAllowCache,
+    destination: SocketAddr,
+    policy: &NetworkPolicyV1,
+) -> EgressDecision {
+    let dns_allowed = cache.allows_ip(destination.ip(), policy);
+    let started_at = Instant::now();
+    let mut decision = evaluate_egress_unmetered(destination, dns_allowed, policy);
+    if decision.is_allowed()
+        && let Some(reason) = dns_allow_required(destination, policy)
+    {
+        pplx_space_metrics::gateway::domain_binding("udp", "unavailable", "host_unavailable", None);
+        decision = EgressDecision::Deny { reason };
+    }
+    let context = EgressContext::Admission(EgressProtocol::Udp);
+    record_latency(context, started_at);
+    record_decision(context, decision, policy.tls_interception);
+    decision
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub(crate) enum HostBindingError {
+    #[error("hostname is not allowed by policy")]
+    HostNotAllowed,
+    #[error("hostname has no DNS attribution for the destination")]
+    HostUnattributed,
+    #[error("destination denied by policy: {0:?}")]
+    PolicyDenied(DenyReason),
+}
+
+fn authorize_domain(
+    policy: &NetworkPolicyV1,
+    host: &DomainName,
+    attributed: bool,
+) -> Result<(), HostBindingError> {
+    if !policy.explicitly_allows_domain_name(host) {
+        Err(HostBindingError::HostNotAllowed)
+    } else if !attributed {
+        Err(HostBindingError::HostUnattributed)
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn authorize_host(
+    policy: &NetworkPolicyV1,
+    destination: SocketAddr,
+    host: &DomainName,
+    cache: &DnsAllowCache,
+) -> Result<(), HostBindingError> {
+    if dns_allow_required(destination, policy).is_none() {
+        return Ok(());
+    }
+    authorize_domain(
+        policy,
+        host,
+        cache.contains_host_binding(destination.ip(), host.as_str()),
+    )?;
+    match evaluate_egress_unmetered(
+        destination,
+        cache.allows_ip(destination.ip(), policy),
+        policy,
+    ) {
+        EgressDecision::Allow => Ok(()),
+        EgressDecision::Deny { reason } => Err(HostBindingError::PolicyDenied(reason)),
+    }
+}
+
+pub(crate) fn allows_dns_query(policy: &NetworkPolicyV1, domain: &DomainName) -> bool {
+    if policy.denies_domain(domain) {
+        false
+    } else if policy.matches_domain_allow_rule(domain) {
+        true
+    } else {
+        policy.default_action().allows_egress()
+    }
 }
 
 /// Compute a verdict without emitting per-decision telemetry. The plaintext

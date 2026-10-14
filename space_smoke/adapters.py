@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import importlib
+import ipaddress
 import json
 import os
 import re
@@ -27,6 +28,9 @@ from urllib.request import Request, urlopen
 
 from space_smoke.capabilities import (
     LimiterProbeOutcome,
+    PodNetwork,
+    TcpProbe,
+    TcpTarget,
     AdminNodeGroupView,
     CensusPublication,
     FencePolicy,
@@ -110,6 +114,11 @@ from space_smoke.runtime import (
 )
 
 KIND_NAMESPACE = "space"
+# The API creates sandbox pods in their own namespace, apart from the control
+# plane (`k8s.sandboxNamespace` in the Kind charts), where the
+# space-sandbox-network-policy chart's NetworkPolicies confine them.
+# Everything else the harness reads or mutates stays in KIND_NAMESPACE.
+KIND_SANDBOX_NAMESPACE = "sandboxes"
 KIND_BOOTSTRAP_POST_API_TIMEOUT_SECONDS = 2400
 # Longer than the 30-minute scenario budget plus a full controller rollout.
 # A crashed owner eventually expires, while a live scenario cannot be taken
@@ -338,6 +347,12 @@ SANDBOX_RESIDENCY_SQL = """\
 SELECT lifecycle, coalesce(active_node_id::text, '') FROM sandboxes WHERE id = '{sandbox_id}'::uuid;
 """
 POD_CAP_QUOTA_NAME = "space-smoke-pod-cap"
+# The sandbox-isolation smoke's pod that no allow rule selects: the sandbox
+# pods' own image (k8s.sandboxPodImage), already on every sandbox node, run by
+# the node's default runtime rather than the SPACE shim.
+UNSELECTED_POD_LABEL = "space.pplx.net/smoke-unselected"
+UNSELECTED_POD_IMAGE = "registry.k8s.io/pause:3.10"
+UNSELECTED_POD_READY_SECONDS = 120
 PUBLIC_API_DEPLOYMENT_SELECTOR = "app.kubernetes.io/name=space-api"
 KIND_REDIS_DEPLOYMENT = "space-redis"
 KIND_OBJECT_STORE_DEPLOYMENT = "space-object-store"
@@ -653,20 +668,26 @@ class KindHarness:
         self.environment = dict(environment or os.environ)
         self._retention_lease_ownership: _LeaseOwnership | None = None
         self._cordon_lease_ownership: _LeaseOwnership | None = None
+        # The public API autoscaler's bounds before `scale_public_api` pinned
+        # them: (name, uid, minReplicas, maxReplicas).
+        self._public_api_autoscaler_bounds: tuple[str, str, int, int] | None = None
 
     def kubectl(
         self,
         *args: str,
         input_text: str | None = None,
         timeout: float | None = None,
+        namespace: str = KIND_NAMESPACE,
     ) -> CommandResult:
+        if namespace not in (KIND_NAMESPACE, KIND_SANDBOX_NAMESPACE):
+            raise ValueError(f"refusing kubectl in namespace {namespace!r}")
         return self.executor.run(
             [
                 "kubectl",
                 "--context",
                 self.config.context,
                 "-n",
-                KIND_NAMESPACE,
+                namespace,
                 *args,
             ],
             input_text=input_text,
@@ -776,6 +797,7 @@ class KindHarness:
             "-o",
             "json",
             timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
         )
         _require_ok(result, "observe cold-create pod")
         pods = json.loads(result.stdout).get("items", [])
@@ -827,6 +849,7 @@ class KindHarness:
             "-o",
             "json",
             timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
         )
         _require_ok(result, "observe warm-pool pod")
         pods = [
@@ -1533,6 +1556,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             "-o",
             "json",
             timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
         )
         _require_ok(result, "observe sandbox pod placement")
         pods = [
@@ -2021,6 +2045,7 @@ ON CONFLICT (key_hash) DO NOTHING;
                 "-o",
                 "json",
                 timeout=15,
+                namespace=KIND_SANDBOX_NAMESPACE,
             )
             payload = json.loads(_require_ok(result, "list completed sandbox pods"))
             items = payload.get("items") if isinstance(payload, dict) else None
@@ -2052,6 +2077,7 @@ ON CONFLICT (key_hash) DO NOTHING;
                     "--force",
                     "--wait=false",
                     timeout=15,
+                    namespace=KIND_SANDBOX_NAMESPACE,
                 ),
                 f"force-clear completed sandbox pod {name}",
             )
@@ -2179,6 +2205,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             "get", "pods", "-l",
             f"space.pplx.net/sandbox-id={_sql_uuid(sandbox_id)}", "-o", "json",
             timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
         )
         document = json.loads(_require_ok(pods, "read active sandbox template build"))
         bound = [p for p in document.get("items", []) if p.get("spec", {}).get("nodeName")]
@@ -2639,11 +2666,65 @@ ON CONFLICT (key_hash) DO NOTHING;
             self.kubectl("get", "deploy", name, "-o", "jsonpath={.spec.replicas}", timeout=15),
             f"read replicas of {name}",
         ).strip()
+        autoscaler = self._public_api_autoscaler(name)
+        if autoscaler is not None:
+            # An autoscaler owns the replica count and reconciles a manual
+            # scale away once its scale-down window passes, so the count is
+            # set through its bounds; `restore_public_api_autoscaler` puts the
+            # captured bounds back.
+            metadata, spec = autoscaler["metadata"], autoscaler["spec"]
+            if self._public_api_autoscaler_bounds is None:
+                self._public_api_autoscaler_bounds = (
+                    str(metadata["name"]), str(metadata["uid"]),
+                    int(spec.get("minReplicas", 1)), int(spec["maxReplicas"]),
+                )
+            self._patch_public_api_autoscaler(replicas, replicas)
         _require_ok(
             self.kubectl("scale", f"deploy/{name}", f"--replicas={replicas}", timeout=30),
             f"scale {name} to {replicas}",
         )
         return int(previous) if previous.isdigit() else 1
+
+    def restore_public_api_autoscaler(self) -> None:
+        if self._public_api_autoscaler_bounds is None:
+            return
+        _, _, minimum, maximum = self._public_api_autoscaler_bounds
+        self._patch_public_api_autoscaler(minimum, maximum)
+        self._public_api_autoscaler_bounds = None
+
+    def _public_api_autoscaler(self, deployment: str) -> dict[str, Any] | None:
+        listing = json.loads(
+            _require_ok(self.kubectl("get", "hpa", "-o", "json", timeout=15), "list autoscalers")
+            or "{}"
+        )
+        matches = [
+            item
+            for item in listing.get("items", [])
+            if (item.get("spec") or {}).get("scaleTargetRef", {}).get("kind") == "Deployment"
+            and item["spec"]["scaleTargetRef"].get("name") == deployment
+        ]
+        if len(matches) > 1:
+            raise SmokeConfigurationError(f"more than one autoscaler targets {deployment}")
+        return matches[0] if matches else None
+
+    def _patch_public_api_autoscaler(self, minimum: int, maximum: int) -> None:
+        assert self._public_api_autoscaler_bounds is not None
+        name, uid, _, _ = self._public_api_autoscaler_bounds
+        current = json.loads(
+            _require_ok(self.kubectl("get", "hpa", name, "-o", "json", timeout=15), f"read {name}")
+            or "{}"
+        )
+        if current.get("metadata", {}).get("uid") != uid:
+            raise SmokeConfigurationError(f"refusing replaced autoscaler {name}")
+        patch = [
+            {"op": "test", "path": "/metadata/uid", "value": uid},
+            {"op": "replace", "path": "/spec/minReplicas", "value": minimum},
+            {"op": "replace", "path": "/spec/maxReplicas", "value": maximum},
+        ]
+        _require_ok(
+            self.kubectl("patch", "hpa", name, "--type=json", "--patch", json.dumps(patch), timeout=15),
+            f"set {name} bounds to {minimum}..{maximum}",
+        )
 
     def wait_public_api_rollout(self, *, timeout: float) -> None:
         name = self._public_api_deployment()
@@ -2654,31 +2735,39 @@ ON CONFLICT (key_hash) DO NOTHING;
             ),
             f"await rollout of {name}",
         )
+        self._wait_deployment_pods_drained(name, timeout=timeout)
 
     def wait_public_api_pods_drained(self, *, timeout: float) -> None:
-        """Block until only the Deployment's desired API pods exist, none Terminating.
+        """Block until only the Deployment's desired API pods exist, none Terminating."""
 
-        `kubectl rollout status` completes a scale-down once the available
-        count matches the spec, while the surplus pods are still shutting
-        down. A localhost port-forward pinned to one of them (Tilt forwards
-        to the newest pod, the first a scale-down removes) drops when it
-        exits, so callers that need the route must wait for the drain too.
+        self._wait_deployment_pods_drained(self._public_api_deployment(), timeout=timeout)
+
+    def _wait_deployment_pods_drained(self, name: str, *, timeout: float) -> None:
+        """Block until only the Deployment's desired pods exist, none Terminating.
+
+        `kubectl rollout status` completes a rolling update, or a scale-down,
+        once the available count matches the spec, while the replaced pods are
+        still shutting down. A client that holds a pooled connection to one of
+        them (the load-balanced entry hands each connection to one replica)
+        has it reset when that pod exits, so a caller about to reuse its
+        client waits for the old pods to be gone, which closes those
+        connections first.
         """
 
-        name = self._public_api_deployment()
-        deployment = json.loads(
-            _require_ok(
-                self.kubectl("get", "deploy", name, "-o", "json", timeout=15),
-                f"read {name}",
-            )
-        )
-        desired = int(deployment["spec"].get("replicas", 1))
-        match_labels = deployment["spec"]["selector"].get("matchLabels") or {}
-        if not match_labels:
-            raise SmokeConfigurationError(f"{name} has no matchLabels selector to list its pods by")
-        selector = ",".join(f"{key}={value}" for key, value in sorted(match_labels.items()))
         deadline = time.monotonic() + timeout
         while True:
+            # Re-read each poll: an autoscaler may move the desired count.
+            deployment = json.loads(
+                _require_ok(
+                    self.kubectl("get", "deploy", name, "-o", "json", timeout=15),
+                    f"read {name}",
+                )
+            )
+            desired = int(deployment["spec"].get("replicas", 1))
+            match_labels = deployment["spec"]["selector"].get("matchLabels") or {}
+            if not match_labels:
+                raise SmokeConfigurationError(f"{name} has no matchLabels selector to list its pods by")
+            selector = ",".join(f"{key}={value}" for key, value in sorted(match_labels.items()))
             pods = json.loads(
                 _require_ok(
                     self.kubectl("get", "pods", "-l", selector, "-o", "json", timeout=15),
@@ -2785,6 +2874,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             self.kubectl("rollout", "status", f"deploy/{name}", f"--timeout={int(timeout)}s", timeout=timeout + 30),
             f"await rollout of {name}",
         )
+        self._wait_deployment_pods_drained(name, timeout=timeout)
 
     def node_group_env(self) -> dict[str, str | None]:
         """`api:<key>` / `controller:<key>` literals for the gate and the labeler."""
@@ -3162,12 +3252,16 @@ ON CONFLICT (key_hash) DO NOTHING;
     def sandbox_pod_render(self, sandbox_id: str) -> SandboxPodRender | None:
         result = self.kubectl(
             "get", "pods", "-l", f"space.pplx.net/sandbox-id={_sql_uuid(sandbox_id)}", "-o", "json", timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
         )
         _require_ok(result, "read the sandbox pod")
         return _newest_pod_render(result.stdout)
 
     def sandbox_pod_count(self) -> int:
-        result = self.kubectl("get", "pods", "-l", KIND_SANDBOX_POD_SELECTOR, "-o", "json", timeout=15)
+        result = self.kubectl(
+            "get", "pods", "-l", KIND_SANDBOX_POD_SELECTOR, "-o", "json", timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
+        )
         _require_ok(result, "count sandbox pods")
         items = json.loads(result.stdout or "{}").get("items", [])
         return sum(1 for item in items if not (item.get("metadata") or {}).get("deletionTimestamp"))
@@ -3279,6 +3373,7 @@ ON CONFLICT (key_hash) DO NOTHING;
     def _sandbox_pod_json(self, sandbox_id: str) -> dict[str, Any] | None:
         result = self.kubectl(
             "get", "pods", "-l", f"space.pplx.net/sandbox-id={_sql_uuid(sandbox_id)}", "-o", "json", timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
         )
         _require_ok(result, "read the sandbox pod")
         items = json.loads(result.stdout or "{}").get("items", [])
@@ -3924,18 +4019,21 @@ ON CONFLICT (key_hash) DO NOTHING;
     def pin_namespace_pod_count(self) -> int:
         self._require_isolated_kind("namespace pod-count quota")
         # `kubectl get pods` over-counts: the quota charges only non-terminal
-        # pods, and a bench carries Completed job pods (seed publish, migrate)
-        # that a naive count includes — the first attempt pinned 16 against a
-        # real usage of 14 and admitted the POST. Create the quota with a wide
+        # pods, and a naive count includes terminal ones (Completed seed-publish
+        # and migrate Jobs, when sandboxes shared the control-plane namespace —
+        # the first attempt pinned 16 against a real usage of 14 and admitted
+        # the POST — and finished sandbox pods here). Create the quota with a wide
         # cap, let the controller report what it actually charges, then pin the
         # cap to exactly that number.
         wide = (
             "apiVersion: v1\nkind: ResourceQuota\n"
-            f"metadata:\n  name: {POD_CAP_QUOTA_NAME}\n  namespace: {KIND_NAMESPACE}\n"
+            f"metadata:\n  name: {POD_CAP_QUOTA_NAME}\n  namespace: {KIND_SANDBOX_NAMESPACE}\n"
             'spec:\n  hard:\n    pods: "10000"\n'
         )
         _require_ok(
-            self.kubectl("apply", "-f", "-", input_text=wide, timeout=30),
+            self.kubectl(
+                "apply", "-f", "-", input_text=wide, timeout=30, namespace=KIND_SANDBOX_NAMESPACE
+            ),
             "apply the pod-count quota",
         )
         deadline = time.monotonic() + 60
@@ -3943,6 +4041,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             used = self.kubectl(
                 "get", "resourcequota", POD_CAP_QUOTA_NAME,
                 "-o", "jsonpath={.status.used.pods}", timeout=15,
+                namespace=KIND_SANDBOX_NAMESPACE,
             )
             value = used.stdout.strip() if used.returncode == 0 else ""
             if value.isdigit():
@@ -3953,7 +4052,9 @@ ON CONFLICT (key_hash) DO NOTHING;
         count = int(value)
         pinned = wide.replace('pods: "10000"', f'pods: "{count}"')
         _require_ok(
-            self.kubectl("apply", "-f", "-", input_text=pinned, timeout=30),
+            self.kubectl(
+                "apply", "-f", "-", input_text=pinned, timeout=30, namespace=KIND_SANDBOX_NAMESPACE
+            ),
             "pin the pod-count quota",
         )
         # Admission reads the quota's status; wait until the pinned hard value
@@ -3963,6 +4064,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             hard = self.kubectl(
                 "get", "resourcequota", POD_CAP_QUOTA_NAME,
                 "-o", "jsonpath={.status.hard.pods}", timeout=15,
+                namespace=KIND_SANDBOX_NAMESPACE,
             )
             if hard.returncode == 0 and hard.stdout.strip() == str(count):
                 return count
@@ -3972,7 +4074,8 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     def lift_namespace_pod_cap(self) -> None:
         result = self.kubectl(
-            "delete", "resourcequota", POD_CAP_QUOTA_NAME, "--ignore-not-found", timeout=30
+            "delete", "resourcequota", POD_CAP_QUOTA_NAME, "--ignore-not-found", timeout=30,
+            namespace=KIND_SANDBOX_NAMESPACE,
         )
         _require_ok(result, "delete the pod-count quota")
 
@@ -4000,6 +4103,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         result = self.kubectl(
             "get", "pods", "-l", f"{SANDBOX_ID_LABEL}={_sql_uuid(sandbox_id)}",
             "-o", "json", timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
         )
         _require_ok(result, "list sandbox pods")
         pods: list[SandboxPodView] = []
@@ -4026,7 +4130,9 @@ ON CONFLICT (key_hash) DO NOTHING;
         if not pod.startswith("space-sbx-"):
             raise ValueError(f"refusing to delete a pod that is not a sandbox execution pod: {pod}")
         _require_ok(
-            self.kubectl("delete", "pod", pod, "--wait=false", timeout=60),
+            self.kubectl(
+                "delete", "pod", pod, "--wait=false", timeout=60, namespace=KIND_SANDBOX_NAMESPACE
+            ),
             f"delete sandbox pod {pod}",
         )
 
@@ -4098,7 +4204,9 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     def restore_pod_document(self, pod_name: str) -> dict[str, Any] | None:
         pod = _kube_pod_name(pod_name)
-        result = self.kubectl("get", "pod", pod, "-o", "json", timeout=15)
+        result = self.kubectl(
+            "get", "pod", pod, "-o", "json", timeout=15, namespace=KIND_SANDBOX_NAMESPACE
+        )
         if result.returncode != 0 and "notfound" in result.detail().lower().replace(" ", ""):
             return None
         document = json.loads(_require_ok(result, f"read pod {pod}") or "{}")
@@ -4122,7 +4230,8 @@ ON CONFLICT (key_hash) DO NOTHING;
             token=token,
         )
         created = self.kubectl(
-            "create", "-f", "-", "-o", "json", input_text=json.dumps(manifest), timeout=30
+            "create", "-f", "-", "-o", "json", input_text=json.dumps(manifest), timeout=30,
+            namespace=KIND_SANDBOX_NAMESPACE,
         )
         uid = (json.loads(_require_ok(created, f"create the planted orphan {name}") or "{}")
                .get("metadata", {}).get("uid"))
@@ -4139,6 +4248,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             self.kubectl(
                 "delete", "pods", "-l", f"{PLANTED_ORPHAN_LABEL}={token}",
                 "--ignore-not-found", "--wait=false", timeout=30,
+                namespace=KIND_SANDBOX_NAMESPACE,
             ),
             f"remove planted orphan pods {token}",
         )
@@ -4330,6 +4440,140 @@ ON CONFLICT (key_hash) DO NOTHING;
                 f"SPACE_TRACE_EXPORTER={traces or 'unset'}"
             )
         return mode
+
+    # --- sandbox network isolation -------------------------------------------
+    #
+    # Probes of the sandbox namespace's NetworkPolicies, run in the node's
+    # operator shell: in its own network namespace (the control-plane
+    # namespace, under no policy), or in a pod's, entered by the netns handle
+    # whose eth0 carries the pod IP. A sandbox pod has no process of its own to
+    # name with a pid; the handle is what the node's runtime created for it.
+
+    def sandbox_pod_network(self, sandbox_id: str) -> PodNetwork | None:
+        result = self.kubectl(
+            "get", "pods", "-l", f"{SANDBOX_ID_LABEL}={_sql_uuid(sandbox_id)}", "-o", "json",
+            timeout=15, namespace=KIND_SANDBOX_NAMESPACE,
+        )
+        running = [
+            pod
+            for pod in json.loads(_require_ok(result, "read the sandbox pod") or "{}").get("items", [])
+            if not (pod.get("metadata") or {}).get("deletionTimestamp")
+            and (pod.get("status") or {}).get("phase") == "Running"
+            and (pod.get("spec") or {}).get("nodeName")
+            and (pod.get("status") or {}).get("podIP")
+        ]
+        if len(running) != 1:
+            return None
+        pod = running[0]
+        return PodNetwork(
+            pod_name=str(pod["metadata"]["name"]),
+            node_name=str(pod["spec"]["nodeName"]),
+            pod_ip=str(pod["status"]["podIP"]),
+        )
+
+    def control_plane_targets(self) -> list[TcpTarget]:
+        return [
+            self._service_target("postgres", "postgres", 5432),
+            self._raw_service_target("kubernetes-api", "default", "kubernetes", 443),
+            self._service_target("internal-api", "space-internal-api", 9800),
+            self._service_target("object-store", "object-store", 8333),
+        ]
+
+    def cluster_dns_target(self) -> TcpTarget:
+        return self._raw_service_target("cluster-dns", "kube-system", "kube-dns", 53)
+
+    def _service_target(self, name: str, service: str, port: int) -> TcpTarget:
+        result = self.kubectl("get", "service", service, "-o", "json", timeout=15)
+        return _service_tcp_target(
+            name, json.loads(_require_ok(result, f"read Service {service}") or "{}"), port
+        )
+
+    def _raw_service_target(self, name: str, namespace: str, service: str, port: int) -> TcpTarget:
+        # Outside the two namespaces the harness addresses; `--raw` takes the
+        # path verbatim and ignores `-n`.
+        path = f"/api/v1/namespaces/{namespace}/services/{service}"
+        result = self.kubectl("get", "--raw", path, timeout=15)
+        return _service_tcp_target(
+            name, json.loads(_require_ok(result, f"read Service {namespace}/{service}") or "{}"), port
+        )
+
+    def probe_from_node_shell(
+        self, node_name: str, targets: Sequence[TcpTarget], *, timeout: float
+    ) -> list[TcpProbe]:
+        script = _tcp_probe_script(targets, timeout=timeout, pod_ip=None)
+        result = self._node_shell_exec(node_name, script, timeout=60 + timeout * len(targets))
+        return _parse_tcp_probes(
+            _require_ok(result, f"probe from the operator shell on {node_name}"), targets
+        )
+
+    def probe_from_pod_netns(
+        self, pod: PodNetwork, targets: Sequence[TcpTarget], *, timeout: float
+    ) -> list[TcpProbe]:
+        script = _tcp_probe_script(targets, timeout=timeout, pod_ip=pod.pod_ip)
+        result = self._node_shell_exec(pod.node_name, script, timeout=60 + timeout * len(targets))
+        if result.returncode == 3 and "NETNS none" in result.stdout:
+            raise SmokeConfigurationError(
+                f"no network namespace on {pod.node_name} carries {pod.pod_name}'s IP {pod.pod_ip}"
+            )
+        output = _require_ok(result, f"probe from the network namespace of {pod.pod_name}")
+        return _parse_tcp_probes(output, targets)
+
+    def start_unselected_pod(self, node_name: str, token: str) -> PodNetwork:
+        self._require_isolated_kind("a pod in the sandbox namespace")
+        if not re.fullmatch(r"[a-f0-9]{8}", token):
+            raise ValueError(f"refusing unselected-pod token {token!r}")
+        name = f"space-smoke-unselected-{token}"
+        manifest = {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": name, "labels": {UNSELECTED_POD_LABEL: token}},
+            "spec": {
+                # Bound directly: the probe needs it on the sandbox's node,
+                # and the scheduler has no say in what this proves.
+                "nodeName": _kube_node_name(node_name),
+                "automountServiceAccountToken": False,
+                "enableServiceLinks": False,
+                "terminationGracePeriodSeconds": 0,
+                "tolerations": [{"operator": "Exists"}],
+                "containers": [
+                    {"name": "pause", "image": UNSELECTED_POD_IMAGE, "imagePullPolicy": "IfNotPresent"}
+                ],
+            },
+        }
+        _require_ok(
+            self.kubectl(
+                "create", "-f", "-", input_text=json.dumps(manifest), timeout=30,
+                namespace=KIND_SANDBOX_NAMESPACE,
+            ),
+            f"create {name}",
+        )
+        deadline = time.monotonic() + UNSELECTED_POD_READY_SECONDS
+        while True:
+            result = self.kubectl(
+                "get", "pod", name, "-o", "json", timeout=15, namespace=KIND_SANDBOX_NAMESPACE
+            )
+            pod = json.loads(_require_ok(result, f"read {name}") or "{}")
+            status = pod.get("status") or {}
+            if status.get("phase") == "Running" and status.get("podIP"):
+                return PodNetwork(pod_name=name, node_name=node_name, pod_ip=str(status["podIP"]))
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"{name} was not Running with a pod IP within {UNSELECTED_POD_READY_SECONDS}s: "
+                    f"phase {status.get('phase')!r}"
+                )
+            time.sleep(2)
+
+    def remove_unselected_pods(self, token: str) -> None:
+        if not re.fullmatch(r"[a-f0-9]{8}", token):
+            raise ValueError(f"refusing unselected-pod token {token!r}")
+        _require_ok(
+            self.kubectl(
+                "delete", "pods", "-l", f"{UNSELECTED_POD_LABEL}={token}",
+                "--ignore-not-found", "--wait=false", timeout=30,
+                namespace=KIND_SANDBOX_NAMESPACE,
+            ),
+            f"remove the unselected pod {token}",
+        )
 
     def _read_deployment_env(self, name: str, keys: Sequence[str]) -> dict[str, str | None]:
         """The literal each key holds on a Deployment's first container, None if unset.
@@ -4982,6 +5226,87 @@ def _completed_deleting_pod_name(pod: object) -> str | None:
         )
     )
     return name if completed else None
+
+
+_PROBE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
+
+
+def _service_tcp_target(name: str, service: Mapping[str, Any], port: int) -> TcpTarget:
+    """A Service's ClusterIP on one of its declared ports."""
+
+    spec = service.get("spec") or {}
+    cluster_ip = str(spec.get("clusterIP") or "")
+    try:
+        ipaddress.IPv4Address(cluster_ip)
+    except ValueError as error:
+        raise SmokeConfigurationError(f"{name} has no IPv4 ClusterIP: {cluster_ip!r}") from error
+    if not any(
+        entry.get("port") == port and entry.get("protocol", "TCP") == "TCP"
+        for entry in spec.get("ports") or ()
+    ):
+        raise SmokeConfigurationError(f"{name}'s Service declares no TCP port {port}")
+    return TcpTarget(name=name, host=cluster_ip, port=port)
+
+
+def _tcp_probe_script(targets: Sequence[TcpTarget], *, timeout: float, pod_ip: str | None) -> str:
+    """Bash for the operator shell: one TCP connect per target, one result line each.
+
+    With `pod_ip`, the connects run in the network namespace whose interface
+    carries that address, found among the node's netns handles; without it,
+    in the shell's own.
+    """
+
+    if not targets:
+        raise ValueError("a probe needs at least one target")
+    if not 0 < timeout <= 30:
+        raise ValueError(f"refusing probe timeout {timeout!r}")
+    names = [target.name for target in targets]
+    if len(set(names)) != len(names):
+        raise ValueError(f"duplicate probe targets: {names}")
+    lines = ["set -u", 'enter=""']
+    if pod_ip is not None:
+        address = str(ipaddress.IPv4Address(pod_ip))
+        lines += [
+            'handle=""',
+            "for candidate in /var/run/netns/*; do",
+            '  [ -e "$candidate" ] || continue',
+            f'  if nsenter --net="$candidate" ip -4 -o addr show 2>/dev/null | grep -qF " inet {address}/"; then',
+            '    handle="$candidate"; break',
+            "  fi",
+            "done",
+            'if [ -z "$handle" ]; then echo "NETNS none"; exit 3; fi',
+            'echo "NETNS $handle"',
+            'enter="nsenter --net=$handle"',
+        ]
+    seconds = f"{timeout:g}"
+    for target in targets:
+        if not _PROBE_NAME.fullmatch(target.name) or not 0 < target.port < 65536:
+            raise ValueError(f"refusing probe target {target!r}")
+        host = str(ipaddress.IPv4Address(target.host))
+        lines += [
+            f"if $enter timeout {seconds} bash -c 'exec 3<>\"/dev/tcp/$0/$1\"' {host} {target.port} 2>/dev/null; then",
+            f"  echo 'PROBE {target.name} connected'",
+            "else",
+            "  rc=$?",
+            f"  if [ \"$rc\" = 124 ]; then echo 'PROBE {target.name} timed-out'; else echo \"PROBE {target.name} refused rc=$rc\"; fi",
+            "fi",
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def _parse_tcp_probes(output: str, targets: Sequence[TcpTarget]) -> list[TcpProbe]:
+    results: dict[str, str] = {}
+    for line in output.splitlines():
+        if line.startswith("PROBE "):
+            _, name, detail = line.split(" ", 2)
+            results[name] = detail
+    missing = [target.name for target in targets if target.name not in results]
+    if missing:
+        raise RuntimeError(f"the probe reported nothing for {missing}: {output.strip()!r}")
+    return [
+        TcpProbe(target=target, connected=results[target.name] == "connected", detail=results[target.name])
+        for target in targets
+    ]
 
 
 def _kube_pod_name(value: str) -> str:

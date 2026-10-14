@@ -50,7 +50,8 @@ allow_k8s_contexts("kind-" + KIND_CLUSTER)
 local(["bash", "infra/space/kind/scripts/check-object-store-transition.sh", KIND_CLUSTER], quiet = True)
 
 # A cluster from before the per-service node DaemonSets still runs the single
-# node-stack pod per node; refuse it rather than run both layouts at once. See
+# node-stack pod per node, and one created before the load-balanced entry has
+# no host port mappings for it; refuse either rather than run on it. See
 # "Upgrading from the node-stack layout" in infra/space/kind/README.md.
 local(["bash", "infra/space/kind/scripts/check-node-layout.sh", KIND_CLUSTER], quiet = True)
 
@@ -69,6 +70,9 @@ TELEMETRY_CONFIG = decode_json(local(["python3", DATADOG_SCRIPT, "preflight", "-
 DATADOG_MODE = TELEMETRY_CONFIG["backend"]
 TELEMETRY_MODE = TELEMETRY_CONFIG["mode"]
 TELEMETRY_SET = TELEMETRY_CONFIG["helm_set"]
+# The build SHA every SPACE image records, matching the version the workloads
+# report; see telemetry_config.py.
+KIND_GIT_SHA = TELEMETRY_CONFIG["commit"] or "unknown"
 watch_file("infra/space/kind/charts/space-kind-telemetry")
 
 # The local backends otel mode exports to, installed as on the bootstrap path.
@@ -185,10 +189,12 @@ def rust_runtime_image(name, dockerfile, runtime_deps):
         pull_base_images(dockerfile),
         RUST_ARTIFACT_BUILD,
         ("docker build -t $EXPECTED_REF -f {dockerfile} {mirrored} " +
-         "--build-arg SPACE_RUST_BUILD_IMAGE={rust_image} .").format(
+         "--build-arg SPACE_RUST_BUILD_IMAGE={rust_image} " +
+         "--build-arg SPACE_GIT_SHA={git_sha} .").format(
             dockerfile = dockerfile,
             mirrored = mirrored_bases(dockerfile),
             rust_image = RUST_ARTIFACT_IMAGE,
+            git_sha = KIND_GIT_SHA,
         ),
     ])
     custom_build(
@@ -241,8 +247,8 @@ custom_build(
         # ("content digest ... not found").
         ("docker build --provenance=false --sbom=false -t $EXPECTED_REF " +
          "-f docker/Dockerfile.worker {} " +
-         "--build-arg SPACE_RUST_BUILD_IMAGE={} .").format(
-            mirrored_bases("docker/Dockerfile.worker"), RUST_ARTIFACT_IMAGE),
+         "--build-arg SPACE_RUST_BUILD_IMAGE={} --build-arg SPACE_GIT_SHA={} .").format(
+            mirrored_bases("docker/Dockerfile.worker"), RUST_ARTIFACT_IMAGE, KIND_GIT_SHA),
     ]),
     deps = RUST_ARTIFACT_DEPS + [
             "docker/Dockerfile.worker",
@@ -309,9 +315,26 @@ custom_build(
 # Namespace + RuntimeClass live in infra/space/kind/manifests/ so the scripted
 # bootstrap (infra/space/kind/scripts/bootstrap.sh) and tilt up share one
 # source of truth. NAMESPACE above must stay "space" — the manifest file
-# hardcodes that name and the charts default to it.
+# hardcodes that name and the charts default to it. The same file creates
+# `sandboxes`, the charts' k8s.sandboxNamespace, where the API creates the
+# per-sandbox pods.
 k8s_yaml("infra/space/kind/manifests/namespace.yaml")
 k8s_yaml("infra/space/kind/manifests/runtimeclass.yaml")
+
+# The sandbox namespace's NetworkPolicies: a default-deny plus the traffic a
+# sandbox pod carries (the chart cites the code behind each rule). The API
+# waits for them, so no sandbox pod runs before its namespace is confined.
+# internal-rpc-tls applies the Namespace manifest first.
+k8s_yaml(helm("infra/space/kind/charts/space-sandbox-network-policy", name = "space", namespace = NAMESPACE))
+k8s_resource(
+    new_name = "space-sandbox-network-policy",
+    objects = [
+        "space-sandbox-default-deny:networkpolicy:sandboxes",
+        "space-sandbox-allow:networkpolicy:sandboxes",
+    ],
+    labels = ["bootstrap"],
+    resource_deps = ["internal-rpc-tls"],
+)
 
 # Label sandbox workers so the api-server's K8s scheduler can place sandbox
 # pods there. Targets only nodes with node-pool=sandbox (set in kind-cluster.yaml.tmpl)
@@ -460,7 +483,7 @@ if DATADOG_MODE == "fakeintake":
         labels = ["observability"],
     )
 
-# Postgres first; the api-server's migrate initContainer blocks on it.
+# Postgres first; the space-db-migrate Job blocks on it.
 k8s_yaml(helm_release("space", "infra/space/kind/charts/space-postgres"))
 k8s_resource(
     "space-postgres",
@@ -473,13 +496,38 @@ k8s_resource(
 # lands.
 SPACE_API_DEPS = ["space-postgres", "label-kind-workers", "label-kind-infra",
                   "advertise-kind-worker-network-slots", "install-space-shim",
-                  "internal-rpc-tls"]
+                  "internal-rpc-tls", "space-sandbox-network-policy", "space-db-migrate"]
+# No port_forward: localhost:8080 is the cluster's host port mapping onto the
+# space-api-entry NodePort (kind-cluster.yaml.tmpl), which spreads connections
+# across the autoscaled replicas as a deployment's load balancer does.
 k8s_yaml(helm_release("space", "infra/space/kind/charts/space-api-local"))
 k8s_resource(
     "space-api",
-    port_forwards = ["8080:8080"],
     labels = ["control-plane"],
     resource_deps = SPACE_API_DEPS,
+)
+# The control-plane migrations, once, before any API replica starts (the
+# chart's space-db-migrate Job), as a deployment runs them ahead of its
+# application releases.
+k8s_resource(
+    "space-db-migrate",
+    labels = ["data"],
+    resource_deps = ["space-postgres", "label-kind-infra"],
+)
+# The dedicated admin API, its own process (--surface admin).
+k8s_resource(
+    "space-admin-api",
+    labels = ["control-plane"],
+    resource_deps = ["space-api"],
+)
+
+# The resource metrics API the API and data-plane HorizontalPodAutoscalers
+# read, in kube-system as a managed cluster's add-on is.
+k8s_yaml(helm("infra/space/kind/charts/space-metrics-server", name = "space", namespace = "kube-system"))
+k8s_resource(
+    "metrics-server",
+    labels = ["control-plane"],
+    resource_deps = ["label-kind-infra"],
 )
 
 # The Kind user stays locked in shared migrations. Provision only after the
@@ -529,9 +577,10 @@ k8s_resource(
 
 # Public data-plane service for native sessions and ECW wildcard hosts.
 k8s_yaml(helm_release("space", "infra/space/kind/charts/space-data-plane-local"))
+# localhost:8090 is the host port mapping onto space-data-plane-entry, as for
+# the API above.
 k8s_resource(
     "space-data-plane",
-    port_forwards = ["8090:8090"],
     labels = ["control-plane"],
     resource_deps = ["space-api", "space-internal-api", "label-kind-infra"],
 )

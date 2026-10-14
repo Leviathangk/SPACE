@@ -107,7 +107,7 @@ async fn failed_plaintext_connect() -> FailedPlaintextConnect {
         dns_attributed_connections: DnsAttributedTcpTracker::default(),
         tls_interception: Default::default(),
         reserved_dns: crate::reserved_dns::test_support::test_core(),
-        reserved_dns_cancellation: crate::reserved_dns::ReservedDnsCancellation::default(),
+        reserved_dns_cancellation: crate::state::ReservedDnsCancellation::default(),
         known_egress_state: crate::known_egress::KnownEgressState::default(),
         debug_state: GatewayDebugState::default(),
         shutdown_token: CancellationToken::new(),
@@ -130,10 +130,13 @@ async fn failed_plaintext_connect() -> FailedPlaintextConnect {
         async move {
             proxy
                 .host_bound_http(gateway_guest, destination, |destination| async move {
-                    Err::<DuplexStream, _>(io::Error::new(
-                        io::ErrorKind::ConnectionRefused,
-                        format!("test connect refusal to {destination}"),
-                    ))
+                    Err::<DuplexStream, _>(
+                        io::Error::new(
+                            io::ErrorKind::ConnectionRefused,
+                            format!("test connect refusal to {destination}"),
+                        )
+                        .into(),
+                    )
                 })
                 .await
         }
@@ -196,7 +199,7 @@ async fn dns_attributed_pypi_proxy() -> (TcpProxy, Arc<NetworkPolicyV1>) {
         dns_attributed_connections: DnsAttributedTcpTracker::default(),
         tls_interception: Default::default(),
         reserved_dns: crate::reserved_dns::test_support::test_core(),
-        reserved_dns_cancellation: crate::reserved_dns::ReservedDnsCancellation::default(),
+        reserved_dns_cancellation: crate::state::ReservedDnsCancellation::default(),
         known_egress_state: crate::known_egress::KnownEgressState::default(),
         debug_state: GatewayDebugState::default(),
         shutdown_token: CancellationToken::new(),
@@ -399,25 +402,11 @@ async fn lazy_plaintext_connect_failure_log_omits_raw_destination() {
 async fn failed_policy_refresh_cancels_established_tcp_connections() {
     let dns_allow_cache = DnsAllowCache::default();
     let dns_attributed_connections = DnsAttributedTcpTracker::default();
-    let install_hook = {
-        let cache = dns_allow_cache.clone();
-        let dns_attributed_connections = dns_attributed_connections.clone();
-        Arc::new(move |policy: &NetworkPolicyV1| {
-            cache.retain_relevant_to_policy(policy);
-            dns_attributed_connections.cancel_denied(policy, &cache);
-        })
-    };
-    let policy_invalidation_hook = {
-        let dns_attributed_connections = dns_attributed_connections.clone();
-        Arc::new(move |invalidation| {
-            if invalidation == crate::state::PolicyInvalidation::InstalledPolicy {
-                dns_attributed_connections.cancel_all();
-            }
-        })
-    };
-    let state = GatewayNetworkState::pending_policy()
-        .with_install_hook(install_hook)
-        .with_policy_invalidation_hook(policy_invalidation_hook);
+    let state = GatewayNetworkState::pending_policy().with_egress(
+        dns_allow_cache.clone(),
+        dns_attributed_connections.clone(),
+        crate::state::ReservedDnsCancellation::default(),
+    );
     install_policy(
         &state,
         NetworkPolicyV1::allow_all(),
@@ -541,7 +530,7 @@ async fn tcp_admission_returns_the_authorized_route_or_deny() {
         dns_attributed_connections: DnsAttributedTcpTracker::default(),
         tls_interception: Default::default(),
         reserved_dns: crate::reserved_dns::test_support::test_core(),
-        reserved_dns_cancellation: crate::reserved_dns::ReservedDnsCancellation::default(),
+        reserved_dns_cancellation: crate::state::ReservedDnsCancellation::default(),
         known_egress_state: crate::known_egress::KnownEgressState::default(),
         debug_state: GatewayDebugState::default(),
         shutdown_token: CancellationToken::new(),
@@ -697,7 +686,7 @@ async fn tcp_handoff_allows_current_and_rejects_replaced_policy() {
         dns_attributed_connections: DnsAttributedTcpTracker::default(),
         tls_interception: Default::default(),
         reserved_dns: crate::reserved_dns::test_support::test_core(),
-        reserved_dns_cancellation: crate::reserved_dns::ReservedDnsCancellation::default(),
+        reserved_dns_cancellation: crate::state::ReservedDnsCancellation::default(),
         known_egress_state: crate::known_egress::KnownEgressState::default(),
         debug_state: GatewayDebugState::default(),
         shutdown_token: CancellationToken::new(),
@@ -750,7 +739,7 @@ async fn record_emits_one_connection_metric_and_reports_every_failure_outcome() 
         dns_attributed_connections: DnsAttributedTcpTracker::default(),
         tls_interception: Default::default(),
         reserved_dns: crate::reserved_dns::test_support::test_core(),
-        reserved_dns_cancellation: crate::reserved_dns::ReservedDnsCancellation::default(),
+        reserved_dns_cancellation: crate::state::ReservedDnsCancellation::default(),
         known_egress_state: crate::known_egress::KnownEgressState::new(vec![host.clone()]),
         debug_state: GatewayDebugState::default(),
         shutdown_token: CancellationToken::new(),
@@ -795,12 +784,9 @@ async fn record_emits_one_connection_metric_and_reports_every_failure_outcome() 
             DenyReason::Default,
         ))),
         FlowOutcome::Rejected(Rejection::Admission(TcpAdmissionDenial::PolicyChanged)),
-        FlowOutcome::RelayFailed(RelayFailure::Connect(io::Error::new(
-            io::ErrorKind::ConnectionRefused,
-            "test connect failure",
-        ))),
-        FlowOutcome::RelayFailed(RelayFailure::PlaintextUpstreamHttp),
-        FlowOutcome::RelayFailed(RelayFailure::PlaintextGuestHttp),
+        FlowOutcome::RelayFailed(RelayFailure::Connect(
+            io::Error::new(io::ErrorKind::ConnectionRefused, "test connect failure").into(),
+        )),
         FlowOutcome::Rejected(Rejection::TlsInterception(TlsInterceptionError::Timeout)),
         FlowOutcome::RelayFailed(RelayFailure::Transfer(io::Error::other(
             "test transfer failure",
@@ -943,7 +929,7 @@ async fn devbox_full_proxy_run_extracts_sni_from_real_client() {
         dns_attributed_connections: DnsAttributedTcpTracker::default(),
         tls_interception: Default::default(),
         reserved_dns: crate::reserved_dns::test_support::test_core(),
-        reserved_dns_cancellation: crate::reserved_dns::ReservedDnsCancellation::default(),
+        reserved_dns_cancellation: crate::state::ReservedDnsCancellation::default(),
         known_egress_state: crate::known_egress::KnownEgressState::default(),
         debug_state: debug_state.clone(),
         shutdown_token: shutdown.clone(),

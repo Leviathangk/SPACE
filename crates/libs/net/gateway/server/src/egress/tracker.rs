@@ -6,14 +6,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
-use pplx_space_net_common::{
-    DenyReason, DomainName, EgressDecision, NetworkPolicyV1, TlsInterception,
-};
+use pplx_space_net_common::{DomainName, NetworkPolicyV1, TlsInterception};
 use tokio_util::sync::CancellationToken;
 
-use super::admission::dns_attributed_host;
+use super::tcp::{dns_attributed_host, revalidate_tcp};
 use crate::dns::DnsAllowCache;
-use crate::egress::{EgressContext, dns_allow_required, evaluate_egress_with_post_policy};
 use crate::tls_sni::ClientHelloScan;
 
 /// Established-flow registry shared by admission and policy resweeps.
@@ -29,23 +26,23 @@ struct DnsAttributedInner {
 }
 
 #[derive(Debug)]
-struct DnsAttributedConnection {
-    destination: SocketAddr,
+pub(super) struct DnsAttributedConnection {
+    pub(super) destination: SocketAddr,
     /// The admission-time ClientHello verdict. Only `NotTls` proves a flow is
     /// plaintext; `None` server names also arise from late, absent, malformed
     /// or oversized ClientHellos that Off relays opaquely.
-    scan: ClientHelloScan,
+    pub(super) scan: ClientHelloScan,
     // The admission policy fixes the transport for this connection's lifetime.
     // This is the effective mode after destination exemptions.
-    admitted_tls_interception: TlsInterception,
+    pub(super) admitted_tls_interception: TlsInterception,
     // DNS expiry limits new admissions, not the lifetime of an exempt TLS flow.
     // Current policy permissions and exemptions are still checked on each sweep.
-    admitted_exempt_host: Option<DomainName>,
+    pub(super) admitted_exempt_host: Option<DomainName>,
     shutdown_token: CancellationToken,
 }
 
-pub(super) struct TcpConnectionGuard {
-    pub(super) interception_mode: TlsInterception,
+pub(crate) struct TcpConnectionGuard {
+    pub(crate) interception_mode: TlsInterception,
     id: u64,
     tracker: DnsAttributedTcpTracker,
 }
@@ -54,7 +51,7 @@ impl DnsAttributedTcpTracker {
     /// Register an established flow. The guard unregisters on drop, so the
     /// caller must hold it for the lifetime of the connection.
     #[must_use]
-    pub(super) fn register(
+    pub(crate) fn register(
         &self,
         destination: SocketAddr,
         scan: ClientHelloScan,
@@ -96,9 +93,7 @@ impl DnsAttributedTcpTracker {
         policy: &NetworkPolicyV1,
         dns_allow_cache: &DnsAllowCache,
     ) -> usize {
-        self.cancel_matching(|connection| {
-            dns_attributed_flow_is_denied(connection, policy, dns_allow_cache)
-        })
+        self.cancel_matching(|connection| !revalidate_tcp(connection, policy, dns_allow_cache))
     }
 
     /// Cancel every tracked flow when there is no policy left to authorize it.
@@ -129,86 +124,6 @@ impl Drop for TcpConnectionGuard {
     fn drop(&mut self) {
         self.tracker.unregister(self.id);
     }
-}
-
-fn dns_attributed_flow_is_denied(
-    connection: &DnsAttributedConnection,
-    policy: &NetworkPolicyV1,
-    dns_allow_cache: &DnsAllowCache,
-) -> bool {
-    // Opaque TLS must reconnect when its destination requires interception.
-    // Prefer the admission binding for an exempt flow; other flows use live DNS.
-    let attributed_host = connection
-        .admitted_exempt_host
-        .as_ref()
-        .or_else(|| dns_attributed_host(connection.destination, &connection.scan, dns_allow_cache));
-    let interception_mode =
-        policy.tls_interception_for(connection.destination.ip(), attributed_host);
-    if connection.scan != ClientHelloScan::NotTls
-        && connection.admitted_tls_interception.is_off()
-        && interception_mode == TlsInterception::On
-    {
-        return true;
-    }
-    let dns_allowed = dns_allow_cache.allows_ip(connection.destination.ip(), policy)
-        || connection
-            .admitted_exempt_host
-            .as_ref()
-            .is_some_and(|host| policy.explicitly_allows_domain_name(host));
-    let server_name = connection.scan.server_name();
-    let explicit_domain_deny =
-        server_name.is_some_and(|server_name| policy.denies_domain(server_name));
-    let decision = evaluate_egress_with_post_policy(
-        EgressContext::Resweep,
-        connection.destination,
-        dns_allowed,
-        policy,
-        |decision| {
-            if explicit_domain_deny
-                && ((decision.is_allowed()
-                    && !policy.tls_interception.is_off()
-                    && interception_mode.is_off())
-                    || matches!(
-                        decision,
-                        EgressDecision::Deny {
-                            reason: DenyReason::Default,
-                        }
-                    ))
-            {
-                return EgressDecision::Deny {
-                    reason: DenyReason::Rule,
-                };
-            }
-            if !decision.is_allowed() {
-                return decision;
-            }
-            let Some(fail_closed_reason) = dns_allow_required(connection.destination, policy)
-            else {
-                return decision;
-            };
-            // A plaintext flow can carry a different Host on every request.
-            // Close it so a retry starts under the new policy.
-            let Some(server_name) = server_name else {
-                return EgressDecision::Deny {
-                    reason: fail_closed_reason,
-                };
-            };
-            if policy.explicitly_allows_domain_name(server_name)
-                && attributed_host == Some(server_name)
-            {
-                decision
-            } else {
-                EgressDecision::Deny {
-                    reason: if explicit_domain_deny {
-                        DenyReason::Rule
-                    } else {
-                        fail_closed_reason
-                    },
-                }
-            }
-        },
-    );
-    !decision.is_allowed()
 }
 
 #[cfg(test)]

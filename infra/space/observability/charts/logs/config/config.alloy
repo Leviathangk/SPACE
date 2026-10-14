@@ -23,6 +23,15 @@ discovery.relabel "eligible_pods" {
     action = "drop"
   }
 {{- end }}
+  // Plain-text output, such as an init container's, has no JSON `service`.
+  // Name such a stream after its container, in the form SPACE services use,
+  // so every stream has one; a line's own JSON `service` replaces it below.
+  rule {
+    source_labels = ["__path__"]
+    regex = ".*/[^/]+/(?:space-)?([^/]+)/[^/]+"
+    target_label = "service"
+    replacement = "space-$1"
+  }
 }
 loki.source.file "pods" {
   targets = discovery.relabel.eligible_pods.output
@@ -30,8 +39,10 @@ loki.source.file "pods" {
 }
 loki.process "cri" {
   stage.cri {}
+  // The transport is `log_source`, not `source`: SPACE JSON lines carry their
+  // own `source` field, which a stream label of that name would shadow.
   stage.static_labels {
-    values = {source = "container", node = sys.env("NODE_NAME"), cluster = {{ .Values.clusterLabel | quote }}}
+    values = {log_source = "container", node = sys.env("NODE_NAME"), cluster = {{ .Values.clusterLabel | quote }}}
   }
   // Transport identity is searchable metadata, not an indexed stream label.
   stage.structured_metadata {
@@ -69,7 +80,7 @@ loki.source.journal "host" {
   max_age = {{ .Values.collection.journal.maxAge | quote }}
   format_as_json = false
   relabel_rules = loki.relabel.journal.rules
-  labels = {source = "journal", namespace = "host", node = sys.env("NODE_NAME"), cluster = {{ .Values.clusterLabel | quote }}}
+  labels = {log_source = "journal", namespace = "host", node = sys.env("NODE_NAME"), cluster = {{ .Values.clusterLabel | quote }}}
   forward_to = [loki.process.space.receiver]
 }
 {{- end }}
@@ -79,6 +90,8 @@ loki.process "space" {
   stage.json {
     expressions = {service = "service", environment = "env", cluster = "cluster_id", event_time = "timestamp"}
   }
+  // A label is set only from a value the line carries, so a container's
+  // fallback `service` stays when the line has none.
   stage.labels {
     values = {service = "", environment = "", cluster = ""}
   }
@@ -92,7 +105,7 @@ loki.process "space" {
   }
   // No pod IDs, sandbox/request IDs, versions, filenames or arbitrary JSON labels.
   stage.label_keep {
-    values = ["service", "environment", "cluster", "namespace", "source", "node"]
+    values = ["service", "environment", "cluster", "namespace", "log_source", "node"]
   }
   forward_to = [loki.write.local.receiver{{ if .Values.validationEcho }}, loki.echo.validation.receiver{{ end }}]
 }

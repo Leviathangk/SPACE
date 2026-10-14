@@ -46,17 +46,48 @@ impl GitHubReleaseSource {
 
     /// The response's status and headers; the caller bounds the wait.
     async fn send(&self, location: &ReleaseUrl) -> Result<reqwest::Response, ReleaseSourceError> {
+        use tracing::Instrument as _;
         let fetch = |source: reqwest::Error| ReleaseSourceError::Fetch {
             location: location.clone(),
             source: Box::new(source),
         };
-        self.client
+        // The URL is a public release location, never user input.
+        let span = tracing::info_span!(
+            "http.client",
+            otel.kind = "client",
+            otel.name = "GET release archive",
+            otel.status_code = tracing::field::Empty,
+            otel.status_description = tracing::field::Empty,
+            "operation.name" = "http.client",
+            http.request.method = "GET",
+            url.full = location.as_str(),
+            http.response.status_code = tracing::field::Empty,
+        );
+        let response = self
+            .client
             .get(location.as_str())
             .send()
+            .instrument(span.clone())
             .await
-            .map_err(fetch)?
-            .error_for_status()
-            .map_err(fetch)
+            .and_then(|response| {
+                span.record("http.response.status_code", response.status().as_u16());
+                response.error_for_status()
+            });
+        match response {
+            Ok(response) => {
+                span.record("otel.status_code", "OK");
+                Ok(response)
+            }
+            Err(error) => {
+                // reqwest's error names the final URL, which after GitHub's
+                // redirect is a signed object-storage URL; `location` already
+                // names the public one.
+                let error = error.without_url();
+                span.record("otel.status_code", "ERROR");
+                span.record("otel.status_description", error.to_string().as_str());
+                Err(fetch(error))
+            }
+        }
     }
 }
 

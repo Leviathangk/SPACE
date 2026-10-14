@@ -304,7 +304,10 @@ apply_node_labels
 # them as different revisions of the SAME release, which makes helm remove
 # the previous chart's resources on the next install. The Tilt setup
 # sidesteps this by using `helm template` + kubectl apply (no release
-# management), which is what we mirror here.
+# management), which is what we mirror here. Every rendered object names its
+# own namespace (`--namespace` sets the release's), so the apply takes no
+# `-n`: the API, cluster-controller and internal-api charts also render RBAC
+# into the sandbox namespace, which a `-n space` apply would refuse.
 helm_apply() {
   local release=$1 chart=$2; shift 2
   log "helm template + apply: $release ← $(basename "$chart")"
@@ -313,7 +316,7 @@ helm_apply() {
     --include-crds \
     ${TELEMETRY_HELM_ARGS[@]+"${TELEMETRY_HELM_ARGS[@]}"} \
     "$@" \
-    | kubectl --context "$KCTX" apply -n "$NAMESPACE" --validate=false -f -
+    | kubectl --context "$KCTX" apply --validate=false -f -
 }
 
 # ── Optional AWS creds for independent credmgr integrations ──────────────────
@@ -336,7 +339,7 @@ else
   log "AWS creds unset — optional credmgr AWS integrations stay disabled."
 fi
 
-# Postgres first; the api-server's migrate initContainer blocks on it. Wait
+# Postgres first; the space-db-migrate Job blocks on it. Wait
 # for it to be ready BEFORE installing other charts that try to talk to it,
 # so initContainer / Job retries don't waste backoff slots.
 helm_apply space "$KIND_DIR/charts/space-postgres"
@@ -363,12 +366,26 @@ helm_apply space "$KIND_DIR/charts/space-redis-local"
 log "waiting for redis Deployment to be ready"
 kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-redis --timeout="${TIMEOUT}s"
 
-# api-server. The initContainer runs the control-plane migrator against the
-# now-ready postgres. The main container is gated on /readyz, which only
-# turns 200 after the K8s pod reflector's initial LIST completes (empty list
-# is fine at this stage — no node-api pods yet).
+# The sandbox namespace's NetworkPolicies, before the API can create the first
+# sandbox pod there.
+helm_apply space "$KIND_DIR/charts/space-sandbox-network-policy"
+
+# The control-plane migrations run once, as the api chart's space-db-migrate
+# Job, against the now-ready postgres before any API replica starts. A Job's
+# pod template is immutable, so the previous run's Job is replaced.
+kubectl --context "$KCTX" -n "$NAMESPACE" delete job space-db-migrate --ignore-not-found >/dev/null
+helm template space "$KIND_DIR/charts/space-api-local" --namespace "$NAMESPACE" \
+  ${TELEMETRY_HELM_ARGS[@]+"${TELEMETRY_HELM_ARGS[@]}"} --show-only templates/migrate-job.yaml \
+  | kubectl --context "$KCTX" apply -n "$NAMESPACE" --validate=false -f -
+log "waiting for the space-db-migrate Job (control-plane migrations)"
+kubectl --context "$KCTX" -n "$NAMESPACE" wait --for=condition=complete \
+  job/space-db-migrate --timeout="${TIMEOUT}s" >/dev/null
+
+# api-server. The main container is gated on /readyz, which only turns 200
+# after the K8s pod reflector's initial LIST completes (empty list is fine at
+# this stage — no node-api pods yet).
 helm_apply space "$KIND_DIR/charts/space-api-local"
-log "waiting for space-api Deployment to be ready (initContainer runs migrations)"
+log "waiting for space-api Deployment to be ready"
 kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-api --timeout="${TIMEOUT}s"
 
 SPACE_CONSOLE_PASSWORD="$CONSOLE_PASSWORD" bash "$KIND_DIR/scripts/provision-local-console.sh"
@@ -386,6 +403,13 @@ if [[ -f "$SSH_KEY_DIR/sandbox_ed25519" ]]; then
 else
   log "WARNING: $SSH_KEY_DIR/sandbox_ed25519 missing (build-seed.sh not run?); space-ssh will not work"
 fi
+
+# The resource metrics API the API and data-plane HorizontalPodAutoscalers
+# read, in kube-system as a managed cluster's add-on is (so not through
+# helm_apply, whose apply is pinned to $NAMESPACE).
+log "helm template + apply: space ← space-metrics-server (kube-system)"
+helm template space "$KIND_DIR/charts/space-metrics-server" --namespace kube-system \
+  | kubectl --context "$KCTX" apply -n kube-system --validate=false -f -
 
 # Once api-server has the control-plane schema, drive everything else.
 helm_apply space "$KIND_DIR/charts/space-internal-api-local"
@@ -427,6 +451,12 @@ kubectl --context "$KCTX" -n "$NAMESPACE" delete job space-seed-publish --ignore
 helm_apply space "$KIND_DIR/charts/space-seed-publish"
 
 # ── Step 8: readiness gates ──────────────────────────────────────────────────
+log "waiting for space-admin-api Deployment"
+kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-admin-api --timeout="${TIMEOUT}s"
+
+log "waiting for metrics-server Deployment"
+kubectl --context "$KCTX" -n kube-system rollout status deploy/metrics-server --timeout="${TIMEOUT}s"
+
 log "waiting for space-internal-api Deployment"
 kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-internal-api --timeout="${TIMEOUT}s"
 
@@ -482,11 +512,14 @@ else
 fi
 
 # ── Step 9: optional port-forwards ───────────────────────────────────────────
-# Without supervision the smoke tests can't be re-run later in the session
-# because their localhost:80{80,90} endpoints have silently gone away: kubectl
-# port-forward dies on its own when its pod restarts. port-forward.sh restarts
-# each forward whenever kubectl exits, and `setsid` lets it survive our parent
-# shell and its tty and emits a pid we can later kill via PF_PIDFILE.
+# The API and data plane need none: localhost:8080 and :8090 are the cluster's
+# host port mappings onto their NodePort entry Services (kind-cluster.yaml.tmpl),
+# which reach every replica and outlive any pod. The single-replica services
+# below are still forwarded. Without supervision the smoke tests can't be
+# re-run later in the session because those endpoints have silently gone away:
+# kubectl port-forward dies on its own when its pod restarts. port-forward.sh
+# restarts each forward whenever kubectl exits, and `setsid` lets it survive
+# our parent shell and its tty and emits a pid we can later kill via PF_PIDFILE.
 start_pf() {
   # Note: assigning all three on one `local` line evaluates `${target##*/}`
   # before `target=$1` lands in the local scope, which trips `set -u`.
@@ -519,8 +552,6 @@ if (( PORT_FORWARD )); then
     done <"$PF_PIDFILE"
   fi
   : >"$PF_PIDFILE"
-  start_pf svc/space-api        8080:8080
-  start_pf svc/space-data-plane 8090:8090
   start_pf svc/space-ui         3000:3000
   # The object store's S3 API: the node-drain smoke asserts the evacuation's snapshot
   # artifacts through it, so a stack brought up this way has to expose it just
@@ -541,21 +572,22 @@ if (( PORT_FORWARD )); then
     start_pf svc/grafana    13000:3000 space-grafana
   fi
 
-  # The forwards bind asynchronously; callers (e.g. the devbox kind command)
-  # run smokes against localhost:8080 immediately after we return. Wait for
-  # the API listener so that race cannot fail a fresh bring-up.
-  log "waiting for the API port-forward on localhost:8080"
-  pf_ready=0
-  for ((i = 1; i <= 60; i++)); do
-    if curl -fsS -m 2 http://localhost:8080/healthz >/dev/null 2>&1; then
-      pf_ready=1
-      break
-    fi
-    sleep 1
-  done
-  (( pf_ready )) || { log "ERROR: API port-forward did not become ready on localhost:8080"; exit 1; }
   log "port-forward pids in $PF_PIDFILE (kill them with: xargs -a $PF_PIDFILE kill -- ; pkill -f \"space-kind-pf:$KCTX|--context $KCTX.*port-forward\")"
 fi
+
+# Callers (e.g. the devbox kind command) run smokes against localhost:8080
+# immediately after we return. Wait for the API through its entry, which
+# serves whatever the port-forward choice.
+log "waiting for the API entry on localhost:8080"
+entry_ready=0
+for ((i = 1; i <= 60; i++)); do
+  if curl -fsS -m 2 http://localhost:8080/healthz >/dev/null 2>&1; then
+    entry_ready=1
+    break
+  fi
+  sleep 1
+done
+(( entry_ready )) || { log "ERROR: the API did not answer on localhost:8080 (its entry NodePort)"; exit 1; }
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 cat <<MSG

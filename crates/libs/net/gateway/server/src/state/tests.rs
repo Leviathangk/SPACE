@@ -407,51 +407,42 @@ async fn domain_policy_installs_ready() {
 }
 
 #[tokio::test]
-async fn install_hook_reconciles_before_ready_on_self_hydration() {
-    // The self-hydration loop calls `refresh` directly, so reconciliation must
-    // live in that shared install path and finish before the policy is ready.
+async fn policy_install_reconciles_dns_and_connections_on_self_hydration() {
     let state = GatewayNetworkState::pending_policy();
-    let state_during_hook = state.clone();
-    let observed_modes = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let observed_modes_for_hook = Arc::clone(&observed_modes);
-    let hook: InstallHook = Arc::new(move |_policy: &NetworkPolicyV1| {
-        observed_modes_for_hook
-            .lock()
-            .unwrap()
-            .push(state_during_hook.state_rx.borrow().mode);
-    });
+    let cancellation = state.reserved_dns_cancellation.operation_token();
+    let shutdown = CancellationToken::new();
+    let _connection = state.tcp_connections.register(
+        "192.0.2.10:443".parse().unwrap(),
+        crate::tls_sni::ClientHelloScan::NotTls,
+        &NetworkPolicyV1::allow_all(),
+        &state.dns_allow_cache,
+        shutdown.clone(),
+    );
     let policy_ref = test_policy_ref();
-    let state = state.with_install_hook(hook);
-
-    // The self-hydration loop uses `SelfRetry`; a successful install must
-    // fire the hook exactly once.
     let snapshot = state
         .refresh(
-            immediate_success_loader(policy_ref.clone()),
+            v1_domain_allow_loader(policy_ref.clone()),
             Some(policy_ref.clone()),
             NetworkStateReason::SelfRetry,
         )
         .await;
     assert_eq!(snapshot.mode, NetworkState::Ready);
-    assert_eq!(
-        observed_modes.lock().unwrap().as_slice(),
-        &[NetworkState::PendingPolicy],
-        "the hook must run once before the new policy is ready"
+    assert!(cancellation.is_cancelled());
+    assert!(
+        shutdown.is_cancelled(),
+        "the installed policy must close the old IP-only connection"
     );
-
-    // A repeat refresh with the same ref short-circuits (already Ready) and
-    // must NOT re-fire the hook — nothing was reinstalled.
-    let _ = state
+    let next_operation = state.reserved_dns_cancellation.operation_token();
+    state
         .refresh(
-            immediate_success_loader(policy_ref.clone()),
+            v1_domain_allow_loader(policy_ref.clone()),
             Some(policy_ref),
             NetworkStateReason::SelfRetry,
         )
         .await;
-    assert_eq!(
-        observed_modes.lock().unwrap().len(),
-        1,
-        "no-op short-circuit must not re-fire the hook"
+    assert!(
+        !next_operation.is_cancelled(),
+        "an unchanged policy must not cancel current DNS work"
     );
 }
 

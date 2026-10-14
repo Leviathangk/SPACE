@@ -44,13 +44,16 @@ use tonic::{Code, transport::Channel};
 use tracing::Instrument;
 use uuid::Uuid;
 
+mod budgets;
 mod caches;
 mod cancel_rate_tracker;
 mod pod_reflector;
+mod pod_worker_channels;
 mod restore_waiters;
 mod sandbox_pod_view;
 mod store;
 
+use budgets::SubstrateBudgets;
 pub use pod_reflector::ReflectorReady;
 use sandbox_pod_view::NodeNetworkSlots;
 pub use sandbox_pod_view::{
@@ -351,6 +354,14 @@ impl PodIp {
     fn socket_addr(self, port: u16) -> SocketAddr {
         SocketAddr::new(self.0, port)
     }
+}
+
+/// A sandbox pod's address and the pod instance it belongs to.
+#[derive(Clone, Debug)]
+struct ResolvedPodInstance {
+    ip: PodIp,
+    pod_uid: Option<PodUid>,
+    generation: i64,
 }
 
 impl std::fmt::Display for PodIp {
@@ -812,6 +823,8 @@ pub struct KubernetesSubstrate {
     /// expand every replica's pool to its cap. Cross-pod arbitration stays
     /// with the DB lease; this only bounds contenders to one per pod.
     wake_coalescer: WakeCoalescer,
+    /// Node-api channels kept per sandbox pod instance for runtime RPCs.
+    pod_worker_channels: Arc<pod_worker_channels::PodWorkerChannels>,
     /// Resolves each pod build's node-group candidate set. Gated by
     /// `sandbox_pod_config.node_group_placement`
     /// (`SPACE_SANDBOX_NODE_GROUP_PLACEMENT`, default off), in which case it
@@ -822,6 +835,9 @@ pub struct KubernetesSubstrate {
     /// directly so a join's re-check interval is settable in tests;
     /// production takes the default, which is those constants.
     recovery_join_backoff: execution::RecoveryJoinBackoffPolicy,
+    /// Readiness, preserve-decision, suspend and connect budgets. Production
+    /// takes the default, which is the constants each one names.
+    budgets: SubstrateBudgets,
     shutdown_token: CancellationToken,
     task_tracker: TaskTracker,
 }
@@ -857,6 +873,7 @@ impl KubernetesSubstrate {
                         shutdown_token.clone(),
                         task_tracker.clone(),
                     ),
+                    pod_worker_channels: Arc::default(),
                     wake_coalescer: Arc::new(
                         pplx_space_common_work_coalescer::WorkCoalescer::with_tracker(
                             task_tracker.clone(),
@@ -871,6 +888,7 @@ impl KubernetesSubstrate {
                     node_group_placement,
                     cancel_tracker: CancelRateTracker::with_default_budget(),
                     recovery_join_backoff: execution::RecoveryJoinBackoffPolicy::default(),
+                    budgets: SubstrateBudgets::default(),
                     shutdown_token,
                     task_tracker,
                 }))

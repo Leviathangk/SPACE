@@ -37,13 +37,25 @@ impl KubernetesSubstrate {
     }
 }
 
+/// How the node answered a generation-bound suspend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GenerationSuspendOutcome {
+    /// The node published this durable suspend artifact.
+    Durable(PublishedLocalArtifact),
+    /// A generation-fenced local delete covers the execution, so the node has
+    /// no artifact to publish. The suspend may still have become durable
+    /// before that delete; only the control plane's snapshot record can say.
+    NodeDeleted,
+}
+
 pub(super) async fn await_generation_suspend(
     client: &mut RuntimeClient,
     sandbox_id: SandboxId,
     execution_generation: ExecutionGeneration,
     endpoint_addr: &str,
     deadline: Instant,
-) -> Result<PublishedLocalArtifact, SubstrateError> {
+    durability_budget: Duration,
+) -> Result<GenerationSuspendOutcome, SubstrateError> {
     poll_generation_suspend(
         |request| {
             let mut client = client.clone();
@@ -53,6 +65,7 @@ pub(super) async fn await_generation_suspend(
         execution_generation,
         endpoint_addr,
         deadline,
+        durability_budget,
     )
     .await
 }
@@ -63,7 +76,9 @@ pub(super) async fn poll_generation_suspend<F, Fut>(
     execution_generation: ExecutionGeneration,
     endpoint_addr: &str,
     deadline: Instant,
-) -> Result<PublishedLocalArtifact, SubstrateError>
+    // The budget `deadline` was derived from, named in the timeout error.
+    durability_budget: Duration,
+) -> Result<GenerationSuspendOutcome, SubstrateError>
 where
     F: FnMut(
         tonic::Request<pplx_space_sbx_mgr_client::proto::PrepareTeardownSuspendRequest>,
@@ -106,8 +121,7 @@ where
             .await
             .map_err(|_| SubstrateError::Timeout {
                 message: format!(
-                    "generation-bound suspend for sandbox {sandbox_id} generation {execution_generation} did not become durable within {}s",
-                    TEARDOWN_SUSPEND_DURABILITY_BUDGET.as_secs(),
+                    "generation-bound suspend for sandbox {sandbox_id} generation {execution_generation} did not become durable within {durability_budget:?}",
                 ),
                 phase: None,
             })? {
@@ -142,7 +156,8 @@ where
                     .unwrap_or(pplx_space_sbx_mgr_client::proto::TeardownSuspendOutcome::Unspecified);
             match outcome {
                 pplx_space_sbx_mgr_client::proto::TeardownSuspendOutcome::Durable => {
-                    return published_generation_suspend_artifact(response, endpoint_addr);
+                    return published_generation_suspend_artifact(response, endpoint_addr)
+                        .map(GenerationSuspendOutcome::Durable);
                 }
                 pplx_space_sbx_mgr_client::proto::TeardownSuspendOutcome::Pending => {
                     pending_responses += 1;
@@ -194,11 +209,7 @@ where
                     });
                 }
                 pplx_space_sbx_mgr_client::proto::TeardownSuspendOutcome::Deleted => {
-                    return Err(SubstrateError::Unavailable {
-                        message: response.reason.unwrap_or_else(|| {
-                            format!("sandbox {sandbox_id} was deleted before suspend completed")
-                        }),
-                    });
+                    return Ok(GenerationSuspendOutcome::NodeDeleted);
                 }
                 pplx_space_sbx_mgr_client::proto::TeardownSuspendOutcome::Unspecified => {
                     return Err(SubstrateError::Failed {
@@ -373,7 +384,8 @@ impl KubernetesSubstrate {
                 .emit_with(
                     SandboxEventDetails::default()
                         .pod_name(pod_name.clone())
-                        .error(error.to_string()),
+                        .error(error.to_string())
+                        .logged_by_caller(),
                 );
                 return Err(error);
             }

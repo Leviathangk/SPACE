@@ -22,6 +22,9 @@ type shimSpan interface {
 
 type tracePipeline interface {
 	start(context.Context, string, ...attribute.KeyValue) (shimSpan, context.Context)
+	// startLinked starts a new root span linked to the context serialized in
+	// the carrier, or an unlinked root when the carrier holds none.
+	startLinked(context.Context, string, propagation.MapCarrier, ...attribute.KeyValue) (shimSpan, context.Context)
 	extract(context.Context, propagation.MapCarrier) context.Context
 	inject(context.Context, propagation.MapCarrier)
 	shutdown(context.Context) error
@@ -111,6 +114,9 @@ func newDisabledTracePipeline() tracePipeline { return disabledTracePipeline{} }
 func (disabledTracePipeline) start(ctx context.Context, _ string, _ ...attribute.KeyValue) (shimSpan, context.Context) {
 	return disabledShimSpan{}, ctx
 }
+func (disabledTracePipeline) startLinked(ctx context.Context, _ string, _ propagation.MapCarrier, _ ...attribute.KeyValue) (shimSpan, context.Context) {
+	return disabledShimSpan{}, ctx
+}
 func (disabledShimSpan) SetAttributes(...attribute.KeyValue) {}
 func (disabledShimSpan) End(error)                           {}
 func (disabledTracePipeline) extract(ctx context.Context, _ propagation.MapCarrier) context.Context {
@@ -142,11 +148,26 @@ func startSpan(ctx context.Context, name string, attrs ...attribute.KeyValue) (s
 	return initTracer().start(ctx, name, attrs...)
 }
 
+// Work that outlives the request that started it, such as a task's teardown
+// after its create, starts a new root linked to that request's serialized
+// context. An empty or malformed traceparent leaves the root unlinked.
+func startLinkedSpan(ctx context.Context, name, traceparent string, attrs ...attribute.KeyValue) (shimSpan, context.Context) {
+	return initTracer().startLinked(ctx, name, propagation.MapCarrier{"traceparent": traceparent}, attrs...)
+}
+
 // An empty or malformed serialized parent preserves the caller's context.
 func startSpanWithRemoteParent(ctx context.Context, name, traceparent string, attrs ...attribute.KeyValue) (shimSpan, context.Context) {
 	pipeline := initTracer()
 	ctx = pipeline.extract(ctx, propagation.MapCarrier{"traceparent": traceparent})
 	return pipeline.start(ctx, name, attrs...)
+}
+
+// The W3C traceparent of ctx's current span, or "" when tracing is off or no
+// span is current.
+func serializedTraceparent(ctx context.Context) string {
+	carrier := propagation.MapCarrier{}
+	initTracer().inject(ctx, carrier)
+	return carrier["traceparent"]
 }
 
 func injectTraceMetadata(ctx context.Context, pipeline tracePipeline) context.Context {

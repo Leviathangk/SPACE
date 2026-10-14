@@ -415,6 +415,77 @@ impl SnapshotSandboxRow {
     }
 }
 
+/// What a `GetArtifactBackupLocation` request asks. The two wire shapes are
+/// told apart before any lookup, so a readiness query cannot select a
+/// storage location.
+enum ArtifactBackupQuery {
+    /// Where the ready backup of this exact local artifact lives.
+    Location(LocalArtifactId, ArtifactKind),
+    Readiness(BackupReadiness),
+}
+
+/// An identity the calling node already holds, to prove backed up.
+enum BackupReadiness {
+    /// These exact immutable bytes have a ready, non-orphaned backup.
+    Artifact(LocalArtifactId, ArtifactKind),
+    /// An unpinned cache's suspend attempt is still the latest ready one.
+    LatestReadySuspend(SnapshotId),
+}
+
+fn parse_artifact_backup_query(
+    req: GetArtifactBackupLocationRequest,
+) -> Result<(SandboxId, ArtifactBackupQuery), Status> {
+    use crate::proto::backup_readiness_query::Artifact;
+    let sandbox_id = SandboxId::from_str(req.sandbox_id.trim())
+        .map_err(|e| Status::invalid_argument(format!("invalid sandbox_id: {e}")))?;
+    let parse_artifact = |local_artifact_id: &str, artifact_kind| {
+        let local_artifact_id = LocalArtifactId::from_str(local_artifact_id.trim())
+            .map_err(|e| Status::invalid_argument(format!("invalid local_artifact_id: {e}")))?;
+        let artifact_kind = artifact_kind_from_proto(artifact_kind)
+            .ok_or_else(|| Status::invalid_argument("artifact_kind must be DISK or FULL"))?;
+        Ok::<_, Status>((local_artifact_id, artifact_kind))
+    };
+    let Some(readiness) = req.readiness else {
+        let (local_artifact_id, artifact_kind) =
+            parse_artifact(&req.local_artifact_id, req.artifact_kind)?;
+        return Ok((
+            sandbox_id,
+            ArtifactBackupQuery::Location(local_artifact_id, artifact_kind),
+        ));
+    };
+    // A readiness query names its identity only inside `readiness`, which is
+    // what makes a server without readiness support reject it.
+    if !req.local_artifact_id.is_empty()
+        || req.artifact_kind != pplx_space_sbx_mgr_client::proto::ArtifactKind::Unspecified as i32
+    {
+        return Err(Status::invalid_argument(
+            "a readiness query must leave local_artifact_id and artifact_kind unset",
+        ));
+    }
+    let readiness = match readiness.artifact {
+        Some(Artifact::LocalArtifact(identity)) => {
+            let (local_artifact_id, artifact_kind) =
+                parse_artifact(&identity.local_artifact_id, identity.artifact_kind)?;
+            BackupReadiness::Artifact(local_artifact_id, artifact_kind)
+        }
+        Some(Artifact::LatestReadySuspendSnapshotId(snapshot_id)) => {
+            BackupReadiness::LatestReadySuspend(SnapshotId::from_str(snapshot_id.trim()).map_err(
+                |e| {
+                    Status::invalid_argument(format!(
+                        "invalid latest_ready_suspend_snapshot_id: {e}"
+                    ))
+                },
+            )?)
+        }
+        None => {
+            return Err(Status::invalid_argument(
+                "readiness artifact identity is required",
+            ));
+        }
+    };
+    Ok((sandbox_id, ArtifactBackupQuery::Readiness(readiness)))
+}
+
 /// Parse the digests a node reports at finalize: one entry per artifact.
 fn parse_artifact_digests(
     digests: &[crate::proto::SnapshotArtifactDigest],
@@ -594,7 +665,12 @@ impl ClusterApiService {
             .await?
             .ok_or_else(|| Status::not_found(format!("snapshot {snapshot_id} not found")))?;
         let source_node = self
-            .authorize_backup_source_node(attempt.source_node_id(), remote_addr, "backup attempt")
+            .authorize_backup_source_node(
+                &self.pool,
+                attempt.source_node_id(),
+                remote_addr,
+                "backup attempt",
+            )
             .await?;
 
         // For READY, persist the uploaded bytes and clear any
@@ -861,6 +937,7 @@ impl ClusterApiService {
         // and a read before the transaction could see a row retention
         // deletes before the insert. A refusal rolls the insert back.
         self.authorize_backup_source_node(
+            &mut *tx,
             persisted.source_node_id(),
             remote_addr,
             "backup attempt",
@@ -922,61 +999,81 @@ impl ClusterApiService {
         &self,
         request: Request<GetArtifactBackupLocationRequest>,
     ) -> Result<Response<GetArtifactBackupLocationResponse>, Status> {
-        let req = request.into_inner();
-        let sandbox_id = SandboxId::from_str(req.sandbox_id.trim())
-            .map_err(|e| Status::invalid_argument(format!("invalid sandbox_id: {e}")))?;
-        let local_artifact_id = LocalArtifactId::from_str(req.local_artifact_id.trim())
-            .map_err(|e| Status::invalid_argument(format!("invalid local_artifact_id: {e}")))?;
-        let artifact_kind = artifact_kind_from_proto(req.artifact_kind)
-            .ok_or_else(|| Status::invalid_argument("artifact_kind must be DISK or FULL"))?;
+        let node_ids = self.caller_node_ids(&request).await?;
+        let (sandbox_id, query) = parse_artifact_backup_query(request.into_inner())?;
+        let (local_artifact_id, artifact_kind) = match query {
+            ArtifactBackupQuery::Location(local_artifact_id, artifact_kind) => {
+                (local_artifact_id, artifact_kind)
+            }
+            ArtifactBackupQuery::Readiness(readiness) => {
+                return self
+                    .artifact_backup_readiness(sandbox_id, &node_ids, readiness)
+                    .await;
+            }
+        };
 
         let mut tx = self.begin_restore_lookup().await?;
 
-        #[derive(FromRow)]
-        struct BackupLocationRow {
-            backup_attempt_id: Uuid,
-            storage_uri: String,
-            size_bytes: Option<i64>,
-        }
-        let row: Option<BackupLocationRow> = sqlx::query_as(sql!(
-            "SELECT s.id AS backup_attempt_id,
-                    ssl.storage_connection_string AS storage_uri,
-                    s.size_bytes
-             FROM snapshots s
-             JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = s.id
-             WHERE s.sandbox_id = $1
-               AND s.local_artifact_id = $2
-               AND s.artifact_kind = $3
-               AND s.state = 'ready'
-             ORDER BY s.timestamp DESC
-             LIMIT 1"
-        ))
-        .bind(sandbox_id.as_uuid())
-        .bind(local_artifact_id.as_uuid())
-        .bind(artifact_kind.as_str())
-        .fetch_optional(&mut *tx)
+        let row = snapshot_store::ready_backup_location_placed_on(
+            &mut *tx,
+            sandbox_id,
+            local_artifact_id,
+            artifact_kind,
+            &node_ids,
+        )
         .await
-        .map_err(|e| Status::internal(format!("artifact backup lookup: {e}")))?;
-        let row = row.ok_or_else(|| {
+        .map_err(|e| Status::internal(format!("artifact backup lookup: {e}")))?
+        .ok_or_else(|| {
             Status::not_found(format!(
                 "no ready backup for local artifact {local_artifact_id}"
             ))
         })?;
-        let artifact_digests = Self::artifact_digests_for_restore(
-            &mut tx,
-            SnapshotId::from_uuid(row.backup_attempt_id),
-        )
-        .await?;
+        let artifact_digests = Self::artifact_digests_for_restore(&mut tx, row.snapshot_id).await?;
         tx.commit()
             .await
             .map_err(|e| Status::internal(format!("finish artifact backup lookup: {e}")))?;
         Ok(Response::new(GetArtifactBackupLocationResponse {
             local_artifact_id: local_artifact_id.to_string(),
             artifact_kind: artifact_kind_to_proto(artifact_kind),
-            backup_attempt_id: row.backup_attempt_id.to_string(),
-            storage_uri: row.storage_uri,
+            backup_attempt_id: row.snapshot_id.to_string(),
+            storage_uri: row.storage_connection_string,
             bytes_uploaded: row.size_bytes.unwrap_or(0),
             artifact_digests,
+            ready: None,
+        }))
+    }
+
+    /// Answer a readiness query with `ready` alone. Former hosts retain local
+    /// caches after placement moves, so any registered node may ask about an
+    /// identity it already holds; location reads stay placement-scoped, and
+    /// eviction needs no storage credentials.
+    async fn artifact_backup_readiness(
+        &self,
+        sandbox_id: SandboxId,
+        node_ids: &[NodeId],
+        readiness: BackupReadiness,
+    ) -> Result<Response<GetArtifactBackupLocationResponse>, Status> {
+        if node_ids.is_empty() {
+            return Err(Status::permission_denied("caller is not a registered node"));
+        }
+        let ready = match readiness {
+            BackupReadiness::Artifact(local_artifact_id, artifact_kind) => {
+                snapshot_store::artifact_backup_ready(
+                    &self.pool,
+                    sandbox_id,
+                    local_artifact_id,
+                    artifact_kind,
+                )
+                .await
+            }
+            BackupReadiness::LatestReadySuspend(snapshot_id) => {
+                snapshot_store::is_latest_ready_suspend(&self.pool, sandbox_id, snapshot_id).await
+            }
+        }
+        .map_err(|e| Status::internal(format!("artifact backup readiness: {e}")))?;
+        Ok(Response::new(GetArtifactBackupLocationResponse {
+            ready: Some(ready),
+            ..Default::default()
         }))
     }
 
@@ -1064,35 +1161,23 @@ impl ClusterApiService {
         &self,
         request: Request<GetSandboxSnapshotStorageUriRequest>,
     ) -> Result<Response<GetSandboxSnapshotStorageUriResponse>, Status> {
+        let node_ids = self.caller_node_ids(&request).await?;
         let req = request.into_inner();
         let sandbox_id = SandboxId::from_str(req.sandbox_id.trim())
             .map_err(|e| Status::invalid_argument(format!("invalid sandbox_id: {e}")))?;
 
-        // Single join: sandbox -> org -> the (optional) override column.
-        // Returning `None` for either "sandbox not found" or "org has no
-        // override" would conflate the two cases; surface a `NotFound`
-        // only when the sandbox itself is unknown so callers can
-        // distinguish "wrong id" from "no override; use env default".
-        let row: Option<Option<String>> = sqlx::query_scalar(sql!(
-            "SELECT o.snapshot_base_object_storage_uri
-             FROM sandboxes s
-             JOIN organizations o ON o.id = s.org_id
-             WHERE s.id = $1"
-        ))
-        .bind(sandbox_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| Status::internal(format!("org snapshot uri lookup: {e}")))?;
-
-        let storage_uri = match row {
-            Some(uri) => uri,
-            None => {
-                return Err(Status::not_found(format!("sandbox {sandbox_id} not found")));
-            }
-        };
+        // The store distinguishes "no sandbox placed on the caller" (`None`,
+        // surfaced as `NotFound`) from "the organization has no override"
+        // (`Some` with an empty URI), so callers can tell "wrong id" from
+        // "no override; use env default".
+        let storage =
+            pplx_space_sandbox_store::snapshot_storage_placed_on(&self.pool, sandbox_id, &node_ids)
+                .await
+                .map_err(|e| Status::internal(format!("org snapshot uri lookup: {e}")))?
+                .ok_or_else(|| Status::not_found(format!("sandbox {sandbox_id} not found")))?;
 
         Ok(Response::new(GetSandboxSnapshotStorageUriResponse {
-            storage_uri,
+            storage_uri: storage.org_storage_uri,
         }))
     }
 
@@ -1100,47 +1185,21 @@ impl ClusterApiService {
         &self,
         request: Request<GetSuspendSnapshotLocationRequest>,
     ) -> Result<Response<GetSuspendSnapshotLocationResponse>, Status> {
+        let node_ids = self.caller_node_ids(&request).await?;
         let req = request.into_inner();
         let sandbox_id = SandboxId::from_str(req.sandbox_id.trim())
             .map_err(|e| Status::invalid_argument(format!("invalid sandbox_id: {e}")))?;
 
         let mut tx = self.begin_restore_lookup().await?;
 
-        #[derive(FromRow)]
-        struct LocationRow {
-            snapshot_id: SnapshotId,
-            storage_connection_string: String,
-            size_bytes: Option<i64>,
-        }
-
-        // Pick the latest ready suspend snapshot for this sandbox. `timestamp`
-        // is the row's immutable creation time (set on INSERT, never updated),
-        // so `ORDER BY timestamp DESC` picks the row whose suspend attempt
-        // started most recently and reached `ready`. Non-ready rows
-        // (`creating`, `failed`, `deleting`) are filtered out entirely, which
-        // is what makes a mid-flight upload — or a row claimed for prune —
-        // invisible to restore.
         // TODO: [legacy] Remove once all restore callers look up exact artifact
         // backups with `GetArtifactBackupLocation`.
-        let row: Option<LocationRow> = sqlx::query_as(sql!(
-            "SELECT s.id AS snapshot_id,
-                    ssl.storage_connection_string,
-                    s.size_bytes
-             FROM snapshots s
-             JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = s.id
-             WHERE s.sandbox_id = $1
-               AND s.type = 'full'
-               AND (s.artifact_origin IS NULL OR s.artifact_origin = 'suspend')
-               AND s.state = 'ready'
-             ORDER BY s.timestamp DESC
-             LIMIT 1"
-        ))
-        .bind(sandbox_id)
-        .fetch_optional(&mut *tx)
+        let row = snapshot_store::latest_ready_suspend_location_placed_on(
+            &mut *tx, sandbox_id, &node_ids,
+        )
         .await
-        .map_err(|e| Status::internal(format!("snapshot lookup: {e}")))?;
-
-        let row = row.ok_or_else(|| {
+        .map_err(|e| Status::internal(format!("snapshot lookup: {e}")))?
+        .ok_or_else(|| {
             Status::not_found(format!(
                 "no suspend snapshot registered for sandbox {sandbox_id}"
             ))
@@ -1156,6 +1215,32 @@ impl ClusterApiService {
             bytes_uploaded: row.size_bytes.unwrap_or(0),
             artifact_digests,
         }))
+    }
+
+    /// The registered nodes at the caller's remote address: the identity a
+    /// sandbox-scoped read acts for, bound the way `validate_origin_remote_addr`
+    /// binds the node-bound RPCs. The reads these nodes make are then limited
+    /// to sandboxes placed on one of them, active there or as the target of a
+    /// pending migration or restore. A host may register more than one node
+    /// (a worker and a builder), so the identity is a set; an address with no
+    /// registered node is an empty set and resolves nothing. A request with no
+    /// remote address is refused.
+    async fn caller_node_ids<T>(&self, request: &Request<T>) -> Result<Vec<NodeId>, Status> {
+        let remote_ip = request
+            .remote_addr()
+            .map(|addr| normalize_ip(addr.ip()))
+            .ok_or_else(|| {
+                Status::permission_denied("node-bound cluster RPC has no remote address")
+            })?;
+        match self
+            .template_releases_store
+            .node_scope_for_address(remote_ip)
+            .await
+            .map_err(|err| Status::internal(format!("resolve caller nodes: {err}")))?
+        {
+            template_releases_store::TemplateReadScope::NodeScoped { node_ids } => Ok(node_ids),
+            template_releases_store::TemplateReadScope::Unscoped => Ok(Vec::new()),
+        }
     }
 
     // Catalog deletion cascades to digests before object cleanup. Both reads
@@ -1226,42 +1311,8 @@ impl ClusterApiService {
         remote_addr: Option<std::net::SocketAddr>,
     ) -> Result<OriginNode, Status> {
         let value = trimmed_required(value, "origin_node_id")?;
-        let role_hint_str = role_hint.map(SpaceNodeRole::as_str);
         if let Ok(node_id) = value.parse::<NodeId>() {
-            let row = sqlx::query_as::<_, OriginNodeRow>(sql!(
-                "SELECT n.id,
-                        host(n.address) AS address,
-                        n.role
-                 FROM nodes n
-                 WHERE n.id = $1
-                   AND ($2::TEXT IS NULL OR n.role = $2)
-                   AND n.managed_by IN ('space', 'k8s')
-                   AND COALESCE(n.state, 'registered') != 'deleted'
-                 LIMIT 1"
-            ))
-            .bind(node_id.as_uuid())
-            .bind(role_hint_str)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|err| Status::internal(format!("resolve origin node: {err}")))?;
-            if let Some(row) = row {
-                let role = SpaceNodeRole::parse(&row.role).map_err(|error| {
-                    Status::internal(format!(
-                        "registered node {} has unknown role {}: {error}",
-                        value, row.role
-                    ))
-                })?;
-                return Ok(OriginNode {
-                    id: row.id,
-                    display_id: value.to_string(),
-                    address: parse_origin_address(row.address.as_deref())?,
-                    role,
-                    bootstrapped: false,
-                });
-            }
-            return Err(Status::not_found(format!(
-                "origin_node_id {value} is not registered"
-            )));
+            return registered_origin_node(&self.pool, &value, node_id, role_hint).await;
         }
 
         let Some(role_hint) = role_hint else {
@@ -1439,6 +1490,7 @@ impl ClusterApiService {
     /// name a node. No source node fails closed. Returns the admitted node.
     async fn authorize_backup_source_node(
         &self,
+        executor: impl sqlx::PgExecutor<'_>,
         source_node_id: Option<NodeId>,
         remote_addr: Option<std::net::SocketAddr>,
         subject: &str,
@@ -1448,12 +1500,54 @@ impl ClusterApiService {
                 "{subject} has no source node that may publish a backup for it"
             ))
         })?;
-        let origin = self
-            .resolve_origin_node_id(&node_id.to_string(), None, None)
-            .await?;
+        let origin = registered_origin_node(executor, &node_id.to_string(), node_id, None).await?;
         validate_origin_remote_addr(&origin, remote_addr)?;
         Ok(node_id)
     }
+}
+
+/// Look up a registered node by ID on `executor`, so a caller holding a
+/// transaction does not need a second pooled connection.
+async fn registered_origin_node(
+    executor: impl sqlx::PgExecutor<'_>,
+    display_id: &str,
+    node_id: NodeId,
+    role_hint: Option<SpaceNodeRole>,
+) -> Result<OriginNode, Status> {
+    let row = sqlx::query_as::<_, OriginNodeRow>(sql!(
+        "SELECT n.id,
+                host(n.address) AS address,
+                n.role
+         FROM nodes n
+         WHERE n.id = $1
+           AND ($2::TEXT IS NULL OR n.role = $2)
+           AND n.managed_by IN ('space', 'k8s')
+           AND COALESCE(n.state, 'registered') != 'deleted'
+         LIMIT 1"
+    ))
+    .bind(node_id.as_uuid())
+    .bind(role_hint.map(SpaceNodeRole::as_str))
+    .fetch_optional(executor)
+    .await
+    .map_err(|err| Status::internal(format!("resolve origin node: {err}")))?;
+    let Some(row) = row else {
+        return Err(Status::not_found(format!(
+            "origin_node_id {display_id} is not registered"
+        )));
+    };
+    let role = SpaceNodeRole::parse(&row.role).map_err(|error| {
+        Status::internal(format!(
+            "registered node {display_id} has unknown role {}: {error}",
+            row.role
+        ))
+    })?;
+    Ok(OriginNode {
+        id: row.id,
+        display_id: display_id.to_string(),
+        address: parse_origin_address(row.address.as_deref())?,
+        role,
+        bootstrapped: false,
+    })
 }
 
 async fn read_node_k8s_tombstone(

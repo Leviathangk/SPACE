@@ -29,23 +29,34 @@ fn work(conn: &rusqlite::Connection, kill: bool) -> (JobId, CleanupWork) {
 
 #[tokio::test]
 async fn blocking_stop_follows_a_retryable_attempt_to_durable_completion() {
+    use pplx_space_node_mgr_client::proto::{CleanupSandboxRequest, CleanupSandboxResponse};
+
+    let cleanups = Arc::new(Mutex::new(Vec::new()));
+    let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default()
+        .unary("CleanupSandbox", {
+            let cleanups = Arc::clone(&cleanups);
+            move |request: CleanupSandboxRequest| {
+                let mut cleanups = cleanups.lock().unwrap();
+                cleanups.push(request);
+                if cleanups.len() == 1 {
+                    Err(Status::unavailable("runtime still exiting"))
+                } else {
+                    Ok(CleanupSandboxResponse::default())
+                }
+            }
+        })
+        .serve();
     let conn = crate::db::test_conn();
     let sandbox_id = SandboxId::new();
     let subject = sandbox_id.to_string();
     insert_test_sandbox(&conn, &subject, SandboxState::Stopping);
-    let service = service_for_teardown_test(conn);
-    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let attempts = Arc::clone(&calls);
-    *service.cleanup_executor.dispatch.lock().unwrap() = Some(Arc::new(move |_, _| {
-        let first = attempts.fetch_add(1, Ordering::SeqCst) == 0;
-        Box::pin(async move {
-            if first {
-                Err(Status::unavailable("runtime still exiting"))
-            } else {
-                Ok(())
-            }
-        })
-    }));
+    let service = crate::service::tests::node_manager_transport_tests::service_with_node_manager(
+        conn,
+        node_manager.connector(),
+    );
+    let execution_fence =
+        crate::db::node_execution_fence(&service.db.lock().unwrap(), &subject).unwrap();
+    assert!(execution_fence.is_some());
     let label = SandboxRuntimeLabel::from_sandbox_id(sandbox_id);
     let request = SynchronousCleanupRequest {
         sandbox_id: &subject,
@@ -64,7 +75,17 @@ async fn blocking_stop_follows_a_retryable_attempt_to_durable_completion() {
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    // Each attempt asks node-manager for the stop the caller requested.
+    let requested = CleanupSandboxRequest {
+        execution_fence: execution_fence.map(Into::into),
+        sandbox_id: subject.clone(),
+        force: true,
+        keep_filesystem: true,
+        return_after_slot_release: true,
+        immediate_kill: true,
+    };
+    assert_eq!(*cleanups.lock().unwrap(), [requested.clone(), requested]);
+    assert_eq!(node_manager.calls(), ["CleanupSandbox", "CleanupSandbox"]);
     assert_eq!(
         crate::db::get_sandbox(&service.db.lock().unwrap(), &subject)
             .unwrap()
@@ -542,14 +563,12 @@ async fn lifecycle_and_job_completion_commit_together_and_recover(
     );
     // Virtual time from here on. A case that registered an activation episode
     // also registered the sandbox with the snapshot scheduler, whose first tick
-    // opens a node-manager connection; that connect does not watch shutdown, so
-    // the drain below has to wait out its whole `tokio::time` retry budget
-    // (~9.5 s against an absent socket) before the task can observe the
-    // cancellation. Pausing collapses the backoff without changing what the
-    // drain observes: the connects still run and still fail, and every
-    // assertion after this point reads state the drain is required to have
-    // settled. Only the wait is virtual, so everything above runs on the real
-    // clock exactly as the executor's own timers need.
+    // opens a node-manager connection; that connect does not watch shutdown.
+    // The test service's node-manager is an absent socket dialed once, so the
+    // connect fails at once, and pausing only keeps any later scheduler timer
+    // from holding the drain on the real clock. Every assertion after this
+    // point reads state the drain is required to have settled. Everything
+    // above runs on the real clock exactly as the executor's own timers need.
     tokio::time::pause();
     service.shutdown_token.cancel();
     service.task_tracker.close();

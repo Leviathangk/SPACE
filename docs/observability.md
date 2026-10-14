@@ -133,8 +133,9 @@ Rust metric helpers also use a per-measurement `service` tag for a logical
 RPC or socket service: the destination of gRPC clients, the served interface
 of gRPC rate limiters, and the socket service performing UDS peer-process
 authentication checks. The OTLP sink exports that dimension as `service.role`;
-the constant `service` point attribute and resource `service.name` identify
-the emitting process. This keeps different peers or interfaces in separate
+resource `service.name` alone identifies the emitting process, because OTLP
+points carry no constant `service`, `env` or `version` copy of the resource's
+identity. This keeps different peers or interfaces in separate
 series even when they share one producer. OTLP queries grouping or filtering
 that logical dimension must use `service.role`. Native DogStatsD retains its
 existing wire tags, including both `service` values; its queries do not change.
@@ -170,7 +171,7 @@ cannot make several processes claim the same identity:
 
 | Attribute | Source |
 |---|---|
-| `service.instance.id` | host name and process id |
+| `service.instance.id` | host name and process id; for the Go shim, the node name, else the host name, and process id |
 | `host.name` | the configured node name, else `HOSTNAME` outside Kubernetes |
 | `k8s.node.name` | `SPACE_K8S_NODE_NAME`, then `KUBE_NODE_NAME` |
 | `k8s.pod.name` | `SPACE_K8S_POD_NAME` |
@@ -240,6 +241,15 @@ positive whole number of milliseconds fails startup instead of exporting on a
 cadence nobody chose. Traces are batched by the OpenTelemetry SDK's own
 `OTEL_BSP_*` settings, and `OTEL_TRACES_SAMPLER` applies as usual.
 
+`OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` selects the Rust services'
+metric temporality: `cumulative`, `delta` or `lowmemory`, in any case, with the
+per-instrument meaning the OpenTelemetry specification gives them. Unset or
+blank means **delta**, not the specification's cumulative default; see
+[Collector requirements](#collector-requirements). Any other value fails
+startup the same way a bad cadence does. sandbox-manager forwards the setting
+to the host sidecars it launches, and the guest filesystem worker inherits its
+launcher's. The Go shim does not read it: its own metrics are always delta.
+
 ## Trace filtering
 
 `SPACE_TRACE_FILTER` selects which spans are recorded, in `tracing`
@@ -284,6 +294,103 @@ SQLite migration pool's wait is counted in the PostgreSQL pool metric. Set
 Sidecars and guest workers inherit `SPACE_TRACE_FILTER`, so a child exports the
 same span set as its parent.
 
+## Untraced background traffic
+
+Some calls repeat every few seconds and almost always succeed, and a root trace
+for each would outnumber every request's. They are left untraced, whatever the
+filter:
+
+- `grpc.health.v1.Health` calls made outside a traced request: on the client,
+  with no traced span current; on the server, with no trace context from the
+  caller. A health check a request makes, such as a wake path's capability
+  probe, keeps both spans.
+- GET requests for `/health`, `/healthz`, `/readyz` and `/livez`. Probes report
+  their own result. The data plane keeps every request to a sandbox host
+  traced whatever its path: a sandbox app's `/health` is the sandbox's own
+  traffic.
+- A `grpc.client.connect` made while no traced span is current, that is a
+  background dial, records a span only when it fails, as a root carrying the
+  error. A dial inside a traced request is that request's child, as before.
+- A Kubernetes read (`get`, `list`, `watch`) made while no traced span is
+  current records a `kubernetes.client` span only when it fails: an error, an
+  error status, a response body that fails, or a call dropped before its body
+  completes, as by a caller's timeout. A single-object `get`'s 404 is an
+  existence check's answer, and a watch its consumer drops has not failed. The
+  span opens when the failure is known and carries the call's latency as
+  `k8s.duration_ms`. Writes keep their spans, because a write is a change.
+- The cluster-controller's leadership lease records `kubernetes.client` spans
+  only for failed calls, renewals included; a 409 on its create or replace is a
+  lost race, not a failure. A tick that acquires or loses leadership records
+  `leader_election.change`.
+
+Periodic gRPC polls outside these rules still open a trace per call: dropping
+one end to end needs the caller to propagate a not-sampled context, which is
+the sampler's decision rather than the span layer's.
+
+## S3 client spans
+
+Every S3 operation SPACE issues through the shared S3 HTTP client, the object
+store's and those of snapshot storage and the runtime manager's kernel source,
+gets one `s3.client` span named `S3.<Operation>`. It covers the operation's
+retries and backoff; `s3.attempts` counts the requests, and each failed attempt
+is logged and counted where the client tracks attempts. The span carries
+`s3.outcome` (`ok`, `not_found`, `error`, `abandoned`), `http.status_class` of
+the last response, and `s3.request.bytes` and `s3.response.bytes` when the
+messages declare a length. `not_found` is reserved for a `HeadObject` or
+`GetObject` 404, an existence check's answer, and keeps status OK; any other
+operation's 404 fails it. A failure sets status ERROR and records why as
+`s3.failure_kind`, from a fixed set (`transport`, `connector_timeout`,
+`timeout`, `throttled`, `http_5xx`, `access_denied`, `not_found`, `http_4xx`,
+`service_error`, `abandoned`, `no_result`, `other`), which is also its status
+description; the SDK's and the server's error text, which can quote a key, is
+never recorded. No bucket, key, upload id or range is recorded either. A
+ranged download's chunk keeps its own `S3.GetObject.range` span, which covers
+reading the chunk's body as well, so each chunk shows that span with this
+request span inside it.
+
+## Datadog trace chunks
+
+The native Datadog tracer sends the spans a process records for one trace as a
+chunk. SPACE leaves partial flush off, so a chunk is sent when the process's
+count of the trace's open spans reaches zero, and a span is top-level when its
+parent is not in its chunk or belongs to another service. A count that reaches
+zero early sends the chunk early: every span of the trace that ends afterward
+arrives in a chunk of its own, as a top-level span with its own trace metrics,
+and need not carry the trace's sampling decision. OTLP backends assemble spans
+by ID and show the same trace intact, so this shows only on the native path.
+
+Spans are parented so that each request is counted once in each process it
+reaches:
+
+- A request's server span is the only span parented on the caller's
+  extracted context. Handler spans are ordinary children of the server span,
+  created in its scope; a handler never extracts the caller's context again.
+- Work that outlives the request, or is saved and run later, starts a new root
+  with a span link to the context that started it.
+- A job its submitter waits for runs as a child of the waiting span, through
+  `BackgroundWorker::submit_and_wait`. Any other job is a linked root.
+
+One case remains that SPACE cannot fix. datadog-opentelemetry 0.5.2 counts no
+span whose parent is remote when the process already has that trace open
+(`TraceRegistry::register_local_root_span`), yet that span's end still lowers
+the count. Two requests of one trace that overlap in one process, concurrent
+calls or a call back into a process whose request is still open, therefore
+still fragment under native Datadog until the tracer counts that span.
+
+A change to span parenting, propagation or the trace exporter is validated by
+a Fake Intake capture in Datadog mode
+(`SPACE_KIND_TELEMETRY_MODE=datadog SPACE_KIND_DATADOG_MODE=fakeintake`) of a
+sandbox lifecycle; see
+[the Kind capture](../infra/space/kind/README.md#datadog-optional). The check
+is bounded by the traces that window produced. It fails when the capture holds
+no SPACE trace, or when a span other than a server or consumer span has its
+parent in another process, or shares the remote parent of a request span in
+its own process: SPACE parented work on remote context. It reports, without
+failing, each service's chunks split by the upstream miscount above. A span
+parented on context its own process saved looks the same in the chunks, so
+the split report, not the failure, shows it. A capture whose workloads export
+traces any other way is not checked.
+
 ## Datadog addresses
 
 The native paths keep their existing defaults. DogStatsD goes to
@@ -300,12 +407,25 @@ changes the verdict a run reports — the suites decide that, and losing the
 run's metrics is not a suite failure. It exports **once**, at the end, rather
 than on an interval, so there is no cadence to configure.
 
+### Restricted tag configurations
+
+A Datadog organization can limit which tags it keeps or makes queryable for a
+metric, for example with an explicit per-metric tag configuration. A tag that
+configuration does not list is still sent but cannot be grouped or filtered
+on. That applies to tags added after the configuration was written, including
+the `reason` on `template.gc.tick` and `template.gc.tick_duration_ms` errors
+and the `error_kind` on `template.build.latency_ms`,
+`template.build.step.latency_ms` and `snapshot.restore.failed`. Add them to the
+metric's tag configuration before relying on them; series without them are
+unaffected.
+
 ## Go runtime metrics
 
 With `SPACE_METRICS_SINK=otlp`, the shim also exports Go runtime metrics under
-OpenTelemetry's standard `go.*` names, through the same provider and resource
-as its own metrics. [Select shim telemetry](installation.md#shim-telemetry-selectors)
-lists the instruments.
+OpenTelemetry's standard `go.*` names, to the same endpoint and resource as its
+own metrics but from a separate provider with cumulative temporality.
+[Select shim telemetry](installation.md#shim-telemetry-selectors) lists the
+instruments.
 
 That set is narrower than Datadog's runtime metrics v2, which also reports GC
 cycle counts, GC pause distributions, CPU time by class, and mutex wait time.
@@ -331,7 +451,10 @@ native tracer — mixing the selectors has consequences worth knowing:
 Logs are not an OTLP signal here. Every producer writes to stdout or stderr
 and the collection path is whatever reads a container's output. Rust services
 emit structured records carrying the resolved service name and honor
-`SPACE_LOG_FORMAT`. The Go shim writes plain `[space-shim]` lines to stderr
+`SPACE_LOG_FORMAT`. A JSON record written inside any span with a valid trace
+context, sampled or not, also carries the W3C `trace_id` and `span_id` of the
+nearest such span as lowercase hex, under every trace exporter; the
+Datadog-reserved `dd.trace_id` and `dd.span_id` are not written. The Go shim writes plain `[space-shim]` lines to stderr
 and the smoke script writes plain lines too; neither attaches a service,
 environment, or version, so a log pipeline that needs those must add them from
 pod metadata.
@@ -362,6 +485,89 @@ Before shared initialization, caller-owned logging uses Legacy without caching
 that fallback, preserving the historical Datadog-default behavior while allowing
 later OTLP initialization. Legacy is a migration bridge for production Datadog
 continuity; remove it after native Datadog consumers migrate.
+
+## Firecracker and guest diagnostics
+
+Firecracker and the guest's spaced write nowhere a collector reads, so
+sandbox-manager reads what they produce on its node and re-emits it.
+
+Firecracker writes a metrics flush every 60 seconds to a FIFO node-manager
+creates in its jail. Firecracker opens it non-blocking, so a flush the reader
+has not drained is dropped and counted rather than stalling the VMM. These
+node-wide metrics carry no sandbox id:
+
+| Metric | Type | Tags |
+| --- | --- | --- |
+| `sandbox.firecracker.errors` | counter | `component` (`block`, `net`, `vsock`, `vcpu`, `vmm`, `seccomp`, `signal`), `error` (the Firecracker field) |
+| `sandbox.firecracker.block.mean_latency_ms` | timing, one sample per sandbox and flush with block requests | `op` (`read`, `write`) |
+| `sandbox.firecracker.operation.duration_ms` | timing, once per VM pause, resume, snapshot load or create a flush reports | `operation` |
+| `sandbox.firecracker.metrics.flushes` | counter | `outcome` (`parsed`, `unparsable`, `oversized`) |
+| `sandbox.firecracker.telemetry_dropped` | counter, flushes or log lines Firecracker could not write | `stream` (`metrics`, `log`) |
+| `sandbox.vm.diagnostics` | counter, forwarded WARN and ERROR diagnostics | `source` (`firecracker`, `guest`), `level`, `outcome` (`logged`, `rate_limited`, `dropped_in_guest`) |
+
+The `error` values are listed in `crates/libs/metrics/src/sandbox/vm.rs`.
+
+Firecracker's WARN and ERROR log lines are re-logged by sandbox-manager as
+`firecracker warning` or `firecracker error` with `sandbox_id` and the line in
+`firecracker_message`, at most 20 in a burst and then one every 15 seconds per
+sandbox; `suppressed_since_last` counts the lines skipped. A line can carry
+guest-written values, so it is cut to 512 bytes and its control characters
+are replaced. INFO and DEBUG lines are not forwarded.
+
+spaced records its own WARN and ERROR callsites (level, target, source file and
+line, and a count), never message text or field values, which can carry a
+user's command, path or output. The health probe drains them over the bridge's
+`Ping` about every 24 seconds, and sandbox-manager logs up to four per drain as
+`spaced guest diagnostic` with `sandbox_id` and `guest_level`, `guest_target`,
+`guest_file`, `guest_line` and `guest_count`, at WARN whatever the guest's
+level. The guest is tenant-controlled: the host decodes at most 16 KiB of a
+`Ping` answer, reads at most 32 entries, clamps each count and bounds and
+strips each string. What a restored guest had recorded happened in the
+sandbox its snapshot came from: the guest discards it on a snapshot-restore
+resume notice, and since a restore that ends paused sends none, sandbox-manager
+also drops the first drain after every restore. A guest that predates the
+field sends none.
+
+## Sandbox identity
+
+Telemetry names a sandbox by one canonical value, its bare lowercase UUID
+(`019d84bd-280d-7331-99c6-b63377f3a3a2`), in the `sandbox_id` span attribute
+and JSON log field. A span for work on one sandbox carries it, in every
+service that does such work: space-api's request spans for a sandbox route
+and the cluster-controller's create operation, node-api's sandbox RPCs,
+sandbox-manager and node-manager operations, volume-manager jobs and RPCs for
+a sandbox subject, and every RPC a sandbox's net-gateway serves. A Rust
+service's JSON log line written inside such a span carries the same field,
+unless the event sets its own.
+
+Two other spellings remain where they are part of a contract, and convert by
+prefix:
+
+| Where | Spelling | To the canonical value |
+| --- | --- | --- |
+| Native API ids, public operations' `target_id` | `sbx_<uuid>` | drop `sbx_` |
+| Volume-manager `subject_id`, `job.subject_id` | `sandbox:<uuid>` | drop `sandbox:` |
+
+A fork operation's `target_id` is already the source sandbox's bare UUID. The
+reverse conversion prefixes `sbx_`; in a shell, `${id#sbx_}` gives the
+canonical value.
+
+## Request identity
+
+Every HTTP server span, `http.server`, in space-api and the data plane carries
+the request's `request_id` when it has one. A caller-supplied id is the first
+non-blank of `x-request-id` and `x-correlation-id`, accepted only as at most
+128 bytes of `[A-Za-z0-9._:-]`; anything else is dropped. The native API
+returns that id in `x-request-id`, or, when the caller sent none or one that
+was dropped, a fresh `req_<uuid>` it records instead. gRPC server spans apply
+the same rule to their `request_id`. A JSON log line written inside the
+request inherits it, as it does `sandbox_id`.
+
+Each HTTP response also carries a W3C `traceparent` header naming its
+`http.server` span, so a client can report the trace ID of any request it
+made. The header holds only the version, trace ID, span ID and sampled flag;
+it is absent when traces are off, and a proxied sandbox service's own
+`traceparent` is passed through unchanged.
 
 ## Cargo features
 
@@ -459,24 +665,42 @@ settings, their precedence, and the endpoint rule every producer applies.
 ### Collector requirements
 
 SPACE's own metrics — the `space.*` families — export **delta** temporality
-and **base-2 exponential histograms** (maximum 160 buckets, maximum scale 8),
-with a 2000-series attribute cardinality limit per instrument. Datadog's OTLP
-ingest accepts both as they arrive.
+by default and **base-2 exponential histograms** (maximum 160 buckets, maximum
+scale 8), with a 2000-series attribute cardinality limit per instrument.
+Datadog's OTLP ingest accepts both as they arrive.
 
-That profile is the sinks', not the pipeline's. `go.schedule.duration` comes
-from the runtime instrumentation's own producer, which bypasses the sink's
-temporality and aggregation selectors, so it arrives as a **cumulative
-explicit-bucket** histogram. A Collector pipeline therefore sees both shapes on
-one connection and has to accept both.
+That profile is the sinks', not the pipeline's. The shim's Go runtime metrics
+are **cumulative**, and `go.schedule.duration`, from the runtime
+instrumentation's own producer, is an explicit-bucket histogram. A Collector
+pipeline therefore sees both shapes on one connection and has to accept both.
 
-A Prometheus-style backend does not. Convert in the Collector, not in SPACE:
+A Prometheus-style backend does not. Convert in the Collector:
 
 - delta to cumulative, with the `deltatocumulative` processor;
 - exponential histograms to whatever the backend stores — Prometheus native
   histograms keep the resolution, and converting to explicit buckets loses it.
 
-Exporting cumulative sums from SPACE instead is not an option here: the sinks
-are shared with the DogStatsD path, which is delta by construction.
+The conversion is lossy for sparse series. `deltatocumulative` keeps each
+stream's running total in memory and forgets a stream that has been idle for
+its `max_stale`. The next increment then starts a new total from that
+increment alone, so a counter that ticks less often than `max_stale` reads
+1 → 1 across two events, or drops 2 → 1 like a counter reset, and rate
+queries undercount rare events.
+
+A pipeline that stores cumulative data can avoid that state by having the
+Rust services export cumulative, with
+`OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=cumulative`. Each process
+then reports every stream's running total on every export, so a counter keeps
+its count however long it idles and the Collector passes it through
+unconverted. The cost is that a stream, gauges included, keeps being exported
+with its last value until the process restarts, instead of falling silent
+when nothing records it. The Kind `otel` profile selects cumulative for the
+Rust services.
+
+Delta stays the default because Datadog's OTLP intake accepts only delta
+sums, and drops the first point of each cumulative series it converts, which
+loses exactly the rare events cumulative is meant to keep. The Go shim's own
+metrics stay delta in every mode, Kind's included.
 
 ### Rejected configurations
 
@@ -511,6 +735,7 @@ instead.
 | nonblank OTLP headers | `OTLP exporter headers are not allowed with the plaintext internal metrics profile`; `OTLP traces do not allow OTEL_EXPORTER_OTLP_TRACES_HEADERS or OTEL_EXPORTER_OTLP_HEADERS on a plaintext endpoint`; in the shim, `OTEL_EXPORTER_OTLP_METRICS_HEADERS is not allowed with the plaintext OTLP metric profile` |
 | no metrics endpoint | `missing OTLP endpoint; set OTEL_EXPORTER_OTLP_METRICS_ENDPOINT or OTEL_EXPORTER_OTLP_ENDPOINT` |
 | a bad cadence | `OTEL_METRIC_EXPORT_INTERVAL must be a positive whole number of milliseconds` |
+| an unknown temporality | `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE must be cumulative, delta, or lowmemory, got "monotonic"` |
 | an unknown selector | `invalid SPACE_METRICS_SINK="dogstatsd"; expected one of: auto, datadog, journald, otlp, off`; `invalid SPACE_TRACE_EXPORTER="dd"; expected auto, datadog, otlp, or off` |
 | a selector the build cannot serve | `SPACE_METRICS_SINK="datadog" requires the datadog feature`; `trace exporter otlp requires the otel feature` |
 | `journald` in the shim | `SPACE_METRICS_SINK=journald is not supported by the Go shim; use datadog, otlp, or off` |

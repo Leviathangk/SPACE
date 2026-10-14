@@ -170,10 +170,6 @@ impl SandboxManagerService {
     ) -> Result<Response<CreateResponse>, Status> {
         let peer = self.authorize_peer(&request, "Create", ALLOW_SANDBOX_OPERATOR_OR_TMPLMGR)?;
         let span = tracing::info_span!("sbxmgr.create", template = %request.get_ref().template);
-        pplx_space_observability::trace_propagation::set_span_parent_context_from(
-            &span,
-            request.metadata(),
-        );
         let publish_node_state = !should_skip_node_publish(&request);
         let result = async move {
             let req = request.get_ref();
@@ -197,13 +193,15 @@ impl SandboxManagerService {
 
             // Resolve template to content-addressed paths via template-manager.
             // If caller pinned a content_hash, use it; otherwise resolve newest.
-            let resolved_template =
-                resolve_template_paths(pplx_space_template_mgr_client::proto::TemplateRef {
+            let resolved_template = resolve_template_paths(
+                self.template_resolver.as_ref(),
+                pplx_space_template_mgr_client::proto::TemplateRef {
                     name: template.to_string(),
                     content_hash: req.content_hash.clone(),
                     tag: None,
-                })
-                .await?;
+                },
+            )
+            .await?;
             if let Some(policy) = template_network_policy_from_proto(
                 req.template_network_policy.as_ref(),
                 req.template_network_policy_generation,
@@ -544,10 +542,6 @@ impl SandboxManagerService {
             initial_state = tracing::field::Empty,
             has_rootfs = tracing::field::Empty,
             has_snapshot = tracing::field::Empty,
-        );
-        pplx_space_observability::trace_propagation::set_span_parent_context_from(
-            &span,
-            request.metadata(),
         );
         let sandbox_id = req.sandbox_id.clone();
         let publish_node_state = !should_skip_node_publish(&request);
@@ -1010,7 +1004,7 @@ impl SandboxManagerService {
 
         let mut usage_bytes = std::collections::HashMap::new();
         if !resolved_ids.is_empty() {
-            let mut client = connect_node()
+            let mut client = connect_node(&self.node_manager)
                 .await
                 .map_err(|e| Status::unavailable(format!("cannot connect to node-manager: {e}")))?;
             let response = client
@@ -1177,4 +1171,10 @@ fn project_template_catalog(
 }
 
 #[cfg(test)]
+mod create_after_lookup_tests;
+#[cfg(test)]
+mod create_template_lookup_tests;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod unpersisted_cleanup_tests;

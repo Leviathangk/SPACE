@@ -212,7 +212,8 @@ impl SandboxManagerService {
         if !context.blocking {
             let service = self.clone();
             let background_sandbox_id = publication.sandbox.id.clone();
-            self.spawn_state_writer("SuspendPublication", async move {
+            let span_sandbox_id = background_sandbox_id.clone();
+            self.spawn_detached_state_writer("SuspendPublication", &span_sandbox_id, async move {
                 let _wake_guard = wake_guard;
                 let _artifact_guard = artifact_guard;
                 if let Err(error) = service
@@ -225,6 +226,7 @@ impl SandboxManagerService {
                         error = %error.message(),
                         "asynchronous suspend publication failed"
                     );
+                    super::super::drain::record_detached_failure(error.message());
                 }
             })?;
             return Ok(Response::new(SuspendResponse {
@@ -331,7 +333,7 @@ impl SandboxManagerService {
         // Auto-pause if started
         if sandbox.state == SandboxState::Started {
             let pause_started_at = std::time::Instant::now();
-            let mut node_client = connect_node().await.map_err(|e| {
+            let mut node_client = connect_node(&self.node_manager).await.map_err(|e| {
                 pplx_space_metrics::snapshot::create_failed(
                     create_kind,
                     context.create_codec,
@@ -401,6 +403,8 @@ impl SandboxManagerService {
                 &sandbox_id,
                 "auto-pause failed",
                 guest_preparation_budget,
+                &self.node_manager,
+                self.config.balloon_hint_timeout_ms,
             )
             .await;
             if pause_state != SandboxState::Paused {

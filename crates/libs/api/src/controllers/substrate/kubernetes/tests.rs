@@ -231,6 +231,7 @@ mod kubernetes_tests {
                 shutdown_token.clone(),
                 task_tracker.clone(),
             ),
+            pod_worker_channels: Arc::default(),
             wake_coalescer: Arc::new(
                 pplx_space_common_work_coalescer::WorkCoalescer::with_tracker(task_tracker.clone()),
             ),
@@ -246,6 +247,7 @@ mod kubernetes_tests {
             // snapshots; resolution by `node_group_placement`'s own tests.
             node_group_placement: NodeGroupPlacementResolver::new(pool, false),
             recovery_join_backoff: RecoveryJoinBackoffPolicy::default(),
+            budgets: SubstrateBudgets::default(),
             shutdown_token,
             task_tracker,
         }
@@ -1926,6 +1928,7 @@ mod kubernetes_tests {
                 shutdown_token.clone(),
                 task_tracker.clone(),
             ),
+            pod_worker_channels: Arc::default(),
             wake_coalescer: Arc::new(
                 pplx_space_common_work_coalescer::WorkCoalescer::with_tracker(task_tracker.clone()),
             ),
@@ -1941,6 +1944,7 @@ mod kubernetes_tests {
             // snapshots; resolution by `node_group_placement`'s own tests.
             node_group_placement: NodeGroupPlacementResolver::new(pool, false),
             recovery_join_backoff: RecoveryJoinBackoffPolicy::default(),
+            budgets: SubstrateBudgets::default(),
             shutdown_token,
             task_tracker,
         }
@@ -5930,6 +5934,8 @@ mod kubernetes_tests {
     /// bucket needed.
     fn rejecting_admission(pool: &PgPool) -> crate::cluster_admission::ClusterSandboxAdmission {
         crate::cluster_admission::ClusterSandboxAdmission::with_config(
+            // Direct is only a placeholder capacity source: it reports zero eligible nodes,
+            // as a synced, empty Kubernetes node cache would.
             crate::controllers::substrate::Substrate::Direct(Box::new(
                 crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
             )),
@@ -8909,6 +8915,7 @@ mod kubernetes_tests {
                 shutdown_token.clone(),
                 task_tracker.clone(),
             ),
+            pod_worker_channels: Arc::default(),
             wake_coalescer: Arc::new(
                 pplx_space_common_work_coalescer::WorkCoalescer::with_tracker(task_tracker.clone()),
             ),
@@ -8924,6 +8931,7 @@ mod kubernetes_tests {
             // snapshots; resolution by `node_group_placement`'s own tests.
             node_group_placement: NodeGroupPlacementResolver::new(pool, false),
             recovery_join_backoff: RecoveryJoinBackoffPolicy::default(),
+            budgets: SubstrateBudgets::default(),
             shutdown_token,
             task_tracker,
         }
@@ -9400,6 +9408,8 @@ mod kubernetes_tests {
         );
         let admission = std::sync::Arc::new(
             crate::cluster_admission::ClusterSandboxAdmission::with_config(
+                // Direct is only a placeholder capacity source: it reports zero eligible nodes,
+                // as a synced, empty Kubernetes node cache would.
                 Substrate::Direct(Box::new(
                     crate::controllers::substrate::direct::DirectSubstrate::new(pool),
                 )),
@@ -9462,6 +9472,8 @@ mod kubernetes_tests {
         );
         let admission = std::sync::Arc::new(
             crate::cluster_admission::ClusterSandboxAdmission::with_config(
+                // Direct is only a placeholder capacity source: it reports zero eligible nodes,
+                // as a synced, empty Kubernetes node cache would.
                 Substrate::Direct(Box::new(
                     crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
                 )),
@@ -9535,10 +9547,11 @@ mod kubernetes_tests {
             mock_kubernetes_client(Arc::clone(&captured_pod_creates)),
         );
 
-        // Empty nodes inventory → the admission capacity probe reports zero
-        // eligible nodes → EmptyCluster rejection (no Redis needed).
         let admission = std::sync::Arc::new(
             crate::cluster_admission::ClusterSandboxAdmission::with_config(
+                // Direct is only a placeholder capacity source: its empty nodes inventory reports
+                // zero eligible nodes, as a synced, empty Kubernetes node cache would, so admission
+                // rejects with EmptyCluster (no Redis needed).
                 Substrate::Direct(Box::new(
                     crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
                 )),
@@ -9604,6 +9617,8 @@ mod kubernetes_tests {
         )));
         let admission = std::sync::Arc::new(
             crate::cluster_admission::ClusterSandboxAdmission::with_config(
+                // Direct is only a placeholder capacity source: it reports zero eligible nodes,
+                // as a synced, empty Kubernetes node cache would.
                 Substrate::Direct(Box::new(
                     crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
                 )),
@@ -9665,6 +9680,8 @@ mod kubernetes_tests {
             mock_kubernetes_client(Arc::clone(&captured_pod_creates)),
         )));
         let admission = crate::cluster_admission::ClusterSandboxAdmission::with_config(
+            // Direct is only a placeholder capacity source: it reports zero eligible nodes,
+            // as a synced, empty Kubernetes node cache would.
             Substrate::Direct(Box::new(
                 crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
             )),

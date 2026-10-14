@@ -563,6 +563,7 @@ impl SandboxManagerService {
             pplx_space_node_mgr_client::execution_fence::InstanceTarget::RestoreScope(
                 transfer_scope_id,
             ),
+            &self.node_manager,
         )
         .await
         .map_err(|error| {
@@ -1226,62 +1227,18 @@ impl SandboxManagerService {
                 .flatten()
                 .and_then(|state| state.parse().ok()),
         );
-        if matches!(
+        match crate::db::update_state_superseding_activation_in_transaction(
+            &transaction,
+            &sandbox_id_string,
             target_state,
-            SandboxState::Stopping | SandboxState::Deleting
         ) {
-            match crate::db::update_state_superseding_activation_in_transaction(
-                &transaction,
-                &sandbox_id_string,
-                target_state,
-            ) {
-                Ok(()) => {}
-                Err(crate::db::SupersedeActivationError::QuarantineRecoveryInProgress) => {
-                    return Err(CleanupAdmissionError::QuarantineRecoveryInProgress { sandbox_id });
-                }
-                Err(crate::db::SupersedeActivationError::StateWriteNotApplied(error))
-                    if error.outcome == crate::db::SandboxStateWriteOutcome::Missing =>
-                {
-                    if mode.auto_lifecycle_delete_expectation().is_some() {
-                        return Err(Status::unavailable(
-                            "sandbox disappeared during auto-lifecycle delete admission",
-                        )
-                        .into());
-                    }
-                    return Ok(CleanupAdmission::unpersisted(
-                        sandbox_id,
-                        current_execution_generation,
-                        None,
-                        fence,
-                    ));
-                }
-                Err(crate::db::SupersedeActivationError::StateWriteNotApplied(error)) => {
-                    return Err(Status::unavailable(format!(
-                        "cleanup lifecycle claim was superseded: {error}"
-                    ))
-                    .into());
-                }
-                Err(error) => {
-                    if require_atomic_admission {
-                        return Err(Status::unavailable(format!(
-                            "claim atomic cleanup admission failed: {error}"
-                        ))
-                        .into());
-                    }
-                    return Ok(CleanupAdmission::unpersisted(
-                        sandbox_id,
-                        current_execution_generation,
-                        Some(format!("claim cleanup lifecycle failed: {error}")),
-                        fence,
-                    ));
-                }
+            Ok(()) => {}
+            Err(crate::db::SupersedeActivationError::QuarantineRecoveryInProgress) => {
+                return Err(CleanupAdmissionError::QuarantineRecoveryInProgress { sandbox_id });
             }
-        } else {
-            let outcome = crate::db::update_state(&transaction, &sandbox_id_string, target_state)
-                .map_err(|error| {
-                Status::internal(format!("claim cleanup lifecycle failed: {error}"))
-            })?;
-            if outcome == crate::db::SandboxStateWriteOutcome::Missing {
+            Err(crate::db::SupersedeActivationError::StateWriteNotApplied(error))
+                if error.outcome == crate::db::SandboxStateWriteOutcome::Missing =>
+            {
                 if mode.auto_lifecycle_delete_expectation().is_some() {
                     return Err(Status::unavailable(
                         "sandbox disappeared during auto-lifecycle delete admission",
@@ -1295,9 +1252,26 @@ impl SandboxManagerService {
                     fence,
                 ));
             }
-            outcome.require_applied().map_err(|error| {
-                Status::unavailable(format!("cleanup lifecycle claim was superseded: {error}"))
-            })?;
+            Err(crate::db::SupersedeActivationError::StateWriteNotApplied(error)) => {
+                return Err(Status::unavailable(format!(
+                    "cleanup lifecycle claim was superseded: {error}"
+                ))
+                .into());
+            }
+            Err(error) => {
+                if require_atomic_admission {
+                    return Err(Status::unavailable(format!(
+                        "claim atomic cleanup admission failed: {error}"
+                    ))
+                    .into());
+                }
+                return Ok(CleanupAdmission::unpersisted(
+                    sandbox_id,
+                    current_execution_generation,
+                    Some(format!("claim cleanup lifecycle failed: {error}")),
+                    fence,
+                ));
+            }
         }
         if mode.auto_lifecycle_delete_expectation().is_some()
             && crate::db::cleanup_episode(&transaction, &sandbox_id_string)
@@ -2204,7 +2178,7 @@ impl SandboxManagerService {
             admission,
             cleanup_id,
             || async move {
-                connect_node().await.map_err(|error| {
+                connect_node(&self.node_manager).await.map_err(|error| {
                     Status::internal(format!(
                         "{context}: cannot connect to node-manager: {error}"
                     ))
@@ -2526,7 +2500,7 @@ impl SandboxManagerService {
             || async move {
                 self.flush_guest_before_termination(dispatch_sandbox_id, dispatch_guest_flush)
                     .await;
-                let mut node_client = connect_node().await.map_err(|error| {
+                let mut node_client = connect_node(&self.node_manager).await.map_err(|error| {
                     Status::internal(format!(
                         "{dispatch_context}: cannot connect to node-manager: {error}"
                     ))
@@ -2791,7 +2765,9 @@ impl SandboxManagerService {
                     sandbox_id,
                     SandboxEventType::StopGuestFlushFailed,
                     SandboxEventSource::SbxManager,
-                    SandboxEventDetails::default().error(error.to_string().as_str()),
+                    SandboxEventDetails::default()
+                        .error(error.to_string().as_str())
+                        .logged_by_caller(),
                 );
             }
         }
@@ -2801,7 +2777,8 @@ impl SandboxManagerService {
     /// [`BeforeStopFlush`].
     async fn resume_paused_vm_before_flush(&self, sandbox_id: &str) -> Result<(), StopFlushError> {
         let id = SandboxId::from_str(sandbox_id).map_err(StopFlushError::SandboxId)?;
-        let state = crate::firecracker_via_nodemgr::get_firecracker_vm_state(id).await;
+        let state =
+            crate::firecracker_via_nodemgr::get_firecracker_vm_state(id, &self.node_manager).await;
         if let Err(error) = &state {
             tracing::debug!(%sandbox_id, %error, "VM state unreadable before the stop flush");
         }
@@ -2815,7 +2792,9 @@ impl SandboxManagerService {
                         .map_err(StopFlushError::Fence)?
                         .map(Into::into)
                 };
-                let mut node_client = connect_node().await.map_err(StopFlushError::NodeManager)?;
+                let mut node_client = connect_node(&self.node_manager)
+                    .await
+                    .map_err(StopFlushError::NodeManager)?;
                 node_client
                     .resume_sandbox(ResumeSandboxRequest {
                         execution_fence,
@@ -2896,3 +2875,6 @@ impl BeforeStopFlush {
         }
     }
 }
+
+#[cfg(test)]
+mod stop_admission_tests;

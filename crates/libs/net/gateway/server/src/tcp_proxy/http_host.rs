@@ -8,6 +8,7 @@
 
 use std::convert::Infallible;
 use std::future::Future;
+#[cfg(test)]
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -18,6 +19,7 @@ use std::task::{Context, Poll};
 use http::{Request, Response, StatusCode, header, uri::Authority};
 use http_body_util::{Either, Empty};
 use hyper::body::Incoming;
+#[cfg(test)]
 use hyper::client::conn::http1 as client;
 use hyper::server::conn::http1 as server;
 use hyper::service::service_fn;
@@ -26,10 +28,15 @@ use pplx_space_net_common::DomainName;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Mutex;
 
-use super::routing_headers::{SanitizedBody, SanitizedRequest};
+use super::routing_headers::SanitizedRequest;
+use super::{
+    tls_http::HttpProtocol,
+    upstream::{self, Upstream},
+};
 use crate::dns::DnsAllowCache;
-use crate::egress::{dns_allow_required, evaluate_egress_unmetered};
+use crate::egress::{HostBindingError, authorize_host};
 use crate::state::{GatewayNetworkState, TrafficPolicy};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 pub(super) struct HostBinding {
@@ -54,41 +61,19 @@ impl HostBinding {
         }
     }
 
-    pub(super) async fn authorize<B>(
-        &self,
-        request: &SanitizedRequest<B>,
-    ) -> Result<Authority, BindingOutcome> {
-        let (host, canonical_authority) =
-            validated_request_authority(request).map_err(|()| BindingOutcome::InvalidHost)?;
-        // Established HTTP flows get the same bounded PendingPolicy grace and
-        // telemetry as a new TCP admission instead of synthesizing a transient
-        // 502 during policy hydration.
+    pub(super) async fn authorize(&self, host: &DomainName) -> Result<(), BindingOutcome> {
+        // Established requests retain the bounded PendingPolicy grace.
         let policy = match self.network_state.wait_for_tcp_policy().await {
             TrafficPolicy::Ready(policy) => policy,
             TrafficPolicy::NotReady(_) => return Err(BindingOutcome::PolicyUnavailable),
         };
-        if dns_allow_required(self.destination, &policy).is_none() {
-            return Ok(canonical_authority);
-        }
-        if !policy.explicitly_allows_domain_name(&host) {
-            return Err(BindingOutcome::HostNotAllowed);
-        }
-        if !self
-            .dns_allow_cache
-            .contains_host_binding(self.destination.ip(), host.as_str())
-        {
-            return Err(BindingOutcome::HostUnattributed);
-        }
-
-        let dns_allowed = self
-            .dns_allow_cache
-            .allows_ip(self.destination.ip(), &policy);
-        let decision = evaluate_egress_unmetered(self.destination, dns_allowed, &policy);
-        if decision.is_allowed() {
-            Ok(canonical_authority)
-        } else {
-            Err(BindingOutcome::PolicyDenied)
-        }
+        authorize_host(&policy, self.destination, host, &self.dns_allow_cache).map_err(|error| {
+            match error {
+                HostBindingError::HostNotAllowed => BindingOutcome::HostNotAllowed,
+                HostBindingError::HostUnattributed => BindingOutcome::HostUnattributed,
+                HostBindingError::PolicyDenied(_) => BindingOutcome::PolicyDenied,
+            }
+        })
     }
 }
 
@@ -136,12 +121,22 @@ impl BindingOutcome {
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum Failure {
-    #[error("TCP connect failed: {0}")]
-    Connect(#[source] io::Error),
-    #[error("HTTP/1 handshake failed: {0}")]
-    UpstreamHttp(#[source] hyper::Error),
+    #[error("HTTP origin setup failed: {0}")]
+    Setup(#[source] Arc<upstream::Error>),
     #[error("guest HTTP failed")]
-    GuestHttp,
+    GuestHttp(#[source] hyper::Error),
+}
+
+impl Failure {
+    pub(super) fn reason(&self) -> &'static str {
+        match self {
+            Self::Setup(error) if matches!(error.as_ref(), upstream::Error::Connect(_)) => {
+                "connect"
+            }
+            Self::Setup(_) => "plaintext_upstream_http",
+            Self::GuestHttp(_) => "plaintext_guest_http",
+        }
+    }
 }
 
 #[derive(Default)]
@@ -165,12 +160,33 @@ pub(super) async fn serve<C, F, Fut, U>(
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     F: FnOnce(SocketAddr) -> Fut + Send + 'static,
-    Fut: Future<Output = io::Result<U>> + Send + 'static,
+    Fut: Future<Output = Result<U, super::transport::Error>> + Send + 'static,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let wire_tx = Arc::new(AtomicU64::new(0));
     let wire_rx = Arc::new(AtomicU64::new(0));
-    let upstream = Arc::new(Mutex::new(Upstream::Pending(connect)));
+    let shutdown = CancellationToken::new();
+    let _cancel = shutdown.clone().drop_guard();
+    let destination = binding.destination;
+    let upstream = Arc::new(Upstream::new(
+        {
+            let read = wire_rx.clone();
+            let written = wire_tx.clone();
+            move |_| async move {
+                let inner = connect(destination).await?;
+                Ok((
+                    MeteredIo {
+                        inner,
+                        read,
+                        written,
+                    },
+                    HttpProtocol::Http1,
+                ))
+            }
+        },
+        shutdown,
+        CancellationToken::new(),
+    ));
     let tally = Arc::new(Mutex::new(Served::default()));
 
     let serving = server::Builder::new().serve_connection(
@@ -180,11 +196,9 @@ where
             let upstream = upstream.clone();
             let tally = tally.clone();
             let binding = binding.clone();
-            let wire_tx = wire_tx.clone();
-            let wire_rx = wire_rx.clone();
             async move {
                 let (response, outcome, setup_failure) = match request {
-                    Ok(request) => forward(request, upstream, &binding, wire_tx, wire_rx).await,
+                    Ok(request) => forward(request, upstream, &binding).await,
                     Err(_) => {
                         let outcome = BindingOutcome::InvalidHeaders;
                         pplx_space_metrics::gateway::domain_binding(
@@ -213,6 +227,7 @@ where
         }),
     );
     let ended = serving.await;
+    upstream.shutdown().await;
     let mut served = std::mem::take(&mut *tally.lock().await);
     served.wire_tx = wire_tx.load(Ordering::Relaxed);
     served.wire_rx = wire_rx.load(Ordering::Relaxed);
@@ -224,30 +239,29 @@ where
     }
     match ended {
         Ok(()) => Ok(served),
-        Err(error) if error.is_parse() => Err(Failure::GuestHttp),
+        Err(error) if error.is_parse() => Err(Failure::GuestHttp(error)),
         Err(_) => Ok(served),
     }
 }
 
-enum Upstream<F> {
-    Pending(F),
-    Connected(client::SendRequest<SanitizedBody<ForwardBody>>),
-    Failed,
-}
-
 async fn forward<F, Fut, U>(
     mut request: SanitizedRequest<ForwardBody>,
-    upstream: Arc<Mutex<Upstream<F>>>,
+    upstream: Arc<Upstream<F, ForwardBody>>,
     binding: &HostBinding,
-    wire_tx: Arc<AtomicU64>,
-    wire_rx: Arc<AtomicU64>,
 ) -> (Response<ForwardBody>, BindingOutcome, Option<Failure>)
 where
-    F: FnOnce(SocketAddr) -> Fut + Send + 'static,
-    Fut: Future<Output = io::Result<U>> + Send + 'static,
+    F: FnOnce(HttpProtocol) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<(U, HttpProtocol), upstream::Error>> + Send + 'static,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let authority = match binding.authorize(&request).await {
+    let authorization: Result<Authority, BindingOutcome> = async {
+        let (host, authority) =
+            validated_request_authority(&request).map_err(|()| BindingOutcome::InvalidHost)?;
+        binding.authorize(&host).await?;
+        Ok(authority)
+    }
+    .await;
+    let authority = match authorization {
         Ok(authority) => authority,
         Err(outcome) => {
             pplx_space_metrics::gateway::domain_binding("tcp", "http_host", outcome.as_str(), None);
@@ -267,16 +281,14 @@ where
         return (refusal(outcome.refusal_status()), outcome, None);
     }
 
-    let mut upstream = upstream.lock().await;
-    let sender = match connect_upstream(&mut upstream, binding.destination, wire_tx, wire_rx).await
-    {
+    let sender = match upstream.sender(HttpProtocol::Http1).await {
         Ok(sender) => sender,
         Err(error) => {
             let outcome = BindingOutcome::UpstreamFailed;
-            let (failure, error_kind) = match &error {
-                Failure::Connect(error) => ("connect", Some(error.kind())),
-                Failure::UpstreamHttp(_) => ("http_handshake", None),
-                Failure::GuestHttp => ("guest_http", None),
+            let (failure, error_kind) = match error.as_ref() {
+                upstream::Error::Connect(error) => ("connect", error.io_kind()),
+                upstream::Error::Http(_) => ("http_handshake", None),
+                upstream::Error::Tls(_) | upstream::Error::Cancelled => ("setup", None),
             };
             tracing::debug!(
                 sandbox_id = binding.sandbox_id,
@@ -291,15 +303,22 @@ where
                 "plaintext HTTP upstream connection failed"
             );
             pplx_space_metrics::gateway::domain_binding("tcp", "http_host", outcome.as_str(), None);
-            return (refusal(outcome.refusal_status()), outcome, Some(error));
+            return (
+                refusal(outcome.refusal_status()),
+                outcome,
+                Some(Failure::Setup(error)),
+            );
         }
     };
-    if sender.is_closed() {
-        let outcome = BindingOutcome::UpstreamFailed;
-        pplx_space_metrics::gateway::domain_binding("tcp", "http_host", outcome.as_str(), None);
-        return (refusal(outcome.refusal_status()), outcome, None);
-    }
-    let (response, outcome) = match request.send_http1(sender).await {
+    let sender = match sender.ready().await {
+        Ok(sender) => sender,
+        Err(_) => {
+            let outcome = BindingOutcome::UpstreamFailed;
+            pplx_space_metrics::gateway::domain_binding("tcp", "http_host", outcome.as_str(), None);
+            return (refusal(outcome.refusal_status()), outcome, None);
+        }
+    };
+    let (response, outcome) = match sender.send(request).await {
         Ok(response) if response.status() == StatusCode::SWITCHING_PROTOCOLS => {
             let outcome = BindingOutcome::UpstreamFailed;
             pplx_space_metrics::gateway::domain_binding("tcp", "http_host", outcome.as_str(), None);
@@ -321,54 +340,6 @@ where
         }
     };
     (response, outcome, None)
-}
-
-async fn connect_upstream<F, Fut, U>(
-    upstream: &mut Upstream<F>,
-    destination: SocketAddr,
-    wire_tx: Arc<AtomicU64>,
-    wire_rx: Arc<AtomicU64>,
-) -> Result<&mut client::SendRequest<SanitizedBody<ForwardBody>>, Failure>
-where
-    F: FnOnce(SocketAddr) -> Fut,
-    Fut: Future<Output = io::Result<U>>,
-    U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    match std::mem::replace(upstream, Upstream::Failed) {
-        Upstream::Pending(connect) => {
-            let io = connect(destination).await.map_err(Failure::Connect)?;
-            let metered = MeteredIo {
-                inner: io,
-                read: wire_rx,
-                written: wire_tx,
-            };
-            // Hyper 1.10.1's HTTP/1 handshake performs no socket I/O and always
-            // constructs Ok; peer and send failures surface as upstream_failed.
-            // Keep the typed error boundary for later Hyper setup validation.
-            let (sender, connection) = client::handshake(TokioIo::new(metered))
-                .await
-                .map_err(Failure::UpstreamHttp)?;
-            // Hyper requires the connection future to be driven while request
-            // senders are live. It ends when the sender or socket closes.
-            tokio::spawn(connection);
-            *upstream = Upstream::Connected(sender);
-        }
-        Upstream::Connected(sender) => {
-            *upstream = Upstream::Connected(sender);
-        }
-        Upstream::Failed => {
-            return Err(Failure::Connect(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "upstream connection is unavailable",
-            )));
-        }
-    }
-    match upstream {
-        Upstream::Connected(sender) => Ok(sender),
-        Upstream::Pending(_) | Upstream::Failed => Err(Failure::Connect(io::Error::other(
-            "upstream connection state transition did not install a sender",
-        ))),
-    }
 }
 
 /// Make the bytes forwarded upstream express the same authority that passed

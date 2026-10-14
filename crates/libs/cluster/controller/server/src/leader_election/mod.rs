@@ -804,6 +804,7 @@ where
                 // end up applied to one shape and not the other.
                 let outcome: Option<LeaseFailure> = match attempt {
                     Ok(Ok(true)) => {
+                        leadership_change_span(&config.identity, "acquired", "lease acquired");
                         tracing::info!(
                             identity = %config.identity,
                             "won cluster-controller leadership lease"
@@ -844,6 +845,9 @@ where
                 };
                 marker.set(false);
                 pplx_space_metrics::leader_election::acquire_failed(failure.as_str());
+                // Still campaigning, so certainly not the leader: say so, or a
+                // contender refused from its first attempt never has a series.
+                pplx_space_metrics::leader_election::is_leader(&config.identity, false);
                 // A failure only a human can clear is reported the first time
                 // it's seen, not after the grace window: for the categories that
                 // don't spend the budget there is no later escalation, and
@@ -1427,7 +1431,25 @@ fn resign_lost(
     reason: &str,
 ) {
     marker.set(false);
+    leadership_change_span(identity, "lost", reason);
     tracing::error!(%identity, reason, "resigning cluster-controller leadership");
     pplx_space_metrics::leader_election::lease_lost(identity);
     leader_token.cancel();
+}
+
+/// Mark a tick that changed leadership. Lease calls record spans only when they
+/// fail (the store's client is failure-traced), so renewals and standby polls,
+/// the idle steady state, leave no trace and this span is what shows a change.
+fn leadership_change_span(identity: &str, change: &'static str, reason: &str) {
+    let span = tracing::info_span!(
+        parent: None,
+        "leader_election.change",
+        otel.kind = "internal",
+        "operation.name" = "leader_election.change",
+        leader_election.lease = LEASE_NAME,
+        leader_election.identity = %identity,
+        leader_election.change = change,
+        leader_election.reason = reason,
+    );
+    drop(span);
 }

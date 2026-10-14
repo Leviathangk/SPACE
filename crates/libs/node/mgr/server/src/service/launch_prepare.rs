@@ -2,6 +2,7 @@ use super::cleanup_helpers::*;
 use super::validation::*;
 use super::*;
 use pplx_space_common_core::host::linux::paths;
+use pplx_space_common_core::host::linux::paths::{FIRECRACKER_LOG_FILE, FIRECRACKER_METRICS_FIFO};
 use pplx_space_common_core::sandbox_storage::{validate_rootfs_bytes, validate_rootfs_mib};
 use pplx_space_node_runtime_core::runtime_inventory::{
     ExecutionResolver, ExecutionSelectionMode, RuntimeFileRole, boot_component_role,
@@ -334,7 +335,7 @@ impl NodeManagerService {
         // Place kernel + rootfs + config into the jailer's expected chroot root dir.
         // Clean any leftover from a previous launch (jailer fails with "Text file busy"
         // or "File exists" if artifacts remain from a prior attempt).
-        let jail_root = format!("{chroot_base}/firecracker/{sandbox_id}/root");
+        let jail_root = paths::jail_root(sandbox_id).display().to_string();
         let observed_id = sandbox_id.to_string();
         let existing_pid = self
             .off_runtime("observe jail ownership", move || {
@@ -412,35 +413,25 @@ impl NodeManagerService {
         // mapper), and the `chown -Rh sandbox_uid jail_root` below chowns the
         // bind-mount target (the mapper device) so the unprivileged jailed
         // Firecracker can open it.
-        let rootfs_src = match req
+        //
+        // Both ends are opened first and the mount uses those open files, so
+        // the bind lands on exactly the files opened here even if a path
+        // component changes between the open and the mount.
+        let rootfs_device = req
             .rootfs_block_device_path
-            .as_deref()
-            .filter(|s| !s.is_empty())
-        {
-            Some(dev) => dev.to_string(),
-            None => format!("{CACHE_DIR}/{sandbox_id}/instance/rootfs.ext4"),
-        };
-        let rootfs_dst = format!("{jail_root}/rootfs.ext4");
-        if !std::path::Path::new(&rootfs_dst).exists() {
-            let rootfs_dst_b = rootfs_dst.clone();
-            spawn_lifecycle_blocking(&_lifecycle_permit, move || {
-                std::fs::File::create(&rootfs_dst_b)
-            })
-            .await
-            .map_err(|e| Status::internal(format!("create bind mount target task failed: {e}")))?
-            .map_err(|e| Status::internal(format!("cannot create bind mount target: {e}")))?;
-        }
-        let encrypted = req
-            .rootfs_block_device_path
-            .as_deref()
-            .is_some_and(|p| !p.is_empty());
+            .clone()
+            .filter(|s| !s.is_empty());
+        let instance_dir = format!("{CACHE_DIR}/{sandbox_id}/instance");
+        let jail_dir = jail_root.clone();
         spawn_lifecycle_blocking(&_lifecycle_permit, move || {
-            if encrypted {
-                let source = super::trusted_paths::open_rootfs_device(Path::new(&rootfs_src))?;
-                super::trusted_paths::bind_pinned(&source, Path::new(&rootfs_dst))
-            } else {
-                super::snapshots::bind_mount_file(Path::new(&rootfs_src), Path::new(&rootfs_dst))
-            }
+            let source = match &rootfs_device {
+                Some(device) => super::trusted_paths::open_rootfs_device(Path::new(device))?,
+                None => open_instance_rootfs(Path::new(&instance_dir))?,
+            };
+            let jail = super::trusted_paths::open_directory(Path::new(&jail_dir))?;
+            let target =
+                super::trusted_paths::open_bind_target(&jail, std::ffi::OsStr::new("rootfs.ext4"))?;
+            super::trusted_paths::bind_pinned_files(&source, &target)
         })
         .await
         .map_err(|e| Status::internal(format!("bind rootfs task failed: {e}")))??;
@@ -503,10 +494,31 @@ impl NodeManagerService {
 
         // For snapshot restore: start FC idle (no config, just API socket)
         // For normal boot: start FC with config file
-        let (fc_config, fc_log) = if req.snapshot_restore {
-            ("", "/fc.log")
+        let fc_config = if req.snapshot_restore {
+            ""
         } else {
-            ("/vm-config.json", "/fc.log")
+            "/vm-config.json"
+        };
+        let fc_log = format!("/{FIRECRACKER_LOG_FILE}");
+        // Firecracker writes its metrics flushes to a FIFO that sandbox-manager
+        // reads. Created after the chown above, which would hand its group to
+        // the sandbox. Best effort: a launch without one has no Firecracker
+        // metrics, and Firecracker is told about it only once it exists.
+        let metrics_fifo = format!("{jail_root}/{FIRECRACKER_METRICS_FIFO}");
+        let fc_metrics = match spawn_lifecycle_blocking(&_lifecycle_permit, move || {
+            create_firecracker_metrics_fifo(Path::new(&metrics_fifo), sandbox_uid)
+        })
+        .await
+        {
+            Ok(Ok(())) => format!("/{FIRECRACKER_METRICS_FIFO}"),
+            Ok(Err(error)) => {
+                tracing::warn!(sandbox_id, %error, "launching without Firecracker metrics");
+                String::new()
+            }
+            Err(error) => {
+                tracing::warn!(sandbox_id, %error, "launching without Firecracker metrics");
+                String::new()
+            }
         };
         let fc_console = if self.guest_console_logs {
             format!("{RUN_DIR}/{sandbox_id}/guest-console.log")
@@ -529,7 +541,8 @@ impl NodeManagerService {
                     uid: sandbox_uid,
                     gid: sandbox_uid,
                     fc_config_path: fc_config.to_string(),
-                    fc_log_path: fc_log.to_string(),
+                    fc_log_path: fc_log,
+                    fc_metrics_path: fc_metrics,
                     fc_console_path: fc_console.clone(),
                     cgroup_limits: Some(self.launch_cgroup_limits(req)),
                 },
@@ -580,14 +593,14 @@ impl NodeManagerService {
             kill_launched_process_after_pid_persist_failure(self, sandbox_id, fc_pid).await;
             return Err(status);
         }
-        let api_socket_path = format!("{JAIL_DIR}/firecracker/{sandbox_id}/root/firecracker.sock");
+        let api_socket_path = format!("{jail_root}/firecracker.sock");
         if !req.snapshot_restore {
             // Make v.sock connectable by sbx-manager (for direct vsock health checks).
             // FC creates it owned by sandbox UID; set group to space-sbxmgr so
             // sbx-manager (with that primary group) can connect. Snapshot restores
             // create v.sock during load_snapshot instead, so waiting here only adds
             // a fixed 1s delay.
-            let vsock_path = format!("{chroot_base}/firecracker/{sandbox_id}/root/v.sock");
+            let vsock_path = format!("{jail_root}/v.sock");
             let started = Instant::now();
             loop {
                 let vsock_path_b = vsock_path.clone();
@@ -962,6 +975,13 @@ pub(super) fn validate_materialized_rootfs(rootfs_path: &std::path::Path) -> Res
     Ok(())
 }
 
+/// Open the plaintext launch source, `<instance_dir>/rootfs.ext4`, without
+/// following links at any component; it must be a single-link regular file.
+fn open_instance_rootfs(instance_dir: &Path) -> Result<std::fs::File, Status> {
+    let instance = super::trusted_paths::open_directory(instance_dir)?;
+    super::trusted_paths::open_regular_file(&instance, std::ffi::OsStr::new("rootfs.ext4"))
+}
+
 fn run_rootfs_resize_command(
     operation: &'static str,
     command: &mut std::process::Command,
@@ -980,3 +1000,22 @@ fn run_rootfs_resize_command(
 
 #[cfg(test)]
 mod tests;
+
+/// Create the metrics FIFO owned by the sandbox's Firecracker user, which
+/// opens it read-write and non-blocking so a full pipe drops a flush rather
+/// than stalling the VMM, and readable by sandbox-manager's group.
+fn create_firecracker_metrics_fifo(path: &Path, sandbox_uid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let sbxmgr_gid = pplx_space_common_core::host::linux::identities::groups::SPACE_SBXMGR.gid;
+    nix::unistd::mkfifo(path, nix::sys::stat::Mode::from_bits_truncate(0o600))?;
+    let configured = std::os::unix::fs::lchown(path, Some(sandbox_uid), Some(sbxmgr_gid))
+        .and_then(|()| std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640)));
+    if let Err(error) = configured {
+        // Firecracker must not start with a FIFO it cannot open.
+        if let Err(remove_error) = std::fs::remove_file(path) {
+            tracing::warn!(path = %path.display(), error = %remove_error, "cannot remove unusable metrics FIFO");
+        }
+        return Err(error);
+    }
+    Ok(())
+}

@@ -884,7 +884,7 @@ class NodeSelectorExtrasControl(Protocol):
         ...
 
     def sandbox_pod_count(self) -> int:
-        """Non-pool, non-terminating sandbox pods in the namespace."""
+        """Non-pool, non-terminating pods in the sandbox namespace."""
         ...
 
     def native_create_sandbox(self, *, template: str, metadata: Mapping[str, str]) -> str:
@@ -1483,7 +1483,16 @@ class ConcurrentRestoreControl(Protocol):
     """
 
     def scale_public_api(self, replicas: int) -> int:
-        """Set the kind public API Deployment's replica count; returns the previous count."""
+        """Set the kind public API Deployment's replica count; returns the previous count.
+
+        An autoscaler on the Deployment is pinned to `replicas` (both bounds)
+        so it cannot reconcile the count away; its first captured bounds are
+        restored by `restore_public_api_autoscaler`.
+        """
+        ...
+
+    def restore_public_api_autoscaler(self) -> None:
+        """Put back the autoscaler bounds `scale_public_api` pinned; a no-op when none was."""
         ...
 
     def wait_public_api_rollout(self, *, timeout: float) -> None:
@@ -1503,11 +1512,11 @@ class ConcurrentRestoreControl(Protocol):
 
         Returns the cap. Every pod POST in the namespace is then rejected at
         admission with 403 until the cap is lifted. Blast radius: the quota
-        is namespaced to `space` and pins `pods` only, but every SPACE
-        component lives in that namespace, so any pod that restarts during
-        the seconds-long window is refused until the lift. The compensation
-        (`lift_namespace_pod_cap`, `--ignore-not-found`) is armed before the
-        apply.
+        is namespaced to the sandbox namespace and pins `pods` only, so any
+        sandbox or warm-pool pod created during the seconds-long window is
+        refused until the lift; the control plane in `space` is untouched.
+        The compensation (`lift_namespace_pod_cap`, `--ignore-not-found`) is
+        armed before the apply.
         """
         ...
 
@@ -2145,4 +2154,78 @@ class TelemetryBackendControl(Protocol):
         bench up. Exporters that match no mode, or that are not literals, raise
         `SmokeConfigurationError` naming what was found.
         """
+        ...
+
+
+@dataclass(frozen=True)
+class TcpTarget:
+    """One address a network-isolation probe opens a TCP connection to."""
+
+    name: str
+    host: str
+    port: int
+
+
+@dataclass(frozen=True)
+class TcpProbe:
+    """Whether a TCP connect from one network namespace completed.
+
+    `connected` is a completed handshake; anything else (a refusal, a reset,
+    a policy drop timing out) is not, and `detail` says which the probe saw.
+    """
+
+    target: TcpTarget
+    connected: bool
+    detail: str
+
+
+@dataclass(frozen=True)
+class PodNetwork:
+    """A pod's name, bound node and pod IP."""
+
+    pod_name: str
+    node_name: str
+    pod_ip: str
+
+
+class SandboxNetworkIsolationControl(Protocol):
+    """Kind-only probes of the sandbox namespace's NetworkPolicies.
+
+    Every probe runs in the node's operator shell (`space-node-debug`), either
+    in the shell's own network namespace, which sits in the control-plane
+    namespace with no policy, or in another pod's network namespace entered by
+    its netns handle (`nsenter --net`). Nothing runs inside a sandbox VM, so
+    the per-sandbox net-gateway's own rules are not on the path.
+    """
+
+    def sandbox_pod_network(self, sandbox_id: str) -> PodNetwork | None:
+        """The sandbox's bound, running execution pod in the sandbox namespace."""
+        ...
+
+    def control_plane_targets(self) -> list[TcpTarget]:
+        """Postgres, the Kubernetes API, internal-api and the object store, by Service ClusterIP."""
+        ...
+
+    def cluster_dns_target(self) -> TcpTarget:
+        """The cluster DNS Service on TCP 53, which the allow policy admits."""
+        ...
+
+    def probe_from_node_shell(
+        self, node_name: str, targets: Sequence[TcpTarget], *, timeout: float
+    ) -> list[TcpProbe]:
+        """TCP connects from the operator shell's own network namespace on that node."""
+        ...
+
+    def probe_from_pod_netns(
+        self, pod: PodNetwork, targets: Sequence[TcpTarget], *, timeout: float
+    ) -> list[TcpProbe]:
+        """TCP connects from the pod's network namespace, outside any VM it runs."""
+        ...
+
+    def start_unselected_pod(self, node_name: str, token: str) -> PodNetwork:
+        """A pause pod in the sandbox namespace that no allow rule selects, bound to the node."""
+        ...
+
+    def remove_unselected_pods(self, token: str) -> None:
+        """Delete the pods `start_unselected_pod` created under this token; idempotent."""
         ...

@@ -135,7 +135,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                     )
                     .await?;
                 let execution = fence.execution;
-                let (_, phase_deadline) = ready_wait_bounds(super::super::CREATE_READY_BUDGET);
+                let (_, phase_deadline) = self.budgets.ready_wait_bounds(self.budgets.create_ready);
                 let (pod_ip, binding) = self
                     .wait_for_pod_proxy_reachable(
                         request.metric_identity,
@@ -444,7 +444,8 @@ impl SubstrateAdapter for KubernetesSubstrate {
         // The inner waits clamp to `phase_deadline` so their phase-tagged
         // timeouts fire first; the outer timeout is the backstop for the
         // stretches between them.
-        let (create_budget, phase_deadline) = ready_wait_bounds(super::super::CREATE_READY_BUDGET);
+        let (create_budget, phase_deadline) =
+            self.budgets.ready_wait_bounds(self.budgets.create_ready);
         let select_outcome = match tokio::time::timeout(create_budget, async {
             let (pod_ip, binding) = self
                 .wait_for_pod_proxy_reachable(
@@ -496,16 +497,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
         .await
         {
             Ok(outcome) => outcome,
-            // Neutral message: whether the work is preserved (pod left running,
-            // retry the same sandbox) or torn down (pod never scheduled) is
-            // decided by the preserve check below, so don't promise either here.
-            Err(_elapsed) => Err(SubstrateError::Timeout {
-                message: format!(
-                    "sandbox create did not reach readiness within {}s",
-                    super::super::CREATE_READY_BUDGET.as_secs()
-                ),
-                phase: None,
-            }),
+            Err(_elapsed) => Err(create_ready_timeout_error(self.budgets.create_ready)),
         };
         let binding = match select_outcome {
             Ok(binding) => binding,
@@ -528,7 +520,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 // the latency cliff.
                 if create_wait_should_preserve_node_work(&err)
                     && let Ok(Some(node_id)) = tokio::time::timeout(
-                        super::super::PRESERVE_DECISION_BUDGET,
+                        self.budgets.preserve_decision,
                         self.preservable_create_node(sandbox_uuid, &pod_name),
                     )
                     .await
@@ -1236,7 +1228,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Option<PublishedLocalArtifact>, SubstrateError> {
-        let suspend_deadline = Instant::now() + TEARDOWN_SUSPEND_DURABILITY_BUDGET;
+        let suspend_deadline = Instant::now() + self.budgets.suspend_durability;
         SandboxEvent::new(
             sandbox_id,
             SandboxEventType::SuspendRequested,
@@ -1384,9 +1376,32 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 expected_generation,
                 &endpoint_addr,
                 suspend_deadline,
+                self.budgets.suspend_durability,
             )
             .await
             {
+                Ok(GenerationSuspendOutcome::Durable(published_artifact)) => Ok(published_artifact),
+                // The node can delete the sandbox after its suspend backup
+                // finalized (a failed post-suspend cleanup takes the delete
+                // path), and then has no artifact to publish. The ready
+                // snapshot still proves the suspend durable; without it the
+                // suspend did not complete and the caller may retry.
+                Ok(GenerationSuspendOutcome::NodeDeleted) => self
+                    .store
+                    .durable_suspend_snapshot_artifact(
+                        sandbox_id,
+                        expected_generation,
+                        &expected_pod_uid,
+                    )
+                    .await?
+                    .ok_or_else(|| SubstrateError::Unavailable {
+                        message: format!(
+                            "sandbox {sandbox_id} was deleted on its node before suspend completed"
+                        ),
+                    }),
+                Err(error) => Err(error),
+            };
+            let published_artifact = match published_artifact {
                 Ok(published_artifact) => published_artifact,
                 Err(error) => {
                     tracing::warn!(
@@ -1403,7 +1418,11 @@ impl SubstrateAdapter for KubernetesSubstrate {
                         SandboxEventType::SuspendFailed,
                         SandboxEventSource::Substrate,
                     )
-                    .emit_with(SandboxEventDetails::default().error(error.to_string()));
+                    .emit_with(
+                        SandboxEventDetails::default()
+                            .error(error.to_string())
+                            .logged_by_caller(),
+                    );
                     return Err(error);
                 }
             };
@@ -1458,11 +1477,11 @@ impl SubstrateAdapter for KubernetesSubstrate {
             .require_sandbox(sandbox_id)
             .await
             .map_err(ControllerError::from)?;
-        if let Some(pod_ip) = self
-            .resolve_pod_ip(sandbox_id)
+        if let Some(pod) = self
+            .resolve_pod_instance(sandbox_id)
             .await
             .map_err(ControllerError::from)?
-            && let Ok(client) = self.worker_client_for_pod_ip(pod_ip).await
+            && let Ok(client) = self.kept_worker_client(&pod).await
         {
             return Ok(client);
         }
@@ -1514,15 +1533,15 @@ impl SubstrateAdapter for KubernetesSubstrate {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Option<RuntimeClient>, ControllerError> {
-        let Some(pod_ip) = self
-            .resolve_pod_ip(sandbox_id)
+        let Some(pod) = self
+            .resolve_pod_instance(sandbox_id)
             .await
             .map_err(ControllerError::from)?
         else {
             return Ok(None);
         };
 
-        match self.worker_client_for_pod_ip(pod_ip).await {
+        match self.kept_worker_client(&pod).await {
             Ok(client) => Ok(Some(client)),
             Err(_) => Ok(None),
         }
@@ -1568,11 +1587,12 @@ impl SubstrateAdapter for KubernetesSubstrate {
             return connect_worker(binding.binding.runtime_endpoint).await;
         }
 
-        if let Some(pod_ip) = self
-            .resolve_pod_ip(sandbox.id)
+        if let Some(pod) = self
+            .resolve_pod_instance(sandbox.id)
             .await
             .map_err(ControllerError::from)?
         {
+            let pod_ip = pod.ip;
             // A preserved slow create was reported `started` before its guest
             // command API was confirmed ready. Force a (bounded) command-ready
             // confirmation on first access so a data-plane op can't reach a
@@ -1621,7 +1641,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                     }
                 }
             }
-            if let Ok(client) = self.worker_client_for_pod_ip(pod_ip).await {
+            if let Ok(client) = self.kept_worker_client(&pod).await {
                 return Ok(client);
             }
         }
@@ -2621,7 +2641,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
         let require_pooled_adoption_node_id = if wait_until_ready {
             wait_for_pooled_split_receipt_capability(
                 &mut node_api,
-                Instant::now() + WARM_POOL_SETUP_RPC_TIMEOUT,
+                Instant::now() + self.budgets.pooled_split_receipt_wait,
             )
             .await?;
             true
@@ -3091,5 +3111,19 @@ impl SubstrateAdapter for KubernetesSubstrate {
             });
         }
         Ok(Some(dedupe_inventory_entries(candidates)))
+    }
+}
+
+/// `create_execution`'s error when its outer readiness budget expires.
+///
+/// Neutral message: whether the work is preserved (pod left running, retry the
+/// same sandbox) or torn down (pod never scheduled) is decided by the preserve
+/// check after it, so don't promise either here. `Duration`'s `Debug` renders
+/// a whole-second budget such as the production default as `135s`, and keeps
+/// a test's sub-second budget legible.
+pub(super) fn create_ready_timeout_error(create_ready: Duration) -> SubstrateError {
+    SubstrateError::Timeout {
+        message: format!("sandbox create did not reach readiness within {create_ready:?}"),
+        phase: None,
     }
 }

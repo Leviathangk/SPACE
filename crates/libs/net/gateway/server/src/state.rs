@@ -20,8 +20,13 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use crate::dns::DnsAllowCache;
+use crate::egress::DnsAttributedTcpTracker;
+
 use crate::proto::{NetworkPolicyErrorKind, NetworkState};
 
+mod egress;
+pub use egress::ReservedDnsCancellation;
 mod startup_timing;
 use startup_timing::StartupTiming;
 
@@ -219,22 +224,6 @@ impl PolicyNotReady {
     }
 }
 
-/// Callback invoked after a policy is loaded and validated but before it is
-/// published as ready. The gateway wires this to reconcile cached DNS evidence
-/// and established TCP flows on every install path.
-pub type InstallHook = Arc<dyn Fn(&NetworkPolicyV1) + Send + Sync>;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PolicyInvalidation {
-    /// Called before the current ready state is invalidated.
-    ReadyState,
-    /// Called after removal of an installed policy is published.
-    InstalledPolicy,
-}
-
-/// Called under the state write lock at each policy-invalidation boundary.
-pub type PolicyInvalidationHook = Arc<dyn Fn(PolicyInvalidation) + Send + Sync>;
-
 #[derive(Clone)]
 pub struct GatewayNetworkState {
     state_tx: watch::Sender<Arc<NetworkStateInner>>,
@@ -242,10 +231,12 @@ pub struct GatewayNetworkState {
     writer_lock: Arc<Mutex<()>>,
     refresh_lock: Arc<Mutex<()>>,
     pending_tcp_connections: Arc<AtomicU64>,
-    install_hook: Option<InstallHook>,
-    policy_invalidation_hook: Option<PolicyInvalidationHook>,
+    dns_allow_cache: DnsAllowCache,
+    tcp_connections: DnsAttributedTcpTracker,
+    reserved_dns_cancellation: ReservedDnsCancellation,
     traffic_gate: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     readiness_observer: Option<Arc<StartupTiming>>,
+    owner_contacted: Arc<watch::Sender<bool>>,
 }
 
 #[derive(Clone, Debug)]
@@ -383,23 +374,23 @@ impl GatewayNetworkState {
             writer_lock: Arc::new(Mutex::new(())),
             refresh_lock: Arc::new(Mutex::new(())),
             pending_tcp_connections: Arc::new(AtomicU64::new(0)),
-            install_hook: None,
-            policy_invalidation_hook: None,
+            dns_allow_cache: DnsAllowCache::default(),
+            tcp_connections: DnsAttributedTcpTracker::default(),
+            reserved_dns_cancellation: ReservedDnsCancellation::default(),
+            owner_contacted: Arc::new(watch::channel(false).0),
         }
     }
 
-    /// Attach the policy-install reconciliation hook (see [`InstallHook`]).
-    /// Call once at construction, before `spawn_hydration`.
-    #[must_use]
-    pub fn with_install_hook(mut self, hook: InstallHook) -> Self {
-        self.install_hook = Some(hook);
-        self
+    /// Record that the owning sandbox-manager has called this gateway's control
+    /// socket. The owner registers the gateway's process with host-control
+    /// before it calls, so from now on a policy pull is authorized.
+    pub fn record_owner_contact(&self) {
+        self.owner_contacted.send_replace(true);
     }
 
-    #[must_use]
-    pub fn with_policy_invalidation_hook(mut self, hook: PolicyInvalidationHook) -> Self {
-        self.policy_invalidation_hook = Some(hook);
-        self
+    /// Whether, and when, the owner first called; see [`Self::record_owner_contact`].
+    pub fn owner_contact(&self) -> watch::Receiver<bool> {
+        self.owner_contacted.subscribe()
     }
 
     pub async fn snapshot(&self) -> NetworkStateSnapshot {
@@ -644,11 +635,8 @@ impl GatewayNetworkState {
         let current = self.state_rx.borrow().clone();
         let mut inner = current.as_ref().clone();
         update(&mut inner);
-        if current.mode == NetworkState::Ready
-            && inner.mode != NetworkState::Ready
-            && let Some(hook) = self.policy_invalidation_hook.as_ref()
-        {
-            hook(PolicyInvalidation::ReadyState);
+        if current.mode == NetworkState::Ready && inner.mode != NetworkState::Ready {
+            self.reserved_dns_cancellation.cancel_in_flight();
         }
         let policy_removed = current.policy.is_some() && inner.policy.is_none();
         let inner = Arc::new(inner);
@@ -659,8 +647,14 @@ impl GatewayNetworkState {
         // Publish unavailability before sweeping. An old-policy admission racing
         // the transition then either fails its final generation check or was
         // already registered and is cancelled below.
-        if policy_removed && let Some(hook) = self.policy_invalidation_hook.as_ref() {
-            hook(PolicyInvalidation::InstalledPolicy);
+        if policy_removed {
+            let cancelled = self.tcp_connections.cancel_all();
+            if cancelled > 0 {
+                info!(
+                    dns_attributed_cancelled_tcp_connections = cancelled,
+                    "cancelled TCP connections after network policy invalidation"
+                );
+            }
         }
         inner
     }
@@ -767,7 +761,6 @@ impl GatewayNetworkState {
         let result = tokio::time::timeout(HYDRATION_DEADLINE, (loader)()).await;
         let latency_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         let expected_ref_for_log = expected_ref_display(expected_policy_ref.as_ref());
-        let install_hook = self.install_hook.clone();
 
         let inner = self
             .update_inner(move |inner| {
@@ -790,9 +783,7 @@ impl GatewayNetworkState {
                                 let network_credentials = Arc::new(pulled.network_credentials);
                                 let (action, allow_counts, deny_counts) =
                                     policy_log_summary(&policy);
-                                if let Some(hook) = install_hook.as_ref() {
-                                    hook(&policy);
-                                }
+                                self.reconcile_policy(&policy);
                                 set_mode(inner, NetworkState::Ready, reason);
                                 inner.policy = Some(Arc::clone(&policy));
                                 inner.network_credentials = Some(network_credentials);
@@ -825,6 +816,10 @@ impl GatewayNetworkState {
                                     deny_ips = deny_counts.ips,
                                     deny_cidrs = deny_counts.cidrs,
                                     reason = reason.as_str(),
+                                    // Effective mode for this install. Every
+                                    // install (refresh, self-hydration, restore)
+                                    // logs this line, so it tracks mode changes.
+                                    tls_interception_mode = policy.tls_interception.as_str(),
                                     // The rendered destination strings are NOT
                                     // logged: policy destinations are tenant-
                                     // authored and a hostname can carry arbitrary

@@ -92,13 +92,8 @@ async fn authorization_waits_through_a_transient_policy_refresh() {
         &policy,
     );
     let binding = HostBinding::new("test", DESTINATION.parse().unwrap(), state.clone(), cache);
-    let request = Request::builder()
-        .uri("/simple/")
-        .header(header::HOST, ALLOWED_HOST)
-        .body(Empty::<hyper::body::Bytes>::new())
-        .unwrap();
     let authorizing =
-        tokio::spawn(async move { binding.authorize(&request.try_into().unwrap()).await });
+        tokio::spawn(async move { binding.authorize(&ALLOWED_HOST.parse().unwrap()).await });
     tokio::task::yield_now().await;
     assert!(
         !authorizing.is_finished(),
@@ -113,8 +108,7 @@ async fn authorization_waits_through_a_transient_policy_refresh() {
         )
         .await;
     assert_eq!(snapshot.mode, NetworkState::Ready);
-    let authority = authorizing.await.unwrap().unwrap();
-    assert_eq!(authority.host(), ALLOWED_HOST);
+    authorizing.await.unwrap().unwrap();
 }
 
 async fn assert_request_refused_before_connect(
@@ -130,10 +124,9 @@ async fn assert_request_refused_before_connect(
         let connect_called = connect_called.clone();
         move |_| async move {
             connect_called.store(true, Ordering::Relaxed);
-            Err::<tokio::io::DuplexStream, _>(io::Error::new(
-                io::ErrorKind::ConnectionRefused,
-                "unexpected connect",
-            ))
+            Err::<tokio::io::DuplexStream, _>(
+                io::Error::new(io::ErrorKind::ConnectionRefused, "unexpected connect").into(),
+            )
         }
     }));
     let (mut sender, guest_connection) =
@@ -244,20 +237,10 @@ async fn independent_ip_allow_applies_to_an_existing_host_bound_flow() {
         ready_state(direct_policy).await,
         DnsAllowCache::default(),
     );
-    let request = Request::builder()
-        .uri("/simple/")
-        .header(header::HOST, ALLOWED_HOST)
-        .body(Empty::<hyper::body::Bytes>::new())
+    binding
+        .authorize(&ALLOWED_HOST.parse().unwrap())
+        .await
         .unwrap();
-
-    assert_eq!(
-        binding
-            .authorize(&request.try_into().unwrap())
-            .await
-            .unwrap()
-            .host(),
-        ALLOWED_HOST
-    );
 }
 
 async fn send_request(
@@ -349,7 +332,7 @@ async fn validates_every_host_on_a_keep_alive_connection() {
         }
     });
     let relay = tokio::spawn(serve(guest, binding, move |_| async move {
-        Ok::<_, io::Error>(upstream)
+        Ok::<_, super::super::transport::Error>(upstream)
     }));
 
     let (mut sender, guest_connection) =
@@ -502,7 +485,7 @@ async fn an_unsolicited_upstream_protocol_upgrade_fails_and_closes() {
             .await;
     });
     let relay = tokio::spawn(serve(guest, binding, move |_| async move {
-        Ok::<_, io::Error>(upstream)
+        Ok::<_, super::super::transport::Error>(upstream)
     }));
     let (mut sender, guest_connection) =
         client::handshake::<_, Empty<hyper::body::Bytes>>(TokioIo::new(guest_peer))
@@ -546,7 +529,7 @@ async fn a_dead_upstream_returns_one_retryable_close() {
     let (upstream, upstream_peer) = duplex(PIPE);
     drop(upstream_peer);
     let relay = tokio::spawn(serve(guest, binding, move |_| async move {
-        Ok::<_, io::Error>(upstream)
+        Ok::<_, super::super::transport::Error>(upstream)
     }));
     let (mut sender, guest_connection) =
         client::handshake::<_, Empty<hyper::body::Bytes>>(TokioIo::new(guest_peer))

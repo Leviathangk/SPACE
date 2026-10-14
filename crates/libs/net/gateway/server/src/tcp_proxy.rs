@@ -24,26 +24,28 @@ use crate::debug::GatewayDebugState;
 use crate::dns::DnsAllowCache;
 use crate::egress::{EgressPhase, EgressProtocol};
 use crate::known_egress::KnownEgressState;
-use crate::reserved_dns::{ReservedDnsCancellation, ReservedDnsCore};
+use crate::reserved_dns::ReservedDnsCore;
 use crate::resource_budget::MAX_ACTIVE_TCP_CONNECTIONS;
 use crate::sniff;
-use crate::state::{GatewayNetworkState, PolicyNotReady, TrafficPolicy};
+use crate::state::{GatewayNetworkState, PolicyNotReady, ReservedDnsCancellation, TrafficPolicy};
 use crate::stats::ProxyStats;
 use crate::tls_interception::{TlsInterception, TlsInterceptionError};
 
 mod accounting;
 mod admission;
 mod http_host;
+mod inspected;
 mod relay;
 mod reserved_dns;
 mod routing_headers;
 pub(crate) mod tls;
 mod tls_http;
-mod tracker;
+mod transport;
+mod upstream;
 
-use admission::{AdmittedTcp, TcpAdmissionDenial};
+use crate::egress::DnsAttributedTcpTracker;
+use crate::egress::{AdmittedTcp, TcpAdmissionDenial};
 pub use pplx_space_net_gateway_client::TcpDomainAuthorizationMode;
-pub use tracker::DnsAttributedTcpTracker;
 
 pub struct TcpProxyConfig {
     pub sandbox_id: &'static str,
@@ -211,13 +213,9 @@ impl FlowOutcome {
             Self::Relayed(Relay::HostBoundHttp { .. }) => ("relayed", "host_bound_http"),
             Self::HandledDns { .. } => ("handled", "reserved_dns"),
             Self::InspectedTls => ("relayed", "inspected_tls"),
+            Self::RelayFailed(RelayFailure::Inspected(_)) => ("relay_failed", "inspected_http"),
             Self::RelayFailed(RelayFailure::Connect(_)) => ("relay_failed", "connect"),
-            Self::RelayFailed(RelayFailure::PlaintextUpstreamHttp) => {
-                ("relay_failed", "plaintext_upstream_http")
-            }
-            Self::RelayFailed(RelayFailure::PlaintextGuestHttp) => {
-                ("relay_failed", "plaintext_guest_http")
-            }
+            Self::RelayFailed(RelayFailure::Plaintext(error)) => ("relay_failed", error.reason()),
             Self::RelayFailed(RelayFailure::Transfer(_)) => ("relay_failed", "transfer"),
         }
     }
@@ -250,13 +248,11 @@ enum Rejection {
 
 /// Where relaying failed, named for the phase.
 enum RelayFailure {
-    Connect(io::Error),
-    /// Plaintext upstream accepted TCP but did not speak HTTP/1.1.
-    PlaintextUpstreamHttp,
-    /// A DNS-authorized plaintext guest flow did not speak HTTP/1.1.
-    PlaintextGuestHttp,
+    Connect(transport::Error),
+    Plaintext(http_host::Failure),
     /// Connected, then the byte stream failed (e.g. reset, broken pipe).
     Transfer(io::Error),
+    Inspected(tls_http::HttpError),
 }
 
 /// How the bytes were carried.
@@ -554,7 +550,7 @@ impl TcpProxy {
                     .await
                 {
                     Ok(()) => FlowOutcome::InspectedTls,
-                    Err(error) => FlowOutcome::Rejected(Rejection::TlsInterception(error)),
+                    Err(error) => FlowOutcome::RelayFailed(RelayFailure::Inspected(error)),
                 }
             }
         };
@@ -590,21 +586,25 @@ impl TcpProxy {
         match admitted {
             AdmittedTcp::Tunnel(destination) => self.pass_through(client, destination).await,
             AdmittedTcp::HostBoundHttp(destination) => {
-                self.host_bound_http(client, destination, relay::connect)
+                self.host_bound_http(client, destination, transport::connect)
                     .await
             }
         }
     }
 
     async fn pass_through(&self, client: TcpStream, dst: SocketAddr) -> FlowOutcome {
-        match relay::run(client, dst).await {
-            Ok((wire_tx, wire_rx)) => FlowOutcome::Relayed(Relay::Tunnelled { wire_tx, wire_rx }),
-            Err(relay::Failure::Connect(error)) => {
-                FlowOutcome::RelayFailed(RelayFailure::Connect(error))
-            }
-            Err(relay::Failure::Copy(error)) => {
-                FlowOutcome::RelayFailed(RelayFailure::Transfer(error))
-            }
+        let upstream = match transport::connect(dst).await {
+            Ok(upstream) => upstream,
+            Err(error) => return FlowOutcome::RelayFailed(RelayFailure::Connect(error)),
+        };
+        let report = relay::run(client, upstream, &self.shutdown_token, None).await;
+        match report.result {
+            Ok(()) => FlowOutcome::Relayed(Relay::Tunnelled {
+                wire_tx: report.written.0,
+                wire_rx: report.written.1,
+            }),
+            Err(relay::Error::Io(error)) => FlowOutcome::RelayFailed(RelayFailure::Transfer(error)),
+            Err(relay::Error::Cancelled | relay::Error::Idle) => FlowOutcome::Cancelled,
         }
     }
 
@@ -616,7 +616,7 @@ impl TcpProxy {
     ) -> FlowOutcome
     where
         F: FnOnce(SocketAddr) -> Fut + Send + 'static,
-        Fut: Future<Output = io::Result<U>> + Send + 'static,
+        Fut: Future<Output = Result<U, transport::Error>> + Send + 'static,
         U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let binding = http_host::HostBinding::new(
@@ -634,15 +634,7 @@ impl TcpProxy {
                 wire_tx: served.wire_tx,
                 wire_rx: served.wire_rx,
             }),
-            Err(http_host::Failure::Connect(error)) => {
-                FlowOutcome::RelayFailed(RelayFailure::Connect(error))
-            }
-            Err(http_host::Failure::UpstreamHttp(_)) => {
-                FlowOutcome::RelayFailed(RelayFailure::PlaintextUpstreamHttp)
-            }
-            Err(http_host::Failure::GuestHttp) => {
-                FlowOutcome::RelayFailed(RelayFailure::PlaintextGuestHttp)
-            }
+            Err(error) => FlowOutcome::RelayFailed(RelayFailure::Plaintext(error)),
         }
     }
 
@@ -662,6 +654,14 @@ impl TcpProxy {
             FlowOutcome::Cancelled
             | FlowOutcome::InspectedTls
             | FlowOutcome::RelayFailed(RelayFailure::Connect(_) | RelayFailure::Transfer(_)) => {}
+            FlowOutcome::RelayFailed(RelayFailure::Inspected(error)) => {
+                pplx_space_metrics::gateway::domain_binding(
+                    "tcp",
+                    "tls_transport",
+                    error.as_str(),
+                    None,
+                );
+            }
             FlowOutcome::HandledDns {
                 messages,
                 wire_tx,
@@ -678,22 +678,22 @@ impl TcpProxy {
                     "handled policy-gated TCP DNS connection"
                 );
             }
-            FlowOutcome::RelayFailed(RelayFailure::PlaintextUpstreamHttp) => {
-                pplx_space_metrics::gateway::domain_binding(
+            FlowOutcome::RelayFailed(RelayFailure::Plaintext(error)) => match error {
+                http_host::Failure::Setup(error)
+                    if matches!(error.as_ref(), upstream::Error::Connect(_)) => {}
+                http_host::Failure::Setup(_) => pplx_space_metrics::gateway::domain_binding(
                     "tcp",
                     "http_host",
                     "upstream_http_failed",
                     None,
-                );
-            }
-            FlowOutcome::RelayFailed(RelayFailure::PlaintextGuestHttp) => {
-                pplx_space_metrics::gateway::domain_binding(
+                ),
+                http_host::Failure::GuestHttp(_) => pplx_space_metrics::gateway::domain_binding(
                     "tcp",
                     "http_host",
                     "guest_http_failed",
                     None,
-                );
-            }
+                ),
+            },
             FlowOutcome::Rejected(Rejection::PolicyMissing(reason)) => {
                 debug!(
                     sandbox_id = self.sandbox_id,
@@ -854,9 +854,7 @@ fn interception_detail(error: &TlsInterceptionError) -> Option<&'static str> {
             tonic::Code::Internal => "internal",
             _ => "other",
         }),
-        TlsInterceptionError::AuthorityUnavailable
-        | TlsInterceptionError::Timeout
-        | TlsInterceptionError::Transport(_) => None,
+        TlsInterceptionError::AuthorityUnavailable | TlsInterceptionError::Timeout => None,
     }
 }
 
@@ -876,7 +874,6 @@ fn interception_failure(error: &TlsInterceptionError) -> (accounting::Outcome, &
             tonic::Code::Unavailable => (Outcome::Error, "certificate_unavailable"),
             _ => (Outcome::Error, "certificate_error"),
         },
-        TlsInterceptionError::Transport(error) => (Outcome::Error, error.as_str()),
     }
 }
 

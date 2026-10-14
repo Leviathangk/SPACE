@@ -1,3 +1,4 @@
+mod prefetch_catalog;
 use pplx_space_common_core::types::{LocalArtifactId, NodeId, OrgId, SnapshotId, UserId};
 
 use super::metadata::*;
@@ -441,6 +442,7 @@ async fn scoped_release_lookup_hides_private_bases(
                     service
                         .find_template_release_by_hash(Request::new(
                             FindTemplateReleaseByHashRequest {
+                                generic_only: false,
                                 template_name: name,
                                 hash,
                                 caller_org_id: org,
@@ -450,6 +452,7 @@ async fn scoped_release_lookup_hides_private_bases(
                 } else {
                     service
                         .find_template_release(Request::new(FindTemplateReleaseRequest {
+                            generic_only: false,
                             template_name: name,
                             runtime: "firecracker".into(),
                             tag: "stable".into(),
@@ -872,6 +875,7 @@ async fn register_template_release_reuses_a_bare_hash_release() -> TestResult {
     let latest = fixture
         .service
         .find_template_release(Request::new(FindTemplateReleaseRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             runtime: "firecracker".to_string(),
@@ -938,6 +942,7 @@ async fn register_template_release_prefers_the_duplicate_that_owns_a_location() 
         let resolved = fixture
             .service
             .find_template_release(Request::new(FindTemplateReleaseRequest {
+                generic_only: false,
                 caller_org_id: None,
                 template_name: "code-runtime".to_string(),
                 runtime: "firecracker".to_string(),
@@ -991,6 +996,7 @@ async fn register_template_release_is_idempotent_by_hash() -> TestResult {
     let by_hash = fixture
         .service
         .find_template_release_by_hash(Request::new(FindTemplateReleaseByHashRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             hash: digest_a.to_string(),
@@ -1013,6 +1019,7 @@ async fn register_template_release_is_idempotent_by_hash() -> TestResult {
     let by_tag = fixture
         .service
         .find_template_release(Request::new(FindTemplateReleaseRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             runtime: "firecracker".to_string(),
@@ -1056,6 +1063,7 @@ async fn register_template_release_is_idempotent_by_hash() -> TestResult {
     let latest = fixture
         .service
         .find_template_release(Request::new(FindTemplateReleaseRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             runtime: "firecracker".to_string(),
@@ -1121,6 +1129,7 @@ async fn storage_policy_rejects_registration_without_changing_release_or_tags() 
         let latest = fixture
             .service
             .find_template_release(Request::new(FindTemplateReleaseRequest {
+                generic_only: false,
                 template_name: "code-runtime".into(),
                 runtime: "fc".into(),
                 tag: "latest".into(),
@@ -1159,6 +1168,7 @@ async fn register_template_release_allows_no_storage_locations() -> TestResult {
     let by_hash = fixture
         .service
         .find_template_release_by_hash(Request::new(FindTemplateReleaseByHashRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             hash: digest.to_string(),
@@ -1360,6 +1370,7 @@ async fn find_template_release_by_hash_resolves_bare_hash() -> TestResult {
     let by_bare = fixture
         .service
         .find_template_release_by_hash(Request::new(FindTemplateReleaseByHashRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             hash: bare.to_string(),
@@ -1376,6 +1387,7 @@ async fn find_template_release_by_hash_resolves_bare_hash() -> TestResult {
     let by_prefixed = fixture
         .service
         .find_template_release_by_hash(Request::new(FindTemplateReleaseByHashRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             hash: prefixed.clone(),
@@ -3432,6 +3444,7 @@ async fn release_visible_from(
             .service
             .find_template_release(node_scoped_request(
                 FindTemplateReleaseRequest {
+                    generic_only: false,
                     caller_org_id: caller_org_id.clone(),
                     template_name: template.to_string(),
                     runtime: "firecracker".to_string(),
@@ -3446,6 +3459,7 @@ async fn release_visible_from(
             .service
             .find_template_release_by_hash(node_scoped_request(
                 FindTemplateReleaseByHashRequest {
+                    generic_only: false,
                     caller_org_id,
                     template_name: template.to_string(),
                     hash: hash.to_string(),
@@ -3521,6 +3535,7 @@ async fn node_scoped_lookups_hide_unplaced_private_releases() -> TestResult {
     fixture
         .service
         .find_template_release(Request::new(FindTemplateReleaseRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "private-base".to_string(),
             runtime: "firecracker".to_string(),
@@ -3566,6 +3581,7 @@ async fn placed_sandbox_unlocks_private_release_for_its_node_only() -> TestResul
         .service
         .find_template_release(node_scoped_request(
             FindTemplateReleaseRequest {
+                generic_only: false,
                 caller_org_id: None,
                 template_name: "private-base".to_string(),
                 runtime: "firecracker".to_string(),
@@ -3602,6 +3618,455 @@ async fn placed_sandbox_unlocks_private_release_for_its_node_only() -> TestResul
     .await?;
     assert!(!release_visible_from(&fixture, "private-base", &hash, worker_a_ip, None).await?);
     Ok(())
+}
+
+/// A node reads a sandbox's suspend snapshot location, exact artifact backup
+/// location and organization snapshot storage only while the sandbox is
+/// placed on it: active there, or as the target of a pending migration or
+/// restore. Another node reads `NotFound`, and a request with no remote
+/// address is refused. A former host can still ask whether an identity it
+/// holds is backed up, and learns only that.
+#[tokio::test(flavor = "current_thread")]
+async fn placed_sandbox_locations_resolve_for_its_node_only() -> TestResult {
+    use crate::proto::{
+        BackupReadinessQuery, LocalArtifactBackupIdentity, backup_readiness_query::Artifact,
+    };
+    use prost::Message as _;
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    let worker_a_ip = std::net::Ipv4Addr::new(10, 0, 0, 40);
+    let worker_b_ip = std::net::Ipv4Addr::new(10, 0, 0, 41);
+    let worker_a = insert_k8s_node(pool, worker_a_ip, "worker").await?;
+    let worker_b = insert_k8s_node(pool, worker_b_ip, "worker").await?;
+
+    let sandbox_id = SandboxId::new();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (
+             id, user_id, org_id, managed_by, lifecycle, placement,
+             active_node_id, target_node_id, command_ready_pending,
+             network_policy_generation
+         )
+         VALUES ($1, $2::uuid, $3::uuid, 'k8s', 'started', 'on_node', $4, $4, TRUE, 1)"
+    ))
+    .bind(sandbox_id)
+    .bind(SEEDED_USER_ID)
+    .bind(SEEDED_ORG_ID)
+    .bind(worker_a)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE organizations
+         SET snapshot_base_object_storage_uri = 's3://org-snapshots/base'
+         WHERE id = $1::uuid"
+    ))
+    .bind(SEEDED_ORG_ID)
+    .execute(pool)
+    .await?;
+
+    // The hosting node registers a ready suspend snapshot and a ready backup
+    // of a stopped rootfs, the two artifacts a restore looks up.
+    let suspend_attempt = SnapshotId::new();
+    let suspend_artifact = LocalArtifactId::new();
+    begin_artifact_backup_from_node(
+        &fixture.service,
+        std::net::IpAddr::V4(worker_a_ip),
+        sandbox_id,
+        suspend_artifact,
+        suspend_attempt,
+        pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+        pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend,
+    )
+    .await?;
+    finalize_ready_from_node(&fixture.service, worker_a_ip, suspend_attempt).await?;
+    let disk_artifact = LocalArtifactId::new();
+    let disk_attempt = SnapshotId::new();
+    begin_artifact_backup_from_node(
+        &fixture.service,
+        std::net::IpAddr::V4(worker_a_ip),
+        sandbox_id,
+        disk_artifact,
+        disk_attempt,
+        pplx_space_sbx_mgr_client::proto::ArtifactKind::Disk,
+        pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Stop,
+    )
+    .await?;
+    finalize_ready_from_node(&fixture.service, worker_a_ip, disk_attempt).await?;
+    // Finalizing the suspend snapshot projects the sandbox as suspended and
+    // releases its active placement. Pin it back on the hosting node so the
+    // placement under test is the one written below, not that projection.
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+         SET lifecycle = 'started', placement = 'on_node',
+             active_node_id = $2, target_node_id = $2
+         WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(worker_a)
+    .execute(pool)
+    .await?;
+
+    let reads = |node_ip: Option<std::net::Ipv4Addr>| {
+        let service = &fixture.service;
+        async move {
+            let suspend = service
+                .get_suspend_snapshot_location(maybe_from_node(
+                    GetSuspendSnapshotLocationRequest {
+                        sandbox_id: sandbox_id.to_string(),
+                    },
+                    node_ip,
+                ))
+                .await
+                .map(|response| response.into_inner().snapshot_id);
+            let backup = service
+                .get_artifact_backup_location(maybe_from_node(
+                    GetArtifactBackupLocationRequest {
+                        sandbox_id: sandbox_id.to_string(),
+                        local_artifact_id: disk_artifact.to_string(),
+                        artifact_kind: pplx_space_sbx_mgr_client::proto::ArtifactKind::Disk as i32,
+                        readiness: None,
+                    },
+                    node_ip,
+                ))
+                .await
+                .map(|response| {
+                    let response = response.into_inner();
+                    assert_eq!(
+                        response.ready, None,
+                        "a location reply is not a readiness reply"
+                    );
+                    response.backup_attempt_id
+                });
+            let storage = service
+                .get_sandbox_snapshot_storage_uri(maybe_from_node(
+                    GetSandboxSnapshotStorageUriRequest {
+                        sandbox_id: sandbox_id.to_string(),
+                    },
+                    node_ip,
+                ))
+                .await
+                .map(|response| response.into_inner().storage_uri);
+            (suspend, backup, storage)
+        }
+    };
+    /// The suspend snapshot id, the backup attempt id and the organization
+    /// storage URI, as one node read them.
+    type LocationReads = (
+        Result<String, tonic::Status>,
+        Result<String, tonic::Status>,
+        Result<Option<String>, tonic::Status>,
+    );
+    let codes = |results: &LocationReads| {
+        [
+            results.0.as_ref().err().map(tonic::Status::code),
+            results.1.as_ref().err().map(tonic::Status::code),
+            results.2.as_ref().err().map(tonic::Status::code),
+        ]
+    };
+
+    let (suspend, backup, storage) = reads(Some(worker_a_ip)).await;
+    assert_eq!(suspend?, suspend_attempt.to_string());
+    assert_eq!(backup?, disk_attempt.to_string());
+    assert_eq!(storage?.as_deref(), Some("s3://org-snapshots/base"));
+    assert_eq!(
+        codes(&reads(Some(worker_b_ip)).await),
+        [Some(tonic::Code::NotFound); 3]
+    );
+    assert_eq!(
+        codes(&reads(None).await),
+        [Some(tonic::Code::PermissionDenied); 3]
+    );
+
+    // A pending migration or restore is a target placement: the destination
+    // reads before it becomes active, and the source keeps access while it
+    // still hosts the sandbox.
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET target_node_id = $2 WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(worker_b)
+    .execute(pool)
+    .await?;
+    assert_eq!(codes(&reads(Some(worker_a_ip)).await), [None; 3]);
+    assert_eq!(codes(&reads(Some(worker_b_ip)).await), [None; 3]);
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET active_node_id = $2 WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(worker_b)
+    .execute(pool)
+    .await?;
+    assert_eq!(
+        codes(&reads(Some(worker_a_ip)).await),
+        [Some(tonic::Code::NotFound); 3]
+    );
+
+    // The former host still needs to evict its retained cache. Exact backup
+    // proofs remain available after relocation without reopening URI reads.
+    let exact = |id: LocalArtifactId, kind| {
+        Artifact::LocalArtifact(LocalArtifactBackupIdentity {
+            local_artifact_id: id.to_string(),
+            artifact_kind: kind,
+        })
+    };
+    let full = pplx_space_sbx_mgr_client::proto::ArtifactKind::Full as i32;
+    let disk = pplx_space_sbx_mgr_client::proto::ArtifactKind::Disk as i32;
+    let readiness =
+        |sandbox: SandboxId, artifact: Option<Artifact>| GetArtifactBackupLocationRequest {
+            sandbox_id: sandbox.to_string(),
+            readiness: Some(BackupReadinessQuery { artifact }),
+            ..Default::default()
+        };
+    let check = |sandbox: SandboxId, artifact: Artifact, node_ip| {
+        let service = &fixture.service;
+        let request = readiness(sandbox, Some(artifact));
+        async move {
+            let response = service
+                .get_artifact_backup_location(maybe_from_node(request, node_ip))
+                .await?
+                .into_inner();
+            // A readiness reply carries no identity, location or digests,
+            // whatever its answer.
+            assert_eq!(
+                response,
+                GetArtifactBackupLocationResponse {
+                    ready: response.ready,
+                    ..Default::default()
+                }
+            );
+            Ok::<_, tonic::Status>(response.ready.expect("a readiness reply sets ready"))
+        }
+    };
+    for artifact in [
+        exact(suspend_artifact, full),
+        exact(disk_artifact, disk),
+        Artifact::LatestReadySuspendSnapshotId(suspend_attempt.to_string()),
+    ] {
+        assert!(check(sandbox_id, artifact.clone(), Some(worker_a_ip)).await?);
+        assert!(!check(SandboxId::new(), artifact.clone(), Some(worker_a_ip)).await?);
+        for remote in [None, Some(std::net::Ipv4Addr::new(10, 0, 0, 42))] {
+            assert_eq!(
+                check(sandbox_id, artifact.clone(), remote)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::PermissionDenied,
+            );
+        }
+    }
+    for artifact in [
+        exact(LocalArtifactId::new(), full),
+        exact(suspend_artifact, disk),
+        exact(disk_artifact, full),
+        Artifact::LatestReadySuspendSnapshotId(disk_attempt.to_string()),
+        Artifact::LatestReadySuspendSnapshotId(SnapshotId::new().to_string()),
+    ] {
+        assert!(!check(sandbox_id, artifact, Some(worker_a_ip)).await?);
+    }
+    // A readiness query names its identity only inside `readiness`; mixing it
+    // with the location fields is refused, as are empty or invalid identities.
+    let mixed_id = GetArtifactBackupLocationRequest {
+        local_artifact_id: disk_artifact.to_string(),
+        ..readiness(sandbox_id, Some(exact(disk_artifact, disk)))
+    };
+    let mixed_kind = GetArtifactBackupLocationRequest {
+        artifact_kind: disk,
+        ..readiness(sandbox_id, Some(exact(disk_artifact, disk)))
+    };
+    for request in [
+        mixed_id,
+        mixed_kind,
+        readiness(sandbox_id, None),
+        readiness(sandbox_id, Some(exact(suspend_artifact, 0))),
+        readiness(
+            sandbox_id,
+            Some(Artifact::LatestReadySuspendSnapshotId(
+                "invalid".to_string(),
+            )),
+        ),
+        readiness(
+            sandbox_id,
+            Some(Artifact::LocalArtifact(LocalArtifactBackupIdentity {
+                local_artifact_id: "invalid".to_string(),
+                artifact_kind: full,
+            })),
+        ),
+    ] {
+        let status = fixture
+            .service
+            .get_artifact_backup_location(maybe_from_node(request, Some(worker_a_ip)))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    // Rolling upgrade: a server that predates `readiness` decodes only
+    // fields 1-3. A location request keeps identical bytes, and a readiness
+    // query reaches it with an empty artifact id, which its location path
+    // (the validation kept here) rejects before any lookup.
+    let location = GetArtifactBackupLocationRequest {
+        sandbox_id: sandbox_id.to_string(),
+        local_artifact_id: disk_artifact.to_string(),
+        artifact_kind: disk,
+        readiness: None,
+    };
+    assert_eq!(
+        location.encode_to_vec(),
+        LocationOnlyRequest {
+            sandbox_id: location.sandbox_id.clone(),
+            local_artifact_id: location.local_artifact_id.clone(),
+            artifact_kind: disk,
+        }
+        .encode_to_vec()
+    );
+    for artifact in [
+        exact(disk_artifact, disk),
+        Artifact::LatestReadySuspendSnapshotId(suspend_attempt.to_string()),
+    ] {
+        let wire = readiness(sandbox_id, Some(artifact)).encode_to_vec();
+        let seen_by_old_server = LocationOnlyRequest::decode(wire.as_slice())?;
+        assert_eq!(
+            seen_by_old_server,
+            LocationOnlyRequest {
+                sandbox_id: sandbox_id.to_string(),
+                ..Default::default()
+            }
+        );
+        let request = GetArtifactBackupLocationRequest::decode(
+            seen_by_old_server.encode_to_vec().as_slice(),
+        )?;
+        let status = fixture
+            .service
+            .get_artifact_backup_location(maybe_from_node(request, Some(worker_a_ip)))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    // An unpinned cache's proof must reject an older ready attempt, while an
+    // immutable pinned artifact can still use that same durable backup.
+    sqlx::query(sql!(
+        "UPDATE snapshots SET timestamp = NOW() - INTERVAL '1 hour' WHERE id = $1"
+    ))
+    .bind(suspend_attempt)
+    .execute(pool)
+    .await?;
+    let newer_attempt = SnapshotId::new();
+    let newer_artifact = LocalArtifactId::new();
+    begin_artifact_backup_from_node(
+        &fixture.service,
+        std::net::IpAddr::V4(worker_b_ip),
+        sandbox_id,
+        newer_artifact,
+        newer_attempt,
+        pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+        pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend,
+    )
+    .await?;
+    finalize_ready_from_node(&fixture.service, worker_b_ip, newer_attempt).await?;
+    assert!(
+        !check(
+            sandbox_id,
+            Artifact::LatestReadySuspendSnapshotId(suspend_attempt.to_string()),
+            Some(worker_a_ip)
+        )
+        .await?
+    );
+    assert!(check(sandbox_id, exact(suspend_artifact, full), Some(worker_a_ip)).await?);
+    assert!(
+        check(
+            sandbox_id,
+            Artifact::LatestReadySuspendSnapshotId(newer_attempt.to_string()),
+            Some(worker_a_ip)
+        )
+        .await?
+    );
+    for state in ["creating", "failed", "deleting"] {
+        sqlx::query(sql!("UPDATE snapshots SET state = $2 WHERE id = $1"))
+            .bind(newer_attempt)
+            .bind(state)
+            .execute(pool)
+            .await?;
+        assert!(!check(sandbox_id, exact(newer_artifact, full), Some(worker_a_ip)).await?);
+        assert!(
+            !check(
+                sandbox_id,
+                Artifact::LatestReadySuspendSnapshotId(newer_attempt.to_string()),
+                Some(worker_a_ip)
+            )
+            .await?
+        );
+    }
+    sqlx::query(sql!("UPDATE snapshots SET state = 'ready' WHERE id = $1"))
+        .bind(newer_attempt)
+        .execute(pool)
+        .await?;
+    sqlx::query(sql!(
+        "UPDATE snapshot_storage_locations SET orphaned_at = NOW() WHERE snapshot_id = $1"
+    ))
+    .bind(newer_attempt)
+    .execute(pool)
+    .await?;
+    assert!(!check(sandbox_id, exact(newer_artifact, full), Some(worker_a_ip)).await?);
+    assert!(
+        !check(
+            sandbox_id,
+            Artifact::LatestReadySuspendSnapshotId(suspend_attempt.to_string()),
+            Some(worker_a_ip)
+        )
+        .await?
+    );
+    assert!(
+        !check(
+            sandbox_id,
+            Artifact::LatestReadySuspendSnapshotId(newer_attempt.to_string()),
+            Some(worker_a_ip)
+        )
+        .await?
+    );
+    Ok(())
+}
+
+/// `GetArtifactBackupLocationRequest` as decoded by a server that predates
+/// its readiness query.
+#[derive(Clone, PartialEq, prost::Message)]
+struct LocationOnlyRequest {
+    #[prost(string, tag = "1")]
+    sandbox_id: String,
+    #[prost(string, tag = "2")]
+    local_artifact_id: String,
+    #[prost(int32, tag = "3")]
+    artifact_kind: i32,
+}
+
+/// A request from `node_ip` when given, otherwise one with no remote address.
+fn maybe_from_node<T>(message: T, node_ip: Option<std::net::Ipv4Addr>) -> Request<T> {
+    match node_ip {
+        Some(node_ip) => request_from_node(message, std::net::IpAddr::V4(node_ip)),
+        None => Request::new(message),
+    }
+}
+
+/// Finalize `snapshot_id` as `ready` from the node at `node_ip`.
+async fn finalize_ready_from_node(
+    service: &ClusterApiService,
+    node_ip: std::net::Ipv4Addr,
+    snapshot_id: SnapshotId,
+) -> Result<(), tonic::Status> {
+    service
+        .finalize_artifact_backup(request_from_node(
+            FinalizeArtifactBackupRequest {
+                backup_attempt_id: snapshot_id.to_string(),
+                target_state: SuspendSnapshotTerminalState::Ready as i32,
+                bytes_uploaded: 4096,
+                failure_reason: None,
+                artifact_digests: Vec::new(),
+            },
+            std::net::IpAddr::V4(node_ip),
+        ))
+        .await
+        .map(|_| ())
 }
 
 /// A pre-dispatch build grant lets registered builder nodes resolve the base
@@ -4155,15 +4620,19 @@ async fn finalize(
         .map(|_| ())
 }
 
-/// Helper to call `GetSuspendSnapshotLocation` for assertions.
+/// Helper to call `GetSuspendSnapshotLocation` for assertions, from the node
+/// the seeded sandboxes are placed on.
 async fn get_location(
     service: &ClusterApiService,
     sandbox_id: SandboxId,
 ) -> Result<GetSuspendSnapshotLocationResponse, tonic::Status> {
     service
-        .get_suspend_snapshot_location(Request::new(GetSuspendSnapshotLocationRequest {
-            sandbox_id: sandbox_id.to_string(),
-        }))
+        .get_suspend_snapshot_location(request_from_node(
+            GetSuspendSnapshotLocationRequest {
+                sandbox_id: sandbox_id.to_string(),
+            },
+            TEST_WORKER_IP,
+        ))
         .await
         .map(|r| r.into_inner())
 }
@@ -4954,11 +5423,15 @@ async fn get_artifact_location(
     artifact_kind: pplx_space_sbx_mgr_client::proto::ArtifactKind,
 ) -> Result<GetArtifactBackupLocationResponse, tonic::Status> {
     service
-        .get_artifact_backup_location(Request::new(GetArtifactBackupLocationRequest {
-            sandbox_id: sandbox_id.to_string(),
-            local_artifact_id: local_artifact_id.to_string(),
-            artifact_kind: artifact_kind as i32,
-        }))
+        .get_artifact_backup_location(request_from_node(
+            GetArtifactBackupLocationRequest {
+                sandbox_id: sandbox_id.to_string(),
+                local_artifact_id: local_artifact_id.to_string(),
+                artifact_kind: artifact_kind as i32,
+                readiness: None,
+            },
+            TEST_WORKER_IP,
+        ))
         .await
         .map(|response| response.into_inner())
 }
@@ -5212,6 +5685,27 @@ async fn concurrent_begin_artifact_backup_is_idempotent() -> TestResult {
     .fetch_one(&fixture.service.pool)
     .await?;
     assert_eq!(storage_location_count, 1);
+    Ok(())
+}
+
+// The insert holds its transaction open while authorizing the source node.
+// Concurrent callers each hold a pooled connection, so the authorization
+// lookup must not need a second one; one connection makes that deterministic.
+#[tokio::test(flavor = "current_thread")]
+async fn begin_artifact_backup_completes_on_a_single_pooled_connection() -> TestResult {
+    let Some(fixture) = cluster_fixture_with_max_connections(1).await? else {
+        return Ok(());
+    };
+    let sandbox_id = seed_sandbox(&fixture.service.pool).await?;
+    begin_artifact_backup(
+        &fixture.service,
+        sandbox_id,
+        LocalArtifactId::new(),
+        SnapshotId::from_uuid(Uuid::now_v7()),
+        pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+        pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend,
+    )
+    .await?;
     Ok(())
 }
 
@@ -6023,6 +6517,7 @@ async fn template_visibility_degrades_to_unspecified_without_column() -> TestRes
     let by_tag = fixture
         .service
         .find_template_release(Request::new(FindTemplateReleaseRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             runtime: "firecracker".to_string(),
@@ -6039,6 +6534,7 @@ async fn template_visibility_degrades_to_unspecified_without_column() -> TestRes
     let by_hash = fixture
         .service
         .find_template_release_by_hash(Request::new(FindTemplateReleaseByHashRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             hash: VISIBILITY_TEST_DIGEST.to_string(),
@@ -6123,6 +6619,7 @@ async fn visibility_lookup_reads_from_the_visibility_pool() -> TestResult {
         .with_visibility_pool(sideline.service.pool.clone());
     let response = service
         .find_template_release(Request::new(FindTemplateReleaseRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             runtime: "firecracker".to_string(),
@@ -6147,6 +6644,7 @@ async fn visibility_lookup_reads_from_the_visibility_pool() -> TestResult {
     // one of them back to the shared pool is its own distinct bug.
     let by_hash = service
         .find_template_release_by_hash(Request::new(FindTemplateReleaseByHashRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             hash: VISIBILITY_TEST_DIGEST.to_string(),
@@ -6204,6 +6702,7 @@ async fn template_visibility_unrecognized_value_is_unspecified() -> TestResult {
     let by_tag = fixture
         .service
         .find_template_release(Request::new(FindTemplateReleaseRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             runtime: "firecracker".to_string(),
@@ -6254,6 +6753,7 @@ async fn template_visibility_maps_column_values() -> TestResult {
         async move {
             service
                 .find_template_release(Request::new(FindTemplateReleaseRequest {
+                    generic_only: false,
                     caller_org_id: None,
                     template_name: "code-runtime".to_string(),
                     runtime: "firecracker".to_string(),
@@ -6291,6 +6791,7 @@ async fn template_visibility_maps_column_values() -> TestResult {
     let by_hash = fixture
         .service
         .find_template_release_by_hash(Request::new(FindTemplateReleaseByHashRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             hash: VISIBILITY_TEST_DIGEST.to_string(),
@@ -6398,6 +6899,7 @@ async fn visibility_of_find(fixture: &ClusterFixture) -> TestResult<TemplateVisi
     Ok(fixture
         .service
         .find_template_release(Request::new(FindTemplateReleaseRequest {
+            generic_only: false,
             caller_org_id: None,
             template_name: "code-runtime".to_string(),
             runtime: "firecracker".to_string(),

@@ -304,7 +304,36 @@ pub(super) async fn require_artifact_backup_files(
     policy: BackupFilesPolicy,
 ) -> Result<(), Status> {
     use crate::retained_source::BtrfsSendRootfsPresence;
-    for file in crate::snapshot_upload::artifact_files_for_kind(kind, format) {
+    let mut files = crate::snapshot_upload::artifact_files_for_kind(kind, format);
+    if kind == pplx_space_common_core::types::ArtifactKind::Full {
+        let sidecar = std::path::Path::new(local_path)
+            .join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME);
+        match std::fs::read(&sidecar) {
+            Ok(bytes) => {
+                let meta: crate::snapshot_upload::SnapshotMeta = serde_json::from_slice(&bytes)
+                    .map_err(|error| {
+                        policy.unverified(&format!(
+                            "snapshot metadata is unparseable at {}: {error}",
+                            sidecar.display()
+                        ))
+                    })?;
+                // Encrypted capture seals memory and rootfs into containers.
+                // Admission must require the same files the uploader reads,
+                // regardless of the plaintext rootfs codec in the sidecar.
+                if meta.encrypted {
+                    files = crate::snapshot_upload::encrypted_vm_artifacts();
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(policy.unverified(&format!(
+                    "failed to read snapshot metadata at {}: {error}",
+                    sidecar.display()
+                )));
+            }
+        }
+    }
+    for file in files {
         if file.kind == pplx_space_common_core::types::SnapshotArtifact::RootfsBtrfsSend {
             // Disk artifacts never retain a source: they have no sidecar.
             let source_id = match kind {
@@ -519,6 +548,7 @@ impl SandboxManagerService {
                     crate::proto::ArtifactKind::Full as i32
                 }
             },
+            readiness: None,
         };
 
         match client.get_artifact_backup_location(request).await {
@@ -738,9 +768,10 @@ impl SandboxManagerService {
                     (SandboxState::Stopped, None) => {
                         let id = LocalArtifactId::new();
                         let snapshot_name = format!("d-stop-{id}");
-                        let mut node_client = connect_node().await.map_err(|error| {
-                            Status::internal(format!("connect to node-manager: {error}"))
-                        })?;
+                        let mut node_client =
+                            connect_node(&self.node_manager).await.map_err(|error| {
+                                Status::internal(format!("connect to node-manager: {error}"))
+                            })?;
                         node_client
                             .create_btrfs_snapshot(
                                 pplx_space_node_mgr_client::proto::CreateBtrfsSnapshotRequest {

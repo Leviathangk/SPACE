@@ -75,7 +75,7 @@ impl SandboxManagerService {
 }
 
 pub(crate) fn closed_drain_for_test() -> Arc<DrainState> {
-    let service = SandboxManagerService::new(crate::db::test_conn());
+    let service = SandboxManagerService::for_test(crate::db::test_conn());
     service.begin_draining_for_restart();
     Arc::clone(&service.drain_state)
 }
@@ -98,7 +98,7 @@ fn startup_cleanup_discovery_reports_database_failure_instead_of_empty_inventory
 
 #[tokio::test]
 async fn restore_scope_cleanup_rejects_paths_not_owned_by_its_identity_before_remote_calls() {
-    let service = SandboxManagerService::new(crate::db::test_conn());
+    let service = SandboxManagerService::for_test(crate::db::test_conn());
     let id = SandboxId::new().to_string();
     let scope_id = pplx_space_common_core::types::TransferScopeId::new();
     let other_id = SandboxId::new().to_string();
@@ -237,7 +237,12 @@ fn encrypted_restore_snapshot_error_preserves_invalid_key_status() {
 mod cancelled_cleanup_rpc_tests;
 
 #[cfg(test)]
+mod endpoint_capture_tests;
+#[cfg(test)]
 mod local_backup_inventory_tests;
+
+#[cfg(test)]
+pub(crate) mod node_manager_transport_tests;
 
 #[cfg(test)]
 pub(crate) mod service_tests {
@@ -514,7 +519,7 @@ pub(crate) mod service_tests {
         request
     }
 
-    fn node_api_trusted_lifecycle_request<T>(message: T) -> Request<T> {
+    pub(crate) fn node_api_trusted_lifecycle_request<T>(message: T) -> Request<T> {
         let mut request = Request::new(message);
         request.extensions_mut().insert(PeerIdentity::new(
             users::SPACE_NODEAPI.uid,
@@ -2569,7 +2574,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new();
         insert_test_sandbox(&conn, &sandbox_id.to_string(), SandboxState::Paused);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let current_attempt = SandboxActivationAttemptId::new();
         let current_identity = SpaceApiRouteIdentity {
@@ -2646,7 +2651,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new();
         insert_test_sandbox(&conn, &sandbox_id.to_string(), SandboxState::Started);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let current_identity = SpaceApiRouteIdentity {
             route_generation: Some(RouteGeneration::new(4).unwrap()),
@@ -3755,7 +3760,7 @@ pub(crate) mod service_tests {
             None,
         );
 
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let referencing = service
             .list_build_referencing_sandboxes(tmplmgr_request(
@@ -4408,7 +4413,7 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Paused);
         let policy = NetworkPolicyV1::deny_all();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let error = service
             .set_network_policy(internal_request(SetNetworkPolicyRequest {
@@ -4461,7 +4466,7 @@ pub(crate) mod service_tests {
         )
         .unwrap();
         let policy = NetworkPolicyV1::deny_all();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let error = service
             .set_network_policy(internal_request(SetNetworkPolicyRequest {
@@ -4501,7 +4506,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Paused);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let policy = NetworkPolicyV1::deny_all();
         let make_request = || {
@@ -4601,7 +4606,7 @@ pub(crate) mod service_tests {
             },
         )
         .unwrap();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let error = service
             .apply_network_policy_before_wake(&sandbox_id, "resume")
@@ -4653,55 +4658,6 @@ pub(crate) mod service_tests {
         );
     }
 
-    // Exposure re-apply during a wake in flight: after a suspend, the
-    // cluster marks open port exposures pending and the node-ctl reconciler
-    // re-arms the in-guest loopback bridge once the sandbox is back. The
-    // guest is reachable as soon as the VM resumes — long before the wake's
-    // readiness contract and network-policy gates finish — so the bridge
-    // RPCs must not gate on `Started`. Gating on `Started` left exposed
-    // ports answering 502 for the full duration of a stalled wake even
-    // though the guest was already serving spaced RPCs.
-    #[tokio::test]
-    async fn spaced_open_loopback_bridge_passes_state_gate_while_restoring() {
-        if !crate::service::tests::enter_route_test_process(&[]) {
-            return;
-        }
-
-        let conn = crate::db::test_conn();
-        let sandbox_id = SandboxId::new().to_string();
-        insert_test_sandbox_with_runtime(&conn, &sandbox_id, SandboxState::Restoring);
-        complete_runtime_endpoint_identity(&conn, &sandbox_id);
-        let service = SandboxManagerService::new(conn);
-
-        let error = service
-            .spaced_open_loopback_bridge(node_ctl_request(SpacedOpenLoopbackBridgeRequest {
-                sandbox_id: sandbox_id.clone(),
-                operation: Some(
-                    pplx_space_sbx_mgr_client::operations::OpenLoopbackBridgeRequest {
-                        port: 9012,
-                        wait_timeout: None,
-                    },
-                ),
-            }))
-            .await
-            .expect_err("no spaced-host socket exists in unit tests");
-
-        // The state gate must let a restoring sandbox through; the endpoint
-        // attestation dependency is intentionally absent from this unit test.
-        assert_eq!(
-            error.code(),
-            tonic::Code::Unavailable,
-            "expected the endpoint connect failure, got: {error:?}"
-        );
-        assert!(
-            error
-                .message()
-                .contains("spaced endpoint proof is temporarily unavailable"),
-            "unexpected error message: {}",
-            error.message()
-        );
-    }
-
     #[tokio::test]
     async fn spaced_open_loopback_bridge_marks_non_reachable_states_terminal() {
         if !crate::service::tests::enter_route_test_process(&[]) {
@@ -4726,7 +4682,7 @@ pub(crate) mod service_tests {
             let conn = crate::db::test_conn();
             let sandbox_id = SandboxId::new().to_string();
             insert_test_sandbox(&conn, &sandbox_id, state);
-            let service = SandboxManagerService::new(conn);
+            let service = SandboxManagerService::for_test(conn);
 
             let error = service
                 .spaced_open_loopback_bridge(node_ctl_request(SpacedOpenLoopbackBridgeRequest {
@@ -4770,7 +4726,7 @@ pub(crate) mod service_tests {
             let conn = crate::db::test_conn();
             let sandbox_id = SandboxId::new().to_string();
             insert_test_sandbox(&conn, &sandbox_id, state);
-            let service = SandboxManagerService::new(conn);
+            let service = SandboxManagerService::for_test(conn);
 
             let error = service
                 .set_auto_lifecycle_policy_exact(
@@ -4800,7 +4756,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Restoring);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let metric_capture = pplx_space_metrics::test_capture::capture_counters_guard();
         let error = service
@@ -4844,7 +4800,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Restoring);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let error = service
             .spaced_open_loopback_bridge(internal_request(SpacedOpenLoopbackBridgeRequest {
@@ -4868,83 +4824,6 @@ pub(crate) mod service_tests {
     }
 
     #[tokio::test]
-    async fn spaced_open_loopback_bridge_exempts_node_ctl_without_route_token() {
-        if !crate::service::tests::enter_route_test_process(&[]) {
-            return;
-        }
-
-        let conn = crate::db::test_conn();
-        let sandbox_id = SandboxId::new().to_string();
-        insert_test_sandbox_with_runtime(&conn, &sandbox_id, SandboxState::Restoring);
-        complete_runtime_endpoint_identity(&conn, &sandbox_id);
-        let service = SandboxManagerService::new(conn);
-
-        let error = service
-            .spaced_open_loopback_bridge(node_ctl_request(SpacedOpenLoopbackBridgeRequest {
-                sandbox_id: sandbox_id.clone(),
-                operation: Some(
-                    pplx_space_sbx_mgr_client::operations::OpenLoopbackBridgeRequest {
-                        port: 9012,
-                        wait_timeout: None,
-                    },
-                ),
-            }))
-            .await
-            .expect_err("no spaced-host socket exists in unit tests");
-
-        assert_eq!(
-            error.code(),
-            tonic::Code::Unavailable,
-            "expected the endpoint connect failure, got: {error:?}"
-        );
-        assert!(
-            error
-                .message()
-                .contains("spaced endpoint proof is temporarily unavailable"),
-            "unexpected error message: {}",
-            error.message()
-        );
-    }
-
-    #[tokio::test]
-    async fn spaced_close_loopback_bridge_passes_state_gate_while_restoring() {
-        if !crate::service::tests::enter_route_test_process(&[]) {
-            return;
-        }
-
-        let conn = crate::db::test_conn();
-        let sandbox_id = SandboxId::new().to_string();
-        insert_test_sandbox_with_runtime(&conn, &sandbox_id, SandboxState::Restoring);
-        complete_runtime_endpoint_identity(&conn, &sandbox_id);
-        let service = SandboxManagerService::new(conn);
-
-        let error = service
-            .spaced_close_loopback_bridge(node_ctl_request(SpacedCloseLoopbackBridgeRequest {
-                sandbox_id: sandbox_id.clone(),
-                operation: Some(
-                    pplx_space_sbx_mgr_client::operations::CloseLoopbackBridgeRequest {
-                        port: 9012,
-                    },
-                ),
-            }))
-            .await
-            .expect_err("no spaced-host socket exists in unit tests");
-
-        assert_eq!(
-            error.code(),
-            tonic::Code::Unavailable,
-            "expected the endpoint connect failure, got: {error:?}"
-        );
-        assert!(
-            error
-                .message()
-                .contains("spaced endpoint proof is temporarily unavailable"),
-            "unexpected error message: {}",
-            error.message()
-        );
-    }
-
-    #[tokio::test]
     async fn spaced_close_loopback_bridge_rejects_invalid_route_token() {
         if !crate::service::tests::enter_route_test_process(&[]) {
             return;
@@ -4953,7 +4832,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Restoring);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let error = service
             .spaced_close_loopback_bridge(internal_request_with_invalid_space_api_route_token(
@@ -4986,7 +4865,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Restoring);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let error = service
             .spaced_close_loopback_bridge(internal_request(SpacedCloseLoopbackBridgeRequest {
@@ -5009,78 +4888,6 @@ pub(crate) mod service_tests {
     }
 
     #[tokio::test]
-    async fn spaced_close_loopback_bridge_exempts_node_ctl_without_route_token() {
-        if !crate::service::tests::enter_route_test_process(&[]) {
-            return;
-        }
-
-        let conn = crate::db::test_conn();
-        let sandbox_id = SandboxId::new().to_string();
-        insert_test_sandbox_with_runtime(&conn, &sandbox_id, SandboxState::Restoring);
-        complete_runtime_endpoint_identity(&conn, &sandbox_id);
-        let service = SandboxManagerService::new(conn);
-
-        let error = service
-            .spaced_close_loopback_bridge(node_ctl_request(SpacedCloseLoopbackBridgeRequest {
-                sandbox_id: sandbox_id.clone(),
-                operation: Some(
-                    pplx_space_sbx_mgr_client::operations::CloseLoopbackBridgeRequest {
-                        port: 9012,
-                    },
-                ),
-            }))
-            .await
-            .expect_err("no spaced-host socket exists in unit tests");
-
-        assert_eq!(
-            error.code(),
-            tonic::Code::Unavailable,
-            "expected the endpoint connect failure, got: {error:?}"
-        );
-        assert!(
-            error
-                .message()
-                .contains("spaced endpoint proof is temporarily unavailable"),
-            "unexpected error message: {}",
-            error.message()
-        );
-    }
-
-    #[tokio::test]
-    async fn spaced_wait_ready_trusted_node_api_reaches_spaced_host_without_route_token() {
-        if !crate::service::tests::enter_route_test_process(&[]) {
-            return;
-        }
-
-        let conn = crate::db::test_conn();
-        let sandbox_id = SandboxId::new().to_string();
-        insert_test_sandbox_with_runtime(&conn, &sandbox_id, SandboxState::Started);
-        complete_runtime_endpoint_identity(&conn, &sandbox_id);
-        let service = SandboxManagerService::new(conn);
-
-        let error = service
-            .spaced_wait_ready(node_api_trusted_lifecycle_request(SpacedWaitReadyRequest {
-                sandbox_id,
-                timeout: None,
-            }))
-            .await
-            .expect_err("no spaced-host socket exists in unit tests");
-
-        assert_eq!(
-            error.code(),
-            tonic::Code::Unavailable,
-            "expected the endpoint connect failure, got: {error:?}"
-        );
-        assert!(
-            error
-                .message()
-                .contains("spaced endpoint proof is temporarily unavailable"),
-            "unexpected error message: {}",
-            error.message()
-        );
-    }
-
-    #[tokio::test]
     async fn spaced_wait_ready_allows_identity_free_pool_donor_to_reach_spaced_host() {
         if !crate::service::tests::enter_route_test_process(&[]) {
             return;
@@ -5094,7 +4901,7 @@ pub(crate) mod service_tests {
             [&sandbox_id],
         )
         .unwrap();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let error = service
             .spaced_wait_ready(node_api_trusted_lifecycle_request(SpacedWaitReadyRequest {
@@ -5121,7 +4928,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Suspended);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let error = service
             .spaced_open_loopback_bridge(node_ctl_request(SpacedOpenLoopbackBridgeRequest {
@@ -5217,7 +5024,7 @@ pub(crate) mod service_tests {
             },
         )
         .unwrap();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         for policy in [None, Some(AutoLifecyclePolicy::disabled())] {
             let error = service
@@ -5263,7 +5070,7 @@ pub(crate) mod service_tests {
 
     #[tokio::test]
     async fn wake_rejects_a_generation_fence_without_policy() {
-        let service = SandboxManagerService::new(crate::db::test_conn());
+        let service = SandboxManagerService::for_test(crate::db::test_conn());
         let error = service
             .wake(internal_request(WakeRequest {
                 sandbox_id: SandboxId::new().to_string(),
@@ -5390,7 +5197,7 @@ pub(crate) mod service_tests {
         let row = crate::db::get_sandbox(&conn, &sandbox_id_string)
             .unwrap()
             .unwrap();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let policy = service.effective_network_policy(&row).await.unwrap();
 
@@ -5406,10 +5213,14 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new().to_string();
         insert_orphaned_test_sandbox(&conn, &sandbox_id, SandboxState::Failed);
         let row = crate::db::get_sandbox(&conn, &sandbox_id).unwrap().unwrap();
+        let templates = crate::template_resolver::fake::FakeTemplateResolver::refusing(
+            Status::not_found("orphaned sandboxes must not look up templates"),
+        );
 
-        let error = template_source_for_sandbox_prepare(&row)
+        let error = template_source_for_sandbox_prepare(&templates, &row)
             .await
             .expect_err("orphaned sandbox without rootfs is not startable");
+        assert!(templates.requests().is_empty());
 
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         assert!(error.message().contains("cannot start orphaned sandbox"));
@@ -6562,6 +6373,7 @@ pub(crate) mod service_tests {
         assert!(sandbox_state_may_lack_cache_root(
             SandboxState::CleanupFailed
         ));
+        assert!(sandbox_state_may_lack_cache_root(SandboxState::Quarantined));
 
         assert!(!sandbox_state_may_lack_cache_root(SandboxState::Started));
         assert!(!sandbox_state_may_lack_cache_root(SandboxState::Stopped));
@@ -6844,7 +6656,7 @@ pub(crate) mod service_tests {
         assert!(crate::db::record_remote_restore_artifact_staging(conn, id).unwrap());
     }
 
-    fn insert_test_sandbox_with_runtime(
+    pub(crate) fn insert_test_sandbox_with_runtime(
         conn: &rusqlite::Connection,
         id: &str,
         state: SandboxState,
@@ -6883,7 +6695,7 @@ pub(crate) mod service_tests {
         insert_test_sandbox_with_runtime(conn, id, SandboxState::Started);
     }
 
-    fn complete_runtime_endpoint_identity(conn: &rusqlite::Connection, id: &str) {
+    pub(crate) fn complete_runtime_endpoint_identity(conn: &rusqlite::Connection, id: &str) {
         conn.execute(
             "UPDATE sandboxes
                 SET space_api_route_execution_generation = 1,
@@ -6899,7 +6711,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Suspended);
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
 
         let error = service
             .evict_cluster_deleted_sandbox(tonic::Request::new(
@@ -7012,7 +6824,7 @@ pub(crate) mod service_tests {
             conn,
             SandboxManagerServiceOptions {
                 node_role: Some(NodeRole::Worker),
-                ..Default::default()
+                ..SandboxManagerServiceOptions::for_test()
             },
         );
 
@@ -7133,7 +6945,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_platform_owned_sandbox(&conn, &sandbox_id, SandboxState::Started, None);
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
 
         assert_evict_refused_and_row_untouched(
             &service,
@@ -7157,7 +6969,7 @@ pub(crate) mod service_tests {
             rusqlite::params![sandbox_id],
         )
         .unwrap();
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
 
         assert_evict_refused_and_row_untouched(
             &service,
@@ -7183,7 +6995,7 @@ pub(crate) mod service_tests {
             rusqlite::params![sandbox_id],
         )
         .unwrap();
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
 
         assert_evict_refused_and_row_untouched(
             &service,
@@ -7238,7 +7050,27 @@ pub(crate) mod service_tests {
                 rusqlite::params![sandbox_id],
             )
             .unwrap();
-            let service = service_with_runtime_liveness(conn, false);
+            if state == SandboxState::Quarantined {
+                // Inventory keeps a hold that has no local evidence; this
+                // eviction is one explicit disposition that releases it.
+                let cache_dir = tempfile::tempdir().unwrap();
+                let run_dir = tempfile::tempdir().unwrap();
+                let report = reconcile_sandbox_inventory_in(
+                    &conn,
+                    cache_dir.path(),
+                    run_dir.path(),
+                    ReconcileSource::Test,
+                )
+                .unwrap();
+                assert!(report.changed_ids().is_empty());
+                assert_eq!(
+                    crate::db::get_sandbox(&conn, &sandbox_id)
+                        .unwrap()
+                        .map(|row| row.state),
+                    Some(SandboxState::Quarantined)
+                );
+            }
+            let service = service_with_runtime_probe(conn, false);
 
             let dispatched = Arc::new(std::sync::Mutex::new(Vec::new()));
             let observed = Arc::clone(&dispatched);
@@ -7246,8 +7078,6 @@ pub(crate) mod service_tests {
                 observed.lock().unwrap().push((id, kill));
                 Box::pin(async { Ok(()) })
             }));
-            let run_dir = tempfile::tempdir().unwrap();
-            *service.cleanup_executor.run_dir.lock().unwrap() = Some(run_dir.path().to_owned());
 
             let result = tokio::time::timeout(
                 Duration::from_secs(5),
@@ -7305,7 +7135,7 @@ pub(crate) mod service_tests {
                 rusqlite::params![sandbox_id],
             )
             .unwrap();
-            let service = service_with_runtime_liveness(conn, false);
+            let service = service_with_runtime_probe(conn, false);
             let pull_in_flight = service
                 .auto_lifecycle
                 .staging_lock(&sandbox_id)
@@ -7545,7 +7375,7 @@ pub(crate) mod service_tests {
         );
         set_test_state_changed_at(&conn, &sandbox_id_string, "0");
         set_test_row_version(&conn, &sandbox_id_string, "0");
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
 
         let dispatched = Arc::new(std::sync::Mutex::new(Vec::new()));
         let observed = Arc::clone(&dispatched);
@@ -7553,8 +7383,6 @@ pub(crate) mod service_tests {
             observed.lock().unwrap().push((id, kill));
             Box::pin(async { Ok(()) })
         }));
-        let run_dir = tempfile::tempdir().unwrap();
-        *service.cleanup_executor.run_dir.lock().unwrap() = Some(run_dir.path().to_owned());
 
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -7721,7 +7549,7 @@ pub(crate) mod service_tests {
             &sandbox_id_string,
             &crate::sandbox_eviction::now_secs().to_string(),
         );
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
 
         let dispatched = Arc::new(std::sync::Mutex::new(Vec::new()));
         let observed = Arc::clone(&dispatched);
@@ -7729,8 +7557,6 @@ pub(crate) mod service_tests {
             observed.lock().unwrap().push((id, kill));
             Box::pin(async { Ok(()) })
         }));
-        let run_dir = tempfile::tempdir().unwrap();
-        *service.cleanup_executor.run_dir.lock().unwrap() = Some(run_dir.path().to_owned());
 
         // A write has landed before the RPC starts, and the toucher keeps
         // writing through it, so the row version has moved since the setup
@@ -7799,7 +7625,7 @@ pub(crate) mod service_tests {
         // Old by the row version, fresh by the state clock: the inverse of
         // the stranded row, and it must be read the other way round.
         set_test_row_version(&conn, &sandbox_id_string, "1000000000");
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
 
         let refusal = service
             .evict_cluster_deleted_sandbox(root_peer_request(&sandbox_id_string))
@@ -7851,7 +7677,7 @@ pub(crate) mod service_tests {
         );
         set_test_state_changed_at(&conn, &sandbox_id_string, "not-a-timestamp");
         set_test_row_version(&conn, &sandbox_id_string, "1000000000");
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
 
         assert_evict_refused_and_row_untouched(
             &service,
@@ -7894,7 +7720,7 @@ pub(crate) mod service_tests {
         )
         .unwrap();
         set_test_state_changed_at(&conn, &sandbox_id_string, "1000000000");
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
 
         assert_evict_refused_and_row_untouched(
             &service,
@@ -7934,7 +7760,7 @@ pub(crate) mod service_tests {
                 .unwrap();
             }
             set_test_row_version(&conn, &sandbox_id_string, "0");
-            let service = service_with_runtime_liveness(conn, false);
+            let service = service_with_runtime_probe(conn, false);
 
             assert_evict_refused_and_row_untouched(
                 &service,
@@ -8139,7 +7965,7 @@ pub(crate) mod service_tests {
             let conn = crate::db::test_conn();
             let sandbox_id = SandboxId::new().to_string();
             insert_test_sandbox(&conn, &sandbox_id, state);
-            let service = service_with_runtime_liveness(conn, false);
+            let service = service_with_runtime_probe(conn, false);
 
             assert_evict_refused_and_row_untouched(
                 &service,
@@ -8157,7 +7983,7 @@ pub(crate) mod service_tests {
             let conn = crate::db::test_conn();
             let sandbox_id = SandboxId::new().to_string();
             insert_platform_owned_sandbox(&conn, &sandbox_id, state, Some("seed"));
-            let service = service_with_runtime_liveness(conn, false);
+            let service = service_with_runtime_probe(conn, false);
 
             assert_evict_refused_and_row_untouched(&service, &sandbox_id, state, "pool slot").await;
         }
@@ -8180,7 +8006,7 @@ pub(crate) mod service_tests {
                 let conn = crate::db::test_conn();
                 let sandbox_id = SandboxId::new().to_string();
                 insert_platform_owned_sandbox(&conn, &sandbox_id, state, None);
-                let mut service = service_with_runtime_liveness(conn, false);
+                let mut service = service_with_runtime_probe(conn, false);
                 service.cluster_deleted_eviction_quiescence =
                     super::eviction::cluster_deleted_eviction_quiescence(configured);
 
@@ -8219,7 +8045,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_platform_owned_sandbox(&conn, &sandbox_id, SandboxState::Suspended, Some("seed"));
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
 
         let refusal = service
             .evict_cluster_deleted_sandbox(root_peer_request(&sandbox_id))
@@ -8239,7 +8065,7 @@ pub(crate) mod service_tests {
             rusqlite::params![sandbox_id],
         )
         .unwrap();
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
 
         assert_evict_refused_and_row_untouched(
             &service,
@@ -8260,7 +8086,7 @@ pub(crate) mod service_tests {
             rusqlite::params![sandbox_id],
         )
         .unwrap();
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
         assert!(!service.feature_flags.is_configured());
 
         // Stub only node-manager dispatch; run the real eviction claim,
@@ -8271,8 +8097,6 @@ pub(crate) mod service_tests {
             observed.lock().unwrap().push((id, kill));
             Box::pin(async { Ok(()) })
         }));
-        let run_dir = tempfile::tempdir().unwrap();
-        *service.cleanup_executor.run_dir.lock().unwrap() = Some(run_dir.path().to_owned());
 
         let result = tokio::time::timeout(
             Duration::from_secs(5),
@@ -8342,7 +8166,7 @@ pub(crate) mod service_tests {
                 ),
         };
         crate::auto_lifecycle_delete_receipts::db::insert_pending_receipt(&conn, receipt).unwrap();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let error = service
             .update_runtime_fields(sandbox_id, runtime_fields(generation, 7))
@@ -8548,7 +8372,17 @@ pub(crate) mod service_tests {
         let typed_sandbox_id = SandboxId::new();
         let sandbox_id = typed_sandbox_id.to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Stopping);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
+        // Park the retry attempt at node dispatch so its start is a signal and
+        // the row it would rewrite stays as the failure persisted it.
+        let (started, mut starts) = tokio::sync::mpsc::channel(1);
+        *service.cleanup_executor.dispatch.lock().unwrap() = Some(Arc::new(move |id, _| {
+            let started = started.clone();
+            Box::pin(async move {
+                started.send(id).await.unwrap();
+                std::future::pending().await
+            })
+        }));
         let capture = SandboxEventCapture::default();
         let subscriber = tracing_subscriber::registry().with(capture.clone());
         let guard = tracing::subscriber::set_default(subscriber);
@@ -8562,13 +8396,12 @@ pub(crate) mod service_tests {
         );
         drop(guard);
 
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !service.cleanup_executor.active.contains_key(&sandbox_id) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("blocking cleanup failure must start a live retry runner");
+        let dispatched = tokio::time::timeout(Duration::from_secs(30), starts.recv())
+            .await
+            .expect("blocking cleanup failure must start a live retry runner")
+            .unwrap();
+        assert_eq!(dispatched, sandbox_id);
+        assert!(service.cleanup_executor.active.contains_key(&sandbox_id));
 
         let conn = service.db.lock().unwrap();
         let row = crate::db::get_sandbox(&conn, &sandbox_id).unwrap().unwrap();
@@ -8614,21 +8447,15 @@ pub(crate) mod service_tests {
             conn,
             SandboxManagerServiceOptions {
                 sandbox_runtime_live: Arc::new(move |_| runtime_live),
-                ..Default::default()
+                ..SandboxManagerServiceOptions::for_test()
             },
         )
     }
 
+    /// Teardown tests compare route identities against this node's identity,
+    /// [`crate::service::test_options::test_node_id`].
     pub(crate) fn service_for_teardown_test(conn: rusqlite::Connection) -> SandboxManagerService {
-        SandboxManagerService::new_with_options(
-            conn,
-            SandboxManagerServiceOptions {
-                local_node_id: Some(NodeId::from_uuid(
-                    uuid::Uuid::parse_str("019f8000-0000-7000-8000-0000000000fe").unwrap(),
-                )),
-                ..Default::default()
-            },
-        )
+        SandboxManagerService::for_test(conn)
     }
 
     fn route_identity(
@@ -9153,9 +8980,13 @@ pub(crate) mod service_tests {
                 .into_iter()
                 .find(|candidate| candidate.sandbox_id == sandbox_id)
                 .unwrap();
-            let claimed = crate::db::claim_quarantine_recovery_candidate(&conn, &candidate)
-                .unwrap()
-                .unwrap();
+            let claimed = crate::db::claim_quarantine_recovery_candidate(
+                &conn,
+                &candidate,
+                crate::db::PlanRejectionRunEffect::Leaves,
+            )
+            .unwrap()
+            .unwrap();
             // The staging transfer has recreated the orphan's row. Exercise
             // the actual recovery writers before attempting runtime publication.
             conn.execute(
@@ -10205,7 +10036,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Suspending);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         add_test_monitoring(&service, &sandbox_id).await;
 
         let error = service
@@ -10246,7 +10077,7 @@ pub(crate) mod service_tests {
             "injected cgroup cleanup failure",
         )
         .unwrap();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         add_test_monitoring(&service, &sandbox_id).await;
 
         let error = service
@@ -10289,7 +10120,7 @@ pub(crate) mod service_tests {
             None,
         )
         .unwrap();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         add_test_monitoring(&service, &sandbox_id).await;
 
         let quarantined = service.lookup_sandbox(&sandbox_id).unwrap();
@@ -10350,7 +10181,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Suspended);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let response = service
             .delete(internal_request(DeleteRequest {
@@ -10370,7 +10201,7 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new();
         let sandbox_id_string = sandbox_id.to_string();
         insert_test_sandbox(&conn, &sandbox_id_string, SandboxState::Started);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         add_test_monitoring(&service, &sandbox_id_string).await;
 
         let cleanup_lock = service.cleanup_lock(&sandbox_id_string);
@@ -10439,7 +10270,7 @@ pub(crate) mod service_tests {
             [&sandbox_id_string],
         )
         .unwrap();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let admission = service
             .admit_lifecycle_cleanup(
@@ -10471,7 +10302,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Started);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         for selector in ["all", "", "not-a-uuid", sandbox_id.get(..8).unwrap()] {
             for delete in [false, true] {
                 let code = if delete {
@@ -10753,7 +10584,7 @@ pub(crate) mod service_tests {
             conn,
             SandboxManagerServiceOptions {
                 node_role: Some(NodeRole::Worker),
-                ..Default::default()
+                ..SandboxManagerServiceOptions::for_test()
             },
         );
 
@@ -10874,7 +10705,7 @@ pub(crate) mod service_tests {
             .unwrap()
             .require_applied()
             .unwrap();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let result = service
             .admit_lifecycle_cleanup_from_observed_state(
@@ -10951,42 +10782,10 @@ pub(crate) mod service_tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn fatal_kill_signal_failure_still_schedules_admitted_cleanup() {
-        let conn = crate::db::test_conn();
-        let sandbox_id = SandboxId::new();
-        let sandbox_id_string = sandbox_id.to_string();
-        insert_test_sandbox(&conn, &sandbox_id_string, SandboxState::Started);
-        let service = service_for_teardown_test(conn);
-        service
-            .update_runtime_fields(
-                sandbox_id,
-                runtime_fields(ExecutionGeneration::new(1).unwrap(), 7),
-            )
-            .unwrap();
-
-        let error = service
-            .kill(internal_request(KillRequest {
-                sandbox_id: sandbox_id_string.clone(),
-                signal: 9,
-                blocking: false,
-            }))
-            .await
-            .expect_err("the unavailable node-manager must fail fatal signal dispatch");
-        assert_eq!(error.code(), tonic::Code::Internal);
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while service.cleanup_executor.active.is_empty() {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect("fatal signal failure must still hand admitted cleanup to a runner");
-    }
-
     #[tokio::test]
     async fn unpersisted_delete_clears_activity_without_replacing_live_lock_identity() {
-        let service = SandboxManagerService::new(rusqlite::Connection::open_in_memory().unwrap());
+        let service =
+            SandboxManagerService::for_test(rusqlite::Connection::open_in_memory().unwrap());
         let sandbox_id = "sbx-delete-persistence-failure";
         let wake_before = service.auto_lifecycle.wake_lock(sandbox_id);
         service.auto_lifecycle.record_wake_completed(sandbox_id);
@@ -12300,7 +12099,7 @@ pub(crate) mod service_tests {
             SandboxManagerServiceOptions {
                 shutdown_token: shutdown_token.clone(),
                 task_tracker: task_tracker.clone(),
-                ..Default::default()
+                ..SandboxManagerServiceOptions::for_test()
             },
         );
         let mut wake_guards = Vec::new();
@@ -12359,7 +12158,7 @@ pub(crate) mod service_tests {
             SandboxManagerServiceOptions {
                 shutdown_token: shutdown_token.clone(),
                 task_tracker: task_tracker.clone(),
-                ..Default::default()
+                ..SandboxManagerServiceOptions::for_test()
             },
         );
         let wake_lock = service.auto_lifecycle.wake_lock(&sandbox_id.to_string());
@@ -12388,15 +12187,8 @@ pub(crate) mod service_tests {
         drop(wake_guard);
     }
 
-    pub(crate) fn service_with_runtime_liveness(
-        conn: rusqlite::Connection,
-        runtime_live: bool,
-    ) -> SandboxManagerService {
-        SandboxManagerService::new_with_options(conn, runtime_liveness_options(runtime_live))
-    }
-
-    /// [`service_with_runtime_liveness`] with its absent host-control and
-    /// credential-manager socket paths under the caller's `sockets` directory.
+    /// [`service_with_runtime_probe`] with its host dependencies under the
+    /// caller's `sockets` directory.
     pub(crate) fn service_with_runtime_liveness_and_absent_sockets(
         conn: rusqlite::Connection,
         runtime_live: bool,
@@ -12405,33 +12197,10 @@ pub(crate) mod service_tests {
         SandboxManagerService::new_with_options(
             conn,
             SandboxManagerServiceOptions {
-                host_control_socket_path: sockets.join("absent-host-control.sock"),
-                credential_manager_socket_path: sockets.join("absent-credential-manager.sock"),
-                ..runtime_liveness_options(runtime_live)
+                sandbox_runtime_live: Arc::new(move |_| runtime_live),
+                ..SandboxManagerServiceOptions::for_test_in(sockets)
             },
         )
-    }
-
-    /// Every field is explicit: the `Default` options read the node identity
-    /// from the host. The host-control and credential-manager sockets sit in a
-    /// directory nothing creates, so a path that reaches either one fails to
-    /// connect instead of contacting the host's services.
-    fn runtime_liveness_options(runtime_live: bool) -> SandboxManagerServiceOptions {
-        let sockets =
-            std::env::temp_dir().join(format!("space-sbx-mgr-test-{}", uuid::Uuid::now_v7()));
-        SandboxManagerServiceOptions {
-            host_control_socket_path: sockets.join("absent-host-control.sock"),
-            credential_manager_socket_path: sockets.join("absent-credential-manager.sock"),
-            sandbox_runtime_live: Arc::new(move |_| runtime_live),
-            shutdown_token: tokio_util::sync::CancellationToken::new(),
-            task_tracker: tokio_util::task::TaskTracker::new(),
-            local_node_id: Some(NodeId::from_uuid(
-                uuid::Uuid::parse_str("019f8000-0000-7000-8000-0000000000fe").unwrap(),
-            )),
-            node_role: None,
-            node_managed_by: None,
-            route_ed25519_verification_bundle: None,
-        }
     }
 
     fn insert_suspending_resuspend(conn: &rusqlite::Connection, id: &str) -> LocalArtifactId {
@@ -12456,7 +12225,7 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new().to_string();
         let predecessor = insert_suspending_resuspend(&conn, &sandbox_id);
 
-        let service = service_with_runtime_liveness(conn, true);
+        let service = service_with_runtime_probe(conn, true);
         service.record_suspend_snapshot_publication_failure_after_begin(
             &sandbox_id,
             "snapshot failed",
@@ -12497,7 +12266,7 @@ pub(crate) mod service_tests {
         )
         .unwrap();
         let local_artifact_id = LocalArtifactId::new();
-        let service = service_with_runtime_liveness(conn, true);
+        let service = service_with_runtime_probe(conn, true);
         let begin_failure = super::grpc_lifecycle::artifact_backup_fence_status(
             "ClusterApi BeginArtifactBackup unavailable".to_string(),
         );
@@ -12522,7 +12291,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Suspended);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let sandbox = service.lookup_sandbox(&sandbox_id).unwrap();
         let snapshot_root = tempfile::tempdir().unwrap();
         let local_artifact_id = LocalArtifactId::new();
@@ -12589,7 +12358,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Suspended);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let sandbox = service.lookup_sandbox(&sandbox_id).unwrap();
         let snapshot_root = tempfile::tempdir().unwrap();
         let local_artifact_id = LocalArtifactId::new();
@@ -12683,7 +12452,7 @@ pub(crate) mod service_tests {
         let mut runtime_state = initial_runtime_state(&policy, now_secs().saturating_sub(10));
         recompute_runtime_state(&mut runtime_state, &policy);
         crate::db::update_auto_lifecycle_state(&conn, &sandbox_id, &runtime_state).unwrap();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let error = super::grpc_lifecycle::artifact_backup_fence_status(
             "ClusterApi BeginArtifactBackup unavailable".to_string(),
         );
@@ -12715,7 +12484,7 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Suspending);
 
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
         service
             .record_suspend_snapshot_publication_failure_after_begin(&sandbox_id, "publish failed");
 
@@ -12796,7 +12565,7 @@ pub(crate) mod service_tests {
                 .unwrap()
             );
         }
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let response =
             <SandboxManagerService as crate::proto::sandbox_manager_server::SandboxManager>::state(
@@ -12843,7 +12612,7 @@ pub(crate) mod service_tests {
         insert_test_sandbox(&conn, &malformed_core_id, SandboxState::Created);
         insert_test_sandbox(&conn, &malformed_provenance_id, SandboxState::Created);
 
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
         service.record_suspend_snapshot_publication_failure_after_begin(
             &quarantined_id,
             "publish failed",
@@ -13008,7 +12777,7 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Suspending);
 
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
         service
             .record_suspend_snapshot_publication_failure_after_begin(&sandbox_id, "publish failed");
         {
@@ -13054,7 +12823,7 @@ pub(crate) mod service_tests {
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Suspending);
         crate::db::update_snapshots_enabled(&conn, &sandbox_id, true).unwrap();
 
-        let service = service_with_runtime_liveness(conn, true);
+        let service = service_with_runtime_probe(conn, true);
         let row = {
             let db = service.db.lock().expect("mutex poisoned");
             crate::db::get_sandbox(&db, &sandbox_id).unwrap().unwrap()
@@ -13092,7 +12861,7 @@ pub(crate) mod service_tests {
         )
         .unwrap();
 
-        let service = service_with_runtime_liveness(conn, true);
+        let service = service_with_runtime_probe(conn, true);
         let stale_row = {
             let db = service.db.lock().expect("mutex poisoned");
             crate::db::get_sandbox(&db, &sandbox_id).unwrap().unwrap()
@@ -13132,7 +12901,7 @@ pub(crate) mod service_tests {
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Suspending);
 
         // Runtime gone → no re-arm even though armed.
-        let dead = service_with_runtime_liveness(conn, false);
+        let dead = service_with_runtime_probe(conn, false);
         let row = {
             let db = dead.db.lock().expect("mutex poisoned");
             crate::db::get_sandbox(&db, &sandbox_id).unwrap().unwrap()
@@ -13150,7 +12919,7 @@ pub(crate) mod service_tests {
         let live_conn = crate::db::test_conn();
         let sandbox_id2 = SandboxId::new().to_string();
         insert_test_sandbox(&live_conn, &sandbox_id2, SandboxState::Suspending);
-        let live = service_with_runtime_liveness(live_conn, true);
+        let live = service_with_runtime_probe(live_conn, true);
         let row2 = {
             let db = live.db.lock().expect("mutex poisoned");
             crate::db::get_sandbox(&db, &sandbox_id2).unwrap().unwrap()
@@ -13182,7 +12951,7 @@ pub(crate) mod service_tests {
             b"complete-staging",
         );
 
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
         let disposition = service.record_suspend_snapshot_publication_failure_after_staging(
             &sandbox_id,
             &sandbox_dir,
@@ -13241,7 +13010,7 @@ pub(crate) mod service_tests {
             b"complete-canonical",
         );
 
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
         let disposition = service.record_suspend_snapshot_publication_failure_after_staging(
             &sandbox_id,
             &sandbox_dir,
@@ -13271,7 +13040,7 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Paused);
 
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
         service
             .record_suspend_snapshot_publication_failure_after_begin(&sandbox_id, "stale failure");
 
@@ -13348,7 +13117,7 @@ pub(crate) mod service_tests {
     #[tokio::test]
     async fn restart_drain_rejects_new_writers_and_waits_for_active_transitions() {
         let conn = crate::db::test_conn();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let writer = service.state_writer_lease("Start").unwrap();
         assert_eq!(service.active_state_transition_count(), 1);
@@ -13388,7 +13157,7 @@ pub(crate) mod service_tests {
     #[tokio::test]
     async fn restart_drain_reports_active_state_transition_methods() {
         let conn = crate::db::test_conn();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let first_start = service.state_writer_lease("Start").unwrap();
         let wake = service.state_writer_lease("Wake").unwrap();
@@ -13419,8 +13188,6 @@ pub(crate) mod service_tests {
         let service = service_for_teardown_test(conn);
         let locks = DependencyDrainFiles::new();
         locks.enable_for(&service);
-        let run_dir = tempfile::tempdir().unwrap();
-        *service.cleanup_executor.run_dir.lock().unwrap() = Some(run_dir.path().to_owned());
         *service.cleanup_executor.dispatch.lock().unwrap() =
             Some(Arc::new(|_, _| Box::pin(async { Ok(()) })));
         // Admit the real blocking RPC, but prevent its durable attempt from
@@ -13536,7 +13303,7 @@ pub(crate) mod service_tests {
     #[tokio::test]
     async fn dependency_restart_gate_blocks_new_writers_before_draining_active_writer() {
         let conn = crate::db::test_conn();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let locks = DependencyDrainFiles::new();
         locks.enable_for(&service);
         let active_writer = service.state_writer_lease("Start").unwrap();
@@ -13566,7 +13333,7 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Suspended);
 
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let locks = DependencyDrainFiles::new();
         locks.enable_for(&service);
         let cleanup_blocker = service.cleanup_lock(&sandbox_id).lock_owned().await;
@@ -13587,8 +13354,6 @@ pub(crate) mod service_tests {
         drop(cleanup_blocker);
         let dispatched = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
-        let run_dir = tempfile::tempdir().unwrap();
-        *service.cleanup_executor.run_dir.lock().unwrap() = Some(run_dir.path().to_owned());
         *service.cleanup_executor.dispatch.lock().unwrap() = Some(Arc::new({
             let dispatched = dispatched.clone();
             let release = release.clone();
@@ -13647,7 +13412,7 @@ pub(crate) mod service_tests {
         )
         .unwrap();
 
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let locks = DependencyDrainFiles::new();
         locks.enable_for(&service);
         let startup_recovery = service.startup_recovery_lease().unwrap();
@@ -13756,11 +13521,11 @@ pub(crate) mod service_tests {
     async fn dependency_restart_capability_hands_off_between_active_instances() {
         let predecessor = {
             let conn = crate::db::test_conn();
-            SandboxManagerService::new(conn)
+            SandboxManagerService::for_test(conn)
         };
         let successor = {
             let conn = crate::db::test_conn();
-            SandboxManagerService::new(conn)
+            SandboxManagerService::for_test(conn)
         };
         let locks = DependencyDrainFiles::new();
         locks.enable_for(&predecessor);
@@ -13791,7 +13556,7 @@ pub(crate) mod service_tests {
     #[tokio::test]
     async fn startup_recovery_waits_for_dependency_replacement_to_finish() {
         let conn = crate::db::test_conn();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let locks = DependencyDrainFiles::new();
         locks.enable_for(&service);
         let admission_file = locks.lock_admission();
@@ -13830,7 +13595,7 @@ pub(crate) mod service_tests {
     #[tokio::test]
     async fn startup_recovery_admission_wait_is_cancellable() {
         let conn = crate::db::test_conn();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let locks = DependencyDrainFiles::new();
         locks.enable_for(&service);
         let admission_file = locks.lock_admission();
@@ -13860,7 +13625,7 @@ pub(crate) mod service_tests {
     #[tokio::test(start_paused = true)]
     async fn startup_recovery_admission_wait_has_a_bounded_timeout() {
         let conn = crate::db::test_conn();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let locks = DependencyDrainFiles::new();
         locks.enable_for(&service);
         let _admission_file = locks.lock_admission();
@@ -13905,7 +13670,7 @@ pub(crate) mod service_tests {
         recompute_runtime_state(&mut runtime_state, &policy);
         crate::db::update_auto_lifecycle_state(&conn, &sandbox_id, &runtime_state).unwrap();
 
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let locks = DependencyDrainFiles::new();
         locks.enable_for(&service);
         let _admission_file = locks.lock_admission();
@@ -13953,7 +13718,7 @@ pub(crate) mod service_tests {
         let peer_pid = u32::try_from(peer_cred.pid().unwrap()).unwrap();
         crate::db::update_netgtw_pid(&conn, &sandbox_id, peer_cred.uid(), peer_pid).unwrap();
 
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let before = {
             let db = service.db.lock().expect("mutex poisoned");
             crate::db::get_sandbox(&db, &sandbox_id).unwrap().unwrap()
@@ -13995,7 +13760,7 @@ pub(crate) mod service_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn restart_drain_observes_concurrent_writer_completion() {
         let conn = crate::db::test_conn();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let writers = (0..64)
             .map(|_| service.state_writer_lease("Start").unwrap())
             .collect::<Vec<_>>();
@@ -14045,7 +13810,7 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Creating);
 
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let records = service
             .recover_prelaunch_startup_states_in(cache_dir.path(), &Default::default())
             .unwrap();
@@ -14070,7 +13835,7 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Starting);
 
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let records = service
             .recover_prelaunch_startup_states_in(cache_dir.path(), &Default::default())
             .unwrap();
@@ -14098,7 +13863,7 @@ pub(crate) mod service_tests {
         std::fs::write(instance_dir.join("rootfs.ext4"), []).unwrap();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Starting);
 
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let records = service
             .recover_prelaunch_startup_states_in(cache_dir.path(), &Default::default())
             .unwrap();
@@ -14127,7 +13892,7 @@ pub(crate) mod service_tests {
         )
         .unwrap();
         insert_test_sandbox(&conn, &sibling, SandboxState::Checkpointing);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let records = service
             .recover_interrupted_resident_operations()
             .await
@@ -14190,7 +13955,7 @@ pub(crate) mod service_tests {
             [&transient],
         )
         .unwrap();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         service.recover_interrupted_startup_states().await.unwrap();
         assert_eq!(
             service.lookup_sandbox(&good).unwrap().state,
@@ -14239,7 +14004,7 @@ pub(crate) mod service_tests {
              BEGIN SELECT RAISE(ABORT, 'injected recovery persistence failure'); END;",
         )
         .unwrap();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         service
             .recover_interrupted_resident_operations()
             .await
@@ -14268,7 +14033,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &id, SandboxState::Resuming);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let row = service.lookup_sandbox(&id).unwrap();
         let error = service
             .prepare_startup_resident(&row, SandboxState::Started)
@@ -14339,7 +14104,7 @@ pub(crate) mod service_tests {
                 let _subscriber = tracing::subscriber::set_default(
                     tracing_subscriber::registry().with(capture.clone()),
                 );
-                let service = SandboxManagerService::new(conn);
+                let service = SandboxManagerService::for_test(conn);
                 let before = service.lookup_sandbox(&id).unwrap();
                 let pid = before.pid;
                 let mut observations = observations.into_iter();
@@ -14422,7 +14187,7 @@ pub(crate) mod service_tests {
             let conn = crate::db::test_conn();
             let id = SandboxId::new().to_string();
             insert_test_sandbox_with_runtime(&conn, &id, SandboxState::Resuming);
-            let service = SandboxManagerService::new(conn);
+            let service = SandboxManagerService::for_test(conn);
             let capture = SandboxEventCapture::default();
             let _subscriber = tracing::subscriber::set_default(
                 tracing_subscriber::registry().with(capture.clone()),
@@ -14475,7 +14240,7 @@ pub(crate) mod service_tests {
             let conn = crate::db::test_conn();
             let id = SandboxId::new().to_string();
             insert_test_sandbox_with_runtime(&conn, &id, SandboxState::Checkpointing);
-            let service = SandboxManagerService::new(conn);
+            let service = SandboxManagerService::for_test(conn);
             let before = service.lookup_sandbox(&id).unwrap();
             let record = service
                 .recover_resident_with_probe(
@@ -14526,7 +14291,7 @@ pub(crate) mod service_tests {
             let conn = crate::db::test_conn();
             let sandbox_id = SandboxId::new().to_string();
             insert_test_sandbox_with_runtime(&conn, &sandbox_id, SandboxState::Pausing);
-            let service = SandboxManagerService::new(conn);
+            let service = SandboxManagerService::for_test(conn);
             let row = service.lookup_sandbox(&sandbox_id).unwrap();
             let probe_count = Arc::new(AtomicUsize::new(0));
 
@@ -14560,7 +14325,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox_with_runtime(&conn, &sandbox_id, SandboxState::Pausing);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let row = service.lookup_sandbox(&sandbox_id).unwrap();
         let observations = Arc::new(Mutex::new(
             [
@@ -14610,7 +14375,7 @@ pub(crate) mod service_tests {
         .unwrap();
         let stopping_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &stopping_id, SandboxState::Stopping);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let records = service.recover_interrupted_startup_states().await.unwrap();
 
@@ -14649,7 +14414,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &id, SandboxState::Paused);
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
         let wake = service.auto_lifecycle.wake_lock(&id).lock_owned().await;
         let artifact = service.auto_lifecycle.artifact_lock(&id).lock_owned().await;
         let CleanupLockTryResult::Acquired(delete_fence) = service.try_cleanup_fence(&id) else {
@@ -14699,7 +14464,7 @@ pub(crate) mod service_tests {
         let artifact_id = LocalArtifactId::new();
         let staging = suspend_snapshot_staging_dir(&cache.path().join(&id), artifact_id);
         write_full_suspend_artifact(&staging, &id, artifact_id, b"retained-capture");
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
         let wake = service.auto_lifecycle.wake_lock(&id).lock_owned().await;
         service
             .recover_deferred_suspend_publications_in(
@@ -14814,7 +14579,7 @@ pub(crate) mod service_tests {
                 Some(bundle)
             };
             let inspector = Arc::new(FakeInspector::new(answer.clone()));
-            let service = service_with_runtime_liveness(conn, false)
+            let service = service_with_runtime_probe(conn, false)
                 .with_retained_source_inspector(inspector.clone());
 
             let verdicts = service
@@ -14869,7 +14634,7 @@ pub(crate) mod service_tests {
             ids.push(id);
         }
         let service =
-            service_with_runtime_liveness(conn, false).with_retained_source_inspector(Arc::new(
+            service_with_runtime_probe(conn, false).with_retained_source_inspector(Arc::new(
                 FakeInspector::new(RetainedSourceCheck::Present { rootfs_bytes: 64 }),
             ));
         let mut scan = crate::db::PeriodicLifecycleRecoveryScan::default();
@@ -14909,7 +14674,7 @@ pub(crate) mod service_tests {
         let artifact = LocalArtifactId::new();
         let staging = suspend_snapshot_staging_dir(&cache.path().join(&good), artifact);
         write_full_suspend_artifact(&staging, &good, artifact, b"retained-capture");
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
         let mut scan = crate::db::PeriodicLifecycleRecoveryScan::default();
         for _ in 0..2 {
             let rows = crate::db::periodic_lifecycle_recovery_batch(
@@ -14973,7 +14738,7 @@ pub(crate) mod service_tests {
                     std::os::unix::fs::symlink(target, &link).unwrap();
                     assert_eq!(std::fs::exists(&link).is_err(), unreadable);
                 }
-                let service = service_with_runtime_liveness(conn, false);
+                let service = service_with_runtime_probe(conn, false);
                 let shutdown = CancellationToken::new();
                 shutdown.cancel();
                 service
@@ -15039,7 +14804,7 @@ pub(crate) mod service_tests {
             b"staged-artifact",
         );
 
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
         let records = service
             .recover_prelaunch_startup_states_in(cache_dir.path(), &Default::default())
             .unwrap();
@@ -15097,7 +14862,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Suspending);
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
         let stale_row = {
             let db = service.db.lock().expect("mutex poisoned");
             crate::db::get_sandbox(&db, &sandbox_id).unwrap().unwrap()
@@ -15154,7 +14919,7 @@ pub(crate) mod service_tests {
         )
         .unwrap();
 
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
         let records = service
             .recover_prelaunch_startup_states_in(cache_dir.path(), &Default::default())
             .unwrap();
@@ -15187,7 +14952,7 @@ pub(crate) mod service_tests {
             b"published-before-db-pin",
         );
 
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
         let records = service
             .recover_prelaunch_startup_states_in(cache_dir.path(), &Default::default())
             .unwrap();
@@ -15229,7 +14994,7 @@ pub(crate) mod service_tests {
             b"canonical-artifact",
         );
 
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
         let records = service
             .recover_prelaunch_startup_states_in(cache_dir.path(), &Default::default())
             .unwrap();
@@ -15262,7 +15027,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Suspended);
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
         let sandbox = service.lookup_sandbox(&sandbox_id).unwrap();
         let receipt_id = SandboxCleanupEpisodeId::new();
         let execution_generation = ExecutionGeneration::new(7).unwrap();
@@ -15312,7 +15077,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Restoring);
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
         let sandbox = service.lookup_sandbox(&sandbox_id).unwrap();
         let local_quarantine_id = Uuid::now_v7();
 
@@ -15355,7 +15120,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Restoring);
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
         let sandbox = service.lookup_sandbox(&sandbox_id).unwrap();
 
         let info = service
@@ -15386,7 +15151,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Restoring);
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
         let sandbox = service.lookup_sandbox(&sandbox_id).unwrap();
         let local_quarantine_id = Uuid::now_v7();
 
@@ -15451,7 +15216,7 @@ pub(crate) mod service_tests {
         std::fs::create_dir_all(&staging_dir).unwrap();
         std::fs::write(staging_dir.join("vmstate"), b"partial").unwrap();
 
-        let service = service_with_runtime_liveness(conn, true);
+        let service = service_with_runtime_probe(conn, true);
         let records = service
             .recover_prelaunch_startup_states_in(cache_dir.path(), &Default::default())
             .unwrap();
@@ -15515,7 +15280,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Started);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         // Park the lock so the wake and the suspend queue behind it in a
         // deterministic order: wake first, suspend second.
@@ -15575,7 +15340,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Started);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         service
             .wake(internal_request(WakeRequest {
@@ -15603,7 +15368,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Started);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         service.auto_lifecycle.record_wake_completed(&sandbox_id);
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -15642,7 +15407,7 @@ pub(crate) mod service_tests {
             )
             .unwrap()
         );
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let response = service
             .suspend(internal_request(SuspendRequest {
@@ -15744,7 +15509,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         seed_due_access_idle_sandbox(&conn, &sandbox_id, 120, 300);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let before = access_idle_last_touched(&service, &sandbox_id);
         service.begin_draining_for_restart();
 
@@ -15770,7 +15535,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Suspended);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         service.begin_draining_for_restart();
 
         let error = match service
@@ -15878,7 +15643,7 @@ pub(crate) mod service_tests {
             conn,
             SandboxManagerServiceOptions {
                 route_ed25519_verification_bundle: Some(Arc::new(verification_bundle)),
-                ..Default::default()
+                ..SandboxManagerServiceOptions::for_test()
             },
         );
         (service, route_token)
@@ -16126,7 +15891,7 @@ pub(crate) mod service_tests {
             let conn = crate::db::test_conn();
             let id = SandboxId::new().to_string();
             insert_test_sandbox(&conn, &id, state);
-            let service = SandboxManagerService::new(conn);
+            let service = SandboxManagerService::for_test(conn);
             service
                 .set_auto_lifecycle_policy_exact(
                     &id,
@@ -16191,7 +15956,7 @@ pub(crate) mod service_tests {
         let mut runtime_state = initial_runtime_state(&policy, 1_234);
         recompute_runtime_state(&mut runtime_state, &policy);
         crate::db::update_auto_lifecycle_state(&conn, &sandbox_id, &runtime_state).unwrap();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let before = access_idle_last_touched(&service, &sandbox_id);
         let before_access = last_access_at(&service, &sandbox_id);
@@ -16233,7 +15998,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Suspended);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let error = service
             .wake(internal_request(WakeRequest {
@@ -16307,7 +16072,7 @@ pub(crate) mod service_tests {
         // Arrange.
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let capture = SandboxEventCapture::default();
         let subscriber = tracing_subscriber::registry().with(capture.clone());
         let guard = tracing::subscriber::set_default(subscriber);
@@ -16469,7 +16234,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Started);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let before = now_secs();
 
         let sandbox = service.lookup_sandbox(&sandbox_id).unwrap();
@@ -16500,7 +16265,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Started);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         for _ in 0..5 {
             let second = now_secs();
             let sandbox = service.lookup_sandbox(&sandbox_id).unwrap();
@@ -16550,7 +16315,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         let policy = seed_due_access_idle_sandbox(&conn, &sandbox_id, 120, 300);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let (_host_tx, _client_stream) = open_presence_test_stream(None);
         yield_to_forward_task().await;
@@ -16572,7 +16337,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         let policy = seed_due_access_idle_sandbox(&conn, &sandbox_id, 120, 300);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let seeded_epoch = access_idle_epoch(&service, &sandbox_id);
 
         let (host_tx, _client_stream) =
@@ -16610,7 +16375,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         let _policy = seed_due_access_idle_sandbox(&conn, &sandbox_id, 120, 300);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let seeded_epoch = access_idle_epoch(&service, &sandbox_id);
 
         let (tick_observer, mut ticks) = tokio::sync::mpsc::unbounded_channel();
@@ -16653,7 +16418,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         let policy = seed_due_access_idle_sandbox(&conn, &sandbox_id, 120, 300);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let (_host_tx, client_stream) =
             open_presence_test_stream(Some(test_stream_presence(&service, &sandbox_id, 60, 3600)));
@@ -16682,7 +16447,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         let policy = seed_due_access_idle_sandbox(&conn, &sandbox_id, 120, 300);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         // cap = 2 intervals: ticks at +60s and +120s land (the +120s tick
         // observes elapsed >= cap and disarms), later ticks must not fire.
@@ -16719,7 +16484,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         let policy = seed_due_access_idle_sandbox(&conn, &sandbox_id, 120, 300);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         {
             let db = service.db.lock().expect("mutex poisoned");
             crate::db::update_state(&db, &sandbox_id, SandboxState::Suspended)
@@ -16751,7 +16516,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         let policy = seed_due_access_idle_sandbox(&conn, &sandbox_id, 120, 300);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let stale = seed_due_access_idle_sandbox_state(&service, &sandbox_id, &policy, 300);
 
         let wake_lock = service.auto_lifecycle.wake_lock(&sandbox_id);
@@ -16789,7 +16554,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         let policy = seed_due_access_idle_sandbox(&conn, &sandbox_id, 120, 300);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let stale = seed_due_access_idle_sandbox_state(&service, &sandbox_id, &policy, 300);
 
         let (_host_tx, _client_stream) =
@@ -16813,7 +16578,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         seed_due_access_idle_sandbox(&conn, &sandbox_id, 120, 300);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let (host_tx, mut client_stream) =
             open_presence_test_stream(Some(test_stream_presence(&service, &sandbox_id, 60, 3600)));
@@ -16874,7 +16639,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Started);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         for round in 0..32 {
             // Clears the wake-completion record (and the lock maps) so each
@@ -16950,7 +16715,7 @@ pub(crate) mod service_tests {
             rusqlite::params![stale_updated_at, sandbox_id],
         )
         .unwrap();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         service
             .run_due_auto_lifecycle(&sandbox_id)
@@ -17037,7 +16802,7 @@ pub(crate) mod service_tests {
             rusqlite::params![stale_updated_at, sandbox_id],
         )
         .unwrap();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         service
             .run_due_auto_lifecycle(&sandbox_id)
@@ -17070,7 +16835,7 @@ pub(crate) mod service_tests {
         let mut runtime_state = initial_runtime_state(&policy, now_secs().saturating_sub(10));
         recompute_runtime_state(&mut runtime_state, &policy);
         crate::db::update_auto_lifecycle_state(&conn, &sandbox_id, &runtime_state).unwrap();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let wake_lock = service.auto_lifecycle.wake_lock(&sandbox_id);
         let wake_guard = wake_lock.lock_owned().await;
@@ -17109,7 +16874,7 @@ pub(crate) mod service_tests {
         let mut runtime_state = initial_runtime_state(&policy, now_secs().saturating_sub(10));
         recompute_runtime_state(&mut runtime_state, &policy);
         crate::db::update_auto_lifecycle_state(&conn, &sandbox_id, &runtime_state).unwrap();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(60),
@@ -17175,7 +16940,7 @@ pub(crate) mod service_tests {
         // and the still-refused failed variants are pinned by the
         // `checkpoint_start_keeps_refusing_failed_row_*` tests.
         let conn = crate::db::test_conn();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         for state in [SandboxState::Created, SandboxState::Stopped] {
             let sandbox_id = SandboxId::new().to_string();
@@ -17214,7 +16979,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_started_test_sandbox(&conn, &sandbox_id);
-        let service = service_with_runtime_liveness(conn, true);
+        let service = service_with_runtime_probe(conn, true);
 
         let before = service.lookup_sandbox(&sandbox_id).unwrap();
         let mut request = checkpoint_start_request(sandbox_id.clone(), "suspend", None);
@@ -17243,7 +17008,7 @@ pub(crate) mod service_tests {
         let source_sandbox_id = SandboxId::new().to_string();
         let artifact_snapshot_id = SnapshotId::new().to_string();
         insert_started_test_sandbox(&conn, &sandbox_id);
-        let service = service_with_runtime_liveness(conn, true);
+        let service = service_with_runtime_probe(conn, true);
 
         let response = service
             .start_sandbox(
@@ -17301,7 +17066,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_started_test_sandbox(&conn, &sandbox_id);
-        let mut service = service_with_runtime_liveness(conn, true);
+        let mut service = service_with_runtime_probe(conn, true);
         service.activation_admission_limiter = Arc::new(ActivationAdmissionLimiter::with_config(
             activation_admission_config(1, 0.001, 1.0),
         ));
@@ -17332,7 +17097,7 @@ pub(crate) mod service_tests {
     async fn missing_checkpoint_restore_stages_before_activation_admission() {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
-        let mut service = service_with_runtime_liveness(conn, false);
+        let mut service = service_with_runtime_probe(conn, false);
         service.activation_admission_limiter = Arc::new(ActivationAdmissionLimiter::with_config(
             activation_admission_config(1, 100.0, 100.0),
         ));
@@ -17362,7 +17127,10 @@ pub(crate) mod service_tests {
             .unwrap()
             .require_applied()
             .unwrap();
-        let service = service_with_runtime_liveness(conn, true);
+        // The test service's node-manager refuses every dial, so the
+        // retirement's cleanup cannot start and the row keeps the intent it
+        // persisted.
+        let service = service_with_runtime_probe(conn, true);
 
         service
             .start_sandbox(
@@ -17417,7 +17185,7 @@ pub(crate) mod service_tests {
         )
         .unwrap()
         .unwrap();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let uuid8 = service.lookup_sandbox(&sandbox_id).unwrap().uuid8;
         let cleanup_guard = service
             .activation_cleanup_guard(
@@ -17502,7 +17270,7 @@ pub(crate) mod service_tests {
         insert_test_sandbox_with_runtime(&conn, &sandbox_id_string, SandboxState::Pausing);
         let stopping_id = SandboxId::new();
         insert_test_sandbox(&conn, &stopping_id.to_string(), SandboxState::Stopping);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let targets = service.recover_requested_cleanup_targets();
 
@@ -17581,7 +17349,7 @@ pub(crate) mod service_tests {
             &cleanup_failed_id.to_string(),
             SandboxState::CleanupFailed,
         );
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let mut targets = service.recover_requested_cleanup_targets();
         targets.sort_by_key(|target| target.sandbox_id);
@@ -17624,7 +17392,7 @@ pub(crate) mod service_tests {
             rusqlite::params![Uuid::now_v7().to_string(), &sandbox_id_string],
         )
         .unwrap();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let targets = service.recover_requested_cleanup_targets_for_ids(vec![sandbox_id]);
 
@@ -17641,7 +17409,7 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new();
         let sandbox_id_string = sandbox_id.to_string();
         insert_test_sandbox(&conn, &sandbox_id_string, SandboxState::Deleting);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let targets = service.recover_requested_cleanup_targets_for_ids(vec![sandbox_id]);
 
@@ -17679,7 +17447,7 @@ pub(crate) mod service_tests {
                 ),
         };
         crate::auto_lifecycle_delete_receipts::db::insert_pending_receipt(&conn, receipt).unwrap();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let targets = service.recover_requested_cleanup_targets_for_ids(vec![sandbox_id]);
 
@@ -17722,7 +17490,7 @@ pub(crate) mod service_tests {
             CleanupCompletion::MarkStopped,
         )
         .unwrap();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let owner = CleanupLockGuard::new(
             Arc::clone(&service.cleanup_locks),
             sandbox_id_string.clone(),
@@ -17761,7 +17529,7 @@ pub(crate) mod service_tests {
             CleanupCompletion::Quarantine,
         )
         .unwrap();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let incumbent = match service.try_cleanup_fence(&sandbox_id_string) {
             CleanupLockTryResult::Acquired(fence) => fence,
             CleanupLockTryResult::Busy => panic!("test fence must be available"),
@@ -17894,7 +17662,7 @@ pub(crate) mod service_tests {
         )
         .unwrap()
         .unwrap();
-        let mut service = SandboxManagerService::new(conn);
+        let mut service = SandboxManagerService::for_test(conn);
         service.activation_admission_limiter = Arc::new(ActivationAdmissionLimiter::with_config(
             activation_admission_config(1, 1_000.0, 1.0),
         ));
@@ -17984,7 +17752,7 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Restoring);
         mark_test_remote_restore_artifact_staging(&conn, &sandbox_id);
-        let mut service = service_with_runtime_liveness(conn, false);
+        let mut service = service_with_runtime_probe(conn, false);
         service.activation_admission_limiter = Arc::new(ActivationAdmissionLimiter::with_config(
             activation_admission_config(1, 0.001, 1.0),
         ));
@@ -18050,7 +17818,7 @@ pub(crate) mod service_tests {
             .unwrap()
             .require_applied()
             .unwrap();
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
 
         let _ = service
             .start_sandbox(
@@ -18083,7 +17851,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Failed);
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
         for _ in 0..2 {
             let error = service
                 .start_sandbox(
@@ -18116,7 +17884,7 @@ pub(crate) mod service_tests {
             "user requested delete",
         )
         .unwrap();
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
 
         let error = service
             .start_sandbox(
@@ -18149,7 +17917,7 @@ pub(crate) mod service_tests {
             [&sandbox_id],
         )
         .unwrap();
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
 
         let error = service
             .start_sandbox(
@@ -18183,7 +17951,10 @@ pub(crate) mod service_tests {
             rusqlite::params![LocalArtifactId::new().to_string(), &sandbox_id],
         )
         .unwrap();
-        let service = service_with_runtime_liveness(conn, false);
+        // The test service's node-manager refuses every dial, so the
+        // retirement's cleanup cannot start and the row keeps the intent it
+        // persisted.
+        let service = service_with_runtime_probe(conn, false);
 
         let _ = service
             .start_sandbox(
@@ -18223,7 +17994,7 @@ pub(crate) mod service_tests {
             crate::db::CleanupCompletion::DeleteRow,
         )
         .unwrap();
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
 
         let _ = service
             .start_sandbox(
@@ -18246,11 +18017,12 @@ pub(crate) mod service_tests {
         );
     }
 
-    // Paused, like the sibling checkpoint-retry cases: the `Unavailable` this
-    // asserts is produced by the vol-manager connect exhausting its retry
-    // budget, which against an absent socket is ~9.5 s of `tokio::time`
-    // backoff. The connects still run and still fail; only the backoff between
-    // them is virtual.
+    // Paused, like the sibling checkpoint-retry cases. The `Unavailable` this
+    // asserts comes from restore staging under the fixed cache root: as an
+    // ordinary user, as CI runs it, the staging directory's `create_dir_all`
+    // fails; as root, the volume-manager connect that follows exhausts its
+    // `tokio::time` retry budget against an absent socket, which pausing
+    // makes virtual.
     #[tokio::test(start_paused = true)]
     async fn checkpoint_retry_preserves_row_for_resumable_restore() {
         // Attempt 1 of a cross-node restore can be cancelled mid-stage (the
@@ -18263,7 +18035,7 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Restoring);
         mark_test_remote_restore_artifact_staging(&conn, &sandbox_id);
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
 
         let error = service
             .start_sandbox(
@@ -18318,7 +18090,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Failed);
-        let service = service_with_runtime_liveness(conn, true);
+        let service = service_with_runtime_probe(conn, true);
 
         let error = service
             .start_sandbox(
@@ -18428,7 +18200,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_started_test_sandbox(&conn, &sandbox_id);
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
 
         let error = service
             .start_sandbox(
@@ -18455,7 +18227,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_started_test_sandbox(&conn, &sandbox_id);
-        let service = service_with_runtime_liveness(conn, true);
+        let service = service_with_runtime_probe(conn, true);
 
         let error = service
             .start_sandbox(
@@ -18487,7 +18259,10 @@ pub(crate) mod service_tests {
             crate::db::CleanupCompletion::MarkSuspended,
         )
         .unwrap();
-        let service = SandboxManagerService::new(conn);
+        // The test service's node-manager refuses every dial, so the
+        // retirement's cleanup cannot start and the row keeps the intent it
+        // persisted.
+        let service = SandboxManagerService::for_test(conn);
 
         let _ = service
             .start_sandbox(
@@ -18532,7 +18307,7 @@ pub(crate) mod service_tests {
             "restore activation was interrupted",
         )
         .unwrap();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         add_test_monitoring(&service, &sandbox_id).await;
         service.auto_lifecycle.record_wake_completed(&sandbox_id);
         let pending = service.lookup_sandbox(&sandbox_id).unwrap();
@@ -18602,7 +18377,7 @@ pub(crate) mod service_tests {
             .unwrap();
             let before = initial_runtime_state(&policy, now_secs().saturating_sub(1000));
             crate::db::update_auto_lifecycle_state(&conn, &key, &before).unwrap();
-            let service = SandboxManagerService::new(conn);
+            let service = SandboxManagerService::for_test(conn);
             install_authoritative_route_epoch(
                 &mut service.route_stream_epochs.lock().unwrap(),
                 id,
@@ -18716,7 +18491,7 @@ pub(crate) mod service_tests {
         .unwrap();
         let old = initial_runtime_state(&policy, now_secs().saturating_sub(1000));
         crate::db::update_auto_lifecycle_state(&conn, &id.to_string(), &old).unwrap();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let protection = {
             let mut epochs = service.route_stream_epochs.lock().unwrap();
             install_authoritative_route_epoch(&mut epochs, id, RouteStreamEpochIdentity(identity));
@@ -18782,7 +18557,7 @@ pub(crate) mod service_tests {
             .unwrap();
             let due = initial_runtime_state(&policy, now_secs().saturating_sub(1000));
             crate::db::update_auto_lifecycle_state(&conn, &key, &due).unwrap();
-            let service = SandboxManagerService::new(conn);
+            let service = SandboxManagerService::for_test(conn);
             install_authoritative_route_epoch(
                 &mut service.route_stream_epochs.lock().unwrap(),
                 id,
@@ -18847,7 +18622,7 @@ pub(crate) mod service_tests {
         let key = id.to_string();
         let policy = access_idle_policy(300);
         insert_test_sandbox_with_policy(&conn, &key, SandboxState::Started, &policy);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let mut owners = Vec::new();
         for generation in [1, 2] {
             let identity = route_identity(id, generation, SandboxActivationAttemptId::new());
@@ -18909,7 +18684,7 @@ pub(crate) mod service_tests {
             crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::Unfenced,
         )
         .unwrap();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let now = now_secs();
         let mut request = touch_auto_lifecycle_access_request(&id.to_string(), now);
         let extend =
@@ -19058,7 +18833,7 @@ pub(crate) mod service_tests {
         crate::auto_lifecycle::extend_access_deadline(&mut runtime, &policy, now_secs() + 900)
             .unwrap();
         crate::db::update_auto_lifecycle_state(&conn, &id, &runtime).unwrap();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         service
             .set_auto_lifecycle_policy_exact(
                 &id,
@@ -19097,7 +18872,7 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new().to_string();
         let policy = access_idle_policy(30);
         insert_test_sandbox_with_policy(&conn, &sandbox_id, SandboxState::Started, &policy);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let observed_at = now_secs() + 600;
 
         let response = service
@@ -19136,7 +18911,7 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new().to_string();
         let policy = access_idle_policy(30);
         insert_test_sandbox_with_policy(&conn, &sandbox_id, SandboxState::Started, &policy);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let observed_at = now_secs() + 600;
 
         service
@@ -19185,7 +18960,7 @@ pub(crate) mod service_tests {
             &AutoLifecycleRuntimeState::default(),
         )
         .unwrap();
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
         let observed_at = now_secs() + 600;
 
         let response = service
@@ -19221,7 +18996,7 @@ pub(crate) mod service_tests {
             .unwrap()
             .expect("sandbox row")
             .auto_lifecycle_state;
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let response = service
             .touch_auto_lifecycle(internal_request(touch_auto_lifecycle_access_request(
@@ -19250,7 +19025,7 @@ pub(crate) mod service_tests {
             SandboxState::Started,
             &AutoLifecyclePolicy::disabled(),
         );
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let response = service
             .touch_auto_lifecycle(internal_request(touch_auto_lifecycle_access_request(
@@ -19468,7 +19243,7 @@ pub(crate) mod service_tests {
             }],
         };
         insert_test_sandbox_with_policy(&conn, &sandbox_id, SandboxState::Started, &policy);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let before = now_secs();
         let outcome = service
@@ -19519,7 +19294,7 @@ pub(crate) mod service_tests {
             }],
         };
         insert_test_sandbox_with_policy(&conn, &sandbox_id, SandboxState::Started, &policy);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let outcome = service
             .request_guest_active_for(&sandbox_id, Duration::from_secs(10))
@@ -19551,7 +19326,7 @@ pub(crate) mod service_tests {
             }],
         };
         insert_test_sandbox_with_policy(&conn, &sandbox_id, SandboxState::Started, &policy);
-        let service = SandboxManagerService::new(conn);
+        let service = SandboxManagerService::for_test(conn);
 
         let before = now_secs();
         assert!(

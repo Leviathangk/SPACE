@@ -14,8 +14,8 @@ import re
 from capture import query, save
 
 COUNTER = "space_node_mgr_loop_devices_created_total"
-GAUGE = "space_node_mgr_cleanup_operation_in_flight_ratio"
-TIMING = "space_sandbox_state_convergence_duration_ms_milliseconds"
+GAUGE = "space_node_mgr_cleanup_operation_in_flight"
+TIMING = "space_sandbox_state_convergence_duration_milliseconds"
 STATE = "space_sandbox_guest_vcpu_count"
 CREATED = "space_sandbox_api_created_total"
 
@@ -114,7 +114,7 @@ def main():
         native = [item for item in series if item["metric"]["__name__"] == metric]
         check(metric + " stored as native histogram", len(native) == 2 and all(item.get("histograms") for item in native), {"series": len(native), "first": [item.get("histograms", [])[:1] for item in native]})
     identities = {item["metric"].get("service_instance_id") for item in series}
-    required = {"service", "cluster_id", "deployment_environment_name", "service_version", "service_name", "service_instance_id", "k8s_pod_name", "k8s_node_name", "k8s_cluster_name"}
+    required = {"cluster_id", "deployment_environment_name", "service_version", "service_name", "service_instance_id", "k8s_pod_name", "k8s_node_name", "k8s_cluster_name"}
     check("Distinct producers and identities survive", len(identities) == 2 and all(required <= item["metric"].keys() for item in series), sorted(identities))
     dimensions = {"state": "started", "template": "oss-synthetic", "tls_interception": "off", "kind": "device_node"}
     check("Product dimensions survive", all(any(i["metric"].get(k) == v for i in series) for k, v in dimensions.items()), dimensions)

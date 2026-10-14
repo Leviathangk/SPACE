@@ -1,9 +1,6 @@
 //! CONNECT retains opaque forwarding. SPACE authorizes the outer proxy route;
 //! the tunnel contents and inner destination remain outside HTTP inspection.
 
-use hyper::upgrade::OnUpgrade;
-
-use super::leg::{RelayFault, RelayWitness, Side};
 use super::*;
 
 /// The authority forwarded in an HTTP/1.1 CONNECT request.
@@ -80,7 +77,7 @@ fn target<B>(request: &SanitizedRequest<B>) -> Result<Target, ()> {
 impl<F, Fut, U> Session<F>
 where
     F: FnOnce(HttpProtocol) -> Fut + Send + 'static,
-    Fut: Future<Output = Result<(U, HttpProtocol), TlsTransportError>> + Send,
+    Fut: Future<Output = Result<(U, HttpProtocol), upstream::Error>> + Send + 'static,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     pub(super) async fn connect_request(
@@ -100,16 +97,7 @@ where
             authorization.finish(Outcome::Cancelled, "lease_invalidated");
             return self.refuse(protocol, "lease_invalidated", StatusCode::FORBIDDEN);
         }
-        let proxy = Request::builder()
-            .uri("/")
-            .header(
-                header::HOST,
-                format!("{}:{}", self.lease.host(), self.lease.port()),
-            )
-            .body(())
-            .expect("validated proxy origin");
-        let proxy = SanitizedRequest::try_from(proxy).expect("proxy request has only Host");
-        if let Err(reason) = self.binding.authorize(&proxy).await {
+        if let Err(reason) = self.binding.authorize(self.lease.host()).await {
             authorization.finish(Outcome::Denied, reason.as_str());
             return self.refuse(protocol, reason.as_str(), reason.refusal_status());
         }
@@ -119,35 +107,40 @@ where
         request.set_host(authority.parse().expect("validated CONNECT target"));
         let guest = request.on_upgrade();
         let mut forwarding = Attempt::forwarding(protocol.as_str(), "request");
-        let sender = match self.sender(protocol).await {
-            Ok(Sender::Http1(sender)) => sender,
-            Ok(Sender::Http2(_)) => {
-                forwarding.finish(Outcome::Denied, "invalid_connect");
-                return self.refuse(protocol, "invalid_connect", StatusCode::FORBIDDEN);
-            }
+        let sender = match self.upstream.sender(protocol).await {
+            Ok(sender) => sender,
             Err(error) => {
                 forwarding.finish(Outcome::Error, "origin_setup");
                 error.record("connect_proxy_setup");
                 return self.refuse(protocol, error.as_str(), StatusCode::BAD_GATEWAY);
             }
         };
-        let mut sender = sender.lock().await;
+        let ready = match sender.ready().await {
+            Ok(ready) if ready.is_http1() => ready,
+            Ok(_) => return self.refuse(protocol, "invalid_connect", StatusCode::FORBIDDEN),
+            Err(error) => {
+                HttpError::Protocol(error).record("connect_proxy_ready");
+                return self.refuse(protocol, "upstream_http_error", StatusCode::BAD_GATEWAY);
+            }
+        };
         if !self.lease.is_usable() {
             forwarding.finish(Outcome::Cancelled, "lease_invalidated");
             return self.refuse(protocol, "lease_invalidated", StatusCode::FORBIDDEN);
         }
-        let mut response = match request
-            .map(|body| Either::Left(Self::forwarding_body(protocol, body, "request_body")))
-            .send_http1(&mut sender)
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                forwarding.finish(Outcome::Error, "upstream_http");
-                TlsTransportError::Http(error).record("connect_proxy_request");
-                return self.refuse(protocol, "upstream_http_error", StatusCode::BAD_GATEWAY);
-            }
-        };
+        let mut response =
+            match ready
+                .send(request.map(|body| {
+                    Either::Left(Self::forwarding_body(protocol, body, "request_body"))
+                }))
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    forwarding.finish(Outcome::Error, "upstream_http");
+                    HttpError::Protocol(error).record("connect_proxy_request");
+                    return self.refuse(protocol, "upstream_http_error", StatusCode::BAD_GATEWAY);
+                }
+            };
         if response.status() == StatusCode::SWITCHING_PROTOCOLS {
             forwarding.finish(Outcome::Error, "unexpected_upgrade");
             return self.refuse(protocol, "unexpected_upgrade", StatusCode::BAD_GATEWAY);
@@ -160,82 +153,20 @@ where
         }
         let origin = hyper::upgrade::on(&mut response);
         response.headers_mut().remove(header::CONTENT_LENGTH);
-        self.upgrades
-            .spawn(relay(guest, origin, self.shutdown.clone()).in_current_span());
+        self.upgrades.spawn(
+            upgrade::relay(
+                guest,
+                origin,
+                self.shutdown.clone(),
+                "http1",
+                upgrade::Kind::Connect,
+            )
+            .in_current_span(),
+        );
         Self::record(protocol, "connect_forwarded", response.status());
         forwarding.finish(Outcome::Success, "response_headers");
         response.map(|_| Either::Right(Empty::new()))
     }
-}
-
-async fn relay(guest: OnUpgrade, origin: OnUpgrade, shutdown: CancellationToken) {
-    let mut forwarding = Attempt::forwarding("http1", "relay");
-    let witness = RelayWitness::default();
-    let started_at = tokio::time::Instant::now();
-    let operation = {
-        let witness = witness.clone();
-        async move {
-            let (guest, origin) =
-                tokio::time::timeout(HEADER_TIMEOUT, async { tokio::try_join!(guest, origin) })
-                    .await
-                    .map_err(|_| TlsTransportError::Timeout)??;
-            let mut guest = witness.guest(TokioIo::new(guest));
-            let mut origin = witness.origin(TokioIo::new(origin));
-            tokio::io::copy_bidirectional(&mut guest, &mut origin)
-                .await
-                .map(|_| ())
-                // Attribute the copy to the peer that actually failed. Forcing
-                // every relay error onto the origin makes a guest hang-up look
-                // like an upstream fault.
-                .map_err(|error| match witness.fault().map(RelayFault::side) {
-                    Some(Side::Guest) => TlsTransportError::Downstream(error),
-                    _ => TlsTransportError::Upstream(error),
-                })
-        }
-    };
-    let result = tokio::select! {
-        biased;
-        () = shutdown.cancelled() => Err(TlsTransportError::Invalidated),
-        result = operation => result,
-    };
-    let outcome = match result {
-        Ok(()) => {
-            forwarding.finish(Outcome::Success, "connect_complete");
-            "connect_complete"
-        }
-        // This token is session-local and fires whenever the serve future is
-        // dropped, so the relay cannot tell shutdown from a resweep or an
-        // invalidated lease. Report the end without naming a cause; the
-        // enclosing session watches all three and records the actual one.
-        Err(TlsTransportError::Withdrawn | TlsTransportError::Invalidated) => {
-            forwarding.finish(Outcome::Cancelled, "session_ended");
-            "session_ended"
-        }
-        Err(error) => {
-            let reason = witness.fault().map_or("relay_io", RelayFault::as_str);
-            forwarding.finish(Outcome::Error, reason);
-            error.record("connect_relay");
-            error.as_str()
-        }
-    };
-    let (guest_bytes, origin_bytes) = witness.bytes();
-    pplx_space_metrics::gateway::domain_binding("tcp", "tls_connect", outcome, None);
-    pplx_space_metrics::gateway::relay_duration_ms(
-        "http1",
-        outcome,
-        witness.closed_by(),
-        started_at.elapsed().as_secs_f64() * 1_000.0,
-    );
-    tracing::info!(
-        boundary = "forwarding",
-        operation = "relay",
-        outcome,
-        closed_by = witness.closed_by(),
-        fault = witness.fault().map(RelayFault::as_str),
-        guest_bytes,
-        origin_bytes,
-        "CONNECT forwarding ended"
-    );
 }
 
 #[cfg(test)]

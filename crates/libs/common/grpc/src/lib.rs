@@ -33,10 +33,12 @@ pub const BULK_HTTP2_MAX_FRAME_SIZE: u32 = 256 * 1024;
 mod active_requests;
 mod client;
 mod connect;
+mod connection_watch;
 mod context;
 mod deadline;
 mod forward;
 mod idempotency;
+pub use connection_watch::ConnectionWatch;
 mod policy;
 mod preface;
 pub use preface::PrefaceDeadline;
@@ -51,15 +53,21 @@ mod sandbox_trace;
 mod server;
 pub use sandbox_trace::{
     SandboxTraceContext, record_guest_service_outcome, record_guest_service_status,
+    record_sandbox_id,
 };
 mod status;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 mod trace;
 
 pub use client::GrpcClient;
 pub use connect::{
-    UdsConnectError, connect_tcp_channel_with_retry, connect_tcp_channel_with_retrying_redials,
+    ConnectPhaseError, TcpChannelError, TcpConnectError, TcpEndpointError, UdsConnectError,
+    connect_tcp_channel, connect_tcp_channel_lazy, connect_tcp_channel_with_retry,
+    connect_tcp_channel_with_retry_watched, connect_tcp_channel_with_retrying_redials,
     connect_uds_channel, connect_uds_channel_lazy, connect_uds_channel_with_endpoint,
     connect_uds_channel_with_endpoint_with_retry, connect_uds_channel_with_retry,
+    retrying_redial_bound,
 };
 pub use context::GrpcRetryContext;
 pub use idempotency::generated_idempotency_key;
@@ -86,6 +94,6 @@ pub use status::{
     uds_per_sandbox_limit_exceeded_status, with_retry_after,
 };
 pub use trace::{
-    CLIENT_SERVICE_METADATA_KEY, GrpcClientTrace, current_service_name, set_current_service_name,
-    trace_grpc_client_transport,
+    CLIENT_SERVICE_METADATA_KEY, GrpcClientTrace, current_service_name, is_untraced_grpc_path,
+    set_current_service_name, trace_grpc_client_transport,
 };

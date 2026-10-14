@@ -86,6 +86,8 @@ type RuntimeTransport = GrpcClientTrace<InterceptedService<Channel, SpaceBearerI
 pub struct RuntimeClient {
     worker: WorkerApiClient<RuntimeTransport>,
     channel: Channel,
+    /// Set when `channel` is a cached channel that other callers share.
+    kept: Option<pplx_space_common_grpc::ConnectionWatch>,
 }
 
 impl RuntimeClient {
@@ -94,6 +96,26 @@ impl RuntimeClient {
         Self {
             worker: WorkerApiClient::new(transport),
             channel,
+            kept: None,
+        }
+    }
+
+    /// A client on a channel a cache keeps while `watch` is open.
+    #[cfg(feature = "kubernetes")]
+    fn kept(channel: Channel, watch: pplx_space_common_grpc::ConnectionWatch) -> Self {
+        Self {
+            kept: Some(watch),
+            ..Self::new(channel)
+        }
+    }
+
+    /// Stop handing this client's cached channel to later callers, so the
+    /// next one dials afresh. Call it when the peer showed that new calls
+    /// should reach a new connection, such as a draining node-api; this
+    /// client and its clones keep working. A no-op for an uncached channel.
+    pub(crate) fn retire_kept_connection(&self) {
+        if let Some(watch) = &self.kept {
+            watch.close();
         }
     }
 
@@ -3875,8 +3897,12 @@ pub fn node_api_channel(
     ))
 }
 
-async fn node_api_transport(endpoint: Endpoint) -> Result<Endpoint, ControllerError> {
-    pplx_space_common_grpc::internal_transport::client_endpoint(
+/// Apply the node-api internal transport to `endpoint` for the TCP connect
+/// helpers, carrying the TLS handshake bound the transport applies.
+async fn node_api_connect_endpoint(
+    endpoint: Endpoint,
+) -> Result<pplx_space_common_grpc::internal_transport::ConnectEndpoint, ControllerError> {
+    pplx_space_common_grpc::internal_transport::client_connect_endpoint(
         pplx_space_common_grpc::internal_transport::Service::NodeApi,
         endpoint,
     )
@@ -3913,34 +3939,71 @@ pub(super) async fn require_activation_policy_support(
 }
 
 pub async fn connect_worker(endpoint: Endpoint) -> Result<RuntimeClient, ControllerError> {
-    let endpoint = node_api_transport(endpoint).await?;
-    let channel = pplx_space_common_grpc::connect_tcp_channel_with_retry(
-        "worker-node-api",
-        "worker-node-api",
-        endpoint,
-        pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
-    )
-    .await
-    .map_err(|err| {
-        ControllerError::service_unavailable(format!("node-api not reachable: {err}"))
-    })?;
+    let channel = node_api_connect_endpoint(endpoint)
+        .await?
+        .connect_with_retry(
+            "worker-node-api",
+            "worker-node-api",
+            pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
+        )
+        .await
+        .map_err(|err| {
+            ControllerError::service_unavailable(format!("node-api not reachable: {err}"))
+        })?;
     Ok(RuntimeClient::new(channel))
+}
+
+/// HTTP/2 connection window for a kept worker connection: 16 default-sized
+/// (2 MiB) stream windows.
+#[cfg(feature = "kubernetes")]
+const KEPT_WORKER_CONNECTION_WINDOW_BYTES: u32 = 32 * 1024 * 1024;
+
+/// [`connect_worker`] for a channel a cache keeps: the same dial, plus the
+/// watch that closes once the connection it was dialed with ends.
+#[cfg(feature = "kubernetes")]
+async fn connect_worker_watched(
+    endpoint: Endpoint,
+) -> Result<(Channel, pplx_space_common_grpc::ConnectionWatch), ControllerError> {
+    // A kept connection carries every call to its pod, so it needs its own
+    // liveness check: ping it while idle too, so a peer lost without a FIN is
+    // torn down before the next caller reuses it, rather than only once a
+    // call is in flight.
+    //
+    // It also carries concurrent streams that used to get a connection each.
+    // A reader that stops polling holds up to one stream window of the
+    // connection window; a window several streams wide keeps a few stalled
+    // readers from blocking the pod's other calls. Buffering stays bounded by
+    // the stream windows, as it was across separate connections.
+    let endpoint = endpoint
+        .keep_alive_while_idle(true)
+        .initial_connection_window_size(KEPT_WORKER_CONNECTION_WINDOW_BYTES);
+    node_api_connect_endpoint(endpoint)
+        .await?
+        .connect_with_retry_watched(
+            "worker-node-api",
+            "worker-node-api",
+            pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
+        )
+        .await
+        .map_err(|err| {
+            ControllerError::service_unavailable(format!("node-api not reachable: {err}"))
+        })
 }
 
 pub async fn connect_worker_internal(
     endpoint: Endpoint,
 ) -> Result<RuntimeInternalClient, ControllerError> {
-    let endpoint = node_api_transport(endpoint).await?;
-    let channel = pplx_space_common_grpc::connect_tcp_channel_with_retry(
-        "worker-node-api-internal",
-        "worker-node-api-internal",
-        endpoint,
-        pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
-    )
-    .await
-    .map_err(|err| {
-        ControllerError::service_unavailable(format!("node-api not reachable: {err}"))
-    })?;
+    let channel = node_api_connect_endpoint(endpoint)
+        .await?
+        .connect_with_retry(
+            "worker-node-api-internal",
+            "worker-node-api-internal",
+            pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
+        )
+        .await
+        .map_err(|err| {
+            ControllerError::service_unavailable(format!("node-api not reachable: {err}"))
+        })?;
     Ok(WorkerApiInternalClient::new(wrap_grpc_client_channel(
         InterceptedService::new(
             channel,
@@ -3950,17 +4013,17 @@ pub async fn connect_worker_internal(
 }
 
 pub async fn connect_builder(endpoint: Endpoint) -> Result<BuilderClient, ControllerError> {
-    let endpoint = node_api_transport(endpoint).await?;
-    let channel = pplx_space_common_grpc::connect_tcp_channel_with_retry(
-        "builder-node-api",
-        "builder-node-api",
-        endpoint,
-        pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
-    )
-    .await
-    .map_err(|err| {
-        ControllerError::service_unavailable(format!("node-api not reachable: {err}"))
-    })?;
+    let channel = node_api_connect_endpoint(endpoint)
+        .await?
+        .connect_with_retry(
+            "builder-node-api",
+            "builder-node-api",
+            pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
+        )
+        .await
+        .map_err(|err| {
+            ControllerError::service_unavailable(format!("node-api not reachable: {err}"))
+        })?;
     Ok(BuilderApiClient::new(wrap_grpc_client_channel(
         InterceptedService::new(
             channel,

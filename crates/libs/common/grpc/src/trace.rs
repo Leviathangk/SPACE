@@ -71,7 +71,9 @@ impl MakeClassifier for GrpcClientMakeClassifier {
 
     fn make_classifier<B>(&self, request: &Request<B>) -> Self::Classifier {
         let path = request.uri().path();
-        let inner = if grpc_client_application_statuses_are_expected(path) {
+        let inner = if grpc_client_is_readiness_poll(path) {
+            GrpcErrorsAsFailures::new().with_success(GrpcCode::FailedPrecondition)
+        } else if grpc_client_application_statuses_are_expected(path) {
             grpc_application_status_classifier()
         } else if grpc_client_not_found_is_expected(path) {
             GrpcErrorsAsFailures::new().with_success(GrpcCode::NotFound)
@@ -186,6 +188,17 @@ impl ClassifyEos for GrpcClientEosClassifier {
     }
 }
 
+/// A readiness poll answers FAILED_PRECONDITION until the sandbox has booted.
+/// That "not ready yet" is the expected answer, not a failed call, so it is
+/// classified as success in the response and in the trailers alike.
+fn grpc_client_is_readiness_poll(path: &str) -> bool {
+    matches!(
+        path,
+        "/space.node.api.v1.WorkerApi/SpacedWaitReady"
+            | "/space.sandbox.manager.v1.SandboxManager/SpacedWaitReady"
+    )
+}
+
 fn grpc_client_not_found_is_expected(path: &str) -> bool {
     path == WORKER_API_SPACED_STAT_PATH
 }
@@ -238,12 +251,28 @@ fn grpc_application_status_classifier() -> GrpcErrorsAsFailures {
         .with_success(GrpcCode::Unauthenticated)
 }
 
+/// Whether this gRPC path is a health check, whose calls get no span unless
+/// they run inside a traced request.
+///
+/// Kubelet probes, load balancers and capability polls call it every few
+/// seconds with no request in scope; their traces would outnumber every
+/// request's, and monitors already exclude them. A check a request makes, such
+/// as a wake path's capability probe, keeps its client and server spans.
+pub fn is_untraced_grpc_path(path: &str) -> bool {
+    path.starts_with("/grpc.health.v1.Health/")
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GrpcClientMakeSpan;
 
 impl<B> MakeSpan<B> for GrpcClientMakeSpan {
     fn make_span(&mut self, request: &Request<B>) -> tracing::Span {
         let path = request.uri().path();
+        if is_untraced_grpc_path(path)
+            && !pplx_space_observability::trace_propagation::has_traced_current_span()
+        {
+            return tracing::Span::none();
+        }
         let (rpc_service, rpc_method) = parse_grpc_path(path);
         let otel_name = format!("{rpc_service}/{rpc_method}");
 
@@ -318,6 +347,10 @@ impl OnFailure<GrpcClientFailureClass> for GrpcClientOnFailure {
                 let tonic_code = tonic::Code::from_i32(numeric);
                 let name = tonic_code.description();
                 span.record("rpc.grpc.status_code", numeric);
+                // Every status that reaches here marks the client span ERROR,
+                // application statuses included. The code goes first: recording
+                // it after the description would clear the message.
+                span.record("otel.status_code", "ERROR");
                 span.record("otel.status_description", name);
                 if !failure.is_error {
                     tracing::debug!(
@@ -332,7 +365,6 @@ impl OnFailure<GrpcClientFailureClass> for GrpcClientOnFailure {
                     return;
                 }
 
-                span.record("otel.status_code", "ERROR");
                 tracing::error!(
                     target: "grpc.client",
                     rpc_log_side = "client",

@@ -8,9 +8,11 @@ on:
       - .github/workflows/main-ci.yml
       - infra/space/kind/**
       - scripts/tests/smoke-kind-*.sh
+      - scripts/tests/lib/bootstrap-kind-stack.sh
       - space_smoke/**
       - Tiltfile
       - docker/Dockerfile.rust-build-kind
+      - docker/Dockerfile.worker
       - crates/libs/sbx/mgr/server/src/service/activation_support.rs
       - infra/space/observability/**
       - crates/libs/observability/**
@@ -26,6 +28,7 @@ on:
 # use the existing read-only Actions cache bridge; if both miss, build cold.
 # Neither case permits publication from PRs.
 permissions:
+  actions: read
   contents: read
   packages: read
 

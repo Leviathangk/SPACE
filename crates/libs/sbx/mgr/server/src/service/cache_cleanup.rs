@@ -104,6 +104,10 @@ pub(super) fn ensure_sandbox_cache_root_in(
     })
 }
 
+/// States whose row is not stale merely because it has no cache root or
+/// runtime directory. `Quarantined` is a hold whose local evidence may be
+/// gone; skipping it here also keeps every pass from taking its cleanup fence
+/// and a write transaction. The guarded delete refuses it independently.
 pub(super) fn sandbox_state_may_lack_cache_root(state: SandboxState) -> bool {
     matches!(
         state,
@@ -113,6 +117,7 @@ pub(super) fn sandbox_state_may_lack_cache_root(state: SandboxState) -> bool {
             | SandboxState::Restoring
             | SandboxState::CleanupRequired
             | SandboxState::CleanupFailed
+            | SandboxState::Quarantined
     )
 }
 
@@ -1387,10 +1392,7 @@ impl SandboxManagerService {
     fn orphan_execution_observer(
         &self,
     ) -> impl Fn(SandboxId) -> Result<Option<ExecutionFence>, Status> + use<> {
-        orphan_execution_observer(
-            pplx_space_node_mgr_client::lazy(),
-            self.shutdown_token.clone(),
-        )
+        orphan_execution_observer(self.node_manager.lazy(), self.shutdown_token.clone())
     }
 
     pub(super) fn reconcile_sandbox_inventory(

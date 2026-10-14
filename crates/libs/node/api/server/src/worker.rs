@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use futures_util::{Stream, StreamExt};
 use pplx_space_common_core::types::SandboxId;
-use pplx_space_common_grpc::fwd_retry;
+use pplx_space_common_grpc::{fwd_retry, record_sandbox_id};
 use pplx_space_common_svc::auth::{
     NetworkPolicyMutationAuthority, NodeApiAuthenticatedCaller, WaitReadyLifecycleAuthority,
 };
@@ -240,6 +240,7 @@ impl WorkerApiService {
         Fut: Future<Output = Result<Response<Resp>, Status>> + Send,
     {
         let sandbox_id = request.get_ref().sandbox_id().to_owned();
+        record_sandbox_id(&tracing::Span::current(), &sandbox_id);
         let client = self.clients.sbx();
         self.limited_sbx_operation(method, &sandbox_id, move || {
             crate::restart_handoff::call_with_restart_handoff(
@@ -267,6 +268,7 @@ impl WorkerApiService {
         Fut: Future<Output = Result<Response<S>, Status>> + Send,
     {
         let sandbox_id = request.get_ref().sandbox_id().to_owned();
+        record_sandbox_id(&tracing::Span::current(), &sandbox_id);
         let client = self.clients.sbx();
         let permit = self.acquire_sbx_permit(method, &sandbox_id).await?;
         let response = crate::restart_handoff::call_with_restart_handoff(
@@ -601,6 +603,7 @@ impl WorkerApi for WorkerApiService {
         &self,
         r: Request<pplx_space_sbx_mgr_client::proto::StopRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::StopResponse>, Status> {
+        record_sandbox_id(&tracing::Span::current(), &r.get_ref().sandbox_id);
         fwd_sbx_handoff!(self, "StopSandbox", stop, r)
     }
 
@@ -615,6 +618,7 @@ impl WorkerApi for WorkerApiService {
         &self,
         r: Request<pplx_space_sbx_mgr_client::proto::DeleteRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::DeleteResponse>, Status> {
+        record_sandbox_id(&tracing::Span::current(), &r.get_ref().sandbox_id);
         fwd_sbx_handoff!(self, "DeleteSandbox", delete, r)
     }
 
@@ -622,6 +626,9 @@ impl WorkerApi for WorkerApiService {
         &self,
         r: Request<pplx_space_sbx_mgr_client::proto::StateRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::StateResponse>, Status> {
+        if let [sandbox_id] = r.get_ref().sandbox_ids.as_slice() {
+            record_sandbox_id(&tracing::Span::current(), sandbox_id);
+        }
         fwd_sbx_read!(self, "SandboxState", state, r)
     }
 
@@ -629,6 +636,7 @@ impl WorkerApi for WorkerApiService {
         &self,
         r: Request<pplx_space_sbx_mgr_client::proto::GetSandboxHealthRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::GetSandboxHealthResponse>, Status> {
+        record_sandbox_id(&tracing::Span::current(), &r.get_ref().sandbox_id);
         fwd_sbx_read!(self, "GetSandboxHealth", get_sandbox_health, r)
     }
 
@@ -1158,6 +1166,7 @@ impl WorkerApi for WorkerApiService {
         r: Request<pplx_space_template_mgr_client::proto::DeleteTemplateRequest>,
     ) -> Result<Response<pplx_space_template_mgr_client::proto::DeleteTemplateResponse>, Status>
     {
+        pplx_space_common_svc::auth::template::require_template_mutation_authority(&r)?;
         fwd!(self.clients.tmpl(), delete_template, r)
     }
 
@@ -1166,6 +1175,7 @@ impl WorkerApi for WorkerApiService {
         r: Request<pplx_space_template_mgr_client::proto::DeleteTemplateBuildRequest>,
     ) -> Result<Response<pplx_space_template_mgr_client::proto::DeleteTemplateBuildResponse>, Status>
     {
+        pplx_space_common_svc::auth::template::require_template_mutation_authority(&r)?;
         fwd!(self.clients.tmpl(), delete_template_build, r)
     }
 
@@ -1214,6 +1224,7 @@ impl WorkerApi for WorkerApiService {
         &self,
         r: Request<pplx_space_template_mgr_client::proto::CreatePoolRequest>,
     ) -> Result<Response<pplx_space_template_mgr_client::proto::CreatePoolResponse>, Status> {
+        pplx_space_common_svc::auth::template::require_template_mutation_authority(&r)?;
         fwd!(self.clients.tmpl(), create_pool, r)
     }
 
@@ -1221,6 +1232,7 @@ impl WorkerApi for WorkerApiService {
         &self,
         r: Request<pplx_space_template_mgr_client::proto::DeletePoolRequest>,
     ) -> Result<Response<pplx_space_template_mgr_client::proto::DeletePoolResponse>, Status> {
+        pplx_space_common_svc::auth::template::require_template_mutation_authority(&r)?;
         fwd!(self.clients.tmpl(), delete_pool, r)
     }
 

@@ -1,5 +1,7 @@
 # Native API smoke coverage
 
+[Documentation](../README.md)
+
 Native API correctness, concurrency, and recovery checks are part of the ordinary
 typed `space_smoke.scenarios` inventory. Scenario modules contain their workloads
 and assertions directly; shared HTTP, concurrency, identity, and recovery
@@ -139,10 +141,11 @@ one load-balanced endpoint does not prove distinct-replica coverage.
 
 Recovery stops the controller and replaces API/data-plane pods. The explicit
 fairness regression also temporarily stops object storage. Use a dedicated
-Kind bench and keep its port-forward supervisor alive. The Kind shell harness
-sets the recovery context from `KIND_CLUSTER` and captures the kube-system UID.
-The recovery fixture revalidates those identities, local Kind node inventory,
-deployment ownership, absence of autoscalers, and a shared mutation lease.
+Kind bench. The Kind shell harness sets the recovery context from
+`KIND_CLUSTER` and captures the kube-system UID. The recovery fixture
+revalidates those identities, local Kind node inventory, deployment ownership
+and a shared mutation lease, and pins any autoscaler on a target Deployment to
+its current replica count until the Deployments are restored.
 
 When invoking a Kind-only fault scenario directly (including zero-vCPU
 admission) rather than through the Kind shell harness, supply `SPACE_SMOKE_NATIVE_RECOVERY=1`,

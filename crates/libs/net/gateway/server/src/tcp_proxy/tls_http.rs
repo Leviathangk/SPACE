@@ -3,7 +3,6 @@
 
 use std::convert::Infallible;
 use std::future::Future;
-use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -12,26 +11,31 @@ use std::time::Duration;
 use http::{Request, Response, StatusCode, Version, header};
 use http_body_util::{Either, Empty};
 use hyper::body::{Body as HttpBody, Bytes, Incoming};
+#[cfg(test)]
 use hyper::client::conn::{http1, http2};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{Mutex, MutexGuard, OnceCell};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::Instrument;
 
 use super::accounting::{Attempt, Outcome};
 use super::http_host::HostBinding;
-use super::routing_headers::{SanitizedBody, SanitizedRequest};
-use super::tls::{HttpProtocol, TlsTransportError};
+use super::routing_headers::SanitizedRequest;
+#[cfg(test)]
+use super::tls::TlsTransportError;
+use super::upstream::{self, Upstream};
 use crate::certificates::CertificateLease;
+use crate::tls_sni::HttpAlpn;
+pub(super) use error::HttpError;
+pub(super) use error::http_reason;
 
 mod connect;
 mod credentials;
+mod error;
 mod forward;
-mod leg;
 mod upgrade;
 
 type Body = Either<ForwardingBody, Empty<Bytes>>;
@@ -57,46 +61,6 @@ const MAX_STREAMS: u32 = 32;
 // window doesn't limit upload throughput.
 const GUEST_H2_STREAM_WINDOW: u32 = 128 * 1024;
 const GUEST_H2_CONNECTION_WINDOW: u32 = 4 * 1024 * 1024;
-
-enum Sender {
-    Http1(Mutex<http1::SendRequest<SanitizedBody<Body>>>),
-    Http2(http2::SendRequest<SanitizedBody<Body>>),
-}
-
-enum ReadySender<'a> {
-    Http1(MutexGuard<'a, http1::SendRequest<SanitizedBody<Body>>>),
-    Http2(http2::SendRequest<SanitizedBody<Body>>),
-}
-
-impl Sender {
-    async fn ready(&self) -> Result<ReadySender<'_>, hyper::Error> {
-        match self {
-            Self::Http1(sender) => {
-                let mut sender = sender.lock().await;
-                sender.ready().await?;
-                Ok(ReadySender::Http1(sender))
-            }
-            // Each HTTP/2 stream gets its own flow-control handle.
-            Self::Http2(sender) => Ok(ReadySender::Http2(sender.clone())),
-        }
-    }
-}
-
-impl ReadySender<'_> {
-    const fn is_http1(&self) -> bool {
-        matches!(self, Self::Http1(_))
-    }
-
-    async fn send(
-        self,
-        request: SanitizedRequest<Body>,
-    ) -> Result<Response<Incoming>, hyper::Error> {
-        match self {
-            Self::Http1(mut sender) => request.send_http1(&mut sender).await,
-            Self::Http2(mut sender) => request.send_http2(&mut sender).await,
-        }
-    }
-}
 
 struct ForwardingBody {
     inner: Incoming,
@@ -145,9 +109,7 @@ impl HttpBody for ForwardingBody {
 struct Session<F> {
     binding: HostBinding,
     lease: Arc<CertificateLease>,
-    connect: Mutex<Option<F>>,
-    upstream: OnceCell<Sender>,
-    tasks: TaskTracker,
+    upstream: Upstream<F, Body>,
     upgrades: TaskTracker,
     shutdown: CancellationToken,
     draining: CancellationToken,
@@ -168,25 +130,24 @@ pub(super) async fn serve<C, F, Fut, U>(
     binding: HostBinding,
     lease: Arc<CertificateLease>,
     connect: F,
-) -> Result<(), TlsTransportError>
+) -> Result<(), HttpError>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     F: FnOnce(HttpProtocol) -> Fut + Send + 'static,
-    Fut: Future<Output = Result<(U, HttpProtocol), TlsTransportError>> + Send,
+    Fut: Future<Output = Result<(U, HttpProtocol), upstream::Error>> + Send + 'static,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let shutdown = CancellationToken::new();
     // Dropping this future on revocation also closes every origin socket.
     let _cancel = shutdown.clone().drop_guard();
+    let draining = CancellationToken::new();
     let session = Arc::new(Session {
         binding,
         lease,
-        connect: Mutex::new(Some(connect)),
-        upstream: OnceCell::new(),
-        tasks: TaskTracker::new(),
+        upstream: Upstream::new(connect, shutdown.clone(), draining.clone()),
         upgrades: TaskTracker::new(),
         shutdown,
-        draining: CancellationToken::new(),
+        draining,
     });
     let service = service_fn(|request: Request<Incoming>| {
         let session = session.clone();
@@ -213,9 +174,8 @@ where
     session.upgrades.close();
     session.upgrades.wait().await;
     session.shutdown.cancel();
-    session.tasks.close();
-    session.tasks.wait().await;
-    result.map_err(TlsTransportError::from)
+    session.upstream.shutdown().await;
+    result.map_err(HttpError::from)
 }
 
 fn guest_http_builder() -> auto::Builder<TokioExecutor> {
@@ -242,89 +202,15 @@ fn guest_http_builder() -> auto::Builder<TokioExecutor> {
 impl<F, Fut, U> Session<F>
 where
     F: FnOnce(HttpProtocol) -> Fut + Send + 'static,
-    Fut: Future<Output = Result<(U, HttpProtocol), TlsTransportError>> + Send,
+    Fut: Future<Output = Result<(U, HttpProtocol), upstream::Error>> + Send + 'static,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    /// The origin leg is established lazily, by the first request that passes
-    /// authorization. `guest_protocol` is that request's HTTP version so the
-    /// upstream ALPN offer can match what the guest actually speaks.
-    async fn sender(&self, guest_protocol: HttpProtocol) -> Result<&Sender, TlsTransportError> {
-        self.upstream
-            .get_or_try_init(|| async {
-                // A failed or cancelled initializer has consumed the connector.
-                // Drain this guest session so another stream cannot reuse it.
-                let failed = self.draining.clone().drop_guard();
-                let connect = self
-                    .connect
-                    .lock()
-                    .await
-                    .take()
-                    .ok_or(TlsTransportError::Invalidated)?;
-                let (io, protocol) = connect(guest_protocol).await?;
-                let io = TokioIo::new(UpstreamIo {
-                    inner: io,
-                    _lifetime: self.draining.clone().drop_guard(),
-                });
-                let sender = match protocol {
-                    HttpProtocol::Http1 => {
-                        let (sender, connection) = http1::Builder::new()
-                            .max_headers(MAX_HEADERS)
-                            .handshake(io)
-                            .await?;
-                        self.drive(connection.with_upgrades());
-                        Sender::Http1(Mutex::new(sender))
-                    }
-                    HttpProtocol::Http2 => {
-                        let (sender, connection) = http2::Builder::new(TokioExecutor::new())
-                            .max_header_list_size(MAX_HEADER_BYTES)
-                            .max_send_buf_size(64 * 1024)
-                            .handshake(io)
-                            .await?;
-                        self.drive(connection);
-                        Sender::Http2(sender)
-                    }
-                };
-                failed.disarm();
-                Ok(sender)
-            })
-            .await
-    }
-
     fn forwarding_body(
         protocol: HttpProtocol,
         body: Incoming,
         operation: &'static str,
     ) -> ForwardingBody {
         ForwardingBody::new(body, protocol.as_str(), operation)
-    }
-
-    fn drive(&self, connection: impl Future<Output = Result<(), hyper::Error>> + Send + 'static) {
-        let shutdown = self.shutdown.clone();
-        self.tasks.spawn(
-            async move {
-                tokio::select! {
-                    biased;
-                    () = shutdown.cancelled() => {},
-                    result = connection => {
-                        if let Err(error) = result {
-                            // Hyper Display can contain peer-supplied text.
-                            let failure = super::tls::HttpFailure::classify(&error);
-                            tracing::info!(
-                                stage = "upstream_http",
-                                parse = error.is_parse(),
-                                closed = error.is_closed(),
-                                http_reason = failure.reason,
-                                io_kind = ?failure.io_kind,
-                                h2_reason = failure.h2_reason,
-                                h2_origin = failure.h2_origin,
-                                "inspected HTTP connection ended"
-                            );
-                        }
-                    }
-                }
-            }
-            .in_current_span(),
-        );
     }
 
     fn refuse(
@@ -363,52 +249,39 @@ where
     }
 }
 
-/// An HTTP driver hands its socket to an upgrade without closing it. Drain the
-/// guest only when that socket is dropped, preserving the handshake and relay.
-struct UpstreamIo<T> {
-    inner: T,
-    _lifetime: tokio_util::sync::DropGuard,
-}
-
-impl<T: AsyncRead + Unpin> AsyncRead for UpstreamIo<T> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
-}
-
-impl<T: AsyncWrite + Unpin> AsyncWrite for UpstreamIo<T> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        self.inner.is_write_vectored()
-    }
-
-    fn poll_write_vectored(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[io::IoSlice<'_>],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
-    }
-}
-
 #[cfg(test)]
 mod tests;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum HttpProtocol {
+    Http1,
+    Http2,
+}
+
+impl HttpProtocol {
+    /// The protocol hyper actually parsed a request with. This, not the ALPN
+    /// result, decides how the request is forwarded.
+    pub(super) fn of(version: http::Version) -> Self {
+        if version == http::Version::HTTP_2 {
+            Self::Http2
+        } else {
+            Self::Http1
+        }
+    }
+
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Http1 => "http1",
+            Self::Http2 => "http2",
+        }
+    }
+}
+
+impl From<HttpAlpn> for HttpProtocol {
+    fn from(protocol: HttpAlpn) -> Self {
+        match protocol {
+            HttpAlpn::Http1 => Self::Http1,
+            HttpAlpn::Http2 => Self::Http2,
+        }
+    }
+}

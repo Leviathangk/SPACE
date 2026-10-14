@@ -1,5 +1,7 @@
 # Configuration reference
 
+[Documentation](../README.md)
+
 Every `SPACE_*` environment variable listed here is a supported operator
 setting. Variables that are not listed are not read by release binaries.
 "Unset" means the built-in default applies. Variables marked **required** make
@@ -54,6 +56,12 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_STUCK_CONTAINER_CREATING_GC_MAX_DELETES_PER_MINUTE` | built-in | |
 | `SPACE_WARM_POOL_ORPHAN_GC_ENABLED` | off | Runs dry by default. |
 | `SPACE_ORPHANED_RESTORE_POD_GC_ENABLED` | off | |
+| `SPACE_ORPHANED_RESTORE_POD_GC_DRY_RUN` | true | Classifies and reports orphaned restore pods without deleting them. Only `0`, `false`, `False` or `FALSE` turns it off; any other value keeps it on. |
+| `SPACE_ORPHANED_RESTORE_POD_GC_INTERVAL_SECS`, `SPACE_ORPHANED_RESTORE_POD_GC_TICK_BUDGET_SECS` | 60, 45 | Tick cadence and per-tick time budget. A budget at or above the interval lets ticks run back to back. Seconds; a value above one day clamps to it, and `0` or a non-number keeps the default. |
+| `SPACE_ORPHANED_RESTORE_POD_GC_THRESHOLD_SECS` | 300 | How long a pod must stay superseded before it's deleted. Seconds; a value above one day clamps to it, and `0` or a non-number keeps the default. |
+| `SPACE_ORPHANED_RESTORE_POD_GC_MAX_DELETES_PER_MINUTE` | 60 | Orphans acted on per rolling minute. A larger value clamps to 600; `0` or a non-number keeps the default. To stop deletions, use `DRY_RUN` or `ENABLED`. |
+| `SPACE_ORPHANED_RESTORE_POD_GC_BATCH_SIZE` | 500 | Sandbox rows looked up per query. A larger value clamps to 5000; `0` or a non-number keeps the default. |
+| `SPACE_ORPHANED_RESTORE_POD_GC_TEARDOWN_STUCK_AFTER_SECS` | 300 | How long a pod may stay terminating before it's reported as a stuck teardown. Seconds; a value above one day clamps to it, and `0` or a non-number keeps the default. |
 | `SPACE_RECONCILE_QUEUE_GC_ENABLED` | off | Needs AWS. |
 | `SPACE_ORPHANED_NODES_ENABLED` | off | Needs AWS. |
 | `SPACE_NODE_DRAIN_ENABLED` | off | |
@@ -84,7 +92,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_SANDBOX_NODE_SERVICES_READY_AFFINITY` | off | Prefer nodes whose node-local services are ready; useful only where `SPACE_NODE_SERVICE_READINESS_ENABLED` is on. |
 | `SPACE_SANDBOX_NODE_SELECTOR_KEY`, `SPACE_SANDBOX_NODE_SELECTOR_VALUE` | `node.kubernetes.io/space-enabled`, `true` | Base node selector for sandbox pods and for the node-sync, node-group mirror and warm-pool loops; set both together. |
 | `SPACE_SANDBOX_NODE_SELECTOR_LABELS` | empty | |
-| `SPACE_SANDBOX_NAMESPACE` | `POD_NAMESPACE`, then `default` | |
+| `SPACE_SANDBOX_NAMESPACE` | `POD_NAMESPACE`, then `default` | Namespace of the sandbox pods. When it is not the node services' namespace, also set `SPACE_NODE_API_NAMESPACE`: without it and `POD_NAMESPACE`, the API looks for node-api pods here. |
 | `SPACE_SANDBOX_POD_IMAGE` | `registry.k8s.io/pause:3.10` | |
 | `SPACE_SANDBOX_FORK_ENABLED` | on | |
 | `SPACE_SANDBOX_FORK_HARD_DEADLINE_SECS` | 240 | Positive integer seconds. |
@@ -142,11 +150,13 @@ because disabling it by mistake would leave every create queued forever.
 
 ## Templates and builds
 
+Prefetch requires the catalog to confirm generic-only release resolution from the same database snapshot as its storage locations. Cached visibility alone does not authorize a download. Upgrade the catalog before template-manager; an older catalog cannot acknowledge this restriction, so prefetch pauses until it is upgraded. On-demand pulls retain their existing authorization.
+
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `SPACE_TEMPLATE_PREFETCH_ENABLED` | on | |
 | `SPACE_TEMPLATE_PREFETCH_TAGS` | `seed:latest`, `code-runtime:latest` | |
-| `SPACE_TEMPLATE_PREFETCH_VISIBILITY_ENFORCEMENT` | off | |
+| `SPACE_TEMPLATE_PREFETCH_VISIBILITY_ENFORCEMENT` | retired | Ignored; prefetch requires confirmed generic visibility. |
 | `SPACE_TEMPLATE_CACHE_BUDGET_BYTES` | 100 GiB | 0 or an invalid value disables cache GC. |
 | `SPACE_TEMPLATE_BUILD_DISK_MIB` | build-manager default | JSON. |
 | `SPACE_TRUSTED_TEMPLATE_STORAGE_BUCKETS` | empty = any bucket | |
@@ -183,6 +193,39 @@ the new field to forward each build's grant. Resubmit any older queued system
 jobs that could not be drained: jobs without a grant cannot publish through a
 dual-authority account after the rollout. System-only deployment publishers
 retain their existing publication authority.
+
+### Template balloon device
+
+A template can opt its sandboxes into a Firecracker
+[balloon device](https://github.com/firecracker-microvm/firecracker/blob/main/docs/ballooning.md)
+through `balloon` in its recipe's `[metadata]`, which the build records in the
+template's `metadata.json`:
+
+```toml
+[metadata]
+memory_mib = 8192
+# One of:
+balloon = { mode = "inflate", amount_mib = 1024, deflate_on_oom = true }
+balloon = { mode = "report" }  # free-page reporting
+balloon = { mode = "hint" }    # free-page hinting
+```
+
+`stats_polling_interval_s` (default 0, off) enables balloon statistics in any
+mode. `amount_mib` and `deflate_on_oom` are required for `inflate` and rejected
+otherwise; `amount_mib` must be below the sandbox's memory. Unknown modes and
+fields are rejected. Without `balloon`, the VM configuration is unchanged.
+
+The device is rendered only when a sandbox cold-boots from the template build,
+which includes creating the template's base snapshot. Sandboxes restored from a
+snapshot keep the device that snapshot captured, so changing the setting takes
+effect only after rebuilding the template and its base snapshot. The REST build
+API does not accept the setting yet.
+
+Hint mode also needs `balloon_hint_timeout_ms` (at most 30000) in the node's
+`/space/etc/sandbox.toml`. Before each suspend snapshot, a VM whose balloon has
+free-page hinting then runs one hinting pass bounded by this time; timeouts and
+errors are logged and the snapshot proceeds. Unset, suspend makes no balloon
+calls.
 
 ## Object storage and snapshots
 
@@ -227,14 +270,26 @@ retain their existing publication authority.
 | `SPACE_CREDMGR_AUTH_AUDIENCE` | `space-credential-manager` | Token audience credmgr validates. |
 | `SPACE_CREDMGR_AUTH_ALLOWED_SERVICE_ACCOUNTS` | every credmgr client service | Comma-separated allowlist; narrows which ServiceAccounts are admitted. |
 | `SPACE_CREDMGR_FAIL_ON_KEYLESS_AUTHORITY` | off | Crash instead of serving Ready-but-broken when a node-local authority has no key. |
-| `SPACE_CREDMGR_S3_VEND_ROLE_ARN` | unset = no storage exchange | |
-| `SPACE_CREDMGR_SCOPED_EXCHANGE_TOKEN_MODE` | `legacy` when the role ARN is set, else `disabled` | `legacy`, `mixed`, `enforce` or `disabled`; see `docs/space/design/credential-token-exchange.md`. |
+| `SPACE_CREDMGR_S3_VEND_ROLE_ARN` | unset = no storage exchange | Requires `DATABASE_URL`; a malformed ARN fails startup. See `docs/space/design/credential-token-exchange.md`. |
 | `SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN` | unset = credential references are not resolvable | IAM role assumed per organization for every Secrets Manager read, with session tag `space-org-id=<organization>` and a session policy that allows `GetSecretValue` only on secrets tagged with that organization and `kms:Decrypt` only through Secrets Manager; a malformed ARN fails startup. The role's trust policy admits only the authority's identity, with `sts:AssumeRole` and `sts:TagSession`, and requires the `space-org-id` request tag. Its policy allows `GetSecretValue` only when `secretsmanager:ResourceTag/space-org-id` equals `${aws:PrincipalTag/space-org-id}`, allows `kms:Decrypt` only with `kms:ViaService` `secretsmanager.*.amazonaws.com`, and explicitly denies secrets whose `space-org-id` tag is missing or differs from the session's, sessions without the tag, and any KMS use outside Secrets Manager; the explicit denials also hold against same-account resource and key policies. Tag each referenced secret `space-org-id=<owning organization ID>`. A secret in another account also needs a resource policy allowing the role, and a secret under a customer-managed KMS key (required across accounts) needs the key policy to allow the role `kms:Decrypt` with `kms:ViaService` `secretsmanager.<region>.amazonaws.com`. |
 | `SPACE_CREDMGR_INTERMEDIATE_CA_ARN` | unset | |
 | `SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_URL`, `SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_TOKEN_FILE`, `SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_TLS_CA`, `SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_GRANT_SCHEME`, `SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_TENANT_NAMESPACE` | unset | Configure as a group. |
 | `SPACE_PLATFORM_KEK_PROVIDER` | none | |
 | `SPACE_BYOK_VOLUME_ENCRYPTION` | off | |
 | `SPACE_FALCON_US2_EGRESS_DESTINATIONS`, `SPACE_NET_GATEWAY_KNOWN_EGRESS_DOMAINS` | unset / empty | |
+
+### Template mutation authority
+
+On worker and builder node-api, `DeleteTemplate`, `DeleteTemplateBuild`,
+`CreatePool`, and `DeletePool` require the trusted policy service-account
+capability. Template-manager's local roles and deletion dependency guards still
+apply. Pool target counts have no capacity-based upper bound yet; operators
+must budget pool sizes even after caller authorization succeeds.
+
+With Kubernetes authentication disabled, the shared internal token remains the
+operator trust boundary and retains mutation authority. When Kubernetes
+authentication is enabled, static fallback has no mutation authority. Missing
+authentication context is denied.
 
 ## Database
 

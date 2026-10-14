@@ -35,9 +35,11 @@ pub(super) fn pause_reconciliation_outcome(
 async fn reconcile_state_after_unconfirmed_pause(
     sandbox_id: &SandboxId,
     reason: &str,
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
 ) -> PauseReconciliationOutcome {
     let observation =
-        observe_firecracker_vm_state(sandbox_id, "pause response reconciliation").await;
+        observe_firecracker_vm_state(sandbox_id, "pause response reconciliation", node_manager)
+            .await;
     let outcome = pause_reconciliation_outcome(&observation);
     tracing::warn!(
         sandbox_id = %sandbox_id,
@@ -51,6 +53,10 @@ async fn reconcile_state_after_unconfirmed_pause(
     outcome
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent pause input; the node-manager client and connector are injected"
+)]
 pub(super) async fn pause_with_reconciliation(
     node_client: &mut NodeManagerGrpcClient,
     execution_fence: Option<pplx_space_node_mgr_client::proto::ExecutionFence>,
@@ -58,6 +64,8 @@ pub(super) async fn pause_with_reconciliation(
     sandbox_id: &SandboxId,
     reason_context: &str,
     guest_preparation_budget: GuestSnapshotPreparationBudget,
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
+    balloon_hint_timeout_ms: Option<std::num::NonZeroU32>,
 ) -> SandboxState {
     let sandbox_id_string = sandbox_id.to_string();
     let mut last_reason = None;
@@ -66,6 +74,11 @@ pub(super) async fn pause_with_reconciliation(
             .pause_sandbox(PauseSandboxRequest {
                 execution_fence: execution_fence.clone(),
                 sandbox_id: sandbox_id_string.clone(),
+                // A retry follows a failed or unconfirmed pause and must not
+                // spend the hinting budget again.
+                balloon_hint_timeout_ms: balloon_hint_timeout_ms
+                    .filter(|_| attempt == 0)
+                    .map(std::num::NonZeroU32::get),
             })
             .await
         {
@@ -73,7 +86,9 @@ pub(super) async fn pause_with_reconciliation(
             Err(error) => {
                 let reason = format!("{reason_context}: {error}");
                 last_reason = Some(reason.clone());
-                let outcome = reconcile_state_after_unconfirmed_pause(sandbox_id, &reason).await;
+                let outcome =
+                    reconcile_state_after_unconfirmed_pause(sandbox_id, &reason, node_manager)
+                        .await;
                 let retry_requires_prepare =
                     matches!(&outcome, PauseReconciliationOutcome::Running);
                 match outcome {
@@ -181,7 +196,7 @@ impl SandboxManagerService {
             )));
         }
 
-        let mut node_client = match connect_node().await {
+        let mut node_client = match connect_node(&self.node_manager).await {
             Ok(node_client) => node_client,
             Err(e) => {
                 update_state_best_effort(&self.db, &sandbox.id, SandboxState::Started);
@@ -202,6 +217,8 @@ impl SandboxManagerService {
             &sandbox_id,
             "pause failed",
             GuestSnapshotPreparationBudget::Standard,
+            &self.node_manager,
+            None,
         )
         .await;
         if pause_state != SandboxState::Paused {

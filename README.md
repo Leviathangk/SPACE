@@ -33,7 +33,7 @@ Follow [Installation and configuration](docs/installation.md) to deploy SPACE in
 
 ## Documentation
 
-Read the hosted [Guide](https://space.docs.perplexity.ai/guide/index.html) and [API Reference](https://space.docs.perplexity.ai/api/index.html) online. The links below point to source documentation in this checkout.
+Read the hosted [Guide](https://space.docs.perplexity.ai/guide/index.html) and [API Reference](https://space.docs.perplexity.ai/api/index.html) online. Both update automatically after changes merge. The links below point to source documentation in this checkout.
 
 | Guide | What you will learn |
 |---|---|
@@ -47,6 +47,8 @@ Read the hosted [Guide](https://space.docs.perplexity.ai/guide/index.html) and [
 | [Troubleshooting](docs/troubleshooting.md) | Local setup, authentication, lifecycle operations, command streams, and safe retries. |
 | [Optional Falcon egress](docs/falcon-egress.md) | Configure the destination bundle for federated creates and upgrade existing deployments. |
 | [Observability](docs/observability.md) | Telemetry build features, the Rust/Go selector contract, and unchanged image defaults. |
+| [Warm pools](docs/warm-pools.md) | Keep booted sandboxes ready on Kubernetes so creates skip a cold boot. |
+| [Base snapshots](docs/base-snapshots.md) | Restore sandboxes from a snapshot on a single node, optionally with a node warm pool. |
 
 ### Build documentation locally
 

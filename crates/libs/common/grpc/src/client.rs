@@ -1,6 +1,7 @@
 use tonic::Status;
 use tracing::Instrument as _;
 
+use crate::connect::ConnectSpan;
 use crate::context::GrpcRetryContext;
 use crate::deadline::deadline_exceeded_status;
 use crate::policy::{DEFAULT_LOCAL_GRPC_RETRY_POLICY, GrpcRetryPolicy};
@@ -167,25 +168,15 @@ where
         }
 
         loop {
-            let connect_span = pplx_space_observability::with_peer_service!(tracing::info_span!(
-                "grpc.client.connect",
-                otel.kind = "client",
-                otel.name = "grpc.client.connect",
-                otel.status_code = tracing::field::Empty,
-                otel.status_description = tracing::field::Empty,
-                "operation.name" = "grpc.client.connect",
-                rpc.grpc.status_code = tracing::field::Empty,
-                peer.service = self.service_name,
-                command,
-                retry = *retry_index,
-            ));
+            let connect_span =
+                ConnectSpan::start(self.service_name, command, None, None, *retry_index);
             match self
                 .run_connect_attempt(command, context)
-                .instrument(connect_span.clone())
+                .instrument(connect_span.span())
                 .await
             {
                 ConnectAttemptResult::Connected(client) => {
-                    connect_span.record("otel.status_code", "OK");
+                    connect_span.record_ok();
                     return Ok(client);
                 }
                 ConnectAttemptResult::ConnectError(error) => {
@@ -193,7 +184,7 @@ where
                         "{} connect failed: {error}",
                         self.service_name
                     ));
-                    record_connect_span_error(&connect_span, &status);
+                    connect_span.record_status(&status);
                     let Some(delay) =
                         retry_delay_for_status(self.retry_policy, *retry_index, &status)
                     else {
@@ -232,7 +223,7 @@ where
                         "{} connect attempt timed out after {timeout:?}",
                         self.service_name
                     ));
-                    record_connect_span_error(&connect_span, &status);
+                    connect_span.record_status(&status);
                     let Some(delay) =
                         retry_delay_for_status(self.retry_policy, *retry_index, &status)
                     else {
@@ -267,7 +258,7 @@ where
                     context.sleep(delay, self.service_name, command).await?;
                 }
                 ConnectAttemptResult::Deadline(status) => {
-                    record_connect_span_error(&connect_span, &status);
+                    connect_span.record_status(&status);
                     return Err(status);
                 }
             }
@@ -325,10 +316,4 @@ enum ConnectAttemptResult<C, E> {
     ConnectError(E),
     AttemptTimeout(std::time::Duration),
     Deadline(Status),
-}
-
-fn record_connect_span_error(span: &tracing::Span, status: &Status) {
-    span.record("otel.status_code", "ERROR");
-    span.record("otel.status_description", status.message());
-    span.record("rpc.grpc.status_code", status.code() as i32);
 }

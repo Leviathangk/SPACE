@@ -465,11 +465,82 @@ async fn suspend_execution_resumes_retirement_of_a_committed_suspend() -> TestRe
     Ok(())
 }
 
-/// The node's durable generation suspend artifact is committed to the sandbox
-/// before the exact pod is deleted, and the sandbox ends `suspended` on that
-/// artifact.
+/// Records a ready full suspend snapshot of `artifact`, taken by the
+/// sandbox's active node after the suspend claim this test is about to make,
+/// with a live storage location: the control plane's evidence that a suspend
+/// the node then deleted had already become durable.
+async fn insert_durable_suspend_snapshot(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    artifact: LocalArtifactId,
+) -> TestResult {
+    let node_id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state)
+         VALUES ($1, '127.0.0.1', 'worker', 'k8s', 'ready')"
+    ))
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET active_node_id = $2 WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+    let snapshot_id = Uuid::now_v7();
+    // The claim stamps `lifecycle_changed_at` when the test runs the suspend,
+    // so the snapshot is dated ahead of it.
+    sqlx::query(sql!(
+        "INSERT INTO snapshots
+             (id, sandbox_id, type, state, timestamp, source_node_id, org_id,
+              local_artifact_id, artifact_kind, artifact_origin)
+         VALUES ($1, $2, 'full', 'ready', NOW() + INTERVAL '1 minute', $3,
+                 '00000000-0000-0000-0000-000000000001', $4, 'full', 'suspend')"
+    ))
+    .bind(snapshot_id)
+    .bind(sandbox_id)
+    .bind(node_id)
+    .bind(artifact.as_uuid())
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO snapshot_storage_locations
+             (snapshot_id, storage_connection_string, org_id)
+         VALUES ($1, 's3://space-test/suspend?region=us-east-1',
+                 '00000000-0000-0000-0000-000000000001')"
+    ))
+    .bind(snapshot_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NodeSuspendAnswer {
+    /// The node publishes its durable suspend artifact.
+    Durable,
+    /// The node deleted the sandbox after its suspend snapshot became ready.
+    DeletedAfterDurableSnapshot,
+    /// The node deleted the sandbox and no snapshot proves the suspend.
+    DeletedWithoutEvidence,
+}
+
+/// The generation suspend's durable artifact, whether the node publishes it
+/// or a node that deleted the sandbox leaves it to the control plane's ready
+/// suspend snapshot, is committed to the sandbox before the exact pod is
+/// deleted, and the sandbox ends `suspended` on that artifact. A node delete
+/// without that evidence fails the suspend as retryable and keeps the pod and
+/// the claimed execution.
+#[rstest::rstest]
+#[case::node_publishes_the_artifact(NodeSuspendAnswer::Durable)]
+#[case::node_deleted_after_durable_snapshot(NodeSuspendAnswer::DeletedAfterDurableSnapshot)]
+#[case::node_deleted_without_evidence(NodeSuspendAnswer::DeletedWithoutEvidence)]
 #[tokio::test(flavor = "current_thread")]
-async fn suspend_execution_commits_the_nodes_artifact_before_retiring_the_pod() -> TestResult {
+async fn suspend_execution_commits_the_durable_artifact_before_retiring_the_pod(
+    #[case] answer: NodeSuspendAnswer,
+) -> TestResult {
     if !crate::test_support::enter_sim_worker_process() {
         return Ok(());
     }
@@ -484,9 +555,11 @@ async fn suspend_execution_commits_the_nodes_artifact_before_retiring_the_pod() 
         ExecutionSeed::running(pod_name, "node-suspend-uid"),
     )
     .await?;
-    let worker = start_scripted_worker(ScriptedWorkerConfig::new([(
-        "WorkerApi/PrepareTeardownSuspend",
-        ScriptedReply::message(&sbx::PrepareTeardownSuspendResponse {
+    if matches!(answer, NodeSuspendAnswer::DeletedAfterDurableSnapshot) {
+        insert_durable_suspend_snapshot(&db.pool, sandbox_id, node_artifact).await?;
+    }
+    let suspend_reply = match answer {
+        NodeSuspendAnswer::Durable => sbx::PrepareTeardownSuspendResponse {
             outcome: sbx::TeardownSuspendOutcome::Durable as i32,
             reason: None,
             published_artifact: Some(sbx::PublishedArtifact {
@@ -495,7 +568,17 @@ async fn suspend_execution_commits_the_nodes_artifact_before_retiring_the_pod() 
                 origin: sbx::ArtifactOrigin::Suspend as i32,
                 snapshot_name: None,
             }),
-        }),
+        },
+        NodeSuspendAnswer::DeletedAfterDurableSnapshot
+        | NodeSuspendAnswer::DeletedWithoutEvidence => sbx::PrepareTeardownSuspendResponse {
+            outcome: sbx::TeardownSuspendOutcome::Deleted as i32,
+            reason: None,
+            published_artifact: None,
+        },
+    };
+    let worker = start_scripted_worker(ScriptedWorkerConfig::new([(
+        "WorkerApi/PrepareTeardownSuspend",
+        ScriptedReply::message(&suspend_reply),
     )]))
     .await?;
     // The sandbox's suspend artifact as the apiserver sees the pod DELETE.
@@ -522,24 +605,34 @@ async fn suspend_execution_commits_the_nodes_artifact_before_retiring_the_pod() 
     let mut substrate = substrate_with_node_api_on(&db.pool, client, worker.port);
     substrate.k8s.k8s_blocking_delete_timeout = BLOCKING_DELETE_TIMEOUT;
 
-    let returned = substrate
-        .suspend_execution_tracked(sandbox_id)
-        .await?
-        .expect("Kubernetes suspend always returns its artifact");
+    let outcome = substrate.suspend_execution_tracked(sandbox_id).await;
+
+    if matches!(answer, NodeSuspendAnswer::DeletedWithoutEvidence) {
+        assert!(
+            matches!(outcome, Err(SubstrateError::Unavailable { .. })),
+            "expected a retryable failure, got {outcome:?}"
+        );
+        assert!(log.lock().unwrap().is_empty(), "no pod may be retired");
+        assert_eq!(suspend_artifact_id(&db.pool, sandbox_id).await?, None);
+        assert_eq!(sandbox_lifecycle(&db.pool, sandbox_id).await?, "suspending");
+        assert_eq!(active_execution_count(&db.pool, sandbox_id).await?, 1);
+        return Ok(());
+    }
+    let returned = outcome?.expect("Kubernetes suspend always returns its artifact");
 
     let at_delete = artifact_at_delete.lock().unwrap().clone();
-    assert!(!at_delete.is_empty(), "the pod must be deleted");
+    assert!(!at_delete.is_empty(), "{answer:?}: the pod must be deleted");
     assert!(
         at_delete
             .iter()
             .all(|artifact| *artifact == Some(node_artifact.as_uuid())),
-        "the node's artifact must be committed before every pod DELETE: {at_delete:?}"
+        "{answer:?}: the artifact must be committed before every pod DELETE: {at_delete:?}"
     );
     assert!(
         requests_matching(&log, &Method::DELETE)
             .iter()
             .all(|request| delete_precondition_uid(request) == Some("node-suspend-uid")),
-        "every DELETE must carry the execution's pod UID precondition"
+        "{answer:?}: every DELETE must carry the execution's pod UID precondition"
     );
     assert_eq!(returned.id, node_artifact);
     assert_eq!(returned.kind, ArtifactKind::Full);
@@ -594,5 +687,144 @@ async fn suspend_execution_keeps_the_pod_when_the_node_refuses() -> TestResult {
     );
     assert!(log.lock().unwrap().is_empty(), "no pod may be retired");
     assert_eq!(active_execution_count(&db.pool, sandbox_id).await?, 1);
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SuspendDurability {
+    /// Transient node-api failures and Pending observations end in a durable
+    /// suspend.
+    PendingThenDurable,
+    /// The node reports Pending until the durability budget expires.
+    PendingPastTheBudget,
+    /// No ready node-api pod serves the sandbox's node before the budget
+    /// expires.
+    NodeApiNeverResolves,
+}
+
+/// `suspend_execution` polls a Pending generation suspend through transient
+/// node-api failures until it is durable, within the substrate's durability
+/// budget. When the budget expires first, while the node is still Pending or
+/// before a node-api pod is found, the suspend times out and keeps its claim:
+/// the sandbox stays `suspending`, the execution tracked and the pod in place,
+/// for a retry to join.
+#[rstest::rstest]
+#[case::pending_then_durable(SuspendDurability::PendingThenDurable)]
+#[case::pending_past_the_budget(SuspendDurability::PendingPastTheBudget)]
+#[case::node_api_never_resolves(SuspendDurability::NodeApiNeverResolves)]
+#[tokio::test(flavor = "current_thread")]
+async fn suspend_execution_polls_the_node_within_its_durability_budget(
+    #[case] durability: SuspendDurability,
+) -> TestResult {
+    if !crate::test_support::enter_sim_worker_process_with_owned_token_files() {
+        return Ok(());
+    }
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let sandbox_id = SandboxId::new();
+    let pod_name = "space-sbx-suspend-budget-g1";
+    let node_artifact = LocalArtifactId::new();
+    insert_test_sandbox_row(&db.pool, sandbox_id, "started").await?;
+    insert_execution(
+        &db.pool,
+        sandbox_id,
+        ExecutionSeed::running(pod_name, "suspend-budget-uid"),
+    )
+    .await?;
+    let pending = ScriptedReply::message(&sbx::PrepareTeardownSuspendResponse {
+        outcome: sbx::TeardownSuspendOutcome::Pending as i32,
+        reason: None,
+        published_artifact: None,
+    });
+    let durable = ScriptedReply::message(&sbx::PrepareTeardownSuspendResponse {
+        outcome: sbx::TeardownSuspendOutcome::Durable as i32,
+        reason: None,
+        published_artifact: Some(sbx::PublishedArtifact {
+            local_artifact_id: node_artifact.to_string(),
+            artifact_kind: sbx::ArtifactKind::Full as i32,
+            origin: sbx::ArtifactOrigin::Suspend as i32,
+            snapshot_name: None,
+        }),
+    });
+    let suspend_reply = match durability {
+        SuspendDurability::PendingThenDurable => ScriptedReply::Sequence(Arc::from([
+            ScriptedReply::Status(tonic::Status::unavailable("node-api restarting")),
+            pending.clone(),
+            durable,
+        ])),
+        SuspendDurability::PendingPastTheBudget | SuspendDurability::NodeApiNeverResolves => {
+            pending
+        }
+    };
+    let worker = start_scripted_worker(ScriptedWorkerConfig::new([(
+        "WorkerApi/PrepareTeardownSuspend",
+        suspend_reply,
+    )]))
+    .await?;
+    let (client, log) = scripted_kube_client(move |request| {
+        if request.path != pod_path(pod_name) {
+            return kube_status(StatusCode::BAD_REQUEST, "BadRequest");
+        }
+        match request.method {
+            Method::DELETE => kube_status(StatusCode::OK, "Success"),
+            _ => kube_status(StatusCode::NOT_FOUND, "NotFound"),
+        }
+    });
+    let mut substrate = match durability {
+        SuspendDurability::NodeApiNeverResolves => {
+            substrate_with_store_and_client(db.pool.clone(), client)
+        }
+        SuspendDurability::PendingThenDurable | SuspendDurability::PendingPastTheBudget => {
+            substrate_with_node_api_on(&db.pool, client, worker.port)
+        }
+    };
+    substrate.k8s.k8s_blocking_delete_timeout = BLOCKING_DELETE_TIMEOUT;
+    substrate.budgets.suspend_durability = match durability {
+        // Room for three observations paced 250 ms apart.
+        SuspendDurability::PendingThenDurable => Duration::from_secs(2),
+        SuspendDurability::PendingPastTheBudget | SuspendDurability::NodeApiNeverResolves => {
+            Duration::from_millis(600)
+        }
+    };
+
+    let started = Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        substrate.suspend_execution_tracked(sandbox_id),
+    )
+    .await
+    .map_err(|_| format!("{durability:?}: the suspend must end within its budget"))?;
+    let elapsed = started.elapsed();
+
+    match durability {
+        // The commit and the fenced pod retirement after a durable reply are
+        // pinned by `suspend_execution_commits_the_durable_artifact_before_retiring_the_pod`,
+        // and the poll's per-reply handling by `adapter::tests`; this case
+        // adds that the entry point keeps polling within its budget.
+        SuspendDurability::PendingThenDurable => {
+            let returned = outcome?.expect("Kubernetes suspend always returns its artifact");
+            assert_eq!(returned.id, node_artifact);
+        }
+        SuspendDurability::PendingPastTheBudget | SuspendDurability::NodeApiNeverResolves => {
+            assert!(
+                matches!(outcome, Err(SubstrateError::Timeout { .. })),
+                "{durability:?}: expected a timeout, got {outcome:?}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "{durability:?}: the substrate's durability budget, not the production one, \
+                 must end the suspend: {elapsed:?}"
+            );
+            assert!(
+                log.lock().unwrap().is_empty(),
+                "{durability:?}: the pod must not be retired"
+            );
+            assert_eq!(
+                sandbox_lifecycle(&db.pool, sandbox_id).await?,
+                "suspending",
+                "{durability:?}: the suspend keeps its claim for a retry"
+            );
+            assert_eq!(active_execution_count(&db.pool, sandbox_id).await?, 1);
+        }
+    }
     Ok(())
 }

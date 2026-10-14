@@ -477,14 +477,13 @@ pub fn request_cleanup_episode(
     }
     let previous_state = get_sandbox(&tx, sandbox_id)?.map(|row| row.state);
     let requested_at = now_epoch_i64()?;
-    let preserve_restore_operation = episode.quarantine_recovery.is_some();
     let changed = tx.execute(
         "UPDATE sandboxes
             SET state = 'cleanup_required',
                 failure_reason = ?1,
-                restore_origin = CASE WHEN ?6 THEN restore_origin ELSE NULL END,
-                restore_phase = CASE WHEN ?6 THEN restore_phase ELSE NULL END,
-                restore_storage_uri = CASE WHEN ?6 THEN restore_storage_uri ELSE NULL END,
+                restore_origin = NULL,
+                restore_phase = NULL,
+                restore_storage_uri = NULL,
                 state_changed_at = CASE
                     WHEN state != 'cleanup_required' THEN ?2
                     ELSE state_changed_at
@@ -500,7 +499,6 @@ pub fn request_cleanup_episode(
             sandbox_id,
             episode.completion.as_str(),
             episode.keep_filesystem,
-            preserve_restore_operation,
         ],
     )?;
     if changed != 1 {
@@ -1044,16 +1042,13 @@ pub(crate) fn complete_cleanup_episode_for_job(
     cleanup_jobs::finish_in_transaction(&tx, job_id, &cleanup_jobs::CleanupOutcome::Applied)?;
     tx.commit()?;
     if episode.completion == CleanupCompletion::Quarantine {
-        emit_sandbox_state_event(
+        emit_sandbox_quarantined_event(
             sandbox_id,
-            SandboxEventType::SandboxQuarantined,
             previous_state.as_deref(),
             episode
                 .quarantine_reason_code
-                .unwrap_or(SandboxQuarantineReasonCode::RuntimeProbeInconsistent)
-                .as_str(),
+                .unwrap_or(SandboxQuarantineReasonCode::RuntimeProbeInconsistent),
             "complete_cleanup_episode",
-            SandboxState::Quarantined,
             // Retain historical failure evidence in storage, but do not
             // republish potentially guest-controlled text in a new event.
             None,
@@ -1410,13 +1405,11 @@ pub(crate) fn complete_row_intent_cleanup_for_job(
     tx.commit()?;
 
     if missing_suspend_artifact || quarantine_completion {
-        emit_sandbox_state_event(
+        emit_sandbox_quarantined_event(
             sandbox_id,
-            SandboxEventType::SandboxQuarantined,
             Some(row.state.as_str()),
-            quarantine_reason.as_str(),
+            quarantine_reason,
             "complete_row_intent_cleanup",
-            SandboxState::Quarantined,
             None,
         );
     }
@@ -1529,13 +1522,11 @@ pub(crate) fn quarantine_cleanup_episode_for_job(
     }
     tx.commit()?;
     if changed == 1 {
-        emit_sandbox_state_event(
+        emit_sandbox_quarantined_event(
             sandbox_id,
-            SandboxEventType::SandboxQuarantined,
             Some(row.state.as_str()),
-            reason_code.as_str(),
+            reason_code,
             "quarantine_cleanup_episode",
-            SandboxState::Quarantined,
             Some(&reason),
         );
     }
@@ -1747,6 +1738,7 @@ pub fn mark_cleanup_failed(
     Ok(changed != 0)
 }
 
+#[cfg(test)]
 pub fn clear_cleanup_intent(conn: &Connection, id: &str) -> Result<()> {
     conn.execute(
         "UPDATE sandboxes

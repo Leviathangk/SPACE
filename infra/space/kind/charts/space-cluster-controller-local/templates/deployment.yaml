@@ -142,15 +142,24 @@ spec:
             # whether the node-api behind WorkerApi is the simulator or prod.
             - name: SPACE_K8S_CONTROL_PLANE
               value: "true"
+            # Leader election stays on whatever the replica count: with it off
+            # every replica would run the reconcilers (lib.rs in
+            # crates/libs/cluster/controller/server).
+            - name: SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_ENABLED
+              value: "true"
             # Namespace of the coordination.k8s.io Lease used for leader
             # election (this pod's own namespace, where its lease RBAC is
-            # granted). Single-replica here, but the lease path still runs.
+            # granted). The replicas contend for it.
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
             - name: SPACE_SANDBOX_NAMESPACE
               value: {{ .Values.k8s.sandboxNamespace | quote }}
+            # The node-api DaemonSets run in the release namespace, as on the
+            # api-server.
+            - name: SPACE_NODE_API_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
             - name: SPACE_SANDBOX_POD_IMAGE
               value: {{ .Values.k8s.sandboxPodImage | quote }}
             - name: SPACE_SANDBOX_NODE_SELECTOR_KEY

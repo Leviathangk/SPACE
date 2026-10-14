@@ -1,3 +1,4 @@
+use crate::state::ReservedDnsCancellation;
 use std::sync::Arc;
 
 use hickory_resolver::proto::rr::rdata::A;
