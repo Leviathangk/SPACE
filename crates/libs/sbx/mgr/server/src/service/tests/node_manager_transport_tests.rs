@@ -424,3 +424,44 @@ async fn memory_policy_read_stops_retrying_at_the_caller_deadline() {
         started.elapsed()
     );
 }
+
+/// With node-manager down, as through its restart, `Stats` still answers:
+/// without the cgroup figures only node-manager's inspect supplies, but with
+/// the network figures sandbox-manager holds itself.
+#[tokio::test]
+async fn stats_answers_without_cgroup_figures_while_node_manager_is_down() {
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new().to_string();
+    insert_test_sandbox(&conn, &sandbox_id, SandboxState::Started);
+    // No net-gateway PID, so no live gateway probe: the byte counters come
+    // from the persisted row.
+    conn.execute(
+        "UPDATE sandboxes
+         SET uid = 10000, slot = 7, network_tx_bytes = 1234, network_rx_bytes = 5678
+         WHERE id = ?1",
+        rusqlite::params![sandbox_id],
+    )
+    .unwrap();
+    let service = service_with_node_manager(
+        conn,
+        crate::node_manager_transport::fake::unbound_in_absent_dir(),
+    );
+
+    let stats = service
+        .stats(internal_request(StatsRequest {
+            sandbox_id: sandbox_id.clone(),
+        }))
+        .await
+        .expect("Stats must answer while node-manager is down")
+        .into_inner();
+    assert_eq!(
+        stats,
+        StatsResponse {
+            sandbox_id,
+            network_tx_bytes: 1234,
+            network_rx_bytes: 5678,
+            bytes_forwarded: 1234 + 5678,
+            ..Default::default()
+        }
+    );
+}

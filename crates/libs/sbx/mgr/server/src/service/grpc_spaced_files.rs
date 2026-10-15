@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use super::activation_support::{
     GuestActivityKind, configure_process_env_via_spaced_host, grpc_timeout_budget,
 };
@@ -5,6 +7,48 @@ use super::create_support::sanitize_process_env;
 use super::spaced_bridge::*;
 use super::tail_support::*;
 use super::*;
+
+/// How long a sandbox whose `Stats` inspect failed stays quiet before another
+/// failure is logged. Kubelet polls every sandbox's stats, so a node-manager
+/// restart would otherwise log once per poll per sandbox.
+const STATS_INSPECT_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+static STATS_INSPECT_WARNINGS: std::sync::LazyLock<PerSandboxWarnings> =
+    std::sync::LazyLock::new(|| PerSandboxWarnings::new(STATS_INSPECT_WARN_INTERVAL));
+
+/// When each sandbox last had a warning let through. Entries older than the
+/// interval are dropped whenever one is let through, so the map holds only
+/// sandboxes warned about within the last interval.
+struct PerSandboxWarnings {
+    interval: Duration,
+    last_warned: Mutex<HashMap<String, Instant>>,
+}
+
+impl PerSandboxWarnings {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            last_warned: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Whether a warning for `sandbox_id` at `now` should be logged.
+    fn admit(&self, sandbox_id: &str, now: Instant) -> bool {
+        let mut last_warned = self
+            .last_warned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if last_warned
+            .get(sandbox_id)
+            .is_some_and(|at| now.saturating_duration_since(*at) < self.interval)
+        {
+            return false;
+        }
+        last_warned.retain(|_, at| now.saturating_duration_since(*at) < self.interval);
+        last_warned.insert(sandbox_id.to_owned(), now);
+        true
+    }
+}
 
 fn cpu_stat_usage_usec(content: &str) -> Option<u64> {
     content.lines().find_map(|line| {
@@ -42,8 +86,11 @@ impl SandboxManagerService {
 
         // A read made for every `Stats` call: it shares the service's kept
         // node-manager channel and retries as a replay-safe read, rather than
-        // dialing node-manager for each call.
-        let inspect = pplx_space_common_grpc::fwd_retry!(
+        // dialing node-manager for each call. When it still fails, as through
+        // a node-manager restart, the answer goes out without the cgroup
+        // figures only inspect supplies, left at their unset defaults, rather
+        // than failing the whole call.
+        let inspect = match pplx_space_common_grpc::fwd_retry!(
             "node-manager",
             self.node_manager.lazy(),
             inspect_sandbox,
@@ -55,9 +102,19 @@ impl SandboxManagerService {
                 template: Some(sandbox.template.clone()),
                 execution_only: false,
             })
-        )
-        .map_err(|e| Status::internal(format!("inspect failed: {e}")))?
-        .into_inner();
+        ) {
+            Ok(response) => response.into_inner(),
+            Err(error) => {
+                if STATS_INSPECT_WARNINGS.admit(id, Instant::now()) {
+                    tracing::warn!(
+                        sandbox_id = %id,
+                        %error,
+                        "node-manager inspect failed; answering Stats without cgroup figures"
+                    );
+                }
+                pplx_space_node_mgr_client::proto::InspectSandboxResponse::default()
+            }
+        };
 
         // CPU time comes from the cgroup inspect reads `cpu_max` from. Only
         // node-manager can read it: sandbox-manager runs in its own cgroup
