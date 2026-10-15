@@ -11,6 +11,7 @@ import (
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 )
@@ -26,7 +27,6 @@ type tracePipeline interface {
 	// startLinked starts a new root span linked to the context serialized in
 	// the carrier, or an unlinked root when the carrier holds none.
 	startLinked(context.Context, string, propagation.MapCarrier, ...attribute.KeyValue) (shimSpan, context.Context)
-	extract(context.Context, propagation.MapCarrier) context.Context
 	inject(context.Context, propagation.MapCarrier)
 	shutdown(context.Context) error
 }
@@ -118,11 +118,8 @@ func (disabledTracePipeline) start(ctx context.Context, _ string, _ ...attribute
 func (disabledTracePipeline) startLinked(ctx context.Context, _ string, _ propagation.MapCarrier, _ ...attribute.KeyValue) (shimSpan, context.Context) {
 	return disabledShimSpan{}, ctx
 }
-func (disabledShimSpan) SetAttributes(...attribute.KeyValue) {}
-func (disabledShimSpan) End(error)                           {}
-func (disabledTracePipeline) extract(ctx context.Context, _ propagation.MapCarrier) context.Context {
-	return ctx
-}
+func (disabledShimSpan) SetAttributes(...attribute.KeyValue)                 {}
+func (disabledShimSpan) End(error)                                           {}
 func (disabledTracePipeline) inject(context.Context, propagation.MapCarrier) {}
 func (disabledTracePipeline) shutdown(context.Context) error                 { return nil }
 
@@ -149,11 +146,27 @@ func startSpan(ctx context.Context, name string, attrs ...attribute.KeyValue) (s
 	return initTracer().start(ctx, name, attrs...)
 }
 
+// The span attributes a root that links to its origin records, so a search can
+// find it by the origin's trace ID, and so the samplers, which match the
+// attribute, keep it exactly when the origin was sampled.
+const (
+	originTraceIDAttribute = "origin_trace_id"
+	originSampledAttribute = "origin_sampled"
+)
+
 // Work that outlives the request that started it, such as a task's teardown
 // after its create, starts a new root linked to that request's serialized
-// context. An empty or malformed traceparent leaves the root unlinked.
+// context and sampled as that request was. An empty or malformed traceparent
+// leaves the root unlinked and sampled on its own.
 func startLinkedSpan(ctx context.Context, name, traceparent string, attrs ...attribute.KeyValue) (shimSpan, context.Context) {
-	return initTracer().startLinked(ctx, name, propagation.MapCarrier{"traceparent": traceparent}, attrs...)
+	carrier := propagation.MapCarrier{"traceparent": traceparent}
+	if origin := trace.SpanContextFromContext(propagation.TraceContext{}.Extract(context.Background(), carrier)); origin.IsValid() {
+		attrs = append(attrs,
+			attribute.String(originTraceIDAttribute, origin.TraceID().String()),
+			attribute.Bool(originSampledAttribute, origin.IsSampled()),
+		)
+	}
+	return initTracer().startLinked(ctx, name, carrier, attrs...)
 }
 
 // The W3C traceparent of ctx's current span, or "" when tracing is off or no

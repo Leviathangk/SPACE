@@ -392,6 +392,10 @@ reaches:
 - Reconciliation is fan-in: one pass applies refs that many writers queued.
   Each ref saves its latest writer's `traceparent`, and a pass is a root that
   links to the saved contexts of the refs it claimed.
+- Each `shim.create` attempt is a root linked to the context its Pod's
+  annotation carries: kubelet retries a failed pod sandbox with that
+  annotation unchanged, so joining it would collect every attempt in the one
+  trace. The shim's own teardown spans link to their task's create.
 
 A root that links to the context that caused it records that context's trace
 id as `origin_trace_id`, since a link is not searchable, and whether it was
@@ -400,9 +404,10 @@ any origin it links to was sampled and dropped when none was, so a kept
 request keeps the work it caused. A root with no origin, and every span with a
 parent, keeps the configured sampler. Under OTLP the sampler that
 `OTEL_TRACES_SAMPLER` selects is wrapped to read the root's links. The native
-Datadog sampler cannot be wrapped and does not read links, so two sampling
-rules on `origin_sampled`, ahead of the ones `DD_TRACE_SAMPLING_RULES`
-configures, keep (`1.0`) or drop (`0.0`) such a root. A root links to at
+Datadog samplers do not read links, so two sampling rules on
+`origin_sampled`, ahead of the ones `DD_TRACE_SAMPLING_RULES` configures,
+keep (`1.0`) or drop (`0.0`) such a root. The Rust services and the shim
+apply the same rules to their linked roots. A root links to at
 most eight origins, sampled ones first, so one with any sampled origin always
 links it and is kept. Datadog's rate limit (`DD_TRACE_RATE_LIMIT`) still
 applies to a kept root, and sampling rules sent

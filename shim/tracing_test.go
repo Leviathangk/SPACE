@@ -7,19 +7,15 @@ import (
 	"flag"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/DataDog/dd-trace-go/v2/ddtrace/ext"
 	taskAPI "github.com/containerd/containerd/api/runtime/task/v2"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -71,106 +67,6 @@ func TestDefaultTraceExporterKeepsNativeDatadog(t *testing.T) {
 	}
 }
 
-// An empty or malformed serialized parent preserves the caller's context.
-func startSpanWithRemoteParent(ctx context.Context, name, traceparent string, attrs ...attribute.KeyValue) (shimSpan, context.Context) {
-	pipeline := initTracer()
-	ctx = pipeline.extract(ctx, propagation.MapCarrier{"traceparent": traceparent})
-	return pipeline.start(ctx, name, attrs...)
-}
-
-// Separate processes isolate both SDKs' global state and the lazy initializer.
-func TestStartSpanWithRemoteTraceparent(t *testing.T) {
-	if os.Getenv("SPACE_TRACE_PARENT_TEST") != "1" {
-		for _, mode := range []string{"datadog", "otlp", "off"} {
-			t.Run(mode, func(t *testing.T) {
-				cmd := exec.Command(os.Args[0], "-test.run=^TestStartSpanWithRemoteTraceparent$")
-				for _, item := range os.Environ() {
-					if !strings.HasPrefix(item, "DD_") && !strings.HasPrefix(item, "OTEL_") && !strings.HasPrefix(item, "SPACE_TRACE_") {
-						cmd.Env = append(cmd.Env, item)
-					}
-				}
-				cmd.Env = append(cmd.Env, "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=grpc", "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://127.0.0.1:1", "DD_TRACE_AGENT_URL=http://127.0.0.1:1", "SPACE_TRACE_PARENT_TEST=1", "SPACE_TRACE_EXPORTER="+mode, "DD_INSTRUMENTATION_TELEMETRY_ENABLED=false")
-				headers := "authorization=header-test-secret"
-				if mode == "otlp" {
-					headers = " \t"
-				}
-				cmd.Env = append(cmd.Env, "OTEL_EXPORTER_OTLP_HEADERS="+headers, "OTEL_EXPORTER_OTLP_TRACES_HEADERS="+headers)
-				if output, err := cmd.CombinedOutput(); err != nil {
-					t.Fatalf("%v\n%s", err, output)
-				} else {
-					t.Logf("%s", output)
-				}
-			})
-		}
-		return
-	}
-	const validParent = "00-69f2ccfd00000000e88861448bd50939-ea1dc2f49db4d7a9-01"
-	for name, parent := range map[string]string{"valid": validParent, "missing": "", "malformed": "invalid"} {
-		t.Run(name, func(t *testing.T) {
-			span, ctx := startSpanWithRemoteParent(context.Background(), "shim.create", parent)
-			child, ctx := startSpan(ctx, "shim.sbxmgr.create")
-			if native, ok := span.(datadogSpan); ok {
-				rootID := native.span.Context().SpanID()
-				if got := child.(datadogSpan).span.AsMap()[ext.MapSpanParentID]; got != rootID {
-					t.Fatalf("native child parent=%v, want shim.create %d", got, rootID)
-				}
-				if name == "valid" {
-					parentID, _ := strconv.ParseUint("ea1dc2f49db4d7a9", 16, 64)
-					if got := native.span.AsMap()[ext.MapSpanParentID]; got != parentID {
-						t.Fatalf("native root parent=%v, want remote %d", got, parentID)
-					}
-				}
-			}
-			ctx = metadata.NewOutgoingContext(ctx, metadata.Pairs("authorization", "fixture"))
-			ctx = injectTraceMetadata(ctx, initTracer())
-			md, _ := metadata.FromOutgoingContext(ctx)
-			value := md.Get("traceparent")
-			if os.Getenv("SPACE_TRACE_EXPORTER") == "off" {
-				if len(value) != 0 {
-					t.Fatalf("disabled tracing propagated context: %v", value)
-				}
-			} else {
-				if len(value) != 1 {
-					t.Fatalf("missing outgoing traceparent: %v", value)
-				}
-				if name == "valid" && (!strings.HasPrefix(value[0], parent[:35]) || value[0] == parent) {
-					t.Fatalf("remote traceparent lost: %v", value)
-				}
-				if native, ok := child.(datadogSpan); ok {
-					if got := md.Get("x-datadog-parent-id"); len(got) != 1 || got[0] != strconv.FormatUint(native.span.Context().SpanID(), 10) {
-						t.Fatalf("default native propagation lost child: %v", md)
-					}
-				}
-			}
-			if got := md.Get("authorization"); len(got) != 1 || got[0] != "fixture" {
-				t.Fatalf("metadata lost: %v", md)
-			}
-			child.End(nil)
-			span.End(nil)
-		})
-	}
-	// A call outside any span, such as a relayed stats poll, carries an
-	// unsampled context of its own, unless tracing is off.
-	t.Run("untraced call", func(t *testing.T) {
-		md, _ := metadata.FromOutgoingContext(injectTraceMetadata(context.Background(), initTracer()))
-		value := md.Get("traceparent")
-		if os.Getenv("SPACE_TRACE_EXPORTER") == "off" {
-			if len(value) != 0 {
-				t.Fatalf("disabled tracing propagated context: %v", value)
-			}
-			return
-		}
-		if len(value) != 1 || len(value[0]) != 55 || !strings.HasPrefix(value[0], "00-") || !strings.HasSuffix(value[0], "-00") {
-			t.Fatalf("untraced call did not carry an unsampled context: %v", value)
-		}
-	})
-	started := time.Now()
-	stopTelemetry()
-	if elapsed := time.Since(started); elapsed > telemetryShutdownBudget+300*time.Millisecond {
-		t.Fatalf("shutdown took %v", elapsed)
-	}
-}
-
 func TestOTLPParentageErrorsAndBaggage(t *testing.T) {
 	recorder := tracetest.NewSpanRecorder()
 	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder), sdktrace.WithSampler(sdktrace.AlwaysSample()))
@@ -181,7 +77,7 @@ func TestOTLPParentageErrorsAndBaggage(t *testing.T) {
 	})
 	p := &otlpTracePipeline{tracer: provider.Tracer("test"), provider: provider}
 	const parent = "00-69f2ccfd00000000e88861448bd50939-ea1dc2f49db4d7a9-01"
-	ctx := p.extract(context.Background(), propagation.MapCarrier{"traceparent": parent, "baggage": "job=restore"})
+	ctx := tracePropagation.Extract(context.Background(), propagation.MapCarrier{"traceparent": parent, "baggage": "job=restore"})
 	root, ctx := p.start(ctx, "shim.create", attribute.String("template", "test"))
 	child, ctx := p.start(ctx, "shim.sbxmgr.start")
 	child.SetAttributes(attribute.String("sandbox_id", "fixture"))
