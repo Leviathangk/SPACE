@@ -188,6 +188,9 @@ func injectTraceMetadata(ctx context.Context, pipeline tracePipeline) context.Co
 		// sampled trace for every poll.
 		if traceparent := unsampledTraceparent(); traceparent != "" {
 			carrier["traceparent"] = traceparent
+			// Marks the context as one no request saw, as the Rust services
+			// do, so no server saves it as the origin of later work.
+			carrier["tracestate"] = "space=untraced"
 		}
 	}
 	if len(carrier) == 0 {

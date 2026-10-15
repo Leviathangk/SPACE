@@ -335,6 +335,12 @@ would drop it), and under OTLP an unsampled span is exported only when it
 failed. Such a span's parent is the unrecorded context, so it heads its trace.
 The shim does the same for its calls outside any shim operation, such as
 containerd relaying kubelet's stats polls: it sends a fresh unsampled context.
+Both mark that context with the `tracestate` member `space=untraced`, which its
+descendants carry across services. Work that follows such a call, such as a
+job, a reconcile ref or a detached task, does not save it as its origin, since
+no request was sampled out, and is sampled as a root of its own. The member
+counts only on an unsampled context: a sampled one is saved whatever its
+`tracestate` carries.
 
 ## S3 client spans
 
@@ -390,8 +396,9 @@ reaches:
   inside the request's trace. The executor's work and its node calls are
   children of the attempt.
 - Reconciliation is fan-in: one pass applies refs that many writers queued.
-  Each ref saves its latest writer's `traceparent`, and a pass is a root that
-  links to the saved contexts of the refs it claimed.
+  Each ref saves its latest writer's `traceparent`, except that an unsampled
+  writer never replaces a sampled one, and a pass is a root that links to the
+  saved contexts of the refs it claimed.
 - Each `shim.create` attempt is a root linked to the context its Pod's
   annotation carries: kubelet retries a failed pod sandbox with that
   annotation unchanged, so joining it would collect every attempt in the one

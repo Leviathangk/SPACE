@@ -1415,6 +1415,11 @@ pub mod trace_propagation {
             .is_valid()
     }
 
+    /// The `tracestate` member that marks a context [`set_unsampled_remote_parent`]
+    /// minted, and so every context descended from it, in this process or a
+    /// server it reached. The shim sends the same member.
+    const UNTRACED_MEMBER: (&str, &str) = ("space", "untraced");
+
     /// Parent `span` on a fresh unsampled context that nothing records, for a
     /// call made with no traced request in scope, such as a periodic poll.
     ///
@@ -1424,6 +1429,11 @@ pub mod trace_propagation {
     /// auto-reject priority, which leaves a chunk with an error to the Agent's
     /// error sampler; a sampling rule's user reject would drop it. Call it
     /// after creating `span` and before entering it, when the sampler decides.
+    ///
+    /// The context carries a `tracestate` member that its descendants inherit,
+    /// so work that follows one, such as a job or a reconcile ref, never saves
+    /// it as its origin ([`traceparent_for_span`]): no request was sampled out,
+    /// so the follower is sampled as a root of its own.
     pub fn set_unsampled_remote_parent(span: &tracing::Span) {
         use opentelemetry::trace::{SpanContext, TraceContextExt as _, TraceFlags, TraceState};
         use opentelemetry_sdk::trace::{IdGenerator as _, RandomIdGenerator};
@@ -1433,9 +1443,23 @@ pub mod trace_propagation {
             ids.new_span_id(),
             TraceFlags::default(),
             true,
-            TraceState::default(),
+            TraceState::from_key_value([UNTRACED_MEMBER]).unwrap_or_default(),
         );
         let _ = span.set_parent(opentelemetry::Context::new().with_remote_span_context(parent));
+    }
+
+    /// Whether `cx` descends from a context minted for an untraced caller.
+    fn is_untraced_context(cx: &opentelemetry::Context) -> bool {
+        use opentelemetry::trace::TraceContextExt as _;
+        is_untraced_span_context(cx.span().span_context())
+    }
+
+    /// A minted context is unsampled, so only an unsampled context carrying
+    /// the member is one. A caller can send the member with a sampled
+    /// traceparent; that context is still an origin worth saving.
+    pub(crate) fn is_untraced_span_context(context: &opentelemetry::trace::SpanContext) -> bool {
+        !context.is_sampled()
+            && context.trace_state().get(UNTRACED_MEMBER.0) == Some(UNTRACED_MEMBER.1)
     }
 
     /// Link a root span to the context of the work that caused it, such as
@@ -1509,10 +1533,15 @@ pub mod trace_propagation {
 
     /// Serialize an explicit tracing span's OpenTelemetry context as W3C
     /// traceparent. This is useful when the child work happens on another task.
+    /// A context minted for an untraced caller has none to give: work that
+    /// follows it must not save it as its origin.
     pub fn traceparent_for_span(span: &tracing::Span) -> Option<String> {
         use std::collections::HashMap;
         let mut carrier: HashMap<String, String> = HashMap::new();
         let cx = span.context();
+        if is_untraced_context(&cx) {
+            return None;
+        }
         opentelemetry::global::get_text_map_propagator(|propagator| {
             propagator.inject_context(&cx, &mut carrier);
         });
@@ -1526,6 +1555,9 @@ pub mod trace_propagation {
         use std::collections::HashMap;
         let mut carrier: HashMap<String, String> = HashMap::new();
         let cx = tracing::Span::current().context();
+        if is_untraced_context(&cx) {
+            return None;
+        }
         opentelemetry::global::get_text_map_propagator(|propagator| {
             propagator.inject_context(&cx, &mut carrier);
         });
