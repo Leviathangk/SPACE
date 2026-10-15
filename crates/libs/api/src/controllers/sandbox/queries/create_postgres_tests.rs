@@ -2226,14 +2226,14 @@ async fn postgres_encrypted_create_can_adopt_an_encryptable_pool() -> TestResult
              id, template_release_id, vcpu, memory_mib, target_ready_slots,
              refill_per_tick, max_warming_slots, namespace, enabled, encryptable
          )
-         VALUES ($1, $2, 4, 2048, 3, 1, 1, 'space', true, true)"
+         VALUES ($1, $2, 4, 2048, 3, 1, 1, 'space', true, false)"
     ))
     .bind(pool_config_id)
     .bind(release_id)
     .execute(&db.pool)
     .await?;
 
-    // This substrate supplies an encryptable claim and acknowledges setup.
+    // This substrate supplies an ordinary pool claim and acknowledges encryption.
     let substrate = RetryingPoolSubstrate::new(
         db.pool.clone(),
         pool_config_id,

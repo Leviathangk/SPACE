@@ -322,6 +322,10 @@ pub(crate) fn emit_auto_lifecycle_delete_receipt_superseded_if_present(
 /// manual cascade is the single source of truth for sandbox child tables:
 /// add new child tables here, not at the individual delete call sites.
 fn delete_sandbox_child_rows(tx: &Connection, id: &str) -> Result<()> {
+    tx.execute(
+        sql!("DELETE FROM sandbox_pool_adoptions WHERE sandbox_id = ?1"),
+        params![id],
+    )?;
     teardown_jobs::fail_active(tx, id, TeardownSuspendFailure::Deleted)?;
     crate::route_activation_claims::close_claim(tx, id)?;
     tx.execute(

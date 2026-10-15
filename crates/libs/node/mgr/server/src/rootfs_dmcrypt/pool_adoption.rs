@@ -3,6 +3,7 @@
 use super::*;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt;
+use tracing::Instrument as _;
 
 mod delta;
 
@@ -63,8 +64,9 @@ fn retain_warm_rootfs(origin: &Path) -> std::io::Result<PathBuf> {
     Ok(warm)
 }
 
-/// The suspended linear device holds any requests dispatched after Firecracker
-/// switches drives. Its old file engine can drain before the warm file is read.
+/// Hold requests dispatched after the Sync Firecracker engine switches drives.
+/// PATCH is serialized with its synchronous I/O; it does not drain async I/O.
+#[tracing::instrument(name = "pool_adoption.prepare_drive", skip_all, err)]
 pub(crate) async fn prepare_pool_drive_switch(
     sandbox_id: SandboxId,
     origin_path: PathBuf,
@@ -73,7 +75,8 @@ pub(crate) async fn prepare_pool_drive_switch(
     let warm = device_backing::blocking(move || retain_warm_rootfs(&path)).await?;
     let composite = composite_name(&sandbox_id);
     let mapper_path = PathBuf::from(format!("/dev/mapper/{composite}"));
-    if dm_exists(&composite).await? {
+    let fresh = !dm_exists(&composite).await?;
+    if !fresh {
         let table = run("dmsetup", &["table", &composite]).await?;
         let table = String::from_utf8_lossy(&table);
         let backing = match table.split_whitespace().nth(2) {
@@ -101,9 +104,58 @@ pub(crate) async fn prepare_pool_drive_switch(
         run("dmsetup", &["mknodes", &composite]).await?;
     }
     suspend_device(&composite).await?;
+    if fresh {
+        // Discard speculative udev reads before Firecracker opens the mapper.
+        // Never flush a reused suspended device: it may already hold guest I/O.
+        run_bounded(
+            "blockdev",
+            &["--flushbufs", &mapper_path.to_string_lossy()],
+            FREEZE_COMMAND_BUDGET,
+        )
+        .await?;
+    }
     Ok(PreparedRootfs { mapper_path })
 }
 
+/// Before publication the linear target still owns all writes; releasing it is
+/// safe and lets a retry compare them again. Once the COW is published, recovery
+/// must finish the encrypted switch and never resume the old plaintext target.
+#[tracing::instrument(name = "pool_adoption.recover_drive", skip_all, err)]
+pub(crate) async fn recover_pool_drive(
+    sandbox_id: SandboxId,
+    origin: PathBuf,
+    encrypted: PathBuf,
+    dek: &[u8],
+) -> Result<(), DmCryptError> {
+    let path = encrypted.clone();
+    if device_backing::blocking(move || Backing::open(&path, false))
+        .await?
+        .is_some()
+    {
+        return encrypt_pool_rootfs(
+            sandbox_id,
+            origin.clone(),
+            origin.with_file_name(POOL_ROOTFS_FILE),
+            encrypted,
+            dek,
+        )
+        .await
+        .map(drop);
+    }
+    let composite = composite_name(&sandbox_id);
+    if dm_exists(&composite).await? {
+        let table = run("dmsetup", &["table", &composite]).await?;
+        if String::from_utf8_lossy(&table).split_whitespace().nth(2) != Some("linear") {
+            return Err(DmCryptError::InvalidParams(
+                "unpublished pool drive is not linear".into(),
+            ));
+        }
+        run_bounded("dmsetup", &["resume", &composite], FREEZE_COMMAND_BUDGET).await?;
+    }
+    Ok(())
+}
+
+#[tracing::instrument(name = "pool_adoption.encrypt_drive", skip_all, err)]
 pub(crate) async fn encrypt_pool_rootfs(
     sandbox_id: SandboxId,
     origin_path: PathBuf,
@@ -182,83 +234,91 @@ pub(crate) async fn encrypt_pool_rootfs(
         if dm_exists(&cow).await? {
             ReleaseDevice::Crypt(&cow).run().await?;
         }
-        let path = encrypted_path.clone();
-        let (backing, device) = device_backing::blocking(move || {
-            let backing = Backing::create_unpublished(&path)?;
-            backing.resize(cow_backing_size_bytes(sectors * SECTOR_BYTES))?;
-            let device = LoopDevice::attach(&backing, false)?;
-            Ok((backing, device))
-        })
-        .await?;
-        let device_path = device.path().to_string_lossy();
-        run_with_stdin("cryptsetup", &luks_format_args(&device_path), dek).await?;
-        run_with_stdin(
-            "cryptsetup",
-            &["open", "--key-file=-", &device_path, &cow],
-            dek,
-        )
-        .await?;
-        run(
-            "dd",
-            &[
-                "if=/dev/zero",
-                &format!("of={cow_mapper}"),
-                "bs=1M",
-                "count=4",
-                "oflag=direct",
-                "conv=fsync",
-                "status=none",
-            ],
-        )
-        .await?;
+        let seed_span = tracing::info_span!("pool_adoption.seed");
+        async {
+            let path = encrypted_path.clone();
+            let (backing, device) = device_backing::blocking(move || {
+                let backing = Backing::create_unpublished(&path)?;
+                backing.resize(cow_backing_size_bytes(sectors * SECTOR_BYTES))?;
+                let device = LoopDevice::attach(&backing, false)?;
+                Ok((backing, device))
+            })
+            .await?;
+            let device_path = device.path().to_string_lossy();
+            run_with_stdin("cryptsetup", &luks_format_args(&device_path), dek).await?;
+            run_with_stdin(
+                "cryptsetup",
+                &["open", "--key-file=-", &device_path, &cow],
+                dek,
+            )
+            .await?;
+            run(
+                "dd",
+                &[
+                    "if=/dev/zero",
+                    &format!("of={cow_mapper}"),
+                    "bs=1M",
+                    "count=4",
+                    "oflag=direct",
+                    "conv=fsync",
+                    "status=none",
+                ],
+            )
+            .await?;
+            let table = snapshot_table(
+                sectors,
+                &origin_device.path().to_string_lossy(),
+                &cow_mapper,
+            );
+            run("dmsetup", &["create", &seed, "--table", &table]).await?;
+            run("dmsetup", &["mknodes", &seed]).await?;
+            let seed_path = format!("/dev/mapper/{seed}");
+            let origin_loop = origin_device.path().to_owned();
+            let copied = device_backing::blocking(move || {
+                let source = Backing::require(Backing::open(&warm_path, false)?)?;
+                let origin = Backing::require(Backing::open(
+                    &warm_path.with_file_name("rootfs.ext4"),
+                    false,
+                )?)?;
+                if !device_backing::matches_loop(&origin_loop, &origin.file)? {
+                    return Err(std::io::Error::other("pool origin changed during adoption"));
+                }
+                let mut options = std::fs::File::options();
+                options.read(true).write(true);
+                #[cfg(target_os = "linux")]
+                options.custom_flags(libc::O_DIRECT);
+                let target = options.open(seed_path)?;
+                delta::copy_changed_blocks(&source.file, &origin.file, &target)
+            })
+            .await?;
+            suspend_device(&seed).await?;
+            ReleaseDevice::Snapshot(&seed).run().await?;
+            let name = encrypted_path
+                .file_name()
+                .ok_or_else(|| DmCryptError::InvalidParams("missing COW name".into()))?
+                .to_owned();
+            device_backing::blocking(move || backing.publish(&name)).await?;
+            tracing::info!(%sandbox_id, copied_bytes = copied, "seeded encrypted rootfs from warm file");
+            Ok::<_, DmCryptError>(())
+        }.instrument(seed_span).await?;
+    }
+    async {
         let table = snapshot_table(
             sectors,
             &origin_device.path().to_string_lossy(),
             &cow_mapper,
         );
-        run("dmsetup", &["create", &seed, "--table", &table]).await?;
-        run("dmsetup", &["mknodes", &seed]).await?;
-        let seed_path = format!("/dev/mapper/{seed}");
-        let origin_loop = origin_device.path().to_owned();
-        let copied = device_backing::blocking(move || {
-            let source = Backing::require(Backing::open(&warm_path, false)?)?;
-            let origin = Backing::require(Backing::open(
-                &warm_path.with_file_name("rootfs.ext4"),
-                false,
-            )?)?;
-            if !device_backing::matches_loop(&origin_loop, &origin.file)? {
-                return Err(std::io::Error::other("pool origin changed during adoption"));
-            }
-            let mut options = std::fs::File::options();
-            options.read(true).write(true);
-            #[cfg(target_os = "linux")]
-            options.custom_flags(libc::O_DIRECT);
-            let target = options.open(seed_path)?;
-            delta::copy_changed_blocks(&source.file, &origin.file, &target)
-        })
+        run_bounded(
+            "dmsetup",
+            &["reload", &composite, "--table", &table],
+            FREEZE_COMMAND_BUDGET,
+        )
         .await?;
-        suspend_device(&seed).await?;
-        ReleaseDevice::Snapshot(&seed).run().await?;
-        let name = encrypted_path
-            .file_name()
-            .ok_or_else(|| DmCryptError::InvalidParams("missing COW name".into()))?
-            .to_owned();
-        device_backing::blocking(move || backing.publish(&name)).await?;
-        tracing::info!(%sandbox_id, copied_bytes = copied, "seeded encrypted rootfs from warm file");
+        run_bounded("dmsetup", &["resume", &composite], FREEZE_COMMAND_BUDGET).await?;
+        Ok(PreparedRootfs { mapper_path })
     }
-    let table = snapshot_table(
-        sectors,
-        &origin_device.path().to_string_lossy(),
-        &cow_mapper,
-    );
-    run_bounded(
-        "dmsetup",
-        &["reload", &composite, "--table", &table],
-        FREEZE_COMMAND_BUDGET,
-    )
-    .await?;
-    run_bounded("dmsetup", &["resume", &composite], FREEZE_COMMAND_BUDGET).await?;
-    Ok(PreparedRootfs { mapper_path })
+    .instrument(tracing::info_span!("pool_adoption.commit_drive"))
+    .await
 }
 
 async fn suspend_device(composite: &str) -> Result<(), DmCryptError> {

@@ -392,7 +392,7 @@ pub(super) async fn claim_admission_pool_slot(
     tx: &mut Transaction<'_, Postgres>,
     template_release_id: Uuid,
     namespace: &str,
-) -> Result<Option<AdmissionPoolClaim>, ControllerError> {
+) -> Result<Option<(AdmissionPoolClaim, Option<String>)>, ControllerError> {
     let claim_id = Uuid::now_v7();
     let slot = WarmPoolStore::claim_ready_slot_for_release(
         tx,
@@ -404,12 +404,17 @@ pub(super) async fn claim_admission_pool_slot(
     .await
     .map_err(|err| pool_store_error("failed to claim pool slot at admission", &err))?;
     tracing::Span::current().record("result", if slot.is_some() { "claimed" } else { "miss" });
-    Ok(slot.map(|slot| AdmissionPoolClaim {
-        claim: AdmittedPoolClaim {
-            claim_id,
-            pool_slot_id: slot.id,
-        },
-        sandbox_id: slot.reserved_sandbox_id,
+    Ok(slot.map(|slot| {
+        (
+            AdmissionPoolClaim {
+                claim: AdmittedPoolClaim {
+                    claim_id,
+                    pool_slot_id: slot.id,
+                },
+                sandbox_id: slot.reserved_sandbox_id,
+            },
+            slot.pod_ip,
+        )
     }))
 }
 

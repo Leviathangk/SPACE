@@ -1978,6 +1978,7 @@ impl SandboxManagerService {
     "drive_id": "rootfs",
     "path_on_host": "/rootfs.ext4",
     "is_root_device": true,
+    "io_engine": "Sync",
     "is_read_only": false{disk_rate_limiter}
   }}],
   "machine-config": {{

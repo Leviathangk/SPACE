@@ -17,14 +17,20 @@
 //! - `op` — which device stack: [`OP_ROOTFS`] (the dm-snapshot composite
 //!   over an encrypted COW that Firecracker boots from),
 //!   [`OP_SNAPSHOT_VOLUME`] (the encrypted filesystem a suspend's vmstate
-//!   and memory are written into), [`OP_POOL_ROOTFS`] (the same composite
-//!   over a plaintext COW — the warm-pool member shape).
+//!   and memory are written into), [`OP_POOL_ROOTFS`] (the pre-boot reflink
+//!   retained alongside an ordinary warm-pool rootfs).
 //! - `phase` — where in the prepare/release the failure happened, derived
 //!   from the primitive's error type rather than from a message string, so
 //!   a new error variant cannot silently land in the wrong bucket.
 //! - `reason` — for DEK fetches, whether credmgr was unreachable, refused,
 //!   or failed some other way. Distinguishes an authority outage from a
 //!   revoked or unenrolled org.
+//!
+//! `byok.pool_adoption.duration_ms` measures an owned sandbox-manager adoption,
+//! including lock wait and replay, with `encrypted` and `outcome` (success or
+//! failure) tags. Failed attempts are included. Phase spans break this down
+//! into pause, DEK lookup, drive switch, seed, copy and commit. The copy span
+//! records logical, scanned and copied bytes; identifiers never become tags.
 
 use std::time::Instant;
 
@@ -34,9 +40,20 @@ use crate::emit::{counter, elapsed_ms, tag, timing_ms};
 pub const OP_ROOTFS: &str = "rootfs";
 /// The encrypted snapshot-capture volume a suspend writes into.
 pub const OP_SNAPSHOT_VOLUME: &str = "snapshot_volume";
-/// The warm-pool member rootfs: the same dm-snapshot composite as
-/// [`OP_ROOTFS`] but over a plaintext COW (no owner yet, so no key).
+/// Retaining a pre-boot reflink of an ordinary warm-pool rootfs.
 pub const OP_POOL_ROOTFS: &str = "pool_rootfs";
+
+/// Includes unsuccessful attempts, so a fast success histogram cannot hide failures.
+pub fn pool_adoption_duration(encrypted: bool, succeeded: bool, started: Instant) {
+    timing_ms(
+        "byok.pool_adoption.duration_ms",
+        elapsed_ms(started),
+        &[
+            tag("encrypted", if encrypted { "true" } else { "false" }),
+            tag("outcome", if succeeded { "success" } else { "failure" }),
+        ],
+    );
+}
 
 /// Kernel support for the required device-mapper targets is missing —
 /// `dm_crypt` and/or `dm_snapshot` did not load. Node-level: this node

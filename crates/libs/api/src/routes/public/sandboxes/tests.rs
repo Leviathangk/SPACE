@@ -1396,15 +1396,52 @@ mod admission_pool_claim {
 
     #[tokio::test(flavor = "current_thread")]
     async fn an_encrypted_org_claims_an_ordinary_pool_slot() -> TestDbResult<()> {
-        if !pplx_space_test_env::enter_test_process(&[(
-            "SPACE_BYOK_VOLUME_ENCRYPTION",
-            Some(std::ffi::OsStr::new("true")),
-        )]) {
+        if !pplx_space_test_env::enter_test_process(&[
+            (
+                "SPACE_BYOK_VOLUME_ENCRYPTION",
+                Some(std::ffi::OsStr::new("true")),
+            ),
+            (
+                "SPACE_INTERNAL_RPC_INSECURE_DEV",
+                Some(std::ffi::OsStr::new("true")),
+            ),
+            (
+                "SPACE_INTERNAL_CONTROL_TOKEN",
+                Some(std::ffi::OsStr::new("pool-test-token")),
+            ),
+            ("SPACE_NODE_API_INTERNAL_TOKEN_PATH", None),
+        ]) {
             return Ok(());
         }
         let fixture = AdmissionPoolFixture::new(1).await?;
         fixture.enable_org_encryption().await?;
-        let controller = fixture.controller();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let (health, service) = pplx_space_common_svc::grpc_health_service();
+        health
+            .set_service_status(
+                pplx_space_sbx_mgr_client::ENCRYPTED_POOL_ADOPTION_HEALTH_SERVICE,
+                tonic_health::ServingStatus::Serving,
+            )
+            .await;
+        let _server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming(tonic::transport::server::TcpIncoming::from(listener)),
+        ));
+        sqlx::query(pplx_space_common_core::sql!(
+            "UPDATE kubernetes_pool_slots SET pod_ip = '127.0.0.1' WHERE id = $1"
+        ))
+        .bind(fixture.slots[0].id)
+        .execute(&fixture.db.pool)
+        .await?;
+        let controller = AdmissionPoolFixture::controller_with(
+            crate::controllers::substrate::kubernetes::tests::substrate_with_store_client_proxy_port_and_pod(
+                fixture.db.pool.clone(),
+                crate::controllers::substrate::kubernetes::tests::mock_kubernetes_client(Default::default()),
+                port, None,
+            ),
+        );
         let capture = pplx_space_metrics::test_capture::capture_counters_guard();
         let response = fixture
             .create(Some(&controller), "admission-encrypted", fixture.request())
@@ -1490,7 +1527,8 @@ mod admission_pool_claim {
                 .plan_admission_pool_claim(&fixture.db.pool, fixture.org_id, &request)
                 .await,
             AdmissionPoolPlan::Eligible {
-                template_release_id: fixture.release_id
+                template_release_id: fixture.release_id,
+                volume_encryption: false,
             },
             "positive control"
         );

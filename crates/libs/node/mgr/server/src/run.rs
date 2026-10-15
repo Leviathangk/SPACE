@@ -853,6 +853,12 @@ pub async fn run(
         let (health_reporter, health_service) = pplx_space_common_svc::grpc_health_service();
         health_reporter
             .set_service_status(
+                pplx_space_node_mgr_client::ENCRYPTED_POOL_ADOPTION_HEALTH_SERVICE,
+                tonic_health::ServingStatus::Serving,
+            )
+            .await;
+        health_reporter
+            .set_service_status(
                 RUNTIME_SUPERVISOR_CONNECT_RETRY_HEALTH_SERVICE,
                 tonic_health::ServingStatus::Serving,
             )

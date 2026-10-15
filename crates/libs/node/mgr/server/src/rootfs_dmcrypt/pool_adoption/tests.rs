@@ -7,8 +7,8 @@ impl Drop for DeviceCleanup {
     fn drop(&mut self) {
         let Some(id) = self.0 else { return };
         for device in [
-            ReleaseDevice::Snapshot(&composite_name(&id)),
-            ReleaseDevice::Snapshot(&format!("{}-seed", composite_name(&id))),
+            ReleaseDevice::DiscardSnapshot(&composite_name(&id)),
+            ReleaseDevice::DiscardSnapshot(&format!("{}-seed", composite_name(&id))),
             ReleaseDevice::Crypt(&cow_mapper_name(&id)),
         ] {
             if let Err(error) = device.blocking_with(crate::host_command::output) {
@@ -101,6 +101,25 @@ async fn open_pool_disk_survives_encryption_and_reopen() {
             .unwrap();
         pending.sync_all().unwrap();
     }));
+    // A seed failure must not strand the VMM's rate-limited I/O on the mapper.
+    encrypt_pool_rootfs(
+        sandbox_id,
+        origin.clone(),
+        root.join("missing-warm-file"),
+        encrypted.clone(),
+        &dek,
+    )
+    .await
+    .expect_err("missing source must fail before COW publication");
+    assert!(!encrypted.exists());
+    assert!(!queued.as_ref().unwrap().is_finished());
+    recover_pool_drive(sandbox_id, origin.clone(), encrypted.clone(), &dek)
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), queued.take().unwrap())
+        .await
+        .expect("failed adoption must release queued I/O")
+        .unwrap();
     for attempt in 0..3 {
         if attempt == 1 {
             // Reconstruct a crash after the encrypted backing was committed

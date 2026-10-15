@@ -8,9 +8,17 @@ const BUFFER: usize = 1024 * 1024;
 /// Compare allocated ranges in both files, including holes punched in the warm
 /// file. Only changed blocks enter the encrypted snapshot. Physical extent
 /// addresses are not evidence of equal bytes: filesystem relocation can race us.
+#[tracing::instrument(
+    name = "pool_adoption.compare_copy",
+    skip_all,
+    err,
+    fields(logical_bytes, scanned_bytes, copied_bytes)
+)]
 pub(super) fn copy_changed_blocks(source: &File, origin: &File, target: &File) -> io::Result<u64> {
     source.sync_all()?;
     let size = source.metadata()?.len();
+    let span = tracing::Span::current();
+    span.record("logical_bytes", size);
     if size != origin.metadata()?.len() || size % BLOCK != 0 {
         return Err(io::Error::other(
             "pool rootfs sizes differ or are unaligned",
@@ -29,6 +37,10 @@ pub(super) fn copy_changed_blocks(source: &File, origin: &File, target: &File) -
             merged.push((start, end));
         }
     }
+    span.record(
+        "scanned_bytes",
+        merged.iter().map(|(start, end)| end - start).sum::<u64>(),
+    );
     // The output is O_DIRECT: align both the allocation and each block write.
     let mut allocation = vec![0_u8; BUFFER + BLOCK as usize];
     let alignment = allocation.as_ptr().align_offset(BLOCK as usize);
@@ -70,6 +82,7 @@ pub(super) fn copy_changed_blocks(source: &File, origin: &File, target: &File) -
         }
     }
     target.sync_all()?;
+    span.record("copied_bytes", copied);
     Ok(copied)
 }
 

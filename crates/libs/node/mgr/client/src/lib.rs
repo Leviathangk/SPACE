@@ -343,6 +343,8 @@ fn validate_resource_status_response(
 
 /// Unix socket path for the node-manager gRPC service.
 pub const SOCKET_PATH: &str = pplx_space_common_core::host::linux::paths::NODE_MANAGER_SOCKET;
+/// The node can convert a paused warm-pool drive using PrepareEncryptedRootfs.
+pub const ENCRYPTED_POOL_ADOPTION_HEALTH_SERVICE: &str = "encrypted-pool-drive-adoption-v1";
 const LOCAL_ENDPOINT_URI: &str = "http://[::]:50051";
 
 pub type NodeManagerGrpcClient =

@@ -399,13 +399,9 @@ impl SandboxManagerService {
                     req.autostart,
                 ),
                 open_route_activation.as_ref(),
+                req.encryptable_pool_member,
             )
             .map_err(|e| Status::internal(format!("db insert failed: {e}")))?;
-            if req.encryptable_pool_member {
-                crate::db::pool_adoption::register(&db, &id).map_err(|e| {
-                    Status::internal(format!("register encryptable pool member: {e}"))
-                })?;
-            }
         }
         let create_cleanup = self.activation_cleanup_guard(
             &id,

@@ -30,15 +30,31 @@ type Route = Arc<
 #[derive(Default)]
 pub(crate) struct FakeNodeManager {
     routes: HashMap<&'static str, Route>,
+    encrypted_pool_adoption: bool,
 }
 
 impl FakeNodeManager {
     /// Answer `method` (for example `"StopProcess"`) with `handler`.
-    pub(crate) fn unary<Req, Resp, F>(mut self, method: &'static str, handler: F) -> Self
+    pub(crate) fn encrypted_pool_adoption(mut self) -> Self {
+        self.encrypted_pool_adoption = true;
+        self
+    }
+
+    pub(crate) fn unary<Req, Resp, F>(self, method: &'static str, handler: F) -> Self
     where
         Req: prost::Message + Default + Send + 'static,
         Resp: prost::Message + Send + 'static,
         F: Fn(Req) -> Result<Resp, Status> + Send + Sync + 'static,
+    {
+        self.unary_async(method, move |request| std::future::ready(handler(request)))
+    }
+
+    pub(crate) fn unary_async<Req, Resp, F, Fut>(mut self, method: &'static str, handler: F) -> Self
+    where
+        Req: prost::Message + Default + Send + 'static,
+        Resp: prost::Message + Send + 'static,
+        F: Fn(Req) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<Resp, Status>> + Send + 'static,
     {
         let handler = Arc::new(handler);
         let route: Route = Arc::new(move |request| {
@@ -89,7 +105,10 @@ impl FakeNodeManager {
             ),
         );
         ServedNodeManager {
-            connector: fixed_client(lazy_client(&socket)),
+            connector: NodeManagerConnector::new(Arc::new(InProcess(
+                lazy_client(&socket),
+                self.encrypted_pool_adoption,
+            ))),
             calls,
             stop,
             _sockets: sockets,
@@ -127,7 +146,7 @@ impl Drop for ServedNodeManager {
 /// A connector whose clients are all `client`, for tests that already serve a
 /// node-manager of their own.
 pub(crate) fn fixed_client(client: NodeManagerGrpcClient) -> NodeManagerConnector {
-    NodeManagerConnector::new(Arc::new(InProcess(client)))
+    NodeManagerConnector::new(Arc::new(InProcess(client, false)))
 }
 
 /// A connector whose clients all dial `socket`, a test-owned path nothing
@@ -193,10 +212,14 @@ impl NodeManagerTransport for Unbound {
     }
 }
 
-struct InProcess(NodeManagerGrpcClient);
+struct InProcess(NodeManagerGrpcClient, bool);
 
 #[async_trait::async_trait]
 impl NodeManagerTransport for InProcess {
+    async fn encrypted_pool_adoption_supported(&self) -> bool {
+        self.1
+    }
+
     async fn connect(&self) -> Result<NodeManagerGrpcClient, ConnectError> {
         Ok(self.0.clone())
     }
@@ -212,14 +235,16 @@ impl NodeManagerTransport for InProcess {
 
 struct Unary<F, Resp>(Arc<F>, PhantomData<fn() -> Resp>);
 
-impl<Req, Resp, F> tonic::server::UnaryService<Req> for Unary<F, Resp>
+impl<Req, Resp, F, Fut> tonic::server::UnaryService<Req> for Unary<F, Resp>
 where
-    F: Fn(Req) -> Result<Resp, Status>,
+    F: Fn(Req) -> Fut,
+    Fut: std::future::Future<Output = Result<Resp, Status>> + Send + 'static,
 {
     type Response = Resp;
-    type Future = std::future::Ready<Result<tonic::Response<Resp>, Status>>;
+    type Future = BoxFuture<'static, Result<tonic::Response<Resp>, Status>>;
 
     fn call(&mut self, request: tonic::Request<Req>) -> Self::Future {
-        std::future::ready((self.0)(request.into_inner()).map(tonic::Response::new))
+        let response = (self.0)(request.into_inner());
+        Box::pin(async move { response.await.map(tonic::Response::new) })
     }
 }

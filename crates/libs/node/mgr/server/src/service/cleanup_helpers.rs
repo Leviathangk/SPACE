@@ -1289,7 +1289,7 @@ fn teardown_encrypted_volumes_with(
     }
     for name in snapshots {
         record_device_release(
-            crate::rootfs_dmcrypt::ReleaseDevice::Snapshot(&name),
+            crate::rootfs_dmcrypt::ReleaseDevice::DiscardSnapshot(&name),
             format!("dmsetup remove {name}"),
             &mut errors,
             &mut actions,

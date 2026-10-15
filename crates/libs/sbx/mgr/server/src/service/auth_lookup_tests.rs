@@ -82,28 +82,50 @@ fn fixture_with_claims(
 }
 
 #[tokio::test]
-async fn encrypted_pool_member_refuses_guest_routes_before_adoption() {
+async fn pool_adoption_guest_access_blocks_only_unfinished_claims() {
     if !crate::service::tests::enter_route_test_process(&[]) {
         return;
     }
     let (service, sandbox_id, _, request) = fixture();
     let id = sandbox_id.to_string();
+    let claim = crate::db::pool_adoption::PoolClaim {
+        id: uuid::Uuid::now_v7(),
+        org_id: pplx_space_common_core::types::OrgId::new(),
+        volume_encryption: true,
+    };
     {
         let db = service.db_conn().unwrap();
-        crate::service::tests::service_tests::insert_test_sandbox(&db, &id, SandboxState::Started);
+        crate::service::tests::service_tests::insert_test_sandbox(&db, &id, SandboxState::Paused);
+        crate::db::update_user(&db, &id, &pplx_space_common_core::types::ROOT_SANDBOX_OWNER)
+            .unwrap();
         crate::db::pool_adoption::register(&db, &id).unwrap();
     }
-
-    let error = service
-        .prepare_space_api_bridge(&request, &id, SpacedRpc::PingGuest)
-        .expect_err("an unadopted pool member must refuse a valid guest route");
-
-    assert_eq!(error.code(), Code::FailedPrecondition);
+    let allowed = || service.prepare_space_api_bridge(&request, &id, SpacedRpc::PingGuest);
     assert!(
-        error
-            .message()
-            .contains("encrypted pool adoption must complete")
+        allowed().is_ok(),
+        "legacy unclaimed rows must not block guest access"
     );
+    {
+        let db = service.db_conn().unwrap();
+        assert!(
+            crate::db::pool_adoption::begin(
+                &db,
+                &id,
+                claim,
+                &pplx_space_common_core::types::SandboxOwner::parse(
+                    "user:00000000-0000-0000-0000-000000000020"
+                )
+                .unwrap(),
+                &std::collections::BTreeMap::new(),
+            )
+            .unwrap()
+        );
+    }
+
+    assert_eq!(allowed().unwrap_err().code(), Code::FailedPrecondition);
+    assert!(crate::db::pool_adoption::complete(&service.db_conn().unwrap(), &id, claim).unwrap());
+
+    allowed().unwrap();
 }
 
 #[tokio::test]

@@ -11608,6 +11608,14 @@ mod kubernetes_tests {
     }
 
     async fn pool_claim_fixture(pod: PooledSlotPod<'_>) -> Result<PoolClaimFixture, BoxError> {
+        pool_claim_fixture_at(pod, "10.90.0.7", DEFAULT_SANDBOX_PROXY_PORT).await
+    }
+
+    async fn pool_claim_fixture_at(
+        pod: PooledSlotPod<'_>,
+        pod_ip: &str,
+        port: u16,
+    ) -> Result<PoolClaimFixture, BoxError> {
         use pplx_space_cluster_pool::{NewPoolSlot, WarmPoolStore};
         use pplx_space_common_core::types::{ContentHash, Digest, MemorySize, VcpuCount};
 
@@ -11687,7 +11695,7 @@ mod kubernetes_tests {
             .mark_slot_ready(
                 slot.id,
                 "pool-pod-uid",
-                "10.90.0.7",
+                pod_ip,
                 pod.node_name.unwrap_or("unscheduled"),
             )
             .await?;
@@ -11706,7 +11714,7 @@ mod kubernetes_tests {
             }),
             status: Some(PodStatus {
                 phase: Some(pod.phase.to_string()),
-                pod_ip: Some("10.90.0.7".to_string()),
+                pod_ip: Some(pod_ip.to_string()),
                 ..Default::default()
             }),
         };
@@ -11715,12 +11723,13 @@ mod kubernetes_tests {
             .iter()
             .map(|(name, group)| (*node_with_node_group(name, &config, *group)).clone())
             .collect();
-        let substrate = KubernetesSubstrate {
+        let mut substrate = KubernetesSubstrate {
             store: K8sStore::new(db.pool.clone(), "space".to_string()),
             node_group_placement: NodeGroupPlacementResolver::new(db.pool.clone(), true),
             ..substrate_with_inventory_caches(vec![pooled_pod], nodes)
         };
 
+        substrate.k8s.sandbox_proxy_port = port;
         Ok(PoolClaimFixture {
             db,
             substrate,
@@ -11735,6 +11744,85 @@ mod kubernetes_tests {
             auto_lifecycle: pplx_space_common_core::types::AutoLifecyclePolicy::disabled(),
             network_policy: pplx_space_net_common::NetworkPolicyV1::default(),
         })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn byok_pool_claim_preserves_unsupported_members_for_both_admission_paths()
+    -> Result<(), BoxError> {
+        if !crate::test_support::enter_sim_worker_process() {
+            return Ok(());
+        }
+        let worker = start_sequenced_wake_worker(Arc::new(AtomicUsize::new(0)), None, true).await?;
+        for admission in [false, true] {
+            let fixture = pool_claim_fixture_at(
+                PooledSlotPod {
+                    phase: "Running",
+                    node_name: Some("shared-worker"),
+                    nodes: &[("shared-worker", Some("workers"))],
+                },
+                "127.0.0.1",
+                worker.port,
+            )
+            .await?;
+            worker
+                .health_reporter
+                .set_service_status(
+                    pplx_space_sbx_mgr_client::ENCRYPTED_POOL_ADOPTION_HEALTH_SERVICE,
+                    tonic_health::ServingStatus::NotServing,
+                )
+                .await;
+            let mut request = fixture.request();
+            request.volume_encryption = true;
+
+            let unsupported = if admission {
+                let mut tx = fixture.db.pool.begin().await?;
+                let claim = fixture
+                    .substrate
+                    .claim_admission_pool_slot(&mut tx, fixture.release_id, true)
+                    .await?;
+                tx.commit().await?;
+                claim.is_none()
+            } else {
+                fixture
+                    .substrate
+                    .claim_pooled_execution(&request)
+                    .await?
+                    .claim
+                    .is_none()
+            };
+
+            assert!(unsupported);
+            assert_eq!(fixture.slot_disposition().await?, ("ready".into(), None));
+            worker
+                .health_reporter
+                .set_service_status(
+                    pplx_space_sbx_mgr_client::ENCRYPTED_POOL_ADOPTION_HEALTH_SERVICE,
+                    tonic_health::ServingStatus::Serving,
+                )
+                .await;
+            let supported = if admission {
+                let mut tx = fixture.db.pool.begin().await?;
+                let claim = fixture
+                    .substrate
+                    .claim_admission_pool_slot(&mut tx, fixture.release_id, true)
+                    .await?;
+                tx.commit().await?;
+                claim.is_some()
+            } else {
+                fixture
+                    .substrate
+                    .claim_pooled_execution(&request)
+                    .await?
+                    .claim
+                    .is_some()
+            };
+            assert!(
+                supported,
+                "the same member becomes claimable when its worker supports encryption"
+            );
+            assert_eq!(fixture.slot_disposition().await?.0, "claimed");
+        }
+        Ok(())
     }
 
     /// A claimed warm slot the candidate set refuses, driven through the real

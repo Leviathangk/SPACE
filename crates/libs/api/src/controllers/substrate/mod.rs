@@ -2532,6 +2532,7 @@ pub trait SubstrateAdapter: Send + Sync {
         &self,
         _tx: &mut Transaction<'_, Postgres>,
         _template_release_id: Uuid,
+        _volume_encryption: bool,
     ) -> Result<Option<AdmissionPoolClaim>, ControllerError> {
         Ok(None)
     }
@@ -3681,17 +3682,18 @@ impl SubstrateAdapter for Substrate {
         &self,
         tx: &mut Transaction<'_, Postgres>,
         template_release_id: Uuid,
+        volume_encryption: bool,
     ) -> Result<Option<AdmissionPoolClaim>, ControllerError> {
         match self {
             Self::Direct(substrate) => {
                 substrate
-                    .claim_admission_pool_slot(tx, template_release_id)
+                    .claim_admission_pool_slot(tx, template_release_id, volume_encryption)
                     .await
             }
             #[cfg(feature = "kubernetes")]
             Self::Kubernetes(substrate) => {
                 substrate
-                    .claim_admission_pool_slot(tx, template_release_id)
+                    .claim_admission_pool_slot(tx, template_release_id, volume_encryption)
                     .await
             }
         }

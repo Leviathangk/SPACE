@@ -16,6 +16,11 @@ pub use pplx_space_node_mgr_client::{ConnectError, NodeManagerGrpcClient};
 /// constructors; a caller picks the one whose dial timing it needs.
 #[async_trait::async_trait]
 pub trait NodeManagerTransport: Send + Sync {
+    /// Fail closed until the transport establishes the node's drive-switch support.
+    async fn encrypted_pool_adoption_supported(&self) -> bool {
+        false
+    }
+
     /// A connected client, dialing under the default connect-retry policy.
     async fn connect(&self) -> Result<NodeManagerGrpcClient, ConnectError>;
 
@@ -32,6 +37,37 @@ struct HostSocket;
 
 #[async_trait::async_trait]
 impl NodeManagerTransport for HostSocket {
+    async fn encrypted_pool_adoption_supported(&self) -> bool {
+        use tonic_health::pb::{HealthCheckRequest, health_check_response::ServingStatus};
+        static CHANNEL: std::sync::OnceLock<tonic::transport::Channel> = std::sync::OnceLock::new();
+        let channel = CHANNEL
+            .get_or_init(|| {
+                pplx_space_common_grpc::connect_uds_channel_lazy(
+                    std::path::Path::new(pplx_space_node_mgr_client::SOCKET_PATH),
+                    tonic::transport::Endpoint::from_static("http://[::]:50051"),
+                )
+            })
+            .clone();
+        let probe = async {
+            let mut health = tonic_health::pb::health_client::HealthClient::new(
+                pplx_space_common_grpc::trace_grpc_client_transport(channel),
+            );
+            health
+                .check(HealthCheckRequest {
+                    service: pplx_space_node_mgr_client::ENCRYPTED_POOL_ADOPTION_HEALTH_SERVICE
+                        .into(),
+                })
+                .await
+                .ok()
+                .map(|response| response.into_inner().status == ServingStatus::Serving as i32)
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), probe)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(false)
+    }
+
     async fn connect(&self) -> Result<NodeManagerGrpcClient, ConnectError> {
         pplx_space_node_mgr_client::connect().await
     }
@@ -56,6 +92,10 @@ pub struct NodeManagerConnector {
 }
 
 impl NodeManagerConnector {
+    pub(crate) async fn encrypted_pool_adoption_supported(&self) -> bool {
+        self.transport.encrypted_pool_adoption_supported().await
+    }
+
     /// Node-manager at [`pplx_space_node_mgr_client::SOCKET_PATH`]. Every call
     /// returns the same connector, so the process keeps one capability cache
     /// for the host's node-manager however many places construct it.

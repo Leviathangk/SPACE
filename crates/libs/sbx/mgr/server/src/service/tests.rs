@@ -717,6 +717,150 @@ pub(crate) mod service_tests {
         }
     }
 
+    fn encrypted_pool_member() -> (rusqlite::Connection, String, AdoptPoolSandboxRequest) {
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &id, SandboxState::Paused);
+        crate::db::update_user(
+            &conn,
+            &id,
+            &pplx_space_common_core::types::ROOT_SANDBOX_OWNER,
+        )
+        .unwrap();
+        crate::db::pool_adoption::register(&conn, &id).unwrap();
+        let mut request = pool_adoption_request(None);
+        request.content_hash = Some("hash".into());
+        request.claimed_sandbox = Some(crate::proto::ClaimedPoolSandbox {
+            sandbox_id: id.clone(),
+            claim_id: uuid::Uuid::now_v7().to_string(),
+            expected_org_id: pplx_space_common_core::types::OrgId::new().to_string(),
+            volume_encryption: true,
+        });
+        (conn, id, request)
+    }
+
+    #[tokio::test]
+    async fn pool_adoption_refuses_old_node_manager_before_changing_the_member() {
+        let (conn, id, request) = encrypted_pool_member();
+        let node = crate::node_manager_transport::fake::FakeNodeManager::default().serve();
+        let service = SandboxManagerService::new_with_options(
+            conn,
+            SandboxManagerServiceOptions {
+                node_manager: node.connector(),
+                ..SandboxManagerServiceOptions::for_test()
+            },
+        );
+
+        let error = service
+            .adopt_pool_sandbox(internal_request(request))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(node.calls().is_empty());
+        let sandbox = service.lookup_sandbox(&id).unwrap();
+        assert_eq!(
+            sandbox.user,
+            pplx_space_common_core::types::ROOT_SANDBOX_OWNER
+        );
+        assert_eq!(sandbox.state, SandboxState::Paused);
+        assert!(!crate::db::pool_adoption::incomplete(&service.db.lock().unwrap(), &id).unwrap());
+    }
+
+    #[tokio::test]
+    async fn pool_adoption_finishes_after_caller_cancellation_and_retry_reads_receipt() {
+        use pplx_space_node_mgr_client::proto::{
+            PrepareEncryptedRootfsRequest, PrepareEncryptedRootfsResponse,
+        };
+        let (conn, id, request) = encrypted_pool_member();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let node = crate::node_manager_transport::fake::FakeNodeManager::default()
+            .encrypted_pool_adoption()
+            .unary_async("PrepareEncryptedRootfs", {
+                let entered = entered.clone();
+                let release = release.clone();
+                move |req: PrepareEncryptedRootfsRequest| {
+                    let entered = entered.clone();
+                    let release = release.clone();
+                    async move {
+                        entered.notify_one();
+                        release.notified().await;
+                        Ok(PrepareEncryptedRootfsResponse {
+                            mapper_path: "/dev/mapper/test-pool-drive".into(),
+                            adopted_claim_id: req.pool_adoption.map(|claim| claim.claim_id),
+                        })
+                    }
+                }
+            })
+            .serve();
+        let service = SandboxManagerService::new_with_options(
+            conn,
+            SandboxManagerServiceOptions {
+                node_manager: node.connector(),
+                ..SandboxManagerServiceOptions::for_test()
+            },
+        );
+        let caller = tokio::spawn({
+            let service = service.clone();
+            let request = request.clone();
+            async move { service.adopt_pool_sandbox(internal_request(request)).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        let retry = tokio::spawn({
+            let service = service.clone();
+            async move { service.adopt_pool_sandbox(internal_request(request)).await }
+        });
+        release.notify_one();
+        let response = tokio::time::timeout(Duration::from_secs(5), retry)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.sandbox_id, id);
+        assert!(response.volume_encryption);
+        assert_eq!(node.calls(), ["PrepareEncryptedRootfs"]);
+        assert!(service.lookup_sandbox(&id).unwrap().volume_encryption);
+        assert!(!crate::db::pool_adoption::incomplete(&service.db.lock().unwrap(), &id).unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pool_adoption_requires_live_plaintext_environment_before_completing() {
+        let (conn, id, mut request) = encrypted_pool_member();
+        request.claimed_sandbox.as_mut().unwrap().volume_encryption = false;
+        request.env.insert("MODE".into(), "synthetic".into());
+        crate::db::update_state(&conn, &id, SandboxState::Started)
+            .unwrap()
+            .require_applied()
+            .unwrap();
+        let service = service_for_teardown_test(conn);
+
+        // No guest exists for this synthetic sandbox. Retry must still inject
+        // the environment even though the first attempt persisted it locally.
+        for _ in 0..2 {
+            let error = service
+                .adopt_pool_sandbox(internal_request(request.clone()))
+                .await
+                .unwrap_err();
+
+            assert_eq!(error.code(), tonic::Code::Unavailable);
+            assert_eq!(
+                service.lookup_sandbox(&id).unwrap().state,
+                SandboxState::Started
+            );
+            assert!(
+                crate::db::pool_adoption::incomplete(&service.db_conn().unwrap(), &id).unwrap()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn pool_adoption_completes_plain_claims_and_replays_completed_claims() {
         for (encrypted, completed) in [(false, false), (false, true), (true, true)] {
@@ -751,11 +895,11 @@ pub(crate) mod service_tests {
                     .unwrap()
                 );
                 assert!(crate::db::pool_adoption::complete(&conn, &id, claim_receipt).unwrap());
-                crate::db::update_state(&conn, &id, SandboxState::Started)
-                    .unwrap()
-                    .require_applied()
-                    .unwrap();
             }
+            crate::db::update_state(&conn, &id, SandboxState::Started)
+                .unwrap()
+                .require_applied()
+                .unwrap();
             request.content_hash = Some("hash".to_string());
             request.claimed_sandbox = Some(crate::proto::ClaimedPoolSandbox {
                 sandbox_id: id.clone(),
@@ -774,17 +918,10 @@ pub(crate) mod service_tests {
             assert_eq!(response.sandbox_id, id);
             assert_eq!(response.claim_id, Some(claim.to_string()));
             assert_eq!(response.volume_encryption, encrypted);
-            assert!(
-                !crate::db::pool_adoption::guest_access_blocked(&service.db.lock().unwrap(), &id)
-                    .unwrap()
-            );
+            assert!(!crate::db::pool_adoption::pending(&service.db.lock().unwrap(), &id).unwrap());
             assert_eq!(
                 service.lookup_sandbox(&id).unwrap().state,
-                if completed {
-                    SandboxState::Started
-                } else {
-                    SandboxState::Paused
-                }
+                SandboxState::Started
             );
         }
     }
@@ -1976,6 +2113,7 @@ pub(crate) mod service_tests {
                     crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::ClusterFenced,
                 )
                 .as_ref(),
+                false,
             )
             .unwrap();
             assert!(

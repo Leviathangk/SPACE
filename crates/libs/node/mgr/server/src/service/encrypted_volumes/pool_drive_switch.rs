@@ -9,6 +9,7 @@ use tonic::Status;
 
 use super::super::{JAIL_DIR, RUN_DIR, runtime, trusted_paths};
 
+#[tracing::instrument(name = "pool_adoption.drive_switch", skip_all, err)]
 pub(super) async fn switch(id: &SandboxId, device: &Path) -> Result<(), Status> {
     let id = *id;
     let device = device.to_owned();
@@ -94,7 +95,8 @@ fn bind_drive(id: SandboxId, device: &Path) -> Result<bool, Status> {
             trusted_paths::open_bind_target(&directory, std::ffi::OsStr::new("rootfs.ext4"))?;
         trusted_paths::bind_pinned_files(&source, &target)?;
     }
-    // A retry must not PATCH an already switched drive: draining its pending
-    // I/O would wait forever on the deliberately suspended adoption device.
+    // PATCH only swaps the FD. Safety depends on our Sync engine: disk I/O and
+    // PATCH run serially on the VMM thread. After switching, a queued request
+    // can block that thread on the suspended mapper, so retries must skip PATCH.
     Ok(!has_device)
 }

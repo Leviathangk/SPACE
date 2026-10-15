@@ -166,9 +166,11 @@ pub(crate) async fn create_native_sandbox_operation(
             {
                 AdmissionPoolPlan::Eligible {
                     template_release_id,
+                    volume_encryption,
                 } => NativeCreatePoolPlan::Claim {
                     controller,
                     template_release_id,
+                    volume_encryption,
                 },
                 AdmissionPoolPlan::TemplateMiss => {
                     NativeCreatePoolPlan::Unclaimed(AdmissionClaimOutcome::Miss)
@@ -221,6 +223,7 @@ pub(crate) async fn create_native_sandbox_operation(
         NativeCreatePoolPlan::Claim {
             controller,
             template_release_id,
+            volume_encryption,
         } => {
             // Take the idempotency lock before touching the pool: a retry or
             // a conflicting reuse of the key answers without claiming, and a
@@ -255,7 +258,11 @@ pub(crate) async fn create_native_sandbox_operation(
                 }
                 ObservePublicOperationIdempotency::Missing => {
                     match controller
-                        .claim_admission_pool_slot(admission.transaction(), template_release_id)
+                        .claim_admission_pool_slot(
+                            admission.transaction(),
+                            template_release_id,
+                            volume_encryption,
+                        )
                         .await
                     {
                         // The create's public ID is the slot's reserved ID:
@@ -344,6 +351,7 @@ enum NativeCreatePoolPlan<'a> {
     Claim {
         controller: &'a SandboxController,
         template_release_id: uuid::Uuid,
+        volume_encryption: bool,
     },
 }
 

@@ -74,7 +74,8 @@ use pplx_space_common_core::types::SandboxId;
 
 mod pool_adoption;
 pub(crate) use pool_adoption::{
-    POOL_ROOTFS_FILE, encrypt_pool_rootfs, prepare_pool_drive_switch, retain_pool_origin,
+    POOL_ROOTFS_FILE, encrypt_pool_rootfs, prepare_pool_drive_switch, recover_pool_drive,
+    retain_pool_origin,
 };
 
 /// Bytes of the *decrypted* COW mapper zeroed before a FRESH dm-snapshot is
@@ -269,6 +270,8 @@ pub(crate) fn checked_output_with(
 #[derive(Debug)]
 pub(crate) enum ReleaseDevice<'a> {
     Snapshot(&'a str),
+    /// Terminal cleanup only: fail queued I/O instead of leaving a frozen target.
+    DiscardSnapshot(&'a str),
     Crypt(&'a str),
     Loop(&'a str),
     Unmount(&'a str),
@@ -279,6 +282,7 @@ impl ReleaseDevice<'_> {
     fn command(&self) -> (&'static str, Vec<&str>) {
         match self {
             Self::Snapshot(name) => ("dmsetup", vec!["remove", "--retry", name]),
+            Self::DiscardSnapshot(name) => ("dmsetup", vec!["remove", "--force", "--retry", name]),
             Self::Crypt(name) => ("cryptsetup", vec!["close", name]),
             Self::Loop(path) => ("losetup", vec!["-d", path]),
             Self::Unmount(path) => ("umount", vec![path]),

@@ -52,7 +52,8 @@ fn path_error(error: tonic::Status) -> io::Error {
 pub(crate) async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> io::Result<T> + Send + 'static,
 ) -> Result<T, DmCryptError> {
-    tokio::task::spawn_blocking(work)
+    let span = tracing::Span::current();
+    tokio::task::spawn_blocking(move || span.in_scope(work))
         .await
         .map_err(|e| error(io::Error::other(e)))?
         .map_err(error)

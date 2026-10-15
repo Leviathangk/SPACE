@@ -1588,6 +1588,11 @@ pub fn set_sandbox_owner_if_current(
         return Ok(None);
     };
     if previous.user.as_str() == owner.as_str() {
+        if *expected_current_owner == pplx_space_common_core::types::ROOT_SANDBOX_OWNER
+            && owner != expected_current_owner
+        {
+            pool_adoption::retire_legacy(&tx, id)?;
+        }
         tx.commit()?;
         return Ok(Some(previous));
     }
@@ -1607,6 +1612,11 @@ pub fn set_sandbox_owner_if_current(
     if changed != 1 {
         tx.commit()?;
         return Ok(None);
+    }
+    if *expected_current_owner == pplx_space_common_core::types::ROOT_SANDBOX_OWNER
+        && owner != expected_current_owner
+    {
+        pool_adoption::retire_legacy(&tx, id)?;
     }
     tx.commit()?;
     Ok(Some(previous))

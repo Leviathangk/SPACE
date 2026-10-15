@@ -59,6 +59,7 @@ fn node_execution_cleanup_acknowledgements_are_retryable_and_fenced() {
         },
         None,
         None,
+        false,
     )
     .unwrap();
     let staged = node_execution_fence(&conn, &id).unwrap().unwrap();

@@ -33,6 +33,7 @@ use std::path::{Component, Path, PathBuf};
 use pplx_space_common_core::host::linux::paths;
 use pplx_space_common_core::types::SandboxId;
 use tonic::{Request, Response, Status};
+use tracing::Instrument as _;
 use zeroize::Zeroizing;
 
 use crate::proto::{
@@ -165,24 +166,49 @@ impl NodeManagerService {
             require_paused_pool_vm(&sandbox_id).await?;
         }
         let plaintext_dek = fetch_sandbox_volume_dek(&sandbox_id, adoption.map(|(_, org)| org))
+            .instrument(tracing::info_span!(
+                "byok.key_lookup",
+                pool_adoption = adoption.is_some()
+            ))
             .await
             .inspect_err(|_| metric.failed(pplx_space_metrics::byok::PHASE_DEK))?;
 
         let prepared = if adoption.is_some() {
-            let drive = rootfs_dmcrypt::prepare_pool_drive_switch(sandbox_id, origin_path.clone())
+            let result = async {
+                let drive =
+                    rootfs_dmcrypt::prepare_pool_drive_switch(sandbox_id, origin_path.clone())
+                        .await
+                        .map_err(|e| Status::internal(format!("prepare pool drive switch: {e}")))?;
+                pool_drive_switch::switch(&sandbox_id, &drive.mapper_path).await
+            }
+            .await;
+            let result = match result {
+                Ok(()) => rootfs_dmcrypt::encrypt_pool_rootfs(
+                    sandbox_id,
+                    origin_path.clone(),
+                    instance_dir.join(rootfs_dmcrypt::POOL_ROOTFS_FILE),
+                    cow_path.clone(),
+                    &plaintext_dek,
+                )
                 .await
-                .map_err(|e| Status::internal(format!("prepare pool drive switch: {e}")))?;
-            pool_drive_switch::switch(&sandbox_id, &drive.mapper_path).await?;
-            rootfs_dmcrypt::encrypt_pool_rootfs(
-                sandbox_id,
-                origin_path,
-                instance_dir.join(rootfs_dmcrypt::POOL_ROOTFS_FILE),
-                cow_path,
-                &plaintext_dek,
-            )
-            .await
+                .inspect_err(|error| metric.failed(dmcrypt_error_phase(error)))
+                .map_err(dmcrypt_error_to_status),
+                Err(error) => Err(error),
+            };
+            if result.is_err()
+                && let Err(error) = rootfs_dmcrypt::recover_pool_drive(
+                    sandbox_id,
+                    origin_path,
+                    cow_path,
+                    &plaintext_dek,
+                )
+                .await
+            {
+                tracing::error!(%sandbox_id, %error, "pool drive recovery failed; adoption remains incomplete");
+            }
+            result.inspect_err(|_| metric.failed(pplx_space_metrics::byok::PHASE_DEVICE))?
         } else {
-            rootfs_dmcrypt::prepare(rootfs_dmcrypt::PrepareParams {
+            let result = rootfs_dmcrypt::prepare(rootfs_dmcrypt::PrepareParams {
                 sandbox_id,
                 origin_path,
                 cow_path,
@@ -192,9 +218,10 @@ impl NodeManagerService {
                 rootfs_size_bytes: 0,
                 dek: &plaintext_dek,
             })
-            .await
+            .await;
+            record_outcome(&metric, result)?
         };
-        let prepared = record_outcome(&metric, prepared)?;
+        metric.succeeded();
         // plaintext_dek drops here → Zeroizing scrubs it; cryptsetup already
         // loaded the key into the kernel keyring.
 

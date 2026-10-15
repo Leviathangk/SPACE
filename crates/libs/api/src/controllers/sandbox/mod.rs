@@ -1012,7 +1012,10 @@ fn sandbox_port_observation_is_fresh(observed_at: time::OffsetDateTime) -> bool 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmissionPoolPlan {
     /// Claim a ready slot of this template release.
-    Eligible { template_release_id: Uuid },
+    Eligible {
+        template_release_id: Uuid,
+        volume_encryption: bool,
+    },
     /// The request cannot adopt a slot, or something the decision needs is
     /// unknown at admission.
     Ineligible,

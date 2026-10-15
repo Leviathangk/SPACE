@@ -359,7 +359,7 @@ impl SandboxManagerService {
             Status::permission_denied(format!("{operation} requires a SPACE API route token"))
         })?;
         validate_route_token_ed25519_target(&claims, sandbox_id, operation, allowed_purposes)?;
-        if crate::db::pool_adoption::guest_access_blocked(&*self.db_conn()?, sandbox_id)
+        if crate::db::pool_adoption::incomplete(&*self.db_conn()?, sandbox_id)
             .map_err(|error| Status::internal(format!("db error: {error}")))?
         {
             return Err(Status::failed_precondition(

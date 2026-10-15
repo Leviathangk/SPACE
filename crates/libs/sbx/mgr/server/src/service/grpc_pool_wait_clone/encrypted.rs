@@ -6,6 +6,48 @@ impl SandboxManagerService {
         req: AdoptPoolSandboxRequest,
         owner: SandboxOwner,
     ) -> Result<Response<AdoptPoolSandboxResponse>, Status> {
+        let service = self.clone();
+        let encrypted = req
+            .claimed_sandbox
+            .as_ref()
+            .is_some_and(|claim| claim.volume_encryption);
+        self.spawn_state_writer(
+            "AdoptPoolSandbox",
+            async move {
+                let started = std::time::Instant::now();
+                let result = service.adopt_claimed_pool_sandbox_inner(req, owner).await;
+                tracing::Span::current().record(
+                    "otel.status_code",
+                    if result.is_ok() { "OK" } else { "ERROR" },
+                );
+                pplx_space_metrics::byok::pool_adoption_duration(
+                    encrypted,
+                    result.is_ok(),
+                    started,
+                );
+                result
+            }
+            .instrument(tracing::info_span!(
+                "pool_adoption.adopt",
+                encrypted,
+                otel.status_code = tracing::field::Empty
+            )),
+        )?
+        .await
+        .map_err(|error| Status::internal(format!("pool adoption task failed: {error}")))?
+    }
+
+    #[tracing::instrument(
+        name = "pool_adoption.claim",
+        skip_all,
+        err,
+        fields(sandbox_id, claim_id, replay = false)
+    )]
+    async fn adopt_claimed_pool_sandbox_inner(
+        &self,
+        req: AdoptPoolSandboxRequest,
+        owner: SandboxOwner,
+    ) -> Result<Response<AdoptPoolSandboxResponse>, Status> {
         let claimed = req.claimed_sandbox.as_ref().ok_or_else(|| {
             Status::invalid_argument("encrypted adoption requires an exact sandbox and claim")
         })?;
@@ -25,10 +67,16 @@ impl SandboxManagerService {
             volume_encryption: claimed.volume_encryption,
         };
         let id = sandbox_id.to_string();
-        let _wake =
-            self.auto_lifecycle.wake_lock(&id).try_lock().map_err(|_| {
-                Status::unavailable("pool member has an active lifecycle operation")
-            })?;
+        tracing::Span::current()
+            .record("sandbox_id", &id)
+            .record("claim_id", claim_id.to_string());
+        // Retries wait for the owned attempt, then read its durable receipt.
+        let _wake = self
+            .auto_lifecycle
+            .wake_lock(&id)
+            .lock_owned()
+            .instrument(tracing::info_span!("pool_adoption.wait_for_attempt"))
+            .await;
         let sandbox = self.lookup_sandbox(&id)?;
         if sandbox.template != req.template
             || req
@@ -39,6 +87,19 @@ impl SandboxManagerService {
             return Err(Status::failed_precondition("pool member template changed"));
         }
         let env = sanitize_process_env(req.env.into_iter().collect(), "pool_adopt");
+        if claimed.volume_encryption
+            && crate::db::pool_adoption::pending(&*self.db_conn()?, &id)
+                .map_err(|e| Status::internal(format!("read pool adoption: {e}")))?
+            && !self
+                .node_manager
+                .encrypted_pool_adoption_supported()
+                .instrument(tracing::info_span!("pool_adoption.node_capability"))
+                .await
+        {
+            return Err(Status::failed_precondition(
+                "node manager cannot adopt encrypted pool members",
+            ));
+        }
         {
             let db = self.db_conn()?;
             if !crate::db::pool_adoption::begin(&db, &id, claim, &owner, &env)
@@ -55,15 +116,17 @@ impl SandboxManagerService {
             volume_encryption: claimed.volume_encryption,
             route_identity: space_api_route_identity_to_wire(&sandbox.space_api_route_identity),
         };
-        if !crate::db::pool_adoption::guest_access_blocked(&*self.db_conn()?, &id)
+        if !crate::db::pool_adoption::pending(&*self.db_conn()?, &id)
             .map_err(|e| Status::internal(format!("read pool adoption completion: {e}")))?
         {
+            tracing::Span::current().record("replay", true);
             return Ok(Response::new(response));
         }
-        if sandbox.state == SandboxState::Started {
+        if claimed.volume_encryption && sandbox.state == SandboxState::Started {
             self.pause(internal_request(crate::proto::PauseRequest {
                 sandbox_id: id.clone(),
             }))
+            .instrument(tracing::info_span!("pool_adoption.pause"))
             .await?;
         }
         if claimed.volume_encryption {
@@ -95,8 +158,13 @@ impl SandboxManagerService {
                     "node manager did not acknowledge pool adoption",
                 ));
             }
+        } else if sandbox.state == SandboxState::Started {
+            super::super::activation_support::configure_process_env_via_spaced_host(&id, &env)
+                .instrument(tracing::info_span!("pool_adoption.configure_env"))
+                .await?;
         }
         {
+            let _complete = tracing::info_span!("pool_adoption.complete").entered();
             let db = self.db_conn()?;
             if !crate::db::pool_adoption::complete(&db, &id, claim)
                 .map_err(|e| Status::internal(format!("complete encrypted adoption: {e}")))?
@@ -126,7 +194,7 @@ impl SandboxManagerService {
 
     pub(in crate::service) fn is_encryptable_pool_member(&self, id: &str) -> Result<bool, Status> {
         let db = self.db_conn()?;
-        crate::db::pool_adoption::guest_access_blocked(&db, id)
+        crate::db::pool_adoption::pending(&db, id)
             .map_err(|e| Status::internal(format!("read encryptable pool membership: {e}")))
     }
 }

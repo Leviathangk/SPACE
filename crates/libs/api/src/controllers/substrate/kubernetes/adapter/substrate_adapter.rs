@@ -2007,6 +2007,15 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 continue;
             }
 
+            if request.volume_encryption
+                && !self.pool_worker_supports_encryption(&claim.pod_ip).await
+            {
+                pool::release_claimed_pool_slot(self.store.pool(), &claim).await?;
+                return Ok(PooledExecutionClaimAttempt::missed(
+                    claim_attempt.pool_shape,
+                ));
+            }
+
             let resolved = match placement.as_ref() {
                 Some(resolved) => resolved,
                 None => {
@@ -2552,8 +2561,41 @@ impl SubstrateAdapter for KubernetesSubstrate {
         &self,
         tx: &mut Transaction<'_, Postgres>,
         template_release_id: Uuid,
+        volume_encryption: bool,
     ) -> Result<Option<AdmissionPoolClaim>, ControllerError> {
-        pool::claim_admission_pool_slot(tx, template_release_id, &self.k8s.sandbox_namespace).await
+        use sqlx::Acquire as _;
+        let mut candidate = tx
+            .begin()
+            .await
+            .map_err(|e| ControllerError::internal(format!("begin pool candidate: {e}")))?;
+        let Some((claim, pod_ip)) = pool::claim_admission_pool_slot(
+            &mut candidate,
+            template_release_id,
+            &self.k8s.sandbox_namespace,
+        )
+        .await?
+        else {
+            candidate
+                .rollback()
+                .await
+                .map_err(|e| ControllerError::internal(format!("release pool candidate: {e}")))?;
+            return Ok(None);
+        };
+        if volume_encryption
+            && !self
+                .pool_worker_supports_encryption(pod_ip.as_deref().unwrap_or(""))
+                .await
+        {
+            candidate.rollback().await.map_err(|e| {
+                ControllerError::internal(format!("release unsupported pool candidate: {e}"))
+            })?;
+            return Ok(None);
+        }
+        candidate
+            .commit()
+            .await
+            .map_err(|e| ControllerError::internal(format!("keep pool candidate: {e}")))?;
+        Ok(Some(claim))
     }
 
     async fn persist_pooled_execution_claim(

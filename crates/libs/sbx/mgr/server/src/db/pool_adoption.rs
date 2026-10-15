@@ -13,8 +13,16 @@ pub(crate) fn incomplete(conn: &Connection, id: &str) -> Result<bool> {
     conn.query_row(sql!("SELECT EXISTS (SELECT 1 FROM sandbox_pool_adoptions WHERE sandbox_id = ?1 AND claim_id IS NOT NULL AND completed = 0)"), [id], |row| row.get(0))
 }
 
-pub(crate) fn guest_access_blocked(conn: &Connection, id: &str) -> Result<bool> {
+pub(crate) fn pending(conn: &Connection, id: &str) -> Result<bool> {
     conn.query_row(sql!("SELECT EXISTS (SELECT 1 FROM sandbox_pool_adoptions WHERE sandbox_id = ?1 AND completed = 0)"), [id], |row| row.get(0))
+}
+
+pub(super) fn retire_legacy(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute(
+        sql!("DELETE FROM sandbox_pool_adoptions WHERE sandbox_id = ?1 AND claim_id IS NULL"),
+        [id],
+    )?;
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -68,7 +76,7 @@ pub(crate) fn begin(
 
 pub(crate) fn complete(conn: &Connection, id: &str, claim: PoolClaim) -> Result<bool> {
     let tx = immediate_transaction(conn)?;
-    let changed = tx.execute(sql!("UPDATE sandboxes SET volume_encryption = ?3 WHERE id = ?1 AND state = 'paused' AND EXISTS (SELECT 1 FROM sandbox_pool_adoptions WHERE sandbox_id = ?1 AND claim_id = ?2 AND volume_encryption = ?3 AND org_id = ?4)"), params![id, claim.id.to_string(), claim.volume_encryption, claim.org_id.to_string()])?;
+    let changed = tx.execute(sql!("UPDATE sandboxes SET volume_encryption = ?3 WHERE id = ?1 AND (state = 'paused' OR (state = 'started' AND ?3 = 0)) AND EXISTS (SELECT 1 FROM sandbox_pool_adoptions WHERE sandbox_id = ?1 AND claim_id = ?2 AND volume_encryption = ?3 AND org_id = ?4)"), params![id, claim.id.to_string(), claim.volume_encryption, claim.org_id.to_string()])?;
     if changed != 1 {
         return Ok(false);
     }

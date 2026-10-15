@@ -767,6 +767,7 @@ impl SandboxManagerService {
                 },
                 None,
                 None,
+                false,
             )
             .map_err(|e| Status::internal(format!("db insert: {e}")))?;
         }

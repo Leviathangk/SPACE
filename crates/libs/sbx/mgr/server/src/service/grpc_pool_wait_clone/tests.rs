@@ -43,6 +43,7 @@ fn armed_clone() -> (SandboxManagerService, SandboxId, SandboxCleanupEpisodeId) 
         },
         None,
         None,
+        false,
     )
     .unwrap();
     (SandboxManagerService::for_test(conn), id, cleanup_id)

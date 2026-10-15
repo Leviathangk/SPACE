@@ -1049,11 +1049,11 @@ impl SandboxController {
         let Ok(boot_mode) = CreateBootMode::from_api(req.boot_mode.as_deref(), false) else {
             return AdmissionPoolPlan::Ineligible;
         };
-        match org_encryption_flag(pool, org_id).await {
+        let volume_encryption = match org_encryption_flag(pool, org_id).await {
             Ok(Some(true)) if !byok_volume_encryption_engaged() => {
                 return AdmissionPoolPlan::Ineligible;
             }
-            Ok(Some(_)) => {}
+            Ok(Some(encrypted)) => encrypted,
             Ok(None) => return AdmissionPoolPlan::Ineligible,
             Err(error) => {
                 tracing::warn!(
@@ -1078,6 +1078,7 @@ impl SandboxController {
         }
         AdmissionPoolPlan::Eligible {
             template_release_id: resolved_template.template_release_id,
+            volume_encryption,
         }
     }
 
@@ -1088,9 +1089,10 @@ impl SandboxController {
         &self,
         tx: &mut Transaction<'_, Postgres>,
         template_release_id: Uuid,
+        volume_encryption: bool,
     ) -> Result<Option<AdmissionPoolClaim>, ControllerError> {
         self.substrate
-            .claim_admission_pool_slot(tx, template_release_id)
+            .claim_admission_pool_slot(tx, template_release_id, volume_encryption)
             .await
     }
 

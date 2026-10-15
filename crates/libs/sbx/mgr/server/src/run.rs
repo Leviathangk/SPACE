@@ -1060,13 +1060,32 @@ pub async fn run(
             tonic_health::ServingStatus::Serving,
         )
         .await;
+    {
+        let health_reporter = health_reporter.clone();
+        let node_manager = node_manager.clone();
+        let shutdown = shutdown_token.clone();
+        task_tracker.spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tick.tick() => {}
+                }
+                let supported = node_manager.encrypted_pool_adoption_supported().await;
+                health_reporter
+                    .set_service_status(
+                        pplx_space_sbx_mgr_client::ENCRYPTED_POOL_ADOPTION_HEALTH_SERVICE,
+                        if supported {
+                            tonic_health::ServingStatus::Serving
+                        } else {
+                            tonic_health::ServingStatus::NotServing
+                        },
+                    )
+                    .await;
+            }
+        });
+    }
     let sandbox_shutdown = {
-        health_reporter
-            .set_service_status(
-                pplx_space_sbx_mgr_client::ENCRYPTED_POOL_ADOPTION_HEALTH_SERVICE,
-                tonic_health::ServingStatus::Serving,
-            )
-            .await;
         let token = production_shutdown_token.clone();
         async move { token.cancelled().await }
     };

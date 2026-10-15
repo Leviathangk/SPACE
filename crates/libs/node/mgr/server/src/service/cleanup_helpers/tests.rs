@@ -244,7 +244,8 @@ fn failed_device_teardown_preserves_artifacts_for_retry() {
                         b"0 1024 snapshot 0/1024 8\n".to_vec()
                     }
                 }
-                ("dmsetup", ["remove", "--retry", name]) | ("cryptsetup", ["close", name])
+                ("dmsetup", ["remove", "--force", "--retry", name])
+                | ("cryptsetup", ["close", name])
                     if *name == mapper =>
                 {
                     kernel_device_live.set(false);

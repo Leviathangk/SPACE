@@ -3,6 +3,7 @@
 //! an adopted pod.
 
 use super::*;
+use axum::http::StatusCode;
 
 pub(in crate::controllers::substrate::kubernetes) fn pooled_route_identity_adoption_request(
     claim: &PooledExecutionClaim,
@@ -96,6 +97,22 @@ pub(super) fn pooled_metadata_update_error_is_reclaimable(status: &tonic::Status
 }
 
 impl KubernetesSubstrate {
+    #[tracing::instrument(name = "pool_adoption.worker_capability", skip_all, fields(supported))]
+    pub(super) async fn pool_worker_supports_encryption(&self, pod_ip: &str) -> bool {
+        let endpoint = PodIp::parse(pod_ip)
+            .and_then(|ip| Self::endpoint_for_pod_ip(ip, self.k8s.sandbox_proxy_port));
+        let Ok(endpoint) = endpoint else { return false };
+        let supported = NodeApiClient::with_service_name("worker-node-api", endpoint)
+            .health_service_serving(
+                pplx_space_sbx_mgr_client::ENCRYPTED_POOL_ADOPTION_HEALTH_SERVICE,
+                WARM_POOL_SETUP_RPC_TIMEOUT,
+            )
+            .await
+            .unwrap_or(false);
+        tracing::Span::current().record("supported", supported);
+        supported
+    }
+
     /// Whether an admitted warm pod's node is somewhere this sandbox may run,
     /// by the same rules `claim_pooled_execution` admits a claim under. Only
     /// the outcomes that claim path *adopts* answer `true`; every outcome it
@@ -251,11 +268,23 @@ impl KubernetesSubstrate {
                         ),
                         ..Default::default()
                     },
-                    WARM_POOL_SETUP_RPC_TIMEOUT,
+                    Duration::from_secs(120),
+                )
+                .instrument(
+                    tracing::info_span!("pool_adoption.request", %sandbox_id, volume_encryption),
                 )
                 .await
                 .map_err(|e| {
-                    ControllerError::service_unavailable(format!("encrypted pool adoption: {e}"))
+                    // A timed-out owned adoption may still be converting this
+                    // disk. Do not amplify it into several replacement claims.
+                    ControllerError::new(
+                        if e.code() == Code::DeadlineExceeded {
+                            StatusCode::GATEWAY_TIMEOUT
+                        } else {
+                            StatusCode::SERVICE_UNAVAILABLE
+                        },
+                        format!("encrypted pool adoption: {e}"),
+                    )
                 })?
                 .into_inner();
             if response.sandbox_id != sandbox_id.to_string()
