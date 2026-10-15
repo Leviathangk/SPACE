@@ -206,6 +206,12 @@ pub(crate) async fn run_with_stdin(
         .map(|_| ())
 }
 
+#[tracing::instrument(
+    name = "byok.device_command",
+    skip_all,
+    err,
+    fields(program = cmd, operation = args.first().copied().unwrap_or(""))
+)]
 async fn run_captured(
     cmd: &str,
     args: &[&str],

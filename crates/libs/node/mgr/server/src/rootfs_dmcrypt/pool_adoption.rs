@@ -219,6 +219,12 @@ pub(crate) async fn encrypt_pool_rootfs(
             dek,
         )
         .await?;
+        if dm_exists(&seed).await? {
+            // A crash may leave a pending handover. Discard its inactive
+            // destination before removing the source and reopening the COW.
+            run_bounded("dmsetup", &["clear", &composite], FREEZE_COMMAND_BUDGET).await?;
+            ReleaseDevice::Snapshot(&seed).run().await?;
+        }
     } else {
         // No published COW means Firecracker is still held on the linear target.
         // Any interrupted seed is disposable and has never accepted guest I/O.
@@ -292,7 +298,6 @@ pub(crate) async fn encrypt_pool_rootfs(
             })
             .await?;
             suspend_device(&seed).await?;
-            ReleaseDevice::Snapshot(&seed).run().await?;
             let name = encrypted_path
                 .file_name()
                 .ok_or_else(|| DmCryptError::InvalidParams("missing COW name".into()))?
@@ -315,6 +320,11 @@ pub(crate) async fn encrypt_pool_rootfs(
         )
         .await?;
         run_bounded("dmsetup", &["resume", &composite], FREEZE_COMMAND_BUDGET).await?;
+        if dm_exists(&seed).await? {
+            // Resuming the destination transfers the suspended seed's exception
+            // store in memory; removing the seed first forces a metadata reread.
+            ReleaseDevice::Snapshot(&seed).run().await?;
+        }
         Ok(PreparedRootfs { mapper_path })
     }
     .instrument(tracing::info_span!("pool_adoption.commit_drive"))

@@ -120,8 +120,8 @@ async fn open_pool_disk_survives_encryption_and_reopen() {
         .await
         .expect("failed adoption must release queued I/O")
         .unwrap();
-    for attempt in 0..3 {
-        if attempt == 1 {
+    for attempt in 0..4 {
+        if attempt > 0 {
             // Reconstruct a crash after the encrypted backing was committed
             // but before the suspended linear target was replaced.
             suspend_device(&composite).await.unwrap();
@@ -138,6 +138,29 @@ async fn open_pool_disk_survives_encryption_and_reopen() {
             .unwrap();
             run("dmsetup", &["resume", &composite]).await.unwrap();
             suspend_device(&composite).await.unwrap();
+            if attempt > 1 {
+                // Interrupt handover with the destination table either loaded
+                // or already active, while the suspended seed still exists.
+                let backing = Backing::require(Backing::open(&origin, false).unwrap()).unwrap();
+                let device = LoopDevice::attach(&backing, true).unwrap();
+                let table = snapshot_table(
+                    backing.file.metadata().unwrap().len() / SECTOR_BYTES,
+                    &device.path().to_string_lossy(),
+                    &format!("/dev/mapper/{}", cow_mapper_name(&sandbox_id)),
+                );
+                let seed = format!("{composite}-seed");
+                run("dmsetup", &["create", &seed, "--table", &table])
+                    .await
+                    .unwrap();
+                suspend_device(&seed).await.unwrap();
+                run("dmsetup", &["reload", &composite, "--table", &table])
+                    .await
+                    .unwrap();
+                if attempt == 3 {
+                    run("dmsetup", &["resume", &composite]).await.unwrap();
+                    suspend_device(&composite).await.unwrap();
+                }
+            }
         }
         prepare_pool_drive_switch(sandbox_id, origin.clone())
             .await
@@ -151,6 +174,7 @@ async fn open_pool_disk_survives_encryption_and_reopen() {
         )
         .await
         .unwrap();
+        assert!(!dm_exists(&format!("{composite}-seed")).await.unwrap());
         if let Some(queued) = queued.take() {
             queued.await.unwrap();
         }

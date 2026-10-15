@@ -15,7 +15,10 @@ const BUFFER: usize = 1024 * 1024;
     fields(logical_bytes, scanned_bytes, copied_bytes)
 )]
 pub(super) fn copy_changed_blocks(source: &File, origin: &File, target: &File) -> io::Result<u64> {
-    source.sync_all()?;
+    {
+        let _sync = tracing::info_span!("pool_adoption.sync_source").entered();
+        source.sync_all()?;
+    }
     let size = source.metadata()?.len();
     let span = tracing::Span::current();
     span.record("logical_bytes", size);
@@ -81,7 +84,10 @@ pub(super) fn copy_changed_blocks(source: &File, origin: &File, target: &File) -
             offset += count as u64;
         }
     }
-    target.sync_all()?;
+    {
+        let _sync = tracing::info_span!("pool_adoption.sync_target").entered();
+        target.sync_all()?;
+    }
     span.record("copied_bytes", copied);
     Ok(copied)
 }
