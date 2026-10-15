@@ -245,6 +245,31 @@ class _ScriptedKubectl:
 
 
 class PublicApiEnvOverride(unittest.TestCase):
+    def test_accepts_a_comma_separated_allowlist_and_still_refuses_the_rest(self) -> None:
+        # The kind bench refused `a,b,c` for KNOWN_CLIENTS before the comma was
+        # in the class, which is the one separator that env var's own grammar
+        # requires. Widening it must not let anything else through.
+        harness = KindHarness(_ScriptedKubectl([]), KindConfig())
+        for refused in (
+            "space smoke",
+            "space-smoke;rm -rf /",
+            "$(whoami)",
+            "`id`",
+            "a\nb",
+            "'quoted'",
+            "x" * 65,
+            "",
+        ):
+            with self.subTest(value=refused), self.assertRaisesRegex(ValueError, "refusing"):
+                harness.set_public_api_env({"SPACE_API_CLIENT_CONCURRENCY_KNOWN_CLIENTS": refused})
+        # The accepted shape reaches the key check instead of the value check,
+        # which this closed list of keys then passes; kubectl is never reached
+        # because the scripted runner has no results queued.
+        with self.assertRaises(IndexError):
+            harness.set_public_api_env(
+                {"SPACE_API_CLIENT_CONCURRENCY_KNOWN_CLIENTS": "space-smoke,space-smoke-noisy"}
+            )
+
     def test_refuses_keys_outside_the_limiter_list(self) -> None:
         harness = KindHarness(_ScriptedKubectl([]), KindConfig())
         with self.assertRaisesRegex(ValueError, "refusing"):
