@@ -491,6 +491,9 @@ struct NetworkPolicyReconcileQueueState {
     attempts: BTreeMap<String, u32>,
     dead: BTreeMap<String, String>,
     active: BTreeMap<String, uuid::Uuid>,
+    /// The latest traced enqueuer's `traceparent` per sandbox, which the next
+    /// attempt links to.
+    origins: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -526,14 +529,33 @@ impl NetworkPolicyReconcileQueue {
         state.attempts.remove(sandbox_id);
         state.dead.remove(sandbox_id);
         state.active.remove(sandbox_id);
+        state.origins.remove(sandbox_id);
         drop(state);
         self.emit_metrics();
     }
 
     pub(crate) fn enqueue(&self, sandbox_id: impl Into<String>) -> bool {
         let sandbox_id = sandbox_id.into();
+        // Coalesced requests share one attempt, which links to the latest,
+        // except that an unsampled request's context never replaces a sampled
+        // one, as a node reconcile ref's does not.
+        let origin = pplx_space_observability::trace_propagation::current_traceparent();
         let inserted = {
             let mut state = self.state();
+            if let Some(origin) = origin {
+                let kept = match state.origins.get(&sandbox_id) {
+                    Some(saved) => pplx_space_observability::sampled_origins_first([
+                        origin.as_str(),
+                        saved.as_str(),
+                    ])
+                    .first()
+                    .map(|kept| (*kept).to_owned()),
+                    None => Some(origin),
+                };
+                if let Some(kept) = kept {
+                    state.origins.insert(sandbox_id.clone(), kept);
+                }
+            }
             state.retry_after.remove(&sandbox_id);
             state.attempts.remove(&sandbox_id);
             state.dead.remove(&sandbox_id);
@@ -624,6 +646,12 @@ impl NetworkPolicyReconcileQueue {
         })
         .take(limit)
         .collect()
+    }
+
+    /// The context of the traced request that last queued this sandbox, if
+    /// one did since its previous attempt started.
+    pub(crate) fn take_origin(&self, sandbox_id: &str) -> Option<String> {
+        self.state().origins.remove(sandbox_id)
     }
 
     #[cfg(test)]

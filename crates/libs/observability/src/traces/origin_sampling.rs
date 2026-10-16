@@ -5,9 +5,12 @@
 //! ([`crate::trace_propagation::link_root_to_origins`]). Sampled on its own,
 //! such a root would be kept or dropped independently of the request, so a
 //! kept request could lose the work it caused and a dropped request could
-//! keep work that links to nothing. A root that links to an origin therefore
-//! follows the origin's sampled flag; a root with no origin, and every span
-//! with a parent, keeps the configured sampler.
+//! keep work that links to nothing. A root that links to an origin and
+//! records `origin_sampled` therefore follows the origin's sampled flag. A
+//! root linked without it
+//! ([`crate::trace_propagation::link_root_to_origins_without_following`]), a
+//! root with no origin, and every span with a sampled parent keep the
+//! configured sampler.
 //!
 //! Every span under a parent that was not sampled is recorded unsampled, so
 //! APM stats count it and a failure can still be exported. A gRPC call made
@@ -21,13 +24,17 @@ use opentelemetry::{
 };
 use opentelemetry_sdk::trace::{SamplingDecision, SamplingResult, ShouldSample};
 
-/// The field [`crate::trace_propagation::link_root_to_origins`] records. The
-/// native Datadog sampler never sees links, so its rules match this instead.
-#[cfg(feature = "datadog")]
+/// The field [`crate::trace_propagation::link_root_to_origins`] records on a
+/// root whose sampling follows its origins. The native Datadog sampler never
+/// sees links, so its rules match this instead; the OTLP sampler follows a
+/// root's links only when it carries it, so a root linked with
+/// [`crate::trace_propagation::link_root_to_origins_without_following`] keeps
+/// the configured sampler on both.
 const ORIGIN_SAMPLED_ATTRIBUTE: &str = "origin_sampled";
 
 /// The OTLP pipeline's sampler: the one `OTEL_TRACES_SAMPLER` configures,
-/// except that a root with a valid link follows its links.
+/// except that a root that records `origin_sampled` and has a valid link
+/// follows its links.
 #[derive(Clone, Debug)]
 pub(super) struct FollowOrigin {
     configured: Box<dyn ShouldSample>,
@@ -76,7 +83,13 @@ impl ShouldSample for FollowOrigin {
                     .unwrap_or_default(),
             };
         }
-        if has_parent || origins.peek().is_none() {
+        // Only a root that records `origin_sampled` follows its links, as
+        // the native Datadog rules do; one linked without it, such as a
+        // retry, keeps the configured sampler.
+        let follows = attributes
+            .iter()
+            .any(|attribute| attribute.key.as_str() == ORIGIN_SAMPLED_ATTRIBUTE);
+        if has_parent || !follows || origins.peek().is_none() {
             return self.configured.should_sample(
                 parent_context,
                 trace_id,

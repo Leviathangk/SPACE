@@ -410,14 +410,16 @@ sampled as `origin_sampled`. Its sampling follows that origin: it is kept when
 any origin it links to was sampled and dropped when none was, so a kept
 request keeps the work it caused. A root with no origin keeps the configured
 sampler. Under OTLP the sampler that `OTEL_TRACES_SAMPLER` selects is wrapped
-to read the root's links. The shim's wrapper also makes every span with a
-parent follow it, sampled or recorded unsampled, so a sampler that is not
-parent-based, such as Kind's `always_on`, cannot sample the children of a
-dropped `shim.create` and send their sampled `traceparent` on. The native
-Datadog samplers do not read links, so two sampling rules on
-`origin_sampled`, ahead of the ones `DD_TRACE_SAMPLING_RULES` configures,
-keep (`1.0`) or drop (`0.0`) such a root. The Rust services and the shim
-apply the same rules to their linked roots. A root links to at
+to read the links of a root that records `origin_sampled`. The shim's wrapper
+also makes every span with a parent follow it, sampled or recorded unsampled,
+so a sampler that is not parent-based, such as Kind's `always_on`, cannot
+sample the children of a dropped `shim.create` and send their sampled
+`traceparent` on. The native Datadog samplers do not read links, so two
+sampling rules on `origin_sampled`, ahead of the ones
+`DD_TRACE_SAMPLING_RULES` configures, keep (`1.0`) or drop (`0.0`) such a
+root. The Rust services and the shim apply the same rules to their linked
+roots. A root linked without `origin_sampled` keeps the configured sampler on
+both paths. A root links to at
 most eight origins, sampled ones first, so one with any sampled origin always
 links it and is kept. Datadog's rate limit (`DD_TRACE_RATE_LIMIT`) still
 applies to a kept root, and sampling rules sent
@@ -456,7 +458,8 @@ rest counted in `sandbox_ids.dropped`.
 
 Each asynchronous root also names its Datadog operation, so it has its own
 APM series: `public_operation.execute`, `job.<kind>`, `node_ctl.pass`,
-`sbxmgr.detached` and `leader_election.change`. An internal span that names
+`warm_pool.pass`, `sbxmgr.detached`, `netgtw.startup` and
+`leader_election.change`. An internal span that names
 none falls back to the operation `internal`, shared by every such span of the
 service.
 
@@ -682,6 +685,57 @@ Each HTTP response also carries a W3C `traceparent` header naming its
 made. The header holds only the version, trace ID, span ID and sampled flag;
 it is absent when traces are off, and a proxied sandbox service's own
 `traceparent` is passed through unchanged.
+
+## Sandbox events and traces
+
+A `space sandbox event` line (`event_stream` `space.sandbox`) is written
+synchronously where the transition happens, so it carries `trace_id` and
+`span_id` exactly when that code runs inside a traced span. Work a traced
+request waits for runs in the request's span, so its events carry the
+request's trace ID:
+
+- node-manager's sandbox cleanup, which runs in a task the `CleanupSandbox`
+  call that started it owns;
+- sandbox-manager's lifecycle cleanup admission, which its RPC awaits.
+
+Work that outlives the request runs under a root linked to it, which records
+the request's trace ID as `origin_trace_id` and is sampled as the request was;
+its events carry the root's trace ID:
+
+- a sandbox-manager durable cleanup attempt is a `job.execute` root
+  (`job.sandbox_cleanup`), never a child of its caller, since a caller such as
+  Stop can stop waiting while the attempt runs. It links to the context saved
+  with the job and to the traced caller waiting for it, if any. The first
+  attempt, and one a caller waits for, is sampled as those origins were; a
+  later retry still links to them but takes the configured sampler, through
+  `link_root_to_origins_without_following`, so a job that keeps failing does
+  not keep a trace every retry;
+- sandbox-manager's cluster-deleted eviction teardown runs under
+  `sbxmgr.detached` (`EvictClusterDeletedSandbox`), linked to the
+  `EvictClusterDeletedSandbox` call: node-ctl gives that call a 10-second
+  deadline and treats its expiry as an eviction still in progress, so the
+  teardown can outlive it. A call from an untraced caller gets no root;
+- a network-policy reconcile attempt that a traced request queued runs under
+  `sbxmgr.detached` (`NetworkPolicyReconcile`), linked to the latest traced
+  request that queued it since the previous attempt, except that an unsampled
+  request's context never replaces a sampled one;
+- a net-gateway that sandbox-manager launched from a traced request receives
+  the launch's context as `TRACEPARENT`, and its startup events and first
+  policy pull run under a `netgtw.startup` (`NetGatewayStartup`) root linked
+  to it.
+
+No root is created for events with no request behind them: the
+network-policy reconciler's periodic sweep (every live sandbox once a minute)
+and its retries; startup recovery, the inventory, cache and quarantine
+reconcilers, cold-sandbox eviction and the snapshot scheduler; a cleanup job
+no traced caller persisted, such as one startup recovery schedules; a
+net-gateway the watchdog relaunched, its policy retries and rehydrations, and
+its `network_path_stopped` at shutdown, which a signal causes. Their events
+carry no trace ID, except those a callee writes while serving such work's
+call, which carry the unsampled context of
+[untraced background traffic](#untraced-background-traffic); work that
+follows that context does not save it as its origin. Due auto-lifecycle
+transitions keep their own `AutoLifecycle` root.
 
 ## Cargo features
 

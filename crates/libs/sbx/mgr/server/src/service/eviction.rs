@@ -523,7 +523,11 @@ impl SandboxManagerService {
         // the teardown between the CAS claim and cleanup completion;
         // terminal telemetry, and the pre-delete size estimate whose
         // directory walk can outlive the caller's deadline, live inside
-        // the task for the same reason. Shutdown aborts cooperatively:
+        // the task for the same reason. node-ctl gives this call a 10 s
+        // deadline and treats its expiry as an eviction still in progress,
+        // so the teardown runs under its own root linked to the request
+        // rather than in the request's span, which it would hold open past
+        // that deadline. Shutdown aborts cooperatively:
         // a row already claimed into `deleting` converges through the
         // startup recovery of `deleting` rows, the same contract as a
         // crash mid-teardown.
@@ -532,7 +536,18 @@ impl SandboxManagerService {
         let shutdown = self.shutdown_token.clone();
         let state_before = row.state;
         let checked_updated_at = row.updated_at.clone();
-        let teardown = self.task_tracker.spawn(async move {
+        // A call from an untraced caller, such as a background reconcile,
+        // has no request behind it, so its teardown gets no root of its own.
+        let span = if pplx_space_observability::trace_propagation::traceparent_for_span(
+            &tracing::Span::current(),
+        )
+        .is_some()
+        {
+            super::drain::detached_trace_span("EvictClusterDeletedSandbox", &sandbox_id)
+        } else {
+            tracing::Span::none()
+        };
+        let teardown = async move {
             let reason = crate::sandbox_eviction::EvictReason::ClusterRowAbsent;
             // Size estimate before the directory disappears; log/event
             // only, so it races shutdown too — service drain waits on
@@ -632,7 +647,8 @@ impl SandboxManagerService {
                 }
             }
             result
-        });
+        };
+        let teardown = self.task_tracker.spawn(teardown.instrument(span));
         teardown.await.map_err(|join_error| {
             Status::internal(format!("eviction task failed: {join_error}"))
         })??;

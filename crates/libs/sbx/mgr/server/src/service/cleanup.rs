@@ -924,7 +924,11 @@ impl SandboxManagerService {
             .await
             .map_err(|_| Status::unavailable("cleanup storage closed"))?;
         let service = self.clone();
+        // The caller's span, so the admission's events and the cleanup job it
+        // persists belong to the caller's trace, as `run_blocking_io`'s do.
+        let span = tracing::Span::current();
         let result = tokio::task::spawn_blocking(move || {
+            let _entered = span.enter();
             let _permit = permit;
             let _writer = service.state_writer_lease("CleanupAdmission")?;
             // Ownership travels with the transaction if its caller disappears.

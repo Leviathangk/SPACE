@@ -1484,6 +1484,25 @@ pub mod trace_propagation {
         span: &tracing::Span,
         traceparents: impl IntoIterator<Item = &'a str>,
     ) -> usize {
+        link_root(span, traceparents, true)
+    }
+
+    /// [`link_root_to_origins`] for a root whose sampling should not follow
+    /// its origins, such as a retry of work an earlier root already
+    /// followed its origin for: it links them and records `origin_trace_id`,
+    /// but not `origin_sampled`, so the configured sampler decides it.
+    pub fn link_root_to_origins_without_following<'a>(
+        span: &tracing::Span,
+        traceparents: impl IntoIterator<Item = &'a str>,
+    ) -> usize {
+        link_root(span, traceparents, false)
+    }
+
+    fn link_root<'a>(
+        span: &tracing::Span,
+        traceparents: impl IntoIterator<Item = &'a str>,
+        follow_sampling: bool,
+    ) -> usize {
         let mut linked = 0_usize;
         let mut dropped = 0_usize;
         let mut sampled = false;
@@ -1502,7 +1521,7 @@ pub mod trace_propagation {
             span.add_link(context);
             linked += 1;
         }
-        if linked > 0 {
+        if linked > 0 && follow_sampling {
             span.record("origin_sampled", sampled);
         }
         if dropped > 0 {
@@ -1584,6 +1603,12 @@ pub mod trace_propagation {
     pub fn set_unsampled_remote_parent(_span: &tracing::Span) {}
     pub fn set_span_attribute(_span: &tracing::Span, _key: &'static str, _value: &str) {}
     pub fn link_root_to_origins<'a>(
+        _span: &tracing::Span,
+        _traceparents: impl IntoIterator<Item = &'a str>,
+    ) -> usize {
+        0
+    }
+    pub fn link_root_to_origins_without_following<'a>(
         _span: &tracing::Span,
         _traceparents: impl IntoIterator<Item = &'a str>,
     ) -> usize {
