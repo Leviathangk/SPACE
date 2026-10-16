@@ -5,6 +5,12 @@ object store, which S3-compatible stores provide it, and what the Kind
 prototype on this branch does. It is meant to be dropped or reshaped before
 anything merges.
 
+The prototype first ran SeaweedFS (the recommendation below). It now runs
+RustFS 1.0.1, after a bake-off against versitygw on #109's criteria plus the
+exchange's (`scratch/rustfs-bakeoff/REPORT.md`): SeaweedFS was what #109
+replaced for its harness-only failures. The candidate table and the
+recommendation are kept as they were written.
+
 ## Problem
 
 Deployed node services never hold object-store keys. volume-manager asks its
@@ -35,8 +41,11 @@ volume-manager's transfer executor asks for credentials per job
 (`crates/libs/vol/mgr/server/src/executor.rs`, `exchange_credentials` in
 `crates/libs/vol/mgr/server/src/credentials.rs`):
 
-- `resource` names one exact object, `arn:aws:s3:::<bucket>/<key>`. The
-  executor always passes `is_prefix = false`.
+- `resource` names one exact object, `arn:aws:s3:::<bucket>/<key>`, for a
+  snapshot transfer (`is_prefix = false`), or every object under one artifact
+  prefix, `arn:aws:s3:::<bucket>/<prefix>/*`, for an artifact push or pull
+  (`is_prefix = true`). The session policy then grants that `<prefix>/*`
+  resource and lists with `StringLike` on `<prefix>` and `<prefix>/*`.
 - `scope` is `space.storage.read` for a pull and
   `space.storage.read space.storage.write` for a push. A push needs read as
   well because it verifies the upload with HeadObject before committing it.
@@ -200,19 +209,26 @@ cluster. The default, `static`, is today's behaviour. Both bring-up paths
 
 In exchange mode:
 
-- **Object store.** `space-object-store` runs SeaweedFS behind the same
+- **Object store.** `space-object-store` runs RustFS behind the same
   Deployment, Service (`object-store:8333`), Secret and bucket-init Job.
   - The root identity keeps the existing admin keys. The bucket-init and
     seed-publish Jobs, build-manager and cluster-controller still use them.
-  - A second identity holds no S3 permissions and may only assume the
-    `kind-storage-vend` role.
-  - That role's attached policy covers the `snapshots` and `templates`
-    buckets, and its trust policy names only that identity.
+  - The bucket-init Job also creates a second identity, an IAM user, through
+    RustFS's admin API, and attaches its user policy: read, write and abort
+    uploads of objects in the `snapshots` and `templates` buckets, and list
+    them.
+  - RustFS has no roles or trust policies. Any well-formed `RoleArn` is
+    accepted, and a session gets its caller's own policy intersected with the
+    session policy. So the user policy is the ceiling of every vended
+    session, and, unlike an AWS role, it also applies to the identity's own
+    keys, which only the authority holds.
+  - Session tokens are JWTs signed with a key derived from the root secret,
+    so no signing key is generated or stored.
   - The data lives under its own hostPath. The transition check refuses to
     switch an existing cluster between stores, because neither store can read
     the other's data.
 - **Authority.** `space-credmgr-authority` gets:
-  - `SPACE_CREDMGR_S3_VEND_ROLE_ARN` for that role;
+  - `SPACE_CREDMGR_S3_VEND_ROLE_ARN` for a role name RustFS ignores;
   - the vend identity's keys as its default-chain credentials;
   - `AWS_ENDPOINT_URL_STS=http://object-store:8333`.
 
@@ -221,7 +237,7 @@ In exchange mode:
   accounts.
 - **volume-manager.** On sandbox workers it gets no object-store keys, so every
   snapshot and template transfer goes volume-manager → node agent → authority
-  → SeaweedFS STS → scoped S3 session.
+  → RustFS STS → scoped S3 session.
 - **Builders.** The builder release keeps static keys, because the authority
   refuses builder-node callers (next section). build-manager is unchanged for
   the same reason.
@@ -294,6 +310,9 @@ mode would otherwise break every template build.
 
 ## What the prototype showed on Kind
 
+This section records the SeaweedFS run. The RustFS runs are in
+`scratch/rustfs-bakeoff/REPORT.md`.
+
 The prototype ran on a fresh exchange-mode cluster on a Linux/KVM devbox,
 with the smoke suite and the scenarios that move snapshots and templates
 through the object store. The PR has the results table and timings.
@@ -329,13 +348,16 @@ through the object store. The PR has the results table and timings.
 - Builder volume-manager and build-manager keep static keys until the builder
   UID fix lands.
 - cluster-controller keeps static keys instead of workload identity.
-- STS and S3 are one SeaweedFS endpoint, and there is no AWS account
+- STS and S3 are one RustFS endpoint, and there is no AWS account
   boundary.
+- The role ARN is not validated, so a wrong platform role or a per-org
+  override (`org_storage_vend_identities`) is not caught as AWS would catch
+  it.
 
 ## Decisions for the user
 
 1. Make exchange mode Kind's default, or keep it opt-in? Making it the default
-   means CI mirrors SeaweedFS and every Kind run exercises the exchange.
-2. Accept SeaweedFS's operational cost, or take RustFS and lose role
-   validation?
+   means CI mirrors RustFS and every Kind run exercises the exchange.
+2. Accept RustFS's lack of role validation (see the bake-off report for the
+   other criteria)?
 3. Land the builder UID fix, then convert build-manager?

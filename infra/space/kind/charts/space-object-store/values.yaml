@@ -27,11 +27,11 @@ image:
 # How node services get credentials for this store, set by every bring-up
 # path from SPACE_KIND_STORAGE_CREDENTIALS (infra/space/kind/lib/storage-credentials.sh).
 # `static` runs versitygw, whose root keys (`credentials` below) the node
-# services read. `exchange` runs SeaweedFS (`seaweedfs` below), which serves
-# STS AssumeRole on the S3 port and enforces each session's policy on every
-# S3 request, so the credential-manager authority can vend exact-object
-# sessions as deployments do. The two keep their data in different
-# directories and share none.
+# services read. `exchange` runs RustFS (`rustfs` below), which serves STS
+# AssumeRole on the S3 port and enforces each session's policy on every S3
+# request, so the credential-manager authority can vend exact-object sessions
+# as deployments do. The two keep their data in different directories and
+# share none.
 storageCredentials: static
 
 # The bucket-init Job creates the buckets through the S3 API with the aws CLI
@@ -106,38 +106,39 @@ resources:
     cpu: "1"
     memory: 4Gi
 
-# SeaweedFS, the `exchange` store: one all-in-one process (master, volume
-# server, filer and S3 gateway) over a node-local hostPath. Apache-2.0. 4.48 is
-# the release whose STS and session-policy enforcement was probed with the
-# authority's own policy shape; since 4.19 a session policy that grants
-# `s3:PutObject` also allows the multipart calls, as AWS authorizes them,
-# which volume-manager's streamed uploads need. See
-# docs/design/kind-storage-exchange.md for how the stores compared.
-seaweedfs:
+# RustFS, the `exchange` store: one Rust process (Apache-2.0) serving a
+# single-drive store over a node-local hostPath. Its S3 port also answers STS
+# AssumeRole with MinIO's semantics: the caller must be an IAM user, the
+# session's permissions are that user's policy intersected with the request's
+# session policy, and RoleArn is not checked. Each session policy is enforced
+# on every S3 request, with multipart calls under `s3:PutObject` and
+# HeadObject under `s3:GetObject`, as AWS authorizes them. See
+# scratch/rustfs-bakeoff/REPORT.md for how it compared with versitygw.
+rustfs:
   image:
-    repository: chrislusf/seaweedfs
-    tag: "4.48"
+    repository: docker.io/rustfs/rustfs
+    tag: "1.0.1"
+    # The 1.0.1 release's multi-arch index; ghcr.io/rustfs/rustfs serves the
+    # same digest.
+    digest: sha256:1803faef57627e2d9c2e7d89d655d712ddded5389040054987163043fecb6a3c
     pullPolicy: IfNotPresent
-  # Its own directory: the versitygw POSIX layout and SeaweedFS's volume files
-  # are not interchangeable.
-  dataHostPath: /var/lib/space-object-store-seaweedfs
-  # Master and filer ports inside the pod; only the S3 port is a Service.
-  masterPort: 9333
-  filerPort: 8888
-  # 1 GiB volume files, allocated on demand up to the count below. The
-  # default 30 GB volume would exhaust the Kind node's disk after the first
-  # one, and once no slot is free every write fails with
-  # "topo failed to pick 1 from 0 node candidates" (S3 500).
-  volumeSizeLimitMB: 1024
-  volumeMaxCount: 48
-  # The account and role the authority assumes. AssumeRole is admitted only
-  # by the role's trust policy, which names the vend identity alone; the
-  # identity itself holds no S3 permission. The account is the store's
-  # synthetic default; the authority accepts only a 12-digit account
+  # The image's unprivileged user, which must own the data directory.
+  uid: 10001
+  # Its own directory: RustFS's on-disk format is not versitygw's.
+  dataHostPath: /var/lib/space-object-store-rustfs
+  # Ready once storage and IAM have loaded; live while the process answers.
+  readinessPath: /health/ready
+  livenessPath: /health
+  # RustFS's production default (warn) plus its per-request log line.
+  logFilter: warn,rustfs::server::http=info
+  # The role ARN the authority names. RustFS ignores it, but the authority
+  # accepts only a 12-digit account
   # (crates/libs/credential/mgr/server/src/iam_role_arn.rs).
   accountId: "000000000000"
   vendRole: kind-storage-vend
+  # The IAM user the authority signs AssumeRole with, and the name of its
+  # user policy (templates/secret.yaml).
+  vendPolicy: kind-storage-vend
   vendIdentity:
-    name: kind-storage-vend
     accessKey: localvend
     secretKey: localvend-dev-secret

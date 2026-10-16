@@ -625,7 +625,7 @@ k8s_resource(
 # Versity S3 Gateway (versitygw, Apache-2.0; replaced SeaweedFS, which replaced
 # MinIO) is a real S3-compatible object store on the infra node, serving its
 # POSIX backend from a node-local hostPath. With exchanged storage
-# credentials (STORAGE_CREDENTIALS above) the same resource runs SeaweedFS,
+# credentials (STORAGE_CREDENTIALS above) the same resource runs RustFS,
 # whose S3 port also answers STS. The bucket-init Job creates the
 # `snapshots` + `templates` buckets through the S3 API. All are public
 # registry images the kind nodes pull directly, so no `kind load` step is

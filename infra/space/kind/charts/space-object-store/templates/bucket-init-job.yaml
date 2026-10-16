@@ -44,6 +44,25 @@ spec:
               done
               s3 s3api list-buckets --query 'Buckets[].Name' --output text
               echo "buckets {{ .Values.snapshotBucket }} + {{ .Values.templateBucket }} ready"
+              {{- if eq .Values.storageCredentials "exchange" }}
+              {{- $rf := .Values.rustfs }}
+              # The identity the credential-manager authority signs AssumeRole
+              # with, and its user policy, through RustFS's admin API (SigV4
+              # with the root keys). Each call creates or replaces, so a re-run
+              # over the persisted data converges on the same state.
+              admin() {
+                curl -fsS --aws-sigv4 "aws:amz:$AWS_DEFAULT_REGION:s3" \
+                  --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" \
+                  -H 'content-type: application/json' "$@"
+              }
+              admin -X PUT "$endpoint/rustfs/admin/v3/add-user?accessKey=$VEND_ACCESS_KEY_ID" \
+                -d "{\"secretKey\":\"$VEND_SECRET_ACCESS_KEY\",\"status\":\"enabled\"}" >/dev/null
+              admin -X PUT "$endpoint/rustfs/admin/v3/add-canned-policy?name={{ $rf.vendPolicy }}" \
+                --data-binary @/vend/vend-policy.json >/dev/null
+              admin -X POST "$endpoint/rustfs/admin/v3/idp/builtin/policy/attach" \
+                -d "{\"policies\":[\"{{ $rf.vendPolicy }}\"],\"user\":\"$VEND_ACCESS_KEY_ID\"}" >/dev/null
+              echo "vend identity $VEND_ACCESS_KEY_ID ready with policy {{ $rf.vendPolicy }}"
+              {{- end }}
           env:
             - name: AWS_ACCESS_KEY_ID
               valueFrom:
@@ -57,3 +76,26 @@ spec:
                   key: SPACE_OBJECT_STORE_STATIC_SECRET_ACCESS_KEY
             - name: AWS_DEFAULT_REGION
               value: {{ .Values.region | quote }}
+            {{- if eq .Values.storageCredentials "exchange" }}
+            - name: VEND_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: space-object-store
+                  key: STORAGE_VEND_ACCESS_KEY_ID
+            - name: VEND_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: space-object-store
+                  key: STORAGE_VEND_SECRET_ACCESS_KEY
+          volumeMounts:
+            - name: vend
+              mountPath: /vend
+              readOnly: true
+      volumes:
+        - name: vend
+          secret:
+            secretName: space-object-store
+            items:
+              - key: vend-policy.json
+                path: vend-policy.json
+            {{- end }}

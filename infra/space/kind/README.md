@@ -7,7 +7,7 @@ Firecracker microVM), the production worker service set on every sandbox
 node, a dedicated builder role that runs actual ECW recipes, node registration
 through node-ctl → internal-api, templates distributed through the production
 publish/pull path, and real S3 snapshot transit via an in-cluster object store (versitygw, or
-SeaweedFS with STS when storage credentials are exchanged). The
+RustFS with STS when storage credentials are exchanged). The
 remaining deviations from production are listed in "How it differs from
 production" below.
 
@@ -1075,7 +1075,7 @@ kind cluster: space-local (kind-cluster.yaml.tmpl — 6 nodes)
 │   └── identical to worker
 ├── worker3 [pool=infra,    space.pplx.net/infra=true]
 │   ├── space-postgres        (StatefulSet; PostgreSQL 17 serving TLS only, non-superuser master user)
-│   ├── space-object-store    (versitygw S3 gateway, or SeaweedFS with STS, + bucket-init Job)
+│   ├── space-object-store    (versitygw S3 gateway, or RustFS with STS, + bucket-init Job)
 │   ├── space-redis           (Deployment; the rate limiters' store, which api, admin-api and cluster-controller reach through SPACE_REDIS_URL)
 │   ├── space-api             (Deployment, 2–3 replicas by HPA; SPACE_K8S_CONTROL_PLANE=true)
 │   ├── space-admin-api       (Deployment; the same binary on the dedicated admin surface)
@@ -1616,13 +1616,13 @@ asks of the hosting deployment.
 | Per-service pools: the api tier far above the binary's default of 25, internal-api somewhat above it, every other service on the default; no connection pooler | `POSTGRES_POOL_MAX_CONNECTIONS` 100 for space-api and space-admin-api, 30 for internal-api, unset elsewhere; no pooler. `max_connections` (1400) holds every replica's pools at their HPA maxima plus a rollout surge, the migrate Job and headroom, so a service runs out of its own pool before the server refuses it. The pod's memory limit (8 GiB) is sized for that many backends rather than for the suites' usual load |
 | Server logs lock waits; the application roles' `lock_timeout` is off (`SPACE_DB_APP_LOCK_TIMEOUT` `0`) | `log_lock_waits = on`; `SPACE_DB_APP_LOCK_TIMEOUT` is unset, which leaves `lock_timeout` off the same way. Other server parameters are the image's defaults rather than a managed parameter group |
 | The migration Job fails fast: one attempt, no restarts, its deadline passed to the migrator | The same `space-db-migrate` Job shape (`backoffLimit: 0`, `restartPolicy: Never`, `activeDeadlineSeconds` = `SPACE_DB_MIGRATE_JOB_DEADLINE_SECONDS`), bootstrap-roles → migrate → bootstrap-roles. `bootstrap.sh` stops on a failed Job with its logs; rerunning it replaces the Job |
-| S3 for snapshots + template artifacts                     | In-cluster versitygw (real S3 protocol, sigv4, path-style); SeaweedFS, which also serves STS, when `SPACE_KIND_STORAGE_CREDENTIALS=exchange` |
+| S3 for snapshots + template artifacts                     | In-cluster versitygw (real S3 protocol, sigv4, path-style); RustFS, which also serves STS, when `SPACE_KIND_STORAGE_CREDENTIALS=exchange` |
 | Rate limiters (cluster activation admission at the binary defaults, per-client concurrency in `observe`) on a Redis-compatible store reached over TLS (`rediss://`), its URL delivered through the `space-redis` Secret (`app_deploy.tf`) | the same limiters, modes and defaults on the in-cluster `space-redis` Deployment (one in-memory replica on the infra node), reached over plaintext `redis://space-redis:6379` rendered as a literal: the workspace's Redis clients trust only the webpki roots (`tls-rustls-webpki-roots` in `Cargo.toml`), so they would refuse a CA `internal-rpc-tls.sh` could issue, and the `#insecure` URL fragment would be an environment-only switch. `local.rate_limiters_enforce_and_fail_open` shrinks the caps and scales the store to zero for its fail-open half |
 | `SPACE_REDIS_URL` on api, admin-api, cluster-controller and internal-api | on api, admin-api and cluster-controller only: the limiters that read it live in `crates/libs/api` (api and admin-api build both, the cluster-controller's public-operation dispatcher builds the activation limiter), and nothing `space-internal-api-svc` links reads it |
 | `space-credmgr-authority` Deployment whose platform KEK comes from an external intermediate-key broker, with TLS from its own certificate (`credmgr_authority_tls.tf`; the direct KMS backend is gone, `credmgr_authority_kms.tf`) | two replicas on the same broker path against the in-repo broker fixture (`space-kind-key-broker`), which derives keys instead of protecting them; TLS from a self-signed certificate `internal-rpc-tls.sh` issues per cluster |
 | Internal RPC CA and listener leaves issued by Terraform and synced by External Secrets (`internal_rpc_tls.tf`) | the same Secrets issued per cluster by `scripts/internal-rpc-tls.sh`; the ingress activation leaf names `space-api` rather than `space-ingress-activation` |
-| volume-manager gets exact-object sessions through its node's credential-manager agent and the authority, which assumes the S3 vend role through STS | the same path on sandbox workers when `SPACE_KIND_STORAGE_CREDENTIALS=exchange`, against the object store's STS ([Object-store credentials](#object-store-credentials)). By default, and on builders in every mode, static `SPACE_OBJECT_STORE_STATIC_*` creds (the documented local escape hatch): the authority refuses builder-node callers, whose Kubernetes UID no registration records ([Service identities](#service-identities)) |
-| The authority's STS calls are signed by its workload identity and answered by AWS STS | in `exchange` mode, signed by static keys of the store's vend identity, which may only assume the vend role, and answered by the store itself on its S3 port (`AWS_ENDPOINT_URL_STS`); those keys replace `space-aws-creds`, so its optional AWS integrations are off in that mode. In `static` mode no vend role is configured and the storage exchange is disabled |
+| volume-manager gets exact-object (or artifact-prefix) sessions through its node's credential-manager agent and the authority, which assumes the S3 vend role through STS | the same path on sandbox workers when `SPACE_KIND_STORAGE_CREDENTIALS=exchange`, against the object store's STS ([Object-store credentials](#object-store-credentials)). By default, and on builders in every mode, static `SPACE_OBJECT_STORE_STATIC_*` creds (the documented local escape hatch): the authority refuses builder-node callers, whose Kubernetes UID no registration records ([Service identities](#service-identities)) |
+| The authority's STS calls are signed by its workload identity and answered by AWS STS | in `exchange` mode, signed by static keys of the store's vend identity, an IAM user whose policy covers only the two buckets, and answered by the store itself on its S3 port (`AWS_ENDPOINT_URL_STS`); the store ignores the role ARN, so a wrong role or a per-org override is not caught as AWS would; those keys replace `space-aws-creds`, so its optional AWS integrations are off in that mode. In `static` mode no vend role is configured and the storage exchange is disabled |
 | build-manager gets S3 credentials via credential-manager backed by cloud identity | the store's static root keys in both modes, for the same builder-node reason as volume-manager |
 | cluster-controller reaches S3 with its workload identity   | the store's static root keys as `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, in both modes |
 | `/dev/kvm` access via the AMI's kvm group                 | `space-kind-devices.service` makes `/dev/kvm`, `/dev/vhost-vsock` and `/dev/vhost-net` mode 0666 on the node (kind-only; never replicate on a worker) |
@@ -1985,21 +1985,26 @@ object store, for every bring-up path
 - `static` (the default): versitygw, whose root keys volume-manager reads from
   the `space-object-store` Secret. The authority has no vend role, so
   credential-manager's storage exchange is disabled.
-- `exchange`: the same chart runs SeaweedFS, whose S3 port also answers STS.
+- `exchange`: the same chart runs RustFS, whose S3 port also answers STS.
   The authority gets the settings a deployment uses for the exchange: a vend
   role (`SPACE_CREDMGR_S3_VEND_ROLE_ARN`), base credentials from its AWS
   default chain, and the STS endpoint through the SDK's
   `AWS_ENDPOINT_URL_STS`. Sandbox workers' volume-manager gets no object-store
   keys, so every snapshot and template transfer asks its node's
-  credential-manager agent for a session scoped to that one object. The agent
-  forwards the request to the authority, which checks the caller and the
-  subject's placement and storage, and assumes the vend role with an
-  exact-object session policy. SeaweedFS refuses a session's request for any
-  other object. The vend role's trust policy admits only the vend identity
-  the authority signs with, and that identity has no S3 permission of its
-  own. Builders, build-manager and cluster-controller keep the root keys (see
-  the differences table). The store comparison behind this choice is in
-  [docs/design/kind-storage-exchange.md](../../../docs/design/kind-storage-exchange.md).
+  credential-manager agent for a session scoped to that one object, or to
+  one artifact prefix. The agent forwards the request to the authority, which
+  checks the caller and the subject's placement and storage, and assumes the
+  vend role with a session policy for that object or prefix. RustFS refuses a
+  session's request for anything else. RustFS has no roles: it accepts any
+  well-formed `RoleArn`, and a session gets the signing identity's own user
+  policy intersected with the session policy. The bucket-init Job creates
+  that vend identity, whose policy covers only the `snapshots` and
+  `templates` buckets; unlike an AWS role it also applies to the identity's
+  own keys, which only the authority holds. Builders, build-manager and
+  cluster-controller keep the root keys (see the differences table). The
+  store comparisons behind this choice are in
+  [docs/design/kind-storage-exchange.md](../../../docs/design/kind-storage-exchange.md)
+  and `scratch/rustfs-bakeoff/REPORT.md`.
 
 Pick the mode when the cluster is created and keep it set for every later
 bring-up and smoke run of that cluster:
@@ -2008,8 +2013,8 @@ bring-up and smoke run of that cluster:
 SPACE_KIND_STORAGE_CREDENTIALS=exchange bash scripts/tests/smoke-kind-e2e.sh
 ```
 
-The two stores keep their data in different directories (SeaweedFS's under
-`/var/lib/space-object-store-seaweedfs` on the infra node) and share none, so
+The two stores keep their data in different directories (RustFS's under
+`/var/lib/space-object-store-rustfs` on the infra node) and share none, so
 the transition check below refuses a bring-up that would switch an existing
 cluster's mode. The object store's Deployment records its mode in the
 `space.pplx.net/kind-storage-credentials` label.

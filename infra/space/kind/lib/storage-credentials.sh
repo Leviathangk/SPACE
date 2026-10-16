@@ -6,10 +6,11 @@
 #
 #   static    (default) the versitygw object store; volume-manager,
 #             build-manager and cluster-controller read its static keys.
-#   exchange  the SeaweedFS object store with STS. The credential-manager
-#             authority vends each transfer an exact-object session through
-#             AssumeRole, as deployments do, and volume-manager on the sandbox
-#             workers holds no object-store keys. See "Object-store
+#   exchange  the RustFS object store with STS. The credential-manager
+#             authority vends each transfer a session scoped to its object
+#             or artifact prefix through AssumeRole, as deployments do, and
+#             volume-manager on the sandbox workers holds no object-store
+#             keys. See "Object-store
 #             credentials" in infra/space/kind/README.md.
 #
 # The two stores share no data, so the mode is fixed when a cluster is

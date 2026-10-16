@@ -41,111 +41,91 @@ spec:
       priorityClassName: {{ .Values.priorityClassName }}
       terminationGracePeriodSeconds: 10
 {{- if $exchange }}
+{{- $rf := .Values.rustfs }}
       initContainers:
-        # SeaweedFS signs STS session tokens with this key and refuses to
-        # serve STS without one. It is generated on the store's first start
-        # and kept in its data directory, so sessions survive a restart and
-        # the key lives exactly as long as the objects it guards.
-        - name: sts-signing-key
-          image: "{{ .Values.seaweedfs.image.repository }}:{{ .Values.seaweedfs.image.tag }}"
-          imagePullPolicy: {{ .Values.seaweedfs.image.pullPolicy }}
-          command:
-            - /bin/sh
-            - -c
-            - |
-              set -eu
-              key=/data/.sts-signing-key
-              if [ ! -s "$key" ]; then
-                (umask 077 && head -c 32 /dev/urandom | base64 >"$key.tmp")
-                mv "$key.tmp" "$key"
-              fi
-              cp /config-template/s3.json /etc/seaweedfs/s3.json
-              sed "s|@STS_SIGNING_KEY@|$(cat "$key")|" /config-template/iam.json.tmpl \
-                >/etc/seaweedfs/iam.json
+        # RustFS runs as its image's unprivileged user, and a hostPath that
+        # DirectoryOrCreate makes is root-owned, so hand the data directory
+        # to that user before the server starts. Idempotent on a restart.
+        - name: data-owner
+          image: "{{ $rf.image.repository }}:{{ $rf.image.tag }}@{{ $rf.image.digest }}"
+          imagePullPolicy: {{ $rf.image.pullPolicy }}
+          command: ["/bin/sh", "-c", "chown {{ $rf.uid }}:{{ $rf.uid }} /data && chmod 0750 /data"]
+          securityContext:
+            runAsUser: 0
           volumeMounts:
             - name: data
               mountPath: /data
-            - name: config-template
-              mountPath: /config-template
-              readOnly: true
-            - name: config
-              mountPath: /etc/seaweedfs
       containers:
         - name: object-store
-          image: "{{ .Values.seaweedfs.image.repository }}:{{ .Values.seaweedfs.image.tag }}"
-          imagePullPolicy: {{ .Values.seaweedfs.image.pullPolicy }}
-          # All-in-one master, volume server, filer and S3 gateway. It binds and
-          # advertises the pod IP so the probes and the Service reach every
-          # port. The S3 gateway also answers STS on its port, configured by
-          # -s3.iam.config (templates/secret.yaml).
-          command: ["weed"]
-          args:
-            - server
-            - -dir=/data
-            - -ip=$(POD_IP)
-            - -master.port={{ .Values.seaweedfs.masterPort }}
-            - -master.volumeSizeLimitMB={{ .Values.seaweedfs.volumeSizeLimitMB }}
-            - -volume.max={{ .Values.seaweedfs.volumeMaxCount }}
-            - -filer
-            - -filer.port={{ .Values.seaweedfs.filerPort }}
-            - -s3
-            - -s3.port={{ .Values.service.s3Port }}
-            - -s3.config=/etc/seaweedfs/s3.json
-            - -s3.iam.config=/etc/seaweedfs/iam.json
+          image: "{{ $rf.image.repository }}:{{ $rf.image.tag }}@{{ $rf.image.digest }}"
+          imagePullPolicy: {{ $rf.image.pullPolicy }}
+          # One single-drive server over the data directory. Its S3 port also
+          # answers STS AssumeRole (POST /, Action=AssumeRole). The root
+          # account is the admin keys below; the bucket-init Job creates the
+          # vend identity and its policy through the admin API on the same
+          # port.
           env:
-            - name: POD_IP
+            - name: RUSTFS_ADDRESS
+              value: ":{{ .Values.service.s3Port }}"
+            - name: RUSTFS_VOLUMES
+              value: /data
+            - name: RUSTFS_REGION
+              value: {{ .Values.region | quote }}
+            - name: RUSTFS_ACCESS_KEY
               valueFrom:
-                fieldRef:
-                  fieldPath: status.podIP
+                secretKeyRef:
+                  name: space-object-store
+                  key: SPACE_OBJECT_STORE_STATIC_ACCESS_KEY_ID
+            - name: RUSTFS_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: space-object-store
+                  key: SPACE_OBJECT_STORE_STATIC_SECRET_ACCESS_KEY
+            - name: RUSTFS_CONSOLE_ENABLE
+              value: "false"
+            # Logs to stdout rather than files under /logs, with one line per
+            # completed request, as versitygw prints by default. RustFS
+            # demotes its request log to WARN unless the target is named.
+            - name: RUSTFS_OBS_LOG_STDOUT_ENABLED
+              value: "true"
+            - name: RUSTFS_OBS_LOG_DIRECTORY
+              value: ""
+            - name: RUST_LOG
+              value: {{ $rf.logFilter | quote }}
           ports:
             - name: s3
               containerPort: {{ .Values.service.s3Port }}
               protocol: TCP
-          # The S3 port answers after master, volume server and filer are up,
-          # about 13 s on an idle node and longer under load, so readiness waits
-          # on it with the same slow failure budget as versitygw's, and
-          # liveness allows the start before it counts.
+          # Ready once storage and IAM are loaded (about half a second on an
+          # idle node). Fails slowly for the same reason as versitygw's below.
           readinessProbe:
             httpGet:
-              path: {{ .Values.healthPath }}
+              path: {{ $rf.readinessPath }}
               port: s3
-            initialDelaySeconds: 5
+            initialDelaySeconds: 1
             periodSeconds: 5
             failureThreshold: 12
           livenessProbe:
             httpGet:
-              path: {{ .Values.healthPath }}
+              path: {{ $rf.livenessPath }}
               port: s3
-            initialDelaySeconds: 60
+            initialDelaySeconds: 10
             periodSeconds: 20
             failureThreshold: 6
           volumeMounts:
             - name: data
               mountPath: /data
-            - name: config
-              mountPath: /etc/seaweedfs
-              readOnly: true
           {{- with .Values.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
       volumes:
         # hostPath for the same reason as versitygw's below, in its own
-        # directory.
+        # directory: RustFS's on-disk format is its own.
         - name: data
           hostPath:
-            path: {{ .Values.seaweedfs.dataHostPath }}
+            path: {{ $rf.dataHostPath }}
             type: DirectoryOrCreate
-        - name: config-template
-          secret:
-            secretName: space-object-store
-            items:
-              - key: s3.json
-                path: s3.json
-              - key: iam.json.tmpl
-                path: iam.json.tmpl
-        - name: config
-          emptyDir: {}
 {{- else }}
       containers:
         - name: object-store

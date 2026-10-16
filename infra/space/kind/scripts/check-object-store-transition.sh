@@ -16,7 +16,7 @@
 # transition" in infra/space/kind/README.md.
 #
 # The same holds between the two storage credentials modes: `static` runs
-# versitygw and `exchange` runs SeaweedFS, both behind `object-store:8333`,
+# versitygw and `exchange` runs RustFS, both behind `object-store:8333`,
 # so recorded locations would resolve to a store that never held the objects.
 # The object store's Deployment carries the mode it was created with; one
 # without the label predates the modes and ran versitygw, which is `static`.

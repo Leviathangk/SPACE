@@ -212,11 +212,12 @@ spec:
             # assumes it through STS for every exchange with an exact-object
             # session policy (assume_s3_vend_role,
             # crates/libs/credential/mgr/server/src/service.rs). Kind's STS
-            # is the object store itself (space-object-store, SeaweedFS in
-            # this mode), reached through the AWS SDK's service endpoint
-            # setting. The base credentials are the store's vend identity,
-            # which may only assume that role; a deployment's come from its
-            # workload identity. They take the place of space-aws-creds: one
+            # is the object store itself (space-object-store, RustFS in this
+            # mode), reached through the AWS SDK's service endpoint setting.
+            # The base credentials are the store's vend identity, an IAM user
+            # whose own policy covers only the two buckets and bounds every
+            # session it assumes; a deployment's come from its workload
+            # identity. They take the place of space-aws-creds: one
             # default credential chain cannot sign for two accounts.
             - name: SPACE_CREDMGR_S3_VEND_ROLE_ARN
               valueFrom:
