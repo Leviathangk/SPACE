@@ -408,9 +408,12 @@ A root that links to the context that caused it records that context's trace
 id as `origin_trace_id`, since a link is not searchable, and whether it was
 sampled as `origin_sampled`. Its sampling follows that origin: it is kept when
 any origin it links to was sampled and dropped when none was, so a kept
-request keeps the work it caused. A root with no origin, and every span with a
-parent, keeps the configured sampler. Under OTLP the sampler that
-`OTEL_TRACES_SAMPLER` selects is wrapped to read the root's links. The native
+request keeps the work it caused. A root with no origin keeps the configured
+sampler. Under OTLP the sampler that `OTEL_TRACES_SAMPLER` selects is wrapped
+to read the root's links. The shim's wrapper also makes every span with a
+parent follow it, sampled or recorded unsampled, so a sampler that is not
+parent-based, such as Kind's `always_on`, cannot sample the children of a
+dropped `shim.create` and send their sampled `traceparent` on. The native
 Datadog samplers do not read links, so two sampling rules on
 `origin_sampled`, ahead of the ones `DD_TRACE_SAMPLING_RULES` configures,
 keep (`1.0`) or drop (`0.0`) such a root. The Rust services and the shim

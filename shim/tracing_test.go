@@ -7,6 +7,7 @@ import (
 	"flag"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"testing"
 
@@ -16,6 +17,7 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -153,18 +155,19 @@ func TestOTLPSamplingConfiguration(t *testing.T) {
 	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://127.0.0.1:1")
 	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "grpc")
 	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "deployment.environment.name=prod,malformed_no_equals,team=space")
+	// A root takes the configured sampler; a span with a parent follows the
+	// parent whatever that sampler is.
 	for _, policy := range []struct {
-		name                     string
-		arg                      string
-		root, sampled, unsampled bool
+		name, arg string
+		root      bool
 	}{
-		{"always_on", "", true, true, true},
-		{"always_off", "", false, false, false},
-		{"parentbased_always_on", "", true, true, false},
-		{"parentbased_always_off", "", false, true, false},
-		{"traceidratio", "0", false, false, false},
-		{"traceidratio", "1", true, true, true},
-		{"parentbased_traceidratio", "0", false, true, false},
+		{"always_on", "", true},
+		{"always_off", "", false},
+		{"parentbased_always_on", "", true},
+		{"parentbased_always_off", "", false},
+		{"traceidratio", "0", false},
+		{"traceidratio", "1", true},
+		{"parentbased_traceidratio", "0", false},
 	} {
 		t.Run(policy.name+policy.arg, func(t *testing.T) {
 			t.Setenv("OTEL_TRACES_SAMPLER", policy.name)
@@ -181,7 +184,7 @@ func TestOTLPSamplingConfiguration(t *testing.T) {
 			for _, input := range []struct {
 				flags string
 				want  bool
-			}{{"", policy.root}, {"01", policy.sampled}, {"00", policy.unsampled}} {
+			}{{"", policy.root}, {"01", true}, {"00", false}} {
 				ctx := context.Background()
 				if input.flags != "" {
 					ctx = tracePropagation.Extract(ctx, propagation.MapCarrier{"traceparent": "00-69f2ccfd00000000e88861448bd50939-ea1dc2f49db4d7a9-" + input.flags})
@@ -193,6 +196,120 @@ func TestOTLPSamplingConfiguration(t *testing.T) {
 				span.End(nil)
 			}
 		})
+	}
+}
+
+// exportingOTLPPipeline is the OTLP pipeline with OTEL_TRACES_SAMPLER set to
+// sampler, exporting synchronously to the returned exporter. Like the
+// batcher, the syncer exports only sampled spans.
+func exportingOTLPPipeline(t *testing.T, sampler, arg string) (*otlpTracePipeline, *tracetest.InMemoryExporter) {
+	t.Helper()
+	t.Setenv("OTEL_TRACES_SAMPLER", sampler)
+	t.Setenv("OTEL_TRACES_SAMPLER_ARG", arg)
+	exporter := tracetest.NewInMemoryExporter()
+	provider := sdktrace.NewTracerProvider(
+		sdktrace.WithSyncer(exporter),
+		sdktrace.WithSampler(followOrigin{configured: configuredSampler()}),
+	)
+	t.Cleanup(func() {
+		if err := provider.Shutdown(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	return &otlpTracePipeline{tracer: provider.Tracer("test"), provider: provider}, exporter
+}
+
+// linkedCreate starts shim.create linked to an origin with the given trace
+// flags, and shim.sbxmgr.create under it, and returns both spans' contexts,
+// the traceparent the child would send on, and the names of the spans
+// exported once both end.
+func linkedCreate(t *testing.T, p *otlpTracePipeline, exporter *tracetest.InMemoryExporter, flags string) (root, child trace.SpanContext, traceparent string, exported []string) {
+	t.Helper()
+	origin := propagation.MapCarrier{
+		"traceparent": "00-69f2ccfd00000000e88861448bd50939-ea1dc2f49db4d7a9-" + flags,
+	}
+	rootSpan, ctx := p.startLinked(context.Background(), "shim.create", origin)
+	childSpan, childCtx := p.start(ctx, "shim.sbxmgr.create")
+	outgoing := propagation.MapCarrier{}
+	p.inject(childCtx, outgoing)
+	root = rootSpan.(otlpSpan).SpanContext()
+	child = childSpan.(otlpSpan).SpanContext()
+	childSpan.End(nil)
+	rootSpan.End(nil)
+	for _, span := range exporter.GetSpans() {
+		exported = append(exported, span.Name)
+	}
+	return root, child, outgoing["traceparent"], exported
+}
+
+func traceparentFlags(t *testing.T, traceparent string) string {
+	t.Helper()
+	parts := strings.Split(traceparent, "-")
+	if len(parts) != 4 {
+		t.Fatalf("malformed traceparent %q", traceparent)
+	}
+	return parts[3]
+}
+
+// A sampler that is not parent-based leaves a linked root to its origin and
+// its children to the root: a sampled origin keeps both and sends a sampled
+// traceparent on.
+func TestAlwaysOnKeepsTheCreateOfASampledOrigin(t *testing.T) {
+	p, exporter := exportingOTLPPipeline(t, "always_on", "")
+	root, child, traceparent, exported := linkedCreate(t, p, exporter, "01")
+	if !root.IsSampled() || !child.IsSampled() {
+		t.Fatalf("root sampled=%t child sampled=%t, want both sampled", root.IsSampled(), child.IsSampled())
+	}
+	if want := []string{"shim.sbxmgr.create", "shim.create"}; !slices.Equal(exported, want) {
+		t.Fatalf("exported %v, want %v", exported, want)
+	}
+	if flags := traceparentFlags(t, traceparent); flags != "01" {
+		t.Fatalf("outgoing traceparent %q carries flags %s, want 01", traceparent, flags)
+	}
+}
+
+// always_on would sample every span with a parent: under a root dropped with
+// its unsampled origin, shim.sbxmgr.create would export without its root and
+// send a sampled traceparent to sandbox-manager.
+func TestAlwaysOnKeepsTheCreateOfAnUnsampledOriginUnsampled(t *testing.T) {
+	p, exporter := exportingOTLPPipeline(t, "always_on", "")
+	root, child, traceparent, exported := linkedCreate(t, p, exporter, "00")
+	if root.IsSampled() || child.IsSampled() {
+		t.Fatalf("root sampled=%t child sampled=%t, want neither sampled", root.IsSampled(), child.IsSampled())
+	}
+	if len(exported) != 0 {
+		t.Fatalf("exported %v, want nothing", exported)
+	}
+	if flags := traceparentFlags(t, traceparent); flags != "00" {
+		t.Fatalf("outgoing traceparent %q carries flags %s, want 00", traceparent, flags)
+	}
+}
+
+// A child follows a sampled parent even when the configured sampler would
+// sample nothing, and keeps its parent's tracestate.
+func TestSampledParentKeepsChildUnderZeroRatio(t *testing.T) {
+	p, exporter := exportingOTLPPipeline(t, "traceidratio", "0")
+	root, ctx := p.startLinked(context.Background(), "shim.create", propagation.MapCarrier{
+		"traceparent": "00-69f2ccfd00000000e88861448bd50939-ea1dc2f49db4d7a9-01",
+	})
+	parent := root.(otlpSpan).SpanContext()
+	state, err := trace.ParseTraceState("space=kept")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx = trace.ContextWithSpanContext(ctx, parent.WithTraceState(state))
+	child, _ := p.start(ctx, "shim.sbxmgr.create")
+	got := child.(otlpSpan).SpanContext()
+	child.End(nil)
+	root.End(nil)
+	if !got.IsSampled() {
+		t.Fatal("child of a sampled parent unsampled under traceidratio 0")
+	}
+	if got.TraceState().String() != "space=kept" {
+		t.Fatalf("child tracestate %q, want the parent's space=kept", got.TraceState().String())
+	}
+	if len(exporter.GetSpans()) != 2 {
+		t.Fatalf("exported %d spans, want root and child", len(exporter.GetSpans()))
 	}
 }
 

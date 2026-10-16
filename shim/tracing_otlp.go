@@ -56,7 +56,7 @@ func newOTLPTracePipeline() (tracePipeline, error) {
 		return nil, fmt.Errorf("OTLP trace exporter: %w", err)
 	}
 	// SDK v1.41 reads OTEL_BSP_* itself; the sampler OTEL_TRACES_SAMPLER
-	// selects is wrapped to follow a linked root's origin.
+	// selects is wrapped to follow a linked root's origin and a span's parent.
 	// The default batch queue is bounded and drops on overflow without blocking.
 	provider := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exporter),
@@ -103,13 +103,23 @@ func (p *otlpTracePipeline) shutdown(ctx context.Context) error {
 
 // followOrigin keeps or drops a root that links to an origin as the origin was
 // sampled, so a kept request keeps the work it caused, as the Rust services'
-// sampler does. A root without a valid link, and every span with a parent,
-// keeps the sampler OTEL_TRACES_SAMPLER selects.
+// sampler does. A root without a valid link keeps the sampler
+// OTEL_TRACES_SAMPLER selects. A span with a parent follows its parent
+// whatever that sampler is: one that is not parent-based, such as always_on or
+// traceidratio, would otherwise sample the children of a dropped root, which
+// would export without it and propagate a sampled traceparent from an
+// unsampled origin. As in the Rust sampler, a span under an unsampled parent is
+// recorded but not sampled; the shim's only span processor, the batcher,
+// exports sampled spans alone, so none of it leaves the shim.
 type followOrigin struct{ configured sdktrace.Sampler }
 
 func (f followOrigin) ShouldSample(p sdktrace.SamplingParameters) sdktrace.SamplingResult {
-	if trace.SpanContextFromContext(p.ParentContext).IsValid() {
-		return f.configured.ShouldSample(p)
+	if parent := trace.SpanContextFromContext(p.ParentContext); parent.IsValid() {
+		decision := sdktrace.RecordOnly
+		if parent.IsSampled() {
+			decision = sdktrace.RecordAndSample
+		}
+		return sdktrace.SamplingResult{Decision: decision, Tracestate: parent.TraceState()}
 	}
 	linked, sampled := false, false
 	for _, link := range p.Links {
