@@ -366,7 +366,9 @@ impl SandboxManagerService {
             .map_err(pplx_space_common_grpc::mark_guest_path_not_found)?;
         // A missing directory can surface on the first entry rather than on
         // open, so entries get the same marking.
-        let stream = futures_util::StreamExt::map(stream, |entry| entry.map_err(pplx_space_common_grpc::mark_guest_path_not_found));
+        let stream = futures_util::StreamExt::map(stream, |entry| {
+            entry.map_err(pplx_space_common_grpc::mark_guest_path_not_found)
+        });
         Ok(Response::new(fence_status_stream(
             forward_host_stream(stream, Ok),
             identity_token,
