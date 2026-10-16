@@ -24,7 +24,7 @@ Clients that got usable credentials from it: the authority's
 `AssumeRoleProvider` code (aws-config 1.12.0, aws-sdk-sts 1.114.0), the
 SDK's `assume_role` call, aws CLI v2 (botocore) and `curl --aws-sigv4`.
 
-Size: 744 lines of Go including comments (611 non-blank, non-comment), standard
+Size: 744 lines of Go including comments (651 non-blank, non-comment), standard
 library only; a 10 MB static binary. The request path (SigV4 verification and
 the STS translation) is `sigv4.go` + `sts.go`, 425 lines; `oidc.go` (issuer,
 token minting, test key generation) and `main.go` (flags) are the rest.
