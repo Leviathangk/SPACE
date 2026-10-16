@@ -107,7 +107,9 @@ setup() {
     s3 head-bucket --bucket $b >/dev/null 2>&1 || s3 create-bucket --bucket $b >/dev/null
   done
   iam delete-open-id-connect-provider --open-id-connect-provider-arn "$PROVIDER_ARN" >/dev/null 2>&1 || true
-  iam create-open-id-connect-provider --url "$ISSUER" --client-id-list $AUDIENCE \
+  # A second client ID the trust policy does not name: the trust check, not
+  # only the provider's list, must refuse it.
+  iam create-open-id-connect-provider --url "$ISSUER" --client-id-list $AUDIENCE kind-other-client \
     --thumbprint-list "$(cat "$STATE/keys/ca.sha1")" >/dev/null
   for r in "$ROLE:$SUBJECT" "$OTHER_ROLE:someone-else"; do
     name=${r%%:*} sub=${r#*:}

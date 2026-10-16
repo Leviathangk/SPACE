@@ -1,0 +1,8 @@
+baseline: session GET 200, root GET 200, bridge AssumeRole (curl --aws-sigv4) 200 
+IAM service stopped: session GET 500, root GET 200, bridge AssumeRole 503 <Code>ServiceUnavailable
+IAM service restarted: session GET 200, root GET 200, bridge AssumeRole 200 
+gateway ready in 0.256 s
+gateway restarted: session GET 200, root GET 200
+bridge restarted: session GET 200, bridge AssumeRole 200 
+bridge stopped: session GET 200, bridge AssumeRole 000 
+bridge started: bridge AssumeRole 200 
