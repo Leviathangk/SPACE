@@ -86,6 +86,33 @@ async fn open_pool_disk_survives_encryption_and_reopen() {
         .write(true)
         .open(&prepared.mapper_path)
         .unwrap();
+    // Firecracker seeks the new disk while opening it. A buffered probe must
+    // not hold that seek behind I/O on an already suspended mapper.
+    let probe = disk.try_clone().unwrap();
+    let probe = tokio::task::spawn_blocking(move || probe.read_exact_at(&mut [0; 4096], 0));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let mut sizing = disk.try_clone().unwrap();
+    let mut sizing = tokio::task::spawn_blocking(move || {
+        std::io::Seek::seek(&mut sizing, std::io::SeekFrom::End(0))
+    });
+    let sized = tokio::time::timeout(std::time::Duration::from_secs(1), &mut sizing).await;
+    let probe_finished = probe.is_finished();
+    if sized.is_err() || !probe_finished {
+        run("dmsetup", &["resume", &composite]).await.unwrap();
+    }
+    if sized.is_err() {
+        sizing.await.unwrap().unwrap();
+    }
+    probe.await.unwrap().unwrap();
+    assert_eq!(
+        sized
+            .expect("drive sizing must finish before suspension")
+            .unwrap()
+            .unwrap(),
+        64 * 1024 * 1024
+    );
+    assert!(probe_finished);
+    suspend_device(&composite).await.unwrap();
     let started = std::time::Instant::now();
     let queued_path = prepared.mapper_path.clone();
     let mut queued = Some(tokio::task::spawn_blocking(move || {
@@ -121,6 +148,7 @@ async fn open_pool_disk_survives_encryption_and_reopen() {
         .expect("failed adoption must release queued I/O")
         .unwrap();
     for attempt in 0..4 {
+        let mut seed_probe = None;
         if attempt > 0 {
             // Reconstruct a crash after the encrypted backing was committed
             // but before the suspended linear target was replaced.
@@ -152,7 +180,19 @@ async fn open_pool_disk_survives_encryption_and_reopen() {
                 run("dmsetup", &["create", &seed, "--table", &table])
                     .await
                     .unwrap();
+                let mut options = std::fs::File::options();
+                options.read(true);
+                #[cfg(target_os = "linux")]
+                options.custom_flags(libc::O_DIRECT);
+                let probe = options.open(format!("/dev/mapper/{seed}")).unwrap();
                 suspend_device(&seed).await.unwrap();
+                // A background device probe can hold a read on the suspended
+                // seed. Recovery must fail that read without touching guest I/O.
+                seed_probe = Some(tokio::task::spawn_blocking(move || {
+                    let mut buffer = vec![0; 8192];
+                    let start = buffer.as_ptr().align_offset(4096);
+                    probe.read_at(&mut buffer[start..start + 4096], 0)
+                }));
                 run("dmsetup", &["reload", &composite, "--table", &table])
                     .await
                     .unwrap();
@@ -173,7 +213,13 @@ async fn open_pool_disk_survives_encryption_and_reopen() {
             &dek,
         )
         .await
-        .unwrap();
+        .unwrap_or_else(|error| panic!("encryption attempt {attempt}: {error}"));
+        if let Some(probe) = seed_probe {
+            assert_eq!(
+                probe.await.unwrap().unwrap_err().raw_os_error(),
+                Some(libc::EIO)
+            );
+        }
         assert!(!dm_exists(&format!("{composite}-seed")).await.unwrap());
         if let Some(queued) = queued.take() {
             queued.await.unwrap();

@@ -64,8 +64,8 @@ fn retain_warm_rootfs(origin: &Path) -> std::io::Result<PathBuf> {
     Ok(warm)
 }
 
-/// Hold requests dispatched after the Sync Firecracker engine switches drives.
-/// PATCH is serialized with its synchronous I/O; it does not drain async I/O.
+/// Prepare the disk for the paused Sync Firecracker engine to open and size.
+/// Suspending before PATCH can strand its seek behind a buffered device probe.
 #[tracing::instrument(name = "pool_adoption.prepare_drive", skip_all, err)]
 pub(crate) async fn prepare_pool_drive_switch(
     sandbox_id: SandboxId,
@@ -75,8 +75,7 @@ pub(crate) async fn prepare_pool_drive_switch(
     let warm = device_backing::blocking(move || retain_warm_rootfs(&path)).await?;
     let composite = composite_name(&sandbox_id);
     let mapper_path = PathBuf::from(format!("/dev/mapper/{composite}"));
-    let fresh = !dm_exists(&composite).await?;
-    if !fresh {
+    if dm_exists(&composite).await? {
         let table = run("dmsetup", &["table", &composite]).await?;
         let table = String::from_utf8_lossy(&table);
         let backing = match table.split_whitespace().nth(2) {
@@ -102,17 +101,6 @@ pub(crate) async fn prepare_pool_drive_switch(
         let table = format!("0 {sectors} linear {} 0", device.path().display());
         run("dmsetup", &["create", &composite, "--table", &table]).await?;
         run("dmsetup", &["mknodes", &composite]).await?;
-    }
-    suspend_device(&composite).await?;
-    if fresh {
-        // Discard speculative udev reads before Firecracker opens the mapper.
-        // Never flush a reused suspended device: it may already hold guest I/O.
-        run_bounded(
-            "blockdev",
-            &["--flushbufs", &mapper_path.to_string_lossy()],
-            FREEZE_COMMAND_BUDGET,
-        )
-        .await?;
     }
     Ok(PreparedRootfs { mapper_path })
 }
@@ -164,6 +152,9 @@ pub(crate) async fn encrypt_pool_rootfs(
     dek: &[u8],
 ) -> Result<PreparedRootfs, DmCryptError> {
     let composite = composite_name(&sandbox_id);
+    suspend_device(&composite)
+        .instrument(tracing::info_span!("pool_adoption.freeze_drive"))
+        .await?;
     let cow = cow_mapper_name(&sandbox_id);
     let seed = format!("{composite}-seed");
     let mapper_path = PathBuf::from(format!("/dev/mapper/{composite}"));
@@ -223,7 +214,7 @@ pub(crate) async fn encrypt_pool_rootfs(
             // A crash may leave a pending handover. Discard its inactive
             // destination before removing the source and reopening the COW.
             run_bounded("dmsetup", &["clear", &composite], FREEZE_COMMAND_BUDGET).await?;
-            ReleaseDevice::Snapshot(&seed).run().await?;
+            discard_seed(&seed).await?;
         }
     } else {
         // No published COW means Firecracker is still held on the linear target.
@@ -235,7 +226,7 @@ pub(crate) async fn encrypt_pool_rootfs(
             ));
         }
         if dm_exists(&seed).await? {
-            ReleaseDevice::Snapshot(&seed).run().await?;
+            discard_seed(&seed).await?;
         }
         if dm_exists(&cow).await? {
             ReleaseDevice::Crypt(&cow).run().await?;
@@ -323,12 +314,22 @@ pub(crate) async fn encrypt_pool_rootfs(
         if dm_exists(&seed).await? {
             // Resuming the destination transfers the suspended seed's exception
             // store in memory; removing the seed first forces a metadata reread.
-            ReleaseDevice::Snapshot(&seed).run().await?;
+            discard_seed(&seed).await?;
         }
         Ok(PreparedRootfs { mapper_path })
     }
     .instrument(tracing::info_span!("pool_adoption.commit_drive"))
     .await
+}
+
+async fn discard_seed(seed: &str) -> Result<(), DmCryptError> {
+    // The seed never serves guest I/O. If a probing read holds it open while
+    // suspended, fail that I/O; ordinary removal avoids an extra table switch.
+    match run("dmsetup", &["remove", seed]).await {
+        Ok(_) => Ok(()),
+        Err(DmCryptError::Command { .. }) => ReleaseDevice::DiscardSnapshot(seed).run().await,
+        Err(error) => Err(error),
+    }
 }
 
 async fn suspend_device(composite: &str) -> Result<(), DmCryptError> {

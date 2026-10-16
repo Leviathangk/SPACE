@@ -7,6 +7,8 @@ use std::os::fd::AsFd;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+
 pub(crate) const PROBE_BUDGET: Duration = Duration::from_secs(5);
 pub(crate) const MUTATION_BUDGET: Duration = Duration::from_secs(120);
 const OUTPUT_LIMIT: usize = 1024 * 1024;
@@ -115,6 +117,19 @@ fn capture(
     mut input: &[u8],
     cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> io::Result<Output> {
+    // Exit readiness avoids charging every short command a full polling tick.
+    // Unsupported kernels retain the bounded I/O and cancellation polling.
+    #[cfg(target_os = "linux")]
+    let exit = rustix::process::pidfd_open(
+        rustix::process::Pid::from_child(&child.0),
+        rustix::process::PidfdFlags::empty(),
+    )
+    .ok();
+    #[cfg(not(target_os = "linux"))]
+    let exit: Option<std::os::fd::OwnedFd> = None;
+    let mut exit_poll = exit
+        .as_ref()
+        .map(|fd| PollFd::new(fd.as_fd(), PollFlags::POLLIN));
     let mut stdin = child.0.stdin.take();
     let mut stdout = child.0.stdout.take();
     let mut stderr = child.0.stderr.take().expect("stderr configured as piped");
@@ -172,7 +187,13 @@ fn capture(
                 format!("host command exceeded {budget:?}; terminating and reaping"),
             ));
         }
-        std::thread::sleep(POLL_INTERVAL.min(budget.saturating_sub(started.elapsed())));
+        let timeout =
+            PollTimeout::try_from(POLL_INTERVAL.min(budget.saturating_sub(started.elapsed())))
+                .map_err(io::Error::other)?;
+        match poll(exit_poll.as_mut_slice(), timeout) {
+            Ok(_) | Err(nix::errno::Errno::EINTR) => {}
+            Err(error) => return Err(error.into()),
+        }
     }
 }
 
