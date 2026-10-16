@@ -63,6 +63,8 @@ _DURATION_SECONDS = {
         # quarantine discovery and the real 60 s / 120 s retry gaps.
         "local.quarantine_recovery_backs_off": 260,
         "local.rate_limiters_enforce_and_fail_open": 60,
+        # Measured 135 s; the API holds the faulted connect 120 s before it answers.
+        "local.restore_rollback_late_retry_keeps_original_snapshot": 140,
         "local.retention_claim_finish_forward": 80,
         "local.retention_restore_source_guard": 107,
         "local.snapshot_reaper_reclaims_backed_fork_snapshot": 147,
