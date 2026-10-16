@@ -1,0 +1,335 @@
+
+### B2. Store frozen mid-upload — rustfs
+
+| # | Check | Expected | Observed | Result |
+|---|---|---|---|---|
+| B2.1 | single 200 MiB, frozen 7 s at +2.0 s | never a short or wrong object | client: Ok(209715200) after 16.90 s; 1 failed attempt(s): PutObject[single-7s] #1 stalled_stream  after 8542 ms (retry=true) \| stored: +79s identical (209715200 bytes, sha256 5710dfdee293…) | PASS |
+| B2.2 | single 200 MiB, frozen 17 s at +2.0 s | never a short or wrong object | client: Ok(209715200) after 26.93 s; 2 failed attempt(s): PutObject[single-17s] #1 stalled_stream  after 8539 ms (retry=true); PutObject[single-17s] #2 stalled_stream  after 6014 ms (retry=true) \| stored: +89s identical (209715200 bytes, sha256 616690527677…) | PASS |
+| B2.3 | single 200 MiB, frozen 25 s at +2.0 s | never a short or wrong object | client: Err(S3 put_object failed: dispatch failure: timeout: minimum throughput was specified at 1 B/s, but throughput of 0 B/s was observed (DispatchFailure(DispatchFailure { source: ConnectorError { kind: Timeout, source: ThroughputBelowMinimum { expected: Throughput { bytes_read: 1, per_time_elapsed: 1s }, actual: Throughput { bytes_read: 0, per_time_elapsed: 1s } }, connection: Unknown } }))) after 27.25 s; 3 failed attempt(s): PutObject[single-25s] #1 stalled_stream  after 8538 ms (retry=true); PutObject[single-25s] #2 stalled_stream  after 6013 ms (retry=true); PutObject[single-25s] #3 stalled_stream  after 6013 ms (retry=false) \| stored: +87s absent | PASS |
+| B2.4 | multipart 200 MiB, frozen 7 s at +2.0 s | never a short or wrong object | client: Ok(209715200) after 16.45 s; 3 failed attempt(s): UploadPart[multipart-7s] #1 stalled_stream  after 7528 ms (retry=true); UploadPart[multipart-7s] #1 stalled_stream  after 7932 ms (retry=true); UploadPart[multipart-7s] #1 stalled_stream  after 8437 ms (retry=true) \| stored: +78s identical (209715200 bytes, sha256 a3857a0e42b1…) | PASS |
+| B2.5 | multipart 200 MiB, frozen 17 s at +2.0 s | never a short or wrong object | client: Ok(209715200) after 26.56 s; 6 failed attempt(s): UploadPart[multipart-17s] #1 stalled_stream  after 7628 ms (retry=true); UploadPart[multipart-17s] #1 stalled_stream  after 7729 ms (retry=true); UploadPart[multipart-17s] #1 stalled_stream  after 8442 ms (retry=true); UploadPart[multipart-17s] #2 stalled_stream  after 6013 ms (retry=true); UploadPart[multipart-17s] #2 stalled_stream  after 6012 ms (retry=true); UploadPart[multipart-17s] #2 stalled_stream  after 6013 ms (retry=true) \| stored: +89s identical (209715200 bytes, sha256 08d90aa086e1…) | PASS |
+| B2.6 | multipart 200 MiB, frozen 25 s at +2.0 s | never a short or wrong object | client: Err(S3 multipart upload failed: dispatch failure: timeout: minimum throughput was specified at 1 B/s, but throughput of 0 B/s was observed (DispatchFailure(DispatchFailure { source: ConnectorError { kind: Timeout, source: ThroughputBelowMinimum { expected: Throughput { bytes_read: 1, per_time_elapsed: 1s }, actual: Throughput { bytes_read: 0, per_time_elapsed: 1s } }, connection: Unknown } }))) after 27.09 s; 7 failed attempt(s): UploadPart[multipart-25s] #1 stalled_stream  after 7730 ms (retry=true); UploadPart[multipart-25s] #1 stalled_stream  after 7831 ms (retry=true); UploadPart[multipart-25s] #1 stalled_stream  after 7835 ms (retry=true); UploadPart[multipart-25s] #2 stalled_stream  after 6013 ms (retry=true); UploadPart[multipart-25s] #2 stalled_stream  after 6013 ms (retry=true); UploadPart[multipart-25s] #2 stalled_stream  after 6012 ms (retry=true); UploadPart[multipart-25s] #3 stalled_stream  after 6011 ms (retry=false) \| stored: +87s absent | PASS |
+
+6 passed, 0 failed, 0 informational
+
+#### B2.1: single, freeze 7 s
+
+- pause: ok at +2.0 s; unpause: ok at +9.3 s
+- client: Ok(209715200) after 16.90 s; 1 failed attempt(s): PutObject[single-7s] #1 stalled_stream  after 8542 ms (retry=true)
+- store log for the key (57 requests):
+  - 05:30:25.603 WARN HTTP request remains in flight
+  - 05:30:25.603 WARN PutObject store write remains in flight
+  - 05:30:25.714 WARN PutObject store write returned
+  - 05:30:25.714 PUT object -> 400 in 9008 ms
+  - 05:30:30.605 WARN PutObject store write remains in flight
+  - 05:30:30.605 WARN HTTP request remains in flight
+  - 05:30:33.237 PUT object -> 200 in 7633 ms
+  - 05:30:33.239 HEAD object -> 200 in 0 ms
+  - 05:30:33.241 GET object -> 200 in 1 ms
+  - 05:30:33.242 WARN GetObject streaming body dropped before expected length
+  - 05:30:33.244 GET object -> 206 in 1 ms
+  - 05:30:33.244 GET object -> 206 in 1 ms
+  - 05:30:33.244 GET object -> 206 in 1 ms
+  - 05:30:33.244 GET object -> 206 in 1 ms
+  - 05:30:33.244 GET object -> 206 in 1 ms
+  - 05:30:33.247 GET object -> 206 in 4 ms
+  - 05:30:33.253 GET object -> 206 in 11 ms
+  - 05:30:48.624 HEAD object -> 200 in 0 ms
+  - 05:30:48.631 GET object -> 200 in 6 ms
+  - 05:30:48.632 WARN GetObject streaming body dropped before expected length
+  - 05:30:48.633 GET object -> 206 in 1 ms
+  - 05:30:48.638 GET object -> 206 in 5 ms
+  - 05:30:48.638 GET object -> 206 in 6 ms
+  - 05:30:48.638 GET object -> 206 in 6 ms
+  - 05:30:48.638 GET object -> 206 in 6 ms
+  - 05:30:48.639 GET object -> 206 in 6 ms
+  - 05:30:48.663 GET object -> 206 in 31 ms
+  - 05:31:04.002 HEAD object -> 200 in 0 ms
+  - 05:31:04.008 GET object -> 200 in 5 ms
+  - 05:31:04.009 WARN GetObject streaming body dropped before expected length
+  - 05:31:04.011 GET object -> 206 in 1 ms
+  - 05:31:04.016 GET object -> 206 in 6 ms
+  - 05:31:04.017 GET object -> 206 in 7 ms
+  - 05:31:04.017 GET object -> 206 in 7 ms
+  - 05:31:04.017 GET object -> 206 in 8 ms
+  - 05:31:04.018 GET object -> 206 in 9 ms
+  - 05:31:04.043 GET object -> 206 in 33 ms
+  - 05:31:19.372 HEAD object -> 200 in 0 ms
+  - 05:31:19.378 GET object -> 200 in 5 ms
+  - 05:31:19.378 WARN GetObject streaming body dropped before expected length
+  - 05:31:19.380 GET object -> 206 in 1 ms
+  - 05:31:19.385 GET object -> 206 in 5 ms
+  - 05:31:19.385 GET object -> 206 in 5 ms
+  - 05:31:19.385 GET object -> 206 in 5 ms
+  - 05:31:19.386 GET object -> 206 in 6 ms
+  - 05:31:19.387 GET object -> 206 in 7 ms
+  - 05:31:19.409 GET object -> 206 in 29 ms
+  - 05:31:34.759 HEAD object -> 200 in 0 ms
+  - 05:31:34.767 GET object -> 200 in 7 ms
+  - 05:31:34.768 WARN GetObject streaming body dropped before expected length
+  - 05:31:34.770 GET object -> 206 in 2 ms
+  - 05:31:34.775 GET object -> 206 in 7 ms
+  - 05:31:34.776 GET object -> 206 in 7 ms
+  - 05:31:34.776 GET object -> 206 in 7 ms
+  - 05:31:34.776 GET object -> 206 in 7 ms
+  - 05:31:34.777 GET object -> 206 in 8 ms
+  - 05:31:34.802 GET object -> 206 in 33 ms
+- stored object over time: +17s identical (209715200 bytes, sha256 5710dfdee293…); +33s identical (209715200 bytes, sha256 5710dfdee293…); +48s identical (209715200 bytes, sha256 5710dfdee293…); +63s identical (209715200 bytes, sha256 5710dfdee293…); +79s identical (209715200 bytes, sha256 5710dfdee293…)
+
+#### B2.2: single, freeze 17 s
+
+- pause: ok at +2.0 s; unpause: ok at +19.2 s
+- client: Ok(209715200) after 26.93 s; 2 failed attempt(s): PutObject[single-17s] #1 stalled_stream  after 8539 ms (retry=true); PutObject[single-17s] #2 stalled_stream  after 6014 ms (retry=true)
+- store log for the key (58 requests):
+  - 05:31:54.583 WARN HTTP request remains in flight
+  - 05:31:54.583 WARN PutObject store write remains in flight
+  - 05:31:54.716 WARN PutObject store write returned
+  - 05:31:54.716 PUT object -> 400 in 132 ms
+  - 05:31:54.740 PUT object -> 400 in 19002 ms
+  - 05:31:59.585 WARN PutObject store write remains in flight
+  - 05:31:59.585 WARN HTTP request remains in flight
+  - 05:32:02.301 PUT object -> 200 in 7716 ms
+  - 05:32:02.303 HEAD object -> 200 in 0 ms
+  - 05:32:02.305 GET object -> 200 in 1 ms
+  - 05:32:02.305 WARN GetObject streaming body dropped before expected length
+  - 05:32:02.307 GET object -> 206 in 1 ms
+  - 05:32:02.308 GET object -> 206 in 1 ms
+  - 05:32:02.308 GET object -> 206 in 1 ms
+  - 05:32:02.308 GET object -> 206 in 2 ms
+  - 05:32:02.308 GET object -> 206 in 2 ms
+  - 05:32:02.311 GET object -> 206 in 5 ms
+  - 05:32:02.312 GET object -> 206 in 6 ms
+  - 05:32:17.680 HEAD object -> 200 in 0 ms
+  - 05:32:17.687 GET object -> 200 in 6 ms
+  - 05:32:17.688 WARN GetObject streaming body dropped before expected length
+  - 05:32:17.690 GET object -> 206 in 1 ms
+  - 05:32:17.694 GET object -> 206 in 6 ms
+  - 05:32:17.695 GET object -> 206 in 6 ms
+  - 05:32:17.695 GET object -> 206 in 6 ms
+  - 05:32:17.695 GET object -> 206 in 6 ms
+  - 05:32:17.695 GET object -> 206 in 7 ms
+  - 05:32:17.719 GET object -> 206 in 30 ms
+  - 05:32:33.055 HEAD object -> 200 in 0 ms
+  - 05:32:33.061 GET object -> 200 in 6 ms
+  - 05:32:33.062 WARN GetObject streaming body dropped before expected length
+  - 05:32:33.064 GET object -> 206 in 1 ms
+  - 05:32:33.068 GET object -> 206 in 6 ms
+  - 05:32:33.068 GET object -> 206 in 6 ms
+  - 05:32:33.069 GET object -> 206 in 6 ms
+  - 05:32:33.069 GET object -> 206 in 6 ms
+  - 05:32:33.069 GET object -> 206 in 6 ms
+  - 05:32:33.093 GET object -> 206 in 30 ms
+  - 05:32:48.433 HEAD object -> 200 in 0 ms
+  - 05:32:48.439 GET object -> 200 in 4 ms
+  - 05:32:48.440 WARN GetObject streaming body dropped before expected length
+  - 05:32:48.441 GET object -> 206 in 1 ms
+  - 05:32:48.445 GET object -> 206 in 5 ms
+  - 05:32:48.446 GET object -> 206 in 5 ms
+  - 05:32:48.446 GET object -> 206 in 6 ms
+  - 05:32:48.446 GET object -> 206 in 5 ms
+  - 05:32:48.447 GET object -> 206 in 6 ms
+  - 05:32:48.467 GET object -> 206 in 27 ms
+  - 05:33:03.813 HEAD object -> 200 in 0 ms
+  - 05:33:03.820 GET object -> 200 in 6 ms
+  - 05:33:03.821 WARN GetObject streaming body dropped before expected length
+  - 05:33:03.823 GET object -> 206 in 1 ms
+  - 05:33:03.827 GET object -> 206 in 5 ms
+  - 05:33:03.827 GET object -> 206 in 5 ms
+  - 05:33:03.827 GET object -> 206 in 6 ms
+  - 05:33:03.828 GET object -> 206 in 6 ms
+  - 05:33:03.828 GET object -> 206 in 6 ms
+  - 05:33:03.852 GET object -> 206 in 30 ms
+- stored object over time: +27s identical (209715200 bytes, sha256 616690527677…); +43s identical (209715200 bytes, sha256 616690527677…); +58s identical (209715200 bytes, sha256 616690527677…); +73s identical (209715200 bytes, sha256 616690527677…); +89s identical (209715200 bytes, sha256 616690527677…)
+
+#### B2.3: single, freeze 25 s
+
+- pause: ok at +2.0 s; unpause: ok at +27.3 s
+- client: Err(S3 put_object failed: dispatch failure: timeout: minimum throughput was specified at 1 B/s, but throughput of 0 B/s was observed (DispatchFailure(DispatchFailure { source: ConnectorError { kind: Timeout, source: ThroughputBelowMinimum { expected: Throughput { bytes_read: 1, per_time_elapsed: 1s }, actual: Throughput { bytes_read: 0, per_time_elapsed: 1s } }, connection: Unknown } }))) after 27.25 s; 3 failed attempt(s): PutObject[single-25s] #1 stalled_stream  after 8538 ms (retry=true); PutObject[single-25s] #2 stalled_stream  after 6013 ms (retry=true); PutObject[single-25s] #3 stalled_stream  after 6013 ms (retry=false)
+- store log for the key (11 requests):
+  - 05:33:31.650 WARN HTTP request remains in flight
+  - 05:33:31.650 WARN PutObject store write remains in flight
+  - 05:33:31.681 HEAD object -> 404 in 0 ms
+  - 05:33:31.727 WARN PutObject store write returned
+  - 05:33:31.727 PUT object -> 400 in 26950 ms
+  - 05:33:31.756 PUT object -> 400 in 105 ms
+  - 05:33:31.757 PUT object -> 400 in 106 ms
+  - 05:33:46.683 HEAD object -> 404 in 0 ms
+  - 05:34:01.688 HEAD object -> 404 in 0 ms
+  - 05:34:16.691 HEAD object -> 404 in 0 ms
+  - 05:34:31.694 HEAD object -> 404 in 0 ms
+- stored object over time: +27s absent; +42s absent; +57s absent; +72s absent; +87s absent
+
+#### B2.4: multipart, freeze 7 s
+
+- pause: ok at +2.0 s; unpause: ok at +9.1 s
+- client: Ok(209715200) after 16.45 s; 3 failed attempt(s): UploadPart[multipart-7s] #1 stalled_stream  after 7528 ms (retry=true); UploadPart[multipart-7s] #1 stalled_stream  after 7932 ms (retry=true); UploadPart[multipart-7s] #1 stalled_stream  after 8437 ms (retry=true)
+- store log for the key (65 requests):
+  - 05:34:32.198 POST uploads -> 200 in 7 ms
+  - 05:34:33.256 PUT partNumber=4 -> 200 in 747 ms
+  - 05:34:41.021 WARN HTTP request remains in flight
+  - 05:34:41.021 WARN HTTP request remains in flight
+  - 05:34:41.021 WARN HTTP request remains in flight
+  - 05:34:41.212 PUT partNumber=2 -> 400 in 8872 ms
+  - 05:34:41.367 PUT partNumber=3 -> 400 in 8878 ms
+  - 05:34:41.385 PUT partNumber=1 -> 400 in 9186 ms
+  - 05:34:46.022 WARN HTTP request remains in flight
+  - 05:34:46.022 WARN HTTP request remains in flight
+  - 05:34:46.177 PUT partNumber=3 -> 200 in 5155 ms
+  - 05:34:46.178 PUT partNumber=2 -> 200 in 5156 ms
+  - 05:34:46.290 WARN HTTP request remains in flight
+  - 05:34:48.366 PUT partNumber=1 -> 200 in 7077 ms
+  - 05:34:48.382 POST uploadId -> 200 in 11 ms
+  - 05:34:48.384 HEAD object -> 200 in 0 ms
+  - 05:34:48.386 GET object -> 200 in 1 ms
+  - 05:34:48.386 WARN GetObject streaming body dropped before expected length
+  - 05:34:48.388 GET object -> 206 in 1 ms
+  - 05:34:48.388 GET object -> 206 in 1 ms
+  - 05:34:48.389 GET object -> 206 in 1 ms
+  - 05:34:48.389 GET object -> 206 in 2 ms
+  - 05:34:48.389 GET object -> 206 in 2 ms
+  - 05:34:48.392 GET object -> 206 in 5 ms
+  - 05:34:48.395 GET object -> 206 in 7 ms
+  - 05:35:03.761 HEAD object -> 200 in 0 ms
+  - 05:35:03.768 GET object -> 200 in 6 ms
+  - 05:35:03.768 WARN GetObject streaming body dropped before expected length
+  - 05:35:03.770 GET object -> 206 in 1 ms
+  - 05:35:03.774 GET object -> 206 in 5 ms
+  - 05:35:03.774 GET object -> 206 in 5 ms
+  - 05:35:03.775 GET object -> 206 in 5 ms
+  - 05:35:03.775 GET object -> 206 in 6 ms
+  - 05:35:03.775 GET object -> 206 in 6 ms
+  - 05:35:03.775 GET object -> 206 in 6 ms
+  - 05:35:19.139 HEAD object -> 200 in 0 ms
+  - 05:35:19.146 GET object -> 200 in 6 ms
+  - 05:35:19.146 WARN GetObject streaming body dropped before expected length
+  - 05:35:19.148 GET object -> 206 in 1 ms
+  - 05:35:19.151 GET object -> 206 in 4 ms
+  - 05:35:19.152 GET object -> 206 in 5 ms
+  - 05:35:19.153 GET object -> 206 in 6 ms
+  - 05:35:19.153 GET object -> 206 in 6 ms
+  - 05:35:19.153 GET object -> 206 in 6 ms
+  - 05:35:19.154 GET object -> 206 in 7 ms
+  - 05:35:34.514 HEAD object -> 200 in 0 ms
+  - 05:35:34.520 GET object -> 200 in 5 ms
+  - 05:35:34.521 WARN GetObject streaming body dropped before expected length
+  - 05:35:34.523 GET object -> 206 in 1 ms
+  - 05:35:34.527 GET object -> 206 in 4 ms
+  - 05:35:34.527 GET object -> 206 in 5 ms
+  - 05:35:34.528 GET object -> 206 in 5 ms
+  - 05:35:34.528 GET object -> 206 in 6 ms
+  - 05:35:34.528 GET object -> 206 in 6 ms
+  - 05:35:34.530 GET object -> 206 in 8 ms
+  - 05:35:49.897 HEAD object -> 200 in 0 ms
+  - 05:35:49.904 GET object -> 200 in 6 ms
+  - 05:35:49.905 WARN GetObject streaming body dropped before expected length
+  - 05:35:49.907 GET object -> 206 in 1 ms
+  - 05:35:49.910 GET object -> 206 in 4 ms
+  - 05:35:49.911 GET object -> 206 in 5 ms
+  - 05:35:49.911 GET object -> 206 in 6 ms
+  - 05:35:49.911 GET object -> 206 in 6 ms
+  - 05:35:49.912 GET object -> 206 in 6 ms
+  - 05:35:49.912 GET object -> 206 in 7 ms
+- stored object over time: +17s identical (209715200 bytes, sha256 a3857a0e42b1…); +32s identical (209715200 bytes, sha256 a3857a0e42b1…); +48s identical (209715200 bytes, sha256 a3857a0e42b1…); +63s identical (209715200 bytes, sha256 a3857a0e42b1…); +78s identical (209715200 bytes, sha256 a3857a0e42b1…)
+
+#### B2.5: multipart, freeze 17 s
+
+- pause: ok at +2.0 s; unpause: ok at +19.1 s
+- client: Ok(209715200) after 26.56 s; 6 failed attempt(s): UploadPart[multipart-17s] #1 stalled_stream  after 7628 ms (retry=true); UploadPart[multipart-17s] #1 stalled_stream  after 7729 ms (retry=true); UploadPart[multipart-17s] #1 stalled_stream  after 8442 ms (retry=true); UploadPart[multipart-17s] #2 stalled_stream  after 6013 ms (retry=true); UploadPart[multipart-17s] #2 stalled_stream  after 6012 ms (retry=true); UploadPart[multipart-17s] #2 stalled_stream  after 6013 ms (retry=true)
+- store log for the key (68 requests):
+  - 05:35:50.782 POST uploads -> 200 in 8 ms
+  - 05:35:52.460 PUT partNumber=4 -> 200 in 1377 ms
+  - 05:36:09.609 WARN HTTP request remains in flight
+  - 05:36:09.609 WARN HTTP request remains in flight
+  - 05:36:09.609 WARN HTTP request remains in flight
+  - 05:36:09.900 PUT partNumber=2 -> 400 in 18980 ms
+  - 05:36:09.925 PUT partNumber=3 -> 400 in 18867 ms
+  - 05:36:09.953 PUT partNumber=2 -> 400 in 343 ms
+  - 05:36:09.955 PUT partNumber=1 -> 400 in 345 ms
+  - 05:36:09.962 PUT partNumber=3 -> 400 in 351 ms
+  - 05:36:09.982 PUT partNumber=1 -> 400 in 19199 ms
+  - 05:36:14.611 WARN HTTP request remains in flight
+  - 05:36:14.611 WARN HTTP request remains in flight
+  - 05:36:14.611 WARN HTTP request remains in flight
+  - 05:36:17.049 PUT partNumber=2 -> 200 in 7439 ms
+  - 05:36:17.051 PUT partNumber=1 -> 200 in 7440 ms
+  - 05:36:17.059 PUT partNumber=3 -> 200 in 7449 ms
+  - 05:36:17.075 POST uploadId -> 200 in 11 ms
+  - 05:36:17.077 HEAD object -> 200 in 0 ms
+  - 05:36:17.079 GET object -> 200 in 1 ms
+  - 05:36:17.080 WARN GetObject streaming body dropped before expected length
+  - 05:36:17.082 GET object -> 206 in 1 ms
+  - 05:36:17.082 GET object -> 206 in 1 ms
+  - 05:36:17.082 GET object -> 206 in 1 ms
+  - 05:36:17.082 GET object -> 206 in 1 ms
+  - 05:36:17.082 GET object -> 206 in 2 ms
+  - 05:36:17.086 GET object -> 206 in 5 ms
+  - 05:36:17.088 GET object -> 206 in 7 ms
+  - 05:36:32.466 HEAD object -> 200 in 0 ms
+  - 05:36:32.474 GET object -> 200 in 7 ms
+  - 05:36:32.475 WARN GetObject streaming body dropped before expected length
+  - 05:36:32.478 GET object -> 206 in 2 ms
+  - 05:36:32.482 GET object -> 206 in 6 ms
+  - 05:36:32.482 GET object -> 206 in 7 ms
+  - 05:36:32.483 GET object -> 206 in 7 ms
+  - 05:36:32.484 GET object -> 206 in 8 ms
+  - 05:36:32.484 GET object -> 206 in 8 ms
+  - 05:36:32.485 GET object -> 206 in 10 ms
+  - 05:36:47.851 HEAD object -> 200 in 0 ms
+  - 05:36:47.857 GET object -> 200 in 6 ms
+  - 05:36:47.859 WARN GetObject streaming body dropped before expected length
+  - 05:36:47.861 GET object -> 206 in 1 ms
+  - 05:36:47.864 GET object -> 206 in 5 ms
+  - 05:36:47.865 GET object -> 206 in 5 ms
+  - 05:36:47.865 GET object -> 206 in 6 ms
+  - 05:36:47.866 GET object -> 206 in 6 ms
+  - 05:36:47.866 GET object -> 206 in 6 ms
+  - 05:36:47.866 GET object -> 206 in 7 ms
+  - 05:37:03.231 HEAD object -> 200 in 0 ms
+  - 05:37:03.238 GET object -> 200 in 6 ms
+  - 05:37:03.239 WARN GetObject streaming body dropped before expected length
+  - 05:37:03.242 GET object -> 206 in 2 ms
+  - 05:37:03.246 GET object -> 206 in 6 ms
+  - 05:37:03.247 GET object -> 206 in 7 ms
+  - 05:37:03.247 GET object -> 206 in 7 ms
+  - 05:37:03.247 GET object -> 206 in 7 ms
+  - 05:37:03.248 GET object -> 206 in 7 ms
+  - 05:37:03.249 GET object -> 206 in 9 ms
+  - 05:37:18.614 HEAD object -> 200 in 0 ms
+  - 05:37:18.620 GET object -> 200 in 5 ms
+  - 05:37:18.621 WARN GetObject streaming body dropped before expected length
+  - 05:37:18.623 GET object -> 206 in 1 ms
+  - 05:37:18.626 GET object -> 206 in 4 ms
+  - 05:37:18.627 GET object -> 206 in 5 ms
+  - 05:37:18.627 GET object -> 206 in 5 ms
+  - 05:37:18.628 GET object -> 206 in 6 ms
+  - 05:37:18.628 GET object -> 206 in 6 ms
+  - 05:37:18.629 GET object -> 206 in 7 ms
+- stored object over time: +27s identical (209715200 bytes, sha256 08d90aa086e1…); +42s identical (209715200 bytes, sha256 08d90aa086e1…); +58s identical (209715200 bytes, sha256 08d90aa086e1…); +73s identical (209715200 bytes, sha256 08d90aa086e1…); +89s identical (209715200 bytes, sha256 08d90aa086e1…)
+
+#### B2.6: multipart, freeze 25 s
+
+- pause: ok at +2.0 s; unpause: ok at +27.1 s
+- client: Err(S3 multipart upload failed: dispatch failure: timeout: minimum throughput was specified at 1 B/s, but throughput of 0 B/s was observed (DispatchFailure(DispatchFailure { source: ConnectorError { kind: Timeout, source: ThroughputBelowMinimum { expected: Throughput { bytes_read: 1, per_time_elapsed: 1s }, actual: Throughput { bytes_read: 0, per_time_elapsed: 1s } }, connection: Unknown } }))) after 27.09 s; 7 failed attempt(s): UploadPart[multipart-25s] #1 stalled_stream  after 7730 ms (retry=true); UploadPart[multipart-25s] #1 stalled_stream  after 7831 ms (retry=true); UploadPart[multipart-25s] #1 stalled_stream  after 7835 ms (retry=true); UploadPart[multipart-25s] #2 stalled_stream  after 6013 ms (retry=true); UploadPart[multipart-25s] #2 stalled_stream  after 6013 ms (retry=true); UploadPart[multipart-25s] #2 stalled_stream  after 6012 ms (retry=true); UploadPart[multipart-25s] #3 stalled_stream  after 6011 ms (retry=false)
+- store log for the key (20 requests):
+  - 05:37:19.518 POST uploads -> 200 in 7 ms
+  - 05:37:21.095 PUT partNumber=4 -> 200 in 1273 ms
+  - 05:37:46.334 WARN HTTP request remains in flight
+  - 05:37:46.334 WARN HTTP request remains in flight
+  - 05:37:46.334 WARN HTTP request remains in flight
+  - 05:37:46.336 DELETE uploadId -> 204 in 1 ms
+  - 05:37:46.336 PUT partNumber=1 -> 404 in 1 ms
+  - 05:37:46.336 PUT partNumber=3 -> 404 in 1 ms
+  - 05:37:46.336 PUT partNumber=3 -> 404 in 1 ms
+  - 05:37:46.362 HEAD object -> 404 in 0 ms
+  - 05:37:46.478 PUT partNumber=2 -> 400 in 26817 ms
+  - 05:37:46.589 PUT partNumber=2 -> 400 in 254 ms
+  - 05:37:46.603 PUT partNumber=1 -> 400 in 268 ms
+  - 05:37:46.608 PUT partNumber=3 -> 400 in 26817 ms
+  - 05:37:46.652 PUT partNumber=2 -> 400 in 318 ms
+  - 05:37:46.739 PUT partNumber=1 -> 400 in 27219 ms
+  - 05:38:01.366 HEAD object -> 404 in 0 ms
+  - 05:38:16.370 HEAD object -> 404 in 0 ms
+  - 05:38:31.372 HEAD object -> 404 in 0 ms
+  - 05:38:46.376 HEAD object -> 404 in 0 ms
+- stored object over time: +27s absent; +42s absent; +57s absent; +72s absent; +87s absent
+

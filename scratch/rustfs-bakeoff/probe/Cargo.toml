@@ -1,0 +1,35 @@
+# Measurement tool for the Kind object-store bake-off, not a workspace member
+# and not a test: it drives SPACE's own object-store client against a running
+# S3 endpoint and prints result tables. See ../README.md.
+[package]
+name = "rustfs-bakeoff-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Its own workspace, so the repository's workspace and Cargo.lock stay
+# untouched. Copy the repository's Cargo.lock next to this file before the
+# first build to resolve the same dependency versions (run.sh does).
+[workspace]
+
+[dependencies]
+pplx-space-object-store = { path = "../../../crates/libs/object-store" }
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
+aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "http-1x"] }
+aws-sdk-sts = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-smithy-types = { version = "=1.6.3", features = ["http-body-1-x"] }
+aws-smithy-runtime-api = "1"
+base64 = "0.23"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+hex = "0.4"
+hmac = "0.13"
+http-body = "1"
+md-5 = "0.11"
+serde_json = "1"
+sha2 = "0.11"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time", "process"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "registry"] }
