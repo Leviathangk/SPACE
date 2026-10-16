@@ -174,6 +174,7 @@ fn reconcile_stage_test_reconciler_inner() -> Reconciler {
         orphan_sweep_cursor: AtomicUsize::new(0),
         receipt_backstops: Mutex::new(ReceiptBackstopState::default()),
         node_group_placement: disabled_node_group_placement(),
+        pass_report: Mutex::new(super::PassReport::default()),
     }
 }
 
@@ -225,6 +226,7 @@ fn reconcile_test_reconciler(
         orphan_sweep_cursor: AtomicUsize::new(0),
         receipt_backstops: Mutex::new(ReceiptBackstopState::default()),
         node_group_placement: disabled_node_group_placement(),
+        pass_report: Mutex::new(super::PassReport::default()),
     }
 }
 
@@ -905,6 +907,7 @@ async fn observe_warming_slots_retries_not_started_probe_and_promotes_slot() -> 
         orphan_sweep_cursor: AtomicUsize::new(0),
         receipt_backstops: Mutex::new(ReceiptBackstopState::default()),
         node_group_placement: disabled_node_group_placement(),
+        pass_report: Mutex::new(super::PassReport::default()),
     };
     let config = store
         .reconcilable_configs()
@@ -995,6 +998,7 @@ async fn observe_warming_slots_keeps_young_slot_missing_from_cache() -> TestResu
         orphan_sweep_cursor: AtomicUsize::new(0),
         receipt_backstops: Mutex::new(ReceiptBackstopState::default()),
         node_group_placement: disabled_node_group_placement(),
+        pass_report: Mutex::new(super::PassReport::default()),
     };
     let config = store
         .reconcilable_configs()
@@ -1353,6 +1357,7 @@ async fn reconcile_once_starts_preparing_republished_exact_release() -> TestResu
         orphan_sweep_cursor: AtomicUsize::new(0),
         receipt_backstops: Mutex::new(ReceiptBackstopState::default()),
         node_group_placement: disabled_node_group_placement(),
+        pass_report: Mutex::new(super::PassReport::default()),
     };
 
     let summary = reconciler.reconcile_once().await?;
@@ -1982,7 +1987,7 @@ fn reconcile_config_stage_or_continue_marks_failure_and_returns_empty_work() {
 
     let summary = runtime.block_on(reconciler.reconcile_config_stage_or_continue(
         &config,
-        "observe_warming_slots",
+        super::ConfigStage::ObserveWarmingSlots,
         async {
             Err(super::WarmPoolError::io(std::io::Error::other(
                 "transient stage failure",
