@@ -61,10 +61,22 @@ What you get, and what to change:
   leaves its node**:
 
   ```yaml
-  metrics: {storage: {useDefaultStorageClass: false, ephemeral: true}}
-  traces: {storage: {useDefaultStorageClass: false, ephemeral: true}}
-  logs: {storage: {useDefaultStorageClass: false, ephemeral: true}}
+  metrics:
+    storage: {useDefaultStorageClass: false, ephemeral: true}
+    prometheus: {resources: {limits: {ephemeral-storage: 3Gi}}}
+  traces:
+    storage: {useDefaultStorageClass: false, ephemeral: true}
+    tempo: {resources: {limits: {ephemeral-storage: 5Gi}}}
+  logs:
+    storage: {useDefaultStorageClass: false, ephemeral: true}
+    loki: {resources: {limits: {ephemeral-storage: 3Gi}}}
   ```
+
+  In ephemeral mode, the data size and total `ephemeral-storage` limit must
+  use positive whole `Mi` or `Gi` quantities, with at most nine digits. The
+  limit must cover the data size plus 256Mi for logs and writable layers;
+  the chart refuses smaller budgets instead of raising limits silently.
+  PVC-backed storage is unaffected.
 
 - **Grafana.** With no Secret of your own, the chart generates
   `space-observability-grafana-admin` (user `admin`, random 32-character
@@ -75,6 +87,10 @@ What you get, and what to change:
   `admin-user` and `admin-password`. The UI has no Ingress; use
   `kubectl port-forward --address 127.0.0.1 service/grafana 13000:3000`.
   Prometheus, Loki and Tempo datasources point at the in-namespace Services.
+  With `grafana.persistence.enabled=true`, ephemeral storage uses the same
+  budget rule; a 1Gi data volume requires at least 1280Mi in
+  `grafana.resources.limits.ephemeral-storage`. With persistence disabled,
+  the existing `grafana.persistence.emptyDirSizeLimit` behavior is unchanged.
 - **Network policy.** Every component gets a NetworkPolicy. The gateway
   accepts OTLP only from pods in `spaceNamespaces` (default `[space]`); the
   backends accept only the gateway, Alloy and Grafana. Rendering a policy does

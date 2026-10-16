@@ -127,6 +127,10 @@ logs:
       - podSelector: {matchLabels: {app: grafana}}
       - podSelector: {matchLabels: {app: collector}}
   collection:
+    # Keep the builder exclusion independent of the producer namespace.
+    excludedPodSources:
+      - podNamePrefix: space-builder-build-manager-
+        container: build-manager
     podTargets:
       - {path: "/var/log/pods/space_*/*/*.log", namespace: space}
     # Off by default: hosts without a persistent journal at this path would

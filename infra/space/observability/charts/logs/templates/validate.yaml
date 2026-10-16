@@ -1,6 +1,7 @@
 {{- if include "common.otlpSelected" . }}
 {{- include "common.profileGuard" . }}
 {{- include "common.sharedGuards" . }}
+{{- include "common.ephemeralStorageGuard" (dict "storage" .Values.storage "resources" .Values.loki.resources "key" "storage" "resourcesKey" "loki.resources") }}
 {{- if not (or .Values.collection.podTargets .Values.collection.journal.enabled) }}
 {{- fail "Enable at least one of collection.podTargets or collection.journal" }}
 {{- end }}

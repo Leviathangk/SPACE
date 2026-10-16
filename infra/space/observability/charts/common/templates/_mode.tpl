@@ -7,15 +7,14 @@ accepted as "off"; any other value fails the render.
 {{- define "common.observabilityMode" -}}
 {{- $global := .Values.global | default dict -}}
 {{- $observability := get $global "observability" | default dict -}}
-{{- $mode := get $observability "mode" -}}
-{{- if kindIs "invalid" $mode -}}
-{{- else if kindIs "bool" $mode -}}
-{{- if $mode }}{{ fail "global.observability.mode must be off, datadog or otlp" }}{{ end -}}
-off
-{{- else if has (toString $mode) (list "" "off" "datadog" "otlp") -}}
-{{- toString $mode -}}
-{{- else -}}
-{{- fail (printf "global.observability.mode must be off, datadog or otlp, got %q" (toString $mode)) -}}
+{{- if hasKey $observability "mode" -}}
+{{- $raw := get $observability "mode" -}}
+{{- $mode := toString $raw -}}
+{{- if and (kindIs "bool" $raw) (not $raw) -}}{{- $mode = "off" -}}{{- end -}}
+{{- if not (has $mode (list "off" "datadog" "otlp")) -}}
+{{- fail (printf "global.observability.mode must be off, datadog or otlp, got %q" $mode) -}}
+{{- end -}}
+{{- $mode -}}
 {{- end -}}
 {{- end -}}
 

@@ -32,6 +32,8 @@ persistence:
   size: 1Gi
   storageClassName: null
   existingClaim: ""
+  useDefaultStorageClass: false
+  ephemeral: false
   retain: true
   # Used only when persistence is disabled.
   emptyDirSizeLimit: 256Mi

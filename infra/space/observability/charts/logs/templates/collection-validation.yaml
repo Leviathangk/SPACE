@@ -1,6 +1,8 @@
 {{- if include "common.otlpSelected" . }}
 {{- range $source := .Values.collection.excludedPodSources }}
-{{- range $key := list "namespace" "podNamePrefix" "container" }}
+{{- $keys := list "podNamePrefix" "container" }}
+{{- if hasKey $source "namespace" }}{{- $keys = append $keys "namespace" }}{{- end }}
+{{- range $key := $keys }}
 {{- $value := index $source $key }}
 {{- if not (and (kindIs "string" $value) $value) }}
 {{- fail (printf "collection.excludedPodSources entries require a nonempty literal %s" $key) }}

@@ -150,7 +150,7 @@ spec:
           configMap: {name: grafana-config}
         - name: data
           {{- if .Values.persistence.enabled }}
-          persistentVolumeClaim: {claimName: {{ include "common.claimName" (dict "name" "grafana-data" "storage" .Values.persistence) | quote }}}
+          {{- include "common.dataVolumeSource" (dict "name" "grafana-data" "storage" .Values.persistence) | nindent 10 }}
           {{- else }}
           emptyDir: {sizeLimit: {{ .Values.persistence.emptyDirSizeLimit }}}
           {{- end }}

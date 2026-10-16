@@ -17,9 +17,11 @@ local.file_match "pods" {
 discovery.relabel "eligible_pods" {
   targets = local.file_match.pods.targets
 {{- range .Values.collection.excludedPodSources }}
+{{- $namespace := "[^_/]+" }}
+{{- if hasKey . "namespace" }}{{- $namespace = regexQuoteMeta .namespace }}{{- end }}
   rule {
     source_labels = ["__path__"]
-    regex = {{ printf ".*/%s_%s[^/]*_[^/]+/%s/[^/]+" (regexQuoteMeta .namespace) (regexQuoteMeta .podNamePrefix) (regexQuoteMeta .container) | quote }}
+    regex = {{ printf ".*/%s_%s[^/]*_[^/]+/%s/[^/]+" $namespace (regexQuoteMeta .podNamePrefix) (regexQuoteMeta .container) | quote }}
     action = "drop"
   }
 {{- end }}

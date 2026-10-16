@@ -175,8 +175,12 @@ def test_otlp_storage_defaults_to_the_default_storage_class() -> None:
 
 def test_otlp_ephemeral_storage_uses_empty_dir() -> None:
     args = []
-    for signal in ("metrics", "traces", "logs"):
-        args += ["--set", f"{signal}.storage.ephemeral=true", "--set", f"{signal}.storage.useDefaultStorageClass=false"]
+    for signal, backend, budget in (("metrics", "prometheus", "3Gi"), ("traces", "tempo", "5Gi"), ("logs", "loki", "3Gi")):
+        args += [
+            "--set", f"{signal}.storage.ephemeral=true",
+            "--set", f"{signal}.storage.useDefaultStorageClass=false",
+            "--set", f"{signal}.{backend}.resources.limits.ephemeral-storage={budget}",
+        ]
     docs = by_kind(documents(*OTLP, *args))
     assert not [name for kind, name in docs if kind == "PersistentVolumeClaim"]
     for name in ("prometheus", "tempo", "loki"):
@@ -315,7 +319,8 @@ def test_dns_egress_peers_and_ports_are_configurable(tmp_path: Path) -> None:
         assert found == [custom], name
     # A standalone signal chart reads the same global key.
     standalone = dns_rules(documents("-f", str(CHARTS / "traces/profiles/shared.example.yaml"),
-                                     "--set", "storage.ephemeral=true", "-f", str(values),
+                                     "--set", "storage.ephemeral=true",
+                                     "--set", "tempo.resources.limits.ephemeral-storage=5Gi", "-f", str(values),
                                      chart=CHARTS / "traces"))
     assert standalone and all(found == [custom] for found in standalone.values())
 

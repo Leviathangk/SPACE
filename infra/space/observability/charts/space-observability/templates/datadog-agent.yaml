@@ -2,6 +2,8 @@
 {{- $obs := .Values.global.observability }}
 {{- $dd := .Values.datadog }}
 {{- $name := "datadog-agent" }}
+{{- $dogstatsdPort := include "space-observability.port" (dict "value" $obs.datadog.dogstatsdPort "key" "global.observability.datadog.dogstatsdPort") }}
+{{- $apmPort := include "space-observability.port" (dict "value" $obs.datadog.apmPort "key" "global.observability.datadog.apmPort") }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -76,8 +78,8 @@ spec:
           ports:
             # SPACE pods send to status.hostIP; host-network services and the
             # worker shim use the same node address or the Unix sockets.
-            - {name: dogstatsd, containerPort: {{ $obs.datadog.dogstatsdPort }}, hostPort: {{ $obs.datadog.dogstatsdPort }}, protocol: UDP}
-            - {name: apm, containerPort: {{ $obs.datadog.apmPort }}, hostPort: {{ $obs.datadog.apmPort }}, protocol: TCP}
+            - {name: dogstatsd, containerPort: {{ $dogstatsdPort }}, hostPort: {{ $dogstatsdPort }}, protocol: UDP}
+            - {name: apm, containerPort: {{ $apmPort }}, hostPort: {{ $apmPort }}, protocol: TCP}
           env:
             - name: DD_API_KEY
               valueFrom:
@@ -102,12 +104,12 @@ spec:
             - {name: DD_KUBELET_TLS_VERIFY, value: {{ $dd.kubeletTLSVerify | quote }}}
             - {name: DD_CRI_SOCKET_PATH, value: {{ printf "/host%s" $dd.criSocketPath | quote }}}
             # DogStatsD and APM over the host ports and the shared sockets.
-            - {name: DD_DOGSTATSD_PORT, value: {{ $obs.datadog.dogstatsdPort | quote }}}
+            - {name: DD_DOGSTATSD_PORT, value: {{ $dogstatsdPort | quote }}}
             - {name: DD_DOGSTATSD_NON_LOCAL_TRAFFIC, value: "true"}
             - {name: DD_DOGSTATSD_SOCKET, value: /var/run/datadog/dsd.socket}
             - {name: DD_APM_ENABLED, value: "true"}
             - {name: DD_APM_NON_LOCAL_TRAFFIC, value: "true"}
-            - {name: DD_APM_RECEIVER_PORT, value: {{ $obs.datadog.apmPort | quote }}}
+            - {name: DD_APM_RECEIVER_PORT, value: {{ $apmPort | quote }}}
             - {name: DD_APM_RECEIVER_SOCKET, value: /var/run/datadog/apm.socket}
             # Pod logs from SPACE namespaces only. Inclusion outranks a name or
             # image exclusion, so a SPACE pod whose output must not be
@@ -181,8 +183,8 @@ spec:
   policyTypes: [Ingress]
   ingress:
     - ports:
-        - {protocol: UDP, port: {{ $obs.datadog.dogstatsdPort }}}
-        - {protocol: TCP, port: {{ $obs.datadog.apmPort }}}
+        - {protocol: UDP, port: {{ $dogstatsdPort }}}
+        - {protocol: TCP, port: {{ $apmPort }}}
       from:
         - {{- include "space-observability.spaceNamespaceSelector" . | nindent 10 }}
         {{- with $dd.hostPeers }}
