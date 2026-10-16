@@ -85,6 +85,9 @@ func datadogTraceAgentAddr(host, rawPort string) string {
 	} else if strings.TrimSpace(rawPort) != "" {
 		logShim("ignoring invalid DD_TRACE_AGENT_PORT %q; using %d", rawPort, defaultDatadogTraceAgentPort)
 	}
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
+	}
 	return net.JoinHostPort(host, strconv.Itoa(port))
 }
 

@@ -10,6 +10,8 @@ func TestDatadogTraceAgentAddrHonorsTraceAgentPort(t *testing.T) {
 		{"configured port", "10.0.0.5", "18126", "10.0.0.5:18126"},
 		{"surrounding space", "10.0.0.5", " 9126 ", "10.0.0.5:9126"},
 		{"ipv6 host", "fd00::5", "18126", "[fd00::5]:18126"},
+		{"bracketed ipv6 host", "[fd00::5]", "18126", "[fd00::5]:18126"},
+		{"bracketed ipv6 zone", "[fe80::5%eth0]", "18126", "[fe80::5%eth0]:18126"},
 		{"non-numeric port", "10.0.0.5", "apm", "10.0.0.5:8126"},
 		{"zero port", "10.0.0.5", "0", "10.0.0.5:8126"},
 		{"out of range port", "10.0.0.5", "70000", "10.0.0.5:8126"},
