@@ -205,8 +205,8 @@ fn build_otlp_provider(
         .build()
         .map_err(TraceInitError::Exporter)?;
     // The upstream builder honors OTEL_BSP_*; the sampler keeps the one
-    // OTEL_TRACES_SAMPLER selects for every span that does not follow an
-    // origin or an untraced caller.
+    // OTEL_TRACES_SAMPLER selects for every root that does not follow an
+    // origin, and every span with a parent follows that parent.
     let batch = opentelemetry_sdk::trace::BatchSpanProcessor::builder(
         status_messages::StatusMessages::new(operation_names::OperationNames::new(exporter)),
     )

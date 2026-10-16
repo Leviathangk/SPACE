@@ -236,7 +236,9 @@ whichever it found over plaintext.
 milliseconds and defaults to 10000 in both languages. A value that is not a
 positive whole number of milliseconds fails startup instead of exporting on a
 cadence nobody chose. Traces are batched by the OpenTelemetry SDK's own
-`OTEL_BSP_*` settings, and `OTEL_TRACES_SAMPLER` applies as usual.
+`OTEL_BSP_*` settings. `OTEL_TRACES_SAMPLER` decides only roots that do not
+follow an origin; a span with a parent follows the parent, and a root that
+follows an origin follows it (see [Datadog trace chunks](#datadog-trace-chunks)).
 
 `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` selects the Rust services'
 metric temporality: `cumulative`, `delta` or `lowmemory`, in any case, with the
@@ -409,13 +411,21 @@ id as `origin_trace_id`, since a link is not searchable, and whether it was
 sampled as `origin_sampled`. Its sampling follows that origin: it is kept when
 any origin it links to was sampled and dropped when none was, so a kept
 request keeps the work it caused. A root with no origin keeps the configured
-sampler. Under OTLP the sampler that `OTEL_TRACES_SAMPLER` selects is wrapped
-to read the links of a root that records `origin_sampled`. The shim's wrapper
-also makes every span with a parent follow it, sampled or recorded unsampled,
-so a sampler that is not parent-based, such as Kind's `always_on`, cannot
-sample the children of a dropped `shim.create` and send their sampled
-`traceparent` on. The native Datadog samplers do not read links, so two
-sampling rules on `origin_sampled`, ahead of the ones
+sampler. Under OTLP the Rust services and the shim wrap the sampler that
+`OTEL_TRACES_SAMPLER` selects to read the links of a root that records
+`origin_sampled`, and to make every span with a parent follow it: sampled
+under a sampled parent, recorded unsampled otherwise, keeping the parent's
+tracestate. A sampler that is not parent-based therefore cannot split a
+trace: Kind's `always_on` cannot sample the children of a dropped root and
+send their sampled `traceparent` on, and `traceidratio` cannot drop the
+children of a root kept for its origin. In effect, `always_on`,
+`always_off` and `traceidratio` act like their `parentbased_` forms for any
+span with a valid parent. That includes a server span whose parent arrives in
+a caller's `traceparent`, so a caller that sends a sampled `traceparent` gets
+its request traced. `always_off` therefore does not turn tracing off;
+`SPACE_TRACE_EXPORTER=off` does. The native Datadog samplers give
+every span its trace's priority. They do not read links, so two sampling
+rules on `origin_sampled`, ahead of the ones
 `DD_TRACE_SAMPLING_RULES` configures, keep (`1.0`) or drop (`0.0`) such a
 root. The Rust services and the shim apply the same rules to their linked
 roots. A root linked without `origin_sampled` keeps the configured sampler on

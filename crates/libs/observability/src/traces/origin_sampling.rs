@@ -8,13 +8,17 @@
 //! keep work that links to nothing. A root that links to an origin and
 //! records `origin_sampled` therefore follows the origin's sampled flag. A
 //! root linked without it
-//! ([`crate::trace_propagation::link_root_to_origins_without_following`]), a
-//! root with no origin, and every span with a sampled parent keep the
-//! configured sampler.
+//! ([`crate::trace_propagation::link_root_to_origins_without_following`]) and
+//! a root with no origin keep the configured sampler.
 //!
-//! Every span under a parent that was not sampled is recorded unsampled, so
-//! APM stats count it and a failure can still be exported. A gRPC call made
-//! with no traced request in scope takes such a parent
+//! Every span with a parent follows it, whatever the configured sampler is, as
+//! the shim's sampler does and as the native Datadog sampler gives every span
+//! its trace's priority: a sampler that is not parent-based, such as
+//! `traceidratio`, would otherwise drop most children of a root kept for its
+//! origin. A span under a sampled parent is sampled; one under a parent that
+//! was not sampled is recorded unsampled, so APM stats count it and a failure
+//! can still be exported. A gRPC call made with no traced request in scope
+//! takes such a parent
 //! ([`crate::trace_propagation::set_unsampled_remote_parent`]), and its server
 //! follows the unsampled context it propagates.
 
@@ -32,9 +36,9 @@ use opentelemetry_sdk::trace::{SamplingDecision, SamplingResult, ShouldSample};
 /// the configured sampler on both.
 const ORIGIN_SAMPLED_ATTRIBUTE: &str = "origin_sampled";
 
-/// The OTLP pipeline's sampler: the one `OTEL_TRACES_SAMPLER` configures,
-/// except that a root that records `origin_sampled` and has a valid link
-/// follows its links.
+/// The OTLP pipeline's sampler: the one `OTEL_TRACES_SAMPLER` configures for
+/// roots, except that a root that records `origin_sampled` and has a valid
+/// link follows its links. A span with a parent follows the parent.
 #[derive(Clone, Debug)]
 pub(super) struct FollowOrigin {
     configured: Box<dyn ShouldSample>,
@@ -64,32 +68,34 @@ impl ShouldSample for FollowOrigin {
             .filter(|context| context.has_active_span())
             .map(|context| context.span().span_context().clone())
             .filter(|parent| parent.is_valid());
-        let has_parent = parent.is_some();
+        // A span with a parent follows it whatever OTEL_TRACES_SAMPLER says,
+        // as the native Datadog sampler and the shim do: `always_on` would
+        // otherwise sample the server side of a call its caller left
+        // unsampled, and `traceidratio` would drop most children of a root
+        // kept for its origin.
+        if let Some(parent) = parent {
+            return SamplingResult {
+                decision: if parent.is_sampled() {
+                    SamplingDecision::RecordAndSample
+                } else {
+                    SamplingDecision::RecordOnly
+                },
+                attributes: Vec::new(),
+                trace_state: parent.trace_state().clone(),
+            };
+        }
         let mut origins = links
             .iter()
             .map(|link| &link.span_context)
             .filter(|origin| origin.is_valid())
             .peekable();
-        // A span under a parent that was not sampled is recorded unsampled
-        // whatever OTEL_TRACES_SAMPLER says, as the native Datadog sampler
-        // does: `always_on` would otherwise sample the server side of a call
-        // its caller left unsampled.
-        if parent.as_ref().is_some_and(|parent| !parent.is_sampled()) {
-            return SamplingResult {
-                decision: SamplingDecision::RecordOnly,
-                attributes: Vec::new(),
-                trace_state: parent
-                    .map(|parent| parent.trace_state().clone())
-                    .unwrap_or_default(),
-            };
-        }
         // Only a root that records `origin_sampled` follows its links, as
         // the native Datadog rules do; one linked without it, such as a
         // retry, keeps the configured sampler.
         let follows = attributes
             .iter()
             .any(|attribute| attribute.key.as_str() == ORIGIN_SAMPLED_ATTRIBUTE);
-        if has_parent || !follows || origins.peek().is_none() {
+        if !follows || origins.peek().is_none() {
             return self.configured.should_sample(
                 parent_context,
                 trace_id,
@@ -142,3 +148,7 @@ pub(super) fn datadog_rules(
     rules.extend(configured.iter().cloned());
     rules
 }
+
+#[cfg(test)]
+#[path = "origin_sampling_tests.rs"]
+mod tests;
