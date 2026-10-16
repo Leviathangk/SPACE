@@ -544,7 +544,11 @@ emit structured records carrying the resolved service name and honor
 `SPACE_LOG_FORMAT`. A JSON record written inside any span with a valid trace
 context, sampled or not, also carries the W3C `trace_id` and `span_id` of the
 nearest such span as lowercase hex, under every trace exporter; the
-Datadog-reserved `dd.trace_id` and `dd.span_id` are not written. The Go shim writes plain `[space-shim]` lines to stderr
+Datadog-reserved `dd.trace_id` and `dd.span_id` are not written. A process
+outside Kubernetes defaults to plain text, so the host runtime-supervisor's
+systemd unit sets `SPACE_LOG_FORMAT=json` and its journal lines are the same
+JSON records; the per-sandbox net-gateway and spaced-host it launches share
+its journal stream and are launched with JSON too. The Go shim writes plain `[space-shim]` lines to stderr
 and the smoke script writes plain lines too; neither attaches a service,
 environment, or version, so a log pipeline that needs those must add them from
 pod metadata.
