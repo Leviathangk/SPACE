@@ -50,6 +50,34 @@ refusal as a reset in 10 of 20 tries for a wrong secret, and v1.9.0 did so in
    stored there; sessions survived IAM and gateway restarts only because the
    directory did (`results/resilience.txt`).
 
+## Decisions made during the spike
+
+- **No Kind bring-up.** The questions are the store's and the bridge's, so
+  the spike tests them at store level, as the bake-off's criterion C did, with
+  SPACE's object-store client and the authority's own STS client code.
+  Kind's chart wiring is described below but was not run.
+- **The issuer is reached through `--oidc-discovery-url`, not
+  `--oidc-allow-private-endpoints`.** This keeps versitygw's SSRF guard and
+  TLS verification on, and the issuer name in tokens independent of where the
+  bridge runs.
+- **The vend identity is not a versitygw user.** Its keys are checked only by
+  the bridge, so they open nothing on S3 (C40, C41). RustFS's vend user could
+  read every vended object with its own keys.
+- **C37 and C38 replaced.** versitygw's tokens are opaque, so the JWT
+  alterations had nothing to alter; they became the nearest forgeries
+  (footnote ¹).
+- **B6 runs without SDK retries.** With retries on, the SDK corrects its clock
+  from the refusal and re-signs, which hides the bridge's answer. That
+  behaviour is recorded separately as B6i.
+- **Burst: three interleaved runs per credential kind on one stack**, rather
+  than one each. An IAM user with static keys was added as an info row, to
+  separate policy evaluation from session lookup. The IAM service got 1 CPU and
+  1 GiB, so its cost could not hide in spare cores.
+- **C21 judged as a failed check, not explained away.** The predicate is the
+  bake-off's (a 403 or "denied"). The extra evidence (the store's log, C23,
+  `early`, the v1.8.0 control) went into the conditions rather than into
+  loosening the check.
+
 ## What versitygw needed
 
 Two processes from the same image:
