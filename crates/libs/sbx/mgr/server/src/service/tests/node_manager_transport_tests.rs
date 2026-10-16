@@ -14,7 +14,7 @@
 
 use super::service_tests::{insert_test_sandbox, runtime_fields};
 use super::*;
-use crate::node_manager_transport::fake::FakeNodeManager;
+use crate::node_manager_transport::fake::{FakeNodeManager, StalledNodeManager};
 use crate::service::activation_support::internal_request;
 use pplx_space_common_core::types::{ExecutionGeneration, LocalArtifactId};
 use pplx_space_node_mgr_client::proto::{
@@ -461,6 +461,76 @@ async fn stats_answers_without_cgroup_figures_while_node_manager_is_down() {
             network_tx_bytes: 1234,
             network_rx_bytes: 5678,
             bytes_forwarded: 1234 + 5678,
+            ..Default::default()
+        }
+    );
+}
+
+/// The read's budget bounds the whole read, not only its retries. The kept
+/// channel dials inside an attempt, so with no caller deadline a node-manager
+/// that accepts but never answers would hold the read until the server's own
+/// timeout; it must instead fail at the budget.
+#[tokio::test(start_paused = true)]
+async fn memory_policy_read_gives_up_on_a_stalled_node_manager_at_its_budget() {
+    let budget = pplx_space_common_grpc::DEFAULT_GRPC_CONNECT_RETRY_POLICY.max_elapsed;
+    let node_manager = StalledNodeManager::bind();
+    let service = service_with_node_manager(crate::db::test_conn(), node_manager.connector());
+
+    let started = tokio::time::Instant::now();
+    let error = tokio::time::timeout(
+        budget + std::time::Duration::from_secs(1),
+        service.resolve_sandbox_memory(internal_request(ResolveSandboxMemoryRequest {
+            requested_memory_mib: 8192,
+        })),
+    )
+    .await
+    .expect("the read outlived its budget")
+    .expect_err("node-manager never answers");
+    assert_eq!(error.code(), tonic::Code::DeadlineExceeded, "{error}");
+    assert!(
+        started.elapsed() >= budget,
+        "gave up after {:?}",
+        started.elapsed()
+    );
+}
+
+/// `Stats` bounds its inspect the same way: a node-manager that accepts but
+/// never answers costs it `STATS_INSPECT_TIMEOUT`, after which it answers
+/// without the cgroup figures.
+#[tokio::test(start_paused = true)]
+async fn stats_answers_without_cgroup_figures_when_node_manager_stalls() {
+    let budget = STATS_INSPECT_TIMEOUT;
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new().to_string();
+    insert_test_sandbox(&conn, &sandbox_id, SandboxState::Started);
+    conn.execute(
+        "UPDATE sandboxes SET uid = 10000, slot = 7 WHERE id = ?1",
+        rusqlite::params![sandbox_id],
+    )
+    .unwrap();
+    let node_manager = StalledNodeManager::bind();
+    let service = service_with_node_manager(conn, node_manager.connector());
+
+    let started = tokio::time::Instant::now();
+    let stats = tokio::time::timeout(
+        budget + std::time::Duration::from_secs(1),
+        service.stats(internal_request(StatsRequest {
+            sandbox_id: sandbox_id.clone(),
+        })),
+    )
+    .await
+    .expect("Stats outlived its inspect budget")
+    .expect("Stats must answer while node-manager stalls")
+    .into_inner();
+    assert!(
+        started.elapsed() >= budget,
+        "gave up after {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        stats,
+        StatsResponse {
+            sandbox_id,
             ..Default::default()
         }
     );

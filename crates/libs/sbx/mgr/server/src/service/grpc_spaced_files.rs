@@ -86,23 +86,36 @@ impl SandboxManagerService {
 
         // A read made for every `Stats` call: it shares the service's kept
         // node-manager channel and retries as a replay-safe read, rather than
-        // dialing node-manager for each call. When it still fails, as through
-        // a node-manager restart, the answer goes out without the cgroup
-        // figures only inspect supplies, left at their unset defaults, rather
-        // than failing the whole call.
-        let inspect = match pplx_space_common_grpc::fwd_retry!(
+        // dialing node-manager for each call. `STATS_INSPECT_TIMEOUT` bounds
+        // the whole read, the kept channel's dial included, so a node-manager
+        // that accepts but never answers cannot hold `Stats` open; the
+        // caller's deadline, when it sent one, ends the read sooner. When it
+        // still fails, as through a node-manager restart, the answer goes out
+        // without the cgroup figures only inspect supplies, left at their
+        // unset defaults, rather than failing the whole call.
+        let node_manager = self.node_manager.lazy();
+        let inspect_request = pplx_space_node_mgr_client::proto::InspectSandboxRequest {
+            sandbox_id: id.clone(),
+            uuid8: sandbox.uuid8.to_string(),
+            uid: Some(uid),
+            slot: Some(slot),
+            template: Some(sandbox.template.clone()),
+            execution_only: false,
+        };
+        let inspect = match pplx_space_common_grpc::retry_grpc_status_with_context(
             "node-manager",
-            self.node_manager.lazy(),
-            inspect_sandbox,
-            Request::new(pplx_space_node_mgr_client::proto::InspectSandboxRequest {
-                sandbox_id: id.clone(),
-                uuid8: sandbox.uuid8.to_string(),
-                uid: Some(uid),
-                slot: Some(slot),
-                template: Some(sandbox.template.clone()),
-                execution_only: false,
-            })
-        ) {
+            "InspectSandbox",
+            pplx_space_common_grpc::DEFAULT_LOCAL_GRPC_RETRY_POLICY,
+            pplx_space_common_grpc::GrpcRetryContext::with_timeout(STATS_INSPECT_TIMEOUT)
+                .with_grpc_timeout_metadata(request.metadata()),
+            || {
+                let mut client = node_manager.clone();
+                let inspect_request = inspect_request.clone();
+                async move { client.inspect_sandbox(inspect_request).await }
+            },
+        )
+        .await
+        {
             Ok(response) => response.into_inner(),
             Err(error) => {
                 if STATS_INSPECT_WARNINGS.admit(id, Instant::now()) {

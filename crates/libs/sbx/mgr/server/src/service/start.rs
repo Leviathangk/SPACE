@@ -748,21 +748,27 @@ impl SandboxManagerService {
     pub(super) async fn resolve_sandbox_memory_policy_for_request(
         &self,
         requested_memory_mib: u32,
-        retry_context: pplx_space_common_grpc::GrpcRetryContext,
+        caller_metadata: &tonic::metadata::MetadataMap,
     ) -> Result<ResolvedSandboxMemoryPolicy, Status> {
         // Template-manager asks for this on every reconcile, so the read shares
         // the service's kept node-manager channel rather than dialing
         // node-manager for each call. It keeps the 10 s budget the dial used
-        // to retry within: template-manager falls back to an unclamped memory
-        // size when this fails, so a node-manager restart must be waited out,
-        // not failed fast. The caller's deadline, when it sent one, ends the
-        // retries sooner.
+        // to have: template-manager falls back to an unclamped memory size
+        // when this fails, so a node-manager restart must be waited out, not
+        // failed fast. The budget bounds the whole read, not only its retries:
+        // the kept channel dials inside an attempt, and a node-manager that
+        // accepts but never answers would otherwise hold an attempt until the
+        // server's own timeout. The caller's deadline, when it sent one, ends
+        // the read sooner.
+        const POLICY: pplx_space_common_grpc::GrpcRetryPolicy =
+            pplx_space_common_grpc::DEFAULT_GRPC_CONNECT_RETRY_POLICY;
         let node_manager = self.node_manager.lazy();
         let response = pplx_space_common_grpc::retry_grpc_status_with_context(
             "node-manager",
             "GetNetworkPoolStatus",
-            pplx_space_common_grpc::DEFAULT_GRPC_CONNECT_RETRY_POLICY,
-            retry_context,
+            POLICY,
+            pplx_space_common_grpc::GrpcRetryContext::with_timeout(POLICY.max_elapsed)
+                .with_grpc_timeout_metadata(caller_metadata),
             || {
                 let mut client = node_manager.clone();
                 async move {

@@ -164,6 +164,11 @@ const RESUME_CLOCK_SYNC_TIMEOUT: Duration = Duration::from_secs(5);
 // Foreground Stats should promptly fall back to recorded counters when the
 // gateway is slow. Background observations tolerate a longer 2s probe.
 const NET_GATEWAY_FOREGROUND_STATS_TIMEOUT: Duration = Duration::from_secs(1);
+// Stats' node-manager inspect, its kept channel's dial included, gets as long
+// as the gateway probe in the same call. A merely slow inspect must still
+// answer: without it Stats reports zero CPU time and memory, which kubelet
+// reads as a counter reset and an empty sandbox.
+const STATS_INSPECT_TIMEOUT: Duration = Duration::from_secs(1);
 const NETWORK_POLICY_SYNC_REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
 // End-to-end network-readiness budget, including connection, RPCs and backoff.
 // Startup dependencies may need tens of seconds even after policy hydration.
