@@ -3,7 +3,9 @@
 
 Reads the files collect-volmgr-logs.sh wrote, keeps each job runner
 "job completed" / "job failed" line once, and prints p50, p95 and max of
-elapsed_ms per job kind, plus every transfer over the threshold.
+elapsed_ms per job kind and subject type (sandbox: snapshot uploads and
+downloads; template: template pulls), plus every transfer over the
+threshold.
 
 Usage: transfer-durations.py <dir> [--over-ms 5000]
 """
@@ -50,7 +52,10 @@ def main():
             msg = str(v.get("message", ""))
             if msg == "job completed" and "elapsed_ms" in v:
                 key = (v.get("job_id"), f.name.split(".")[0])
-                jobs[key] = (str(v.get("kind")), int(v["elapsed_ms"]), int(v.get("bytes", 0) or 0), line[:30])
+                # subject_id is logged as Some("sandbox:<uuid>") or Some("template:<name>").
+                subject = re.sub(r'^Some\("|"\)$', "", str(v.get("subject_id", "")))
+                kind = f'{v.get("kind")} ({subject.split(":")[0] or "no subject"})'
+                jobs[key] = (kind, int(v["elapsed_ms"]), int(v.get("bytes", 0) or 0), line[:30])
             elif msg.startswith("job") and "fail" in msg:
                 failures.append((f.name, v.get("kind"), v.get("job_id"), v.get("error_kind"), line[:30]))
     kinds = sorted({k for k, *_ in jobs.values()})

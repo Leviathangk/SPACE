@@ -1,0 +1,14 @@
+[run-suite exchange-1] 2026-10-16T07:56:09Z mode=exchange commit=a078d8c docker host: 31.2 GiB free
+[run-suite exchange-1] 2026-10-16T07:56:09Z bring-up + baseline smoke
+[run-suite exchange-1] 2026-10-16T08:02:52Z smoke-kind-e2e.sh exit=0 after 403 s
+[run-suite exchange-1] 2026-10-16T08:02:53Z health gate
+[run-suite exchange-1] 2026-10-16T08:05:55Z typed suite (all, unsharded)
+[run-suite exchange-1] 2026-10-16T08:06:10Z docker host: 15.2 GiB free
+[run-suite exchange-1] 2026-10-16T08:16:11Z docker host: 13.3 GiB free
+[run-suite exchange-1] 2026-10-16T08:26:12Z docker host: 13.8 GiB free
+[run-suite exchange-1] 2026-10-16T08:36:13Z docker host: 13.1 GiB free
+[run-suite exchange-1] 2026-10-16T08:46:14Z docker host: 12.8 GiB free
+[run-suite exchange-1] 2026-10-16T08:56:15Z docker host: 12.4 GiB free
+[run-suite exchange-1] 2026-10-16T08:58:37Z smoke-kind-typed.sh all exit=2 after 3162 s
+[run-suite exchange-1] 2026-10-16T08:58:37Z transfer durations: | pull (sandbox) | 94 | 0.05 | 0.36 | 0.46 | 0 |
+[run-suite exchange-1] 2026-10-16T08:58:38Z docker host: 12.2 GiB free

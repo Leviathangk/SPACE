@@ -10,7 +10,7 @@
 #   4. the full typed suite, unsharded: SKIP_BOOTSTRAP=1 smoke-kind-typed.sh all;
 #   5. throughout, volume-manager's logs (collect-volmgr-logs.sh) and the Docker
 #      host's free space; afterwards the transfer durations
-#      (transfer-durations.py).
+#      (transfer-durations.py) and per-scenario verdicts (suite-summary.py).
 #
 # The storage mode comes from the caller's SPACE_KIND_STORAGE_CREDENTIALS
 # (unset: static). Output goes to $BAKEOFF_KIND_OUT/<label> (default
@@ -68,10 +68,13 @@ log "smoke-kind-typed.sh all exit=$typed after $((SECONDS - start)) s"
 # One last pass so the final transfers are in.
 kill "$collector_pid" 2>/dev/null
 SPACE_KIND_CLUSTER="${SPACE_KIND_CLUSTER:-space-local}" timeout 120 bash -c "
-  for pod in \$(kubectl --context kind-space-local -n space get pods -l app.kubernetes.io/name=space-volume-manager -o name); do
+  for pod in \$(kubectl --context kind-space-local -n space get pods -l space.pplx.net/node-service=volume-manager -o name); do
     kubectl --context kind-space-local -n space logs \"\${pod#pod/}\" --all-containers --timestamps >>\"$out/volmgr-logs/\${pod#pod/}.log\" 2>/dev/null
   done"
 python3 "$here/transfer-durations.py" "$out/volmgr-logs" >"$out/transfer-durations.md"
+python3 "$here/suite-summary.py" "$out/typed.log" \
+  --show local.pending_backup_census_reports_blocked_upload \
+  --show native_recovery.slow_operation_does_not_block_later_work >"$out/suite.md"
 log "transfer durations: $(head -n 3 "$out/transfer-durations.md" | tail -n 1)"
 log "docker host: $(disk)"
 exit "$typed"
