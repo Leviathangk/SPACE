@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
+use pplx_space_common_core::types::{LinuxPid, SandboxId};
 use pplx_space_net_gateway_client::{ConnectError, NetGatewayControlGrpcClient};
 use tokio::time::Instant;
 
@@ -33,28 +34,29 @@ static KEPT: LazyLock<KeptClients<NetGatewayControlGrpcClient>> =
 /// one with the default connect policy when none is kept. A dial failure is
 /// returned, and reported, as it would be without the cache.
 pub(crate) async fn client(
-    sandbox_id: &str,
-    gateway_pid: Option<u32>,
+    sandbox_id: SandboxId,
+    gateway_pid: Option<LinuxPid>,
 ) -> Result<NetGatewayControlGrpcClient, ConnectError> {
+    let socket_sandbox_id = sandbox_id.to_string();
     KEPT.get_or_connect(sandbox_id, gateway_pid, || {
-        pplx_space_net_gateway_client::connect(sandbox_id)
+        pplx_space_net_gateway_client::connect(&socket_sandbox_id)
     })
     .await
 }
 
 /// Drop the kept client for that gateway process after an RPC on it failed,
 /// so the next call dials again.
-pub(crate) fn discard(sandbox_id: &str, gateway_pid: Option<u32>) {
+pub(crate) fn discard(sandbox_id: SandboxId, gateway_pid: Option<LinuxPid>) {
     KEPT.discard(sandbox_id, gateway_pid);
 }
 
 /// Drop whatever is kept for a sandbox being torn down.
-pub(crate) fn forget(sandbox_id: &str) {
+pub(crate) fn forget(sandbox_id: SandboxId) {
     KEPT.forget(sandbox_id);
 }
 
 struct Kept<T> {
-    gateway_pid: Option<u32>,
+    gateway_pid: Option<LinuxPid>,
     connected_at: Instant,
     client: T,
 }
@@ -66,7 +68,7 @@ pub(crate) struct KeptClients<T> {
 }
 
 struct Entries<T> {
-    by_sandbox: HashMap<String, Kept<T>>,
+    by_sandbox: HashMap<SandboxId, Kept<T>>,
     swept_at: Instant,
 }
 
@@ -84,8 +86,8 @@ impl<T: Clone> KeptClients<T> {
 
     pub(crate) async fn get_or_connect<E, F, Fut>(
         &self,
-        sandbox_id: &str,
-        gateway_pid: Option<u32>,
+        sandbox_id: SandboxId,
+        gateway_pid: Option<LinuxPid>,
         connect: F,
     ) -> Result<T, E>
     where
@@ -100,7 +102,7 @@ impl<T: Clone> KeptClients<T> {
         let mut kept = self.lock();
         self.sweep(&mut kept, now);
         kept.by_sandbox.insert(
-            sandbox_id.to_owned(),
+            sandbox_id,
             Kept {
                 gateway_pid,
                 connected_at: now,
@@ -110,13 +112,13 @@ impl<T: Clone> KeptClients<T> {
         Ok(client)
     }
 
-    fn fresh(&self, sandbox_id: &str, gateway_pid: Option<u32>) -> Option<T> {
+    fn fresh(&self, sandbox_id: SandboxId, gateway_pid: Option<LinuxPid>) -> Option<T> {
         let now = Instant::now();
         let mut kept = self.lock();
         if now.duration_since(kept.swept_at) >= self.sweep_interval {
             self.sweep(&mut kept, now);
         }
-        let entry = kept.by_sandbox.get(sandbox_id)?;
+        let entry = kept.by_sandbox.get(&sandbox_id)?;
         (entry.gateway_pid == gateway_pid && now.duration_since(entry.connected_at) < self.max_age)
             .then(|| entry.client.clone())
     }
@@ -128,19 +130,19 @@ impl<T: Clone> KeptClients<T> {
         kept.swept_at = now;
     }
 
-    pub(crate) fn discard(&self, sandbox_id: &str, gateway_pid: Option<u32>) {
+    pub(crate) fn discard(&self, sandbox_id: SandboxId, gateway_pid: Option<LinuxPid>) {
         let mut kept = self.lock();
         if kept
             .by_sandbox
-            .get(sandbox_id)
+            .get(&sandbox_id)
             .is_some_and(|entry| entry.gateway_pid == gateway_pid)
         {
-            kept.by_sandbox.remove(sandbox_id);
+            kept.by_sandbox.remove(&sandbox_id);
         }
     }
 
-    pub(crate) fn forget(&self, sandbox_id: &str) {
-        self.lock().by_sandbox.remove(sandbox_id);
+    pub(crate) fn forget(&self, sandbox_id: SandboxId) {
+        self.lock().by_sandbox.remove(&sandbox_id);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Entries<T>> {

@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::{JobId, LocalArtifactId};
+use pplx_space_common_core::types::{JobId, LinuxPid, LocalArtifactId};
 
 use super::cleanup_executor::CleanupWait;
 use super::cleanup_support::{
@@ -1588,8 +1588,17 @@ impl SandboxManagerService {
             return fallback;
         }
 
+        // A sandbox row's id is the UUID create assigned; one that does not
+        // parse fails the probe as an absent gateway socket would.
+        let kept_gateway = sandbox_id.parse::<SandboxId>().map(|id| {
+            (
+                id,
+                gateway_pid.and_then(|pid| LinuxPid::try_from_u32(pid).ok()),
+            )
+        });
         let result = tokio::time::timeout(NET_GATEWAY_FOREGROUND_STATS_TIMEOUT, async {
-            let mut client = crate::net_gateway_clients::client(sandbox_id, gateway_pid)
+            let (id, gateway_pid) = kept_gateway.clone().map_err(|error| error.to_string())?;
+            let mut client = crate::net_gateway_clients::client(id, gateway_pid)
                 .await
                 .map_err(|error| error.to_string())?;
             client
@@ -1599,8 +1608,10 @@ impl SandboxManagerService {
                 .map_err(|error| error.to_string())
         })
         .await;
-        if !matches!(result, Ok(Ok(_))) {
-            crate::net_gateway_clients::discard(sandbox_id, gateway_pid);
+        if !matches!(result, Ok(Ok(_)))
+            && let Ok((id, gateway_pid)) = kept_gateway
+        {
+            crate::net_gateway_clients::discard(id, gateway_pid);
         }
 
         let stats = match result {
