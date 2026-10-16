@@ -217,9 +217,10 @@ In exchange mode:
     RustFS's admin API, and attaches its user policy: read, write and abort
     uploads of objects in the `snapshots` and `templates` buckets, and list
     them.
-  - RustFS has no roles or trust policies. Any well-formed `RoleArn` is
-    accepted, and a session gets its caller's own policy intersected with the
-    session policy. So the user policy is the ceiling of every vended
+  - RustFS has no roles or trust policies. It accepts any `RoleArn`, even a
+    malformed one or none (the authority only sends ARNs that
+    `iam_role_arn.rs` accepts), and a session gets its caller's own policy
+    intersected with the session policy. So the user policy is the ceiling of every vended
     session, and, unlike an AWS role, it also applies to the identity's own
     keys, which only the authority holds.
   - Session tokens are JWTs signed with a key derived from the root secret,
@@ -340,6 +341,35 @@ through the object store. The PR has the results table and timings.
 - **Cost.** The object store took about 14 s from pod creation to Ready,
   including its signing-key init container. That compares with about 1 s for
   versitygw. SeaweedFS held about 700 MiB after the seed publish.
+
+## What the RustFS runs showed on Kind
+
+Two full suites ran on fresh exchange-mode clusters with RustFS, with one
+versitygw baseline. Numbers and commands are in
+`scratch/rustfs-bakeoff/REPORT.md`.
+
+- **The path works end to end, through the whole suite.** Every snapshot
+  and template transfer on sandbox workers used a session from the
+  authority. Both suites passed apart from one scenario that this box's disk
+  blocks in either mode.
+- **The scope is enforced by the store.** The real chain was driven by hand
+  from volume-manager's own identity on each sandbox node. A session for one
+  sandbox's snapshot object reached that object and nothing else: RustFS
+  refused the other sandbox's objects, its prefix, writes under read scope,
+  and the templates bucket. The authority refused the first sandbox's
+  subject for the second sandbox's object. It also refused a write session
+  on a node that does not host the sandbox.
+- **A store outage is an STS outage.** STS and S3 share RustFS's endpoint, so
+  the fault scenarios that scale the store to 0 make every exchange fail with
+  `failed to assume the configured storage role` before any S3 request. The
+  jobs retry and recover; the message points at the role, not the endpoint.
+- **RustFS differs from AWS in ways the authority does not exercise.** It
+  answers a forged session token with 500 rather than 403, raises a
+  `DurationSeconds` under 900 to 900, and accepts any `RoleArn`.
+- **Upload bursts need a chart setting.** Stock RustFS admits at most 32
+  concurrent large PUTs and answers the rest with `503 SlowDown`, which made
+  SPACE's client lose 4 of 36 uploads in #109's burst.
+  `RUSTFS_PUT_LARGE_FOREGROUND_ADMISSION_LIMIT=64` removes the failures.
 
 ## What stays different from deployments
 

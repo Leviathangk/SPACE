@@ -1,0 +1,14 @@
+[run-suite baseline-static] 2026-10-16T10:23:33Z mode=static commit=b9160cf docker host: 33.0 GiB free
+[run-suite baseline-static] 2026-10-16T10:23:33Z bring-up + baseline smoke
+[run-suite baseline-static] 2026-10-16T10:29:29Z smoke-kind-e2e.sh exit=0 after 356 s
+[run-suite baseline-static] 2026-10-16T10:29:29Z health gate
+[run-suite baseline-static] 2026-10-16T10:33:33Z typed suite (all, unsharded)
+[run-suite baseline-static] 2026-10-16T10:33:34Z docker host: 17.7 GiB free
+[run-suite baseline-static] 2026-10-16T10:43:35Z docker host: 16.1 GiB free
+[run-suite baseline-static] 2026-10-16T10:53:36Z docker host: 15.6 GiB free
+[run-suite baseline-static] 2026-10-16T11:03:36Z docker host: 14.8 GiB free
+[run-suite baseline-static] 2026-10-16T11:13:37Z docker host: 14.7 GiB free
+[run-suite baseline-static] 2026-10-16T11:23:38Z docker host: 14.3 GiB free
+[run-suite baseline-static] 2026-10-16T11:27:17Z smoke-kind-typed.sh all exit=2 after 3224 s
+[run-suite baseline-static] 2026-10-16T11:27:17Z transfer durations: | pull (sandbox) | 94 | 0.03 | 0.37 | 0.38 | 0 |
+[run-suite baseline-static] 2026-10-16T11:27:18Z docker host: 14.1 GiB free

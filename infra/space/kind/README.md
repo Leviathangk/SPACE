@@ -1996,8 +1996,8 @@ object store, for every bring-up path
   checks the caller and the subject's placement and storage, and assumes the
   vend role with a session policy for that object or prefix. RustFS refuses a
   session's request for anything else. RustFS has no roles: it accepts any
-  well-formed `RoleArn`, and a session gets the signing identity's own user
-  policy intersected with the session policy. The bucket-init Job creates
+  `RoleArn`, even a malformed one, and a session gets the signing identity's
+  own user policy intersected with the session policy. The bucket-init Job creates
   that vend identity, whose policy covers only the `snapshots` and
   `templates` buckets; unlike an AWS role it also applies to the identity's
   own keys, which only the authority holds. Builders, build-manager and
