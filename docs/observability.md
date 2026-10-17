@@ -363,6 +363,22 @@ ranged download's chunk keeps its own `S3.GetObject.range` span, which covers
 reading the chunk's body as well, so each chunk shows that span with this
 request span inside it.
 
+## gRPC client spans
+
+A `grpc.client` span records the call's `rpc.grpc.status_code` and sets status
+ERROR for every status other than OK, except where a method's status is the
+answer to the question the caller asked; those spans keep the code and leave
+the status unset. The exceptions are per method, in
+`crates/libs/common/grpc/src/trace.rs`: a `SpacedWaitReady` FAILED_PRECONDITION
+(not ready yet), a guest refusal on `ServicePortIngress`, the guest's
+application statuses on the WorkerApi's Spaced file and process methods, and
+NOT_FOUND from a file stat, read or list on either hop, from
+`ClusterApi/FindTemplateRelease` (no release has that tag), and from
+`ClusterApi/GetArtifactBackupLocation` (no ready backup yet). Spans of the
+NOT_FOUND methods carry `space.grpc.expected_not_found=true`. Server spans
+follow the OpenTelemetry server convention and never mark an application
+status as an error.
+
 ## Datadog trace chunks
 
 The native Datadog tracer sends the spans a process records for one trace as a

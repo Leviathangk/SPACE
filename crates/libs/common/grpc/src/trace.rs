@@ -58,7 +58,6 @@ pub fn trace_grpc_client_transport<S>(inner: S) -> GrpcClientTrace<S> {
     GrpcClientTraceLayer.layer(inner)
 }
 
-const WORKER_API_SPACED_STAT_PATH: &str = "/space.node.api.v1.WorkerApi/SpacedStat";
 const WORKER_API_SPACED_PREFIX: &str = "/space.node.api.v1.WorkerApi/Spaced";
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -199,8 +198,25 @@ fn grpc_client_is_readiness_poll(path: &str) -> bool {
     )
 }
 
+/// RPCs whose NOT_FOUND is the answer to the question the caller asked, so it
+/// is classified as success. Every caller here maps it to an absent value.
+/// Everywhere else NOT_FOUND stays an error on the client span.
 fn grpc_client_not_found_is_expected(path: &str) -> bool {
-    path == WORKER_API_SPACED_STAT_PATH
+    matches!(
+        path,
+        // The guest path does not exist, on each hop of a file stat, read or
+        // list. The WorkerApi hop's other Spaced methods expect every
+        // application status; see below.
+        "/space.node.api.v1.WorkerApi/SpacedStat"
+            | "/space.sandbox.manager.v1.SandboxManager/SpacedStat"
+            | "/space.sandbox.manager.v1.SandboxManager/SpacedRead"
+            | "/space.sandbox.manager.v1.SandboxManager/SpacedList"
+            // No release carries the requested tag, as for a prefetch tag that
+            // a template does not define. A by-hash miss stays an error.
+            | "/space.node.api.v1.ClusterApi/FindTemplateRelease"
+            // No ready backup exists for this artifact yet.
+            | "/space.node.api.v1.ClusterApi/GetArtifactBackupLocation"
+    )
 }
 
 fn grpc_client_application_statuses_are_expected(path: &str) -> bool {

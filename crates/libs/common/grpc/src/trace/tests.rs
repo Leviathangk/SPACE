@@ -327,3 +327,76 @@ fn non_ingress_precondition_conventions_are_unchanged() {
         }
     }
 }
+
+fn classify_status(path: &str, code: tonic::Code) -> (bool, bool) {
+    let request = Request::builder().uri(path).body(()).unwrap();
+    let response = tonic::Status::new(code, "synthetic").into_http::<()>();
+    let ClassifiedResponse::Ready(from_headers) = GrpcClientMakeClassifier
+        .make_classifier(&request)
+        .classify_response(&response)
+    else {
+        panic!("status in headers must be classified immediately");
+    };
+    let ClassifiedResponse::RequiresEos(eos) = GrpcClientMakeClassifier
+        .make_classifier(&request)
+        .classify_response(&Response::new(()))
+    else {
+        panic!("streaming response must defer classification");
+    };
+    let from_trailers = eos.classify_eos(Some(response.headers()));
+    (from_headers.is_ok(), from_trailers.is_ok())
+}
+
+#[test]
+fn expected_not_found_answers_leave_the_client_span_unset() {
+    for path in [
+        "/space.node.api.v1.WorkerApi/SpacedStat",
+        "/space.sandbox.manager.v1.SandboxManager/SpacedStat",
+        "/space.sandbox.manager.v1.SandboxManager/SpacedRead",
+        "/space.sandbox.manager.v1.SandboxManager/SpacedList",
+        "/space.node.api.v1.ClusterApi/FindTemplateRelease",
+        "/space.node.api.v1.ClusterApi/GetArtifactBackupLocation",
+    ] {
+        assert!(grpc_client_not_found_is_expected(path), "{path}");
+        assert_eq!(
+            classify_status(path, tonic::Code::NotFound),
+            (true, true),
+            "{path}: NOT_FOUND is the answer to the question asked"
+        );
+        for code in [tonic::Code::Unavailable, tonic::Code::Internal] {
+            assert_eq!(
+                classify_status(path, code),
+                (false, false),
+                "{path}: {code:?}"
+            );
+        }
+    }
+    // Outside the WorkerApi's guest-status policy, only NOT_FOUND is exempt.
+    for path in [
+        "/space.sandbox.manager.v1.SandboxManager/SpacedStat",
+        "/space.node.api.v1.ClusterApi/GetArtifactBackupLocation",
+    ] {
+        assert_eq!(
+            classify_status(path, tonic::Code::PermissionDenied),
+            (false, false),
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn not_found_stays_an_error_where_it_means_a_missing_object() {
+    for path in [
+        "/space.sandbox.manager.v1.SandboxManager/SpacedWrite",
+        "/space.sandbox.manager.v1.SandboxManager/Start",
+        "/space.node.api.v1.ClusterApi/FindTemplateReleaseByHash",
+        "/space.node.api.v1.ClusterApi/BeginArtifactBackup",
+    ] {
+        assert!(!grpc_client_not_found_is_expected(path), "{path}");
+        assert_eq!(
+            classify_status(path, tonic::Code::NotFound),
+            (false, false),
+            "{path}"
+        );
+    }
+}
