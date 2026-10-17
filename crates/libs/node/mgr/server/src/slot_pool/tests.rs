@@ -2591,6 +2591,116 @@ mod slot_pool_tests {
         let _ = std::fs::remove_dir_all(temp_root);
     }
 
+    /// Slot 0 holds the sandbox's released lease; with `successor`, Allocate
+    /// has already leased the same sandbox slot 1. The cache root holds a file
+    /// owned by the released lease UID, which stops the reset just after the
+    /// runtime check, so `last_error` shows which gate the reset reached.
+    #[cfg(target_os = "linux")]
+    fn pool_with_released_lease(
+        sandbox_id: &str,
+        previous_pid: Option<u32>,
+        successor: bool,
+    ) -> (std::sync::Arc<NetworkPool>, tempfile::TempDir) {
+        let cache_root = tempfile::tempdir().unwrap();
+        let retained = cache_root.path().join(sandbox_id);
+        std::fs::create_dir_all(&retained).unwrap();
+        std::fs::write(retained.join("owned-by-old-uid"), b"stale cache").unwrap();
+        let lease_uid = std::fs::metadata(retained.join("owned-by-old-uid"))
+            .unwrap()
+            .uid();
+        let mut config = NetworkPoolConfig::new(2);
+        config.target_ready_slots = 0;
+        config.retained_ready_slots = 0;
+        config.min_ready_slots = 0;
+        config.sandbox_cache_dir = cache_root.path().to_path_buf();
+        let pool = test_pool(config);
+        {
+            let conn = pool.db.lock().unwrap();
+            conn.execute(
+                "UPDATE network_slots
+                 SET generation = 1, state = 'dirty', health = 'unknown',
+                     sandbox_id = ?1, sandbox_uid = ?2, pid = ?3, lease_kind = ?4
+                 WHERE slot_id = 0",
+                params![
+                    sandbox_id,
+                    lease_uid,
+                    previous_pid,
+                    LeaseKind::Ephemeral.as_str()
+                ],
+            )
+            .unwrap();
+            if successor {
+                conn.execute(
+                    "UPDATE network_slots
+                     SET generation = 1, state = 'leased', health = 'healthy',
+                         sandbox_id = ?1, sandbox_uid = ?2, lease_kind = ?3,
+                         memory_reservation_mib = 8320
+                     WHERE slot_id = 1",
+                    params![
+                        sandbox_id,
+                        net::sandbox_uid_for_slot(1),
+                        LeaseKind::Ephemeral.as_str()
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        (pool, cache_root)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn reset_slot_does_not_wait_for_the_successor_runtime_of_the_same_sandbox() {
+        let sandbox_id = SandboxId::new().to_string();
+        // The successor lease's VM occupies the sandbox's cgroups and fc.pid.
+        super::liveness::set_test_sandbox_runtime_evidence(&sandbox_id, LeaseLiveness::Live);
+        let (pool, _cache_root) = pool_with_released_lease(&sandbox_id, None, true);
+
+        reset_slot(pool.clone(), 0).await;
+
+        let previous = record(&pool, 0);
+        let error = previous.last_error.as_deref().unwrap();
+        assert!(
+            error.contains("cleanup required before resetting slot 0 generation 1"),
+            "{error}"
+        );
+        assert!(!error.contains("runtime is"), "{error}");
+        assert_eq!(record(&pool, 1).state, SlotState::Leased);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn reset_slot_waits_for_a_live_previous_runtime_despite_a_successor() {
+        let sandbox_id = SandboxId::new().to_string();
+        super::liveness::set_test_sandbox_runtime_evidence(&sandbox_id, LeaseLiveness::Live);
+        let previous_runtime = SandboxMarkerProcess::spawn(&sandbox_id);
+        let (pool, _cache_root) =
+            pool_with_released_lease(&sandbox_id, Some(previous_runtime.id()), true);
+
+        reset_slot(pool.clone(), 0).await;
+
+        let previous = record(&pool, 0);
+        assert_eq!(previous.state, SlotState::Dirty);
+        let error = previous.last_error.as_deref().unwrap();
+        assert!(
+            error.contains("cannot reset slot 0 generation 1") && error.contains("runtime is Live"),
+            "{error}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn reset_slot_without_a_successor_still_waits_for_sandbox_runtime_evidence() {
+        let sandbox_id = SandboxId::new().to_string();
+        super::liveness::set_test_sandbox_runtime_evidence(&sandbox_id, LeaseLiveness::Live);
+        let (pool, _cache_root) = pool_with_released_lease(&sandbox_id, None, false);
+
+        reset_slot(pool.clone(), 0).await;
+
+        let error = record(&pool, 0).last_error.unwrap();
+        assert!(error.contains("runtime is Live"), "{error}");
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn reset_slot_quarantines_after_cleanup_retry_exhaustion() {
