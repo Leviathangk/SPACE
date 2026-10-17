@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 
 use crate::debug::GatewayDebugState;
 use crate::egress::{EgressPhase, EgressProtocol};
-use crate::known_egress::KnownEgressState;
+use crate::known_egress::{KnownEgressState, TransferPeer};
 use crate::reserved_dns::ReservedDnsCore;
 use crate::resource_budget::MAX_ACTIVE_TCP_CONNECTIONS;
 use crate::sniff;
@@ -202,7 +202,7 @@ impl FlowOutcome {
             Self::RelayFailed(RelayFailure::Inspected(_)) => ("relay_failed", "inspected_http"),
             Self::RelayFailed(RelayFailure::Connect(_)) => ("relay_failed", "connect"),
             Self::RelayFailed(RelayFailure::Plaintext(error)) => ("relay_failed", error.reason()),
-            Self::RelayFailed(RelayFailure::Transfer(_)) => ("relay_failed", "transfer"),
+            Self::RelayFailed(RelayFailure::Transfer { .. }) => ("relay_failed", "transfer"),
         }
     }
 
@@ -211,7 +211,7 @@ impl FlowOutcome {
             Self::RelayFailed(RelayFailure::Connect(error)) => {
                 Some(format!("upstream_connect: {error}").into())
             }
-            Self::RelayFailed(RelayFailure::Transfer(error)) => {
+            Self::RelayFailed(RelayFailure::Transfer { error, .. }) => {
                 Some(format!("transfer: {:?}: {error}", error.kind()).into())
             }
             Self::Rejected(_) | Self::RelayFailed(_) => Some(self.metric_tags().1.into()),
@@ -237,7 +237,11 @@ enum RelayFailure {
     Connect(transport::Error),
     Plaintext(http_host::Failure),
     /// Connected, then the byte stream failed (e.g. reset, broken pipe).
-    Transfer(io::Error),
+    Transfer {
+        error: io::Error,
+        /// The peer and operation that failed first.
+        fault: Option<relay::RelayFault>,
+    },
     Inspected(tls_http::HttpError),
 }
 
@@ -573,7 +577,10 @@ impl TcpProxy {
 
     async fn relay(&self, client: TcpStream, admitted: AdmittedTcp) -> FlowOutcome {
         match admitted {
-            AdmittedTcp::Tunnel(destination) => self.pass_through(client, destination).await,
+            AdmittedTcp::Tunnel(destination) => {
+                self.pass_through(client, destination, transport::connect)
+                    .await
+            }
             AdmittedTcp::HostBoundHttp(destination) => {
                 self.host_bound_http(client, destination, transport::connect)
                     .await
@@ -581,8 +588,18 @@ impl TcpProxy {
         }
     }
 
-    async fn pass_through(&self, client: TcpStream, dst: SocketAddr) -> FlowOutcome {
-        let upstream = match transport::connect(dst).await {
+    async fn pass_through<F, Fut, U>(
+        &self,
+        client: TcpStream,
+        dst: SocketAddr,
+        connect: F,
+    ) -> FlowOutcome
+    where
+        F: FnOnce(SocketAddr) -> Fut,
+        Fut: Future<Output = Result<U, transport::Error>>,
+        U: AsyncRead + AsyncWrite + Unpin,
+    {
+        let upstream = match connect(dst).await {
             Ok(upstream) => upstream,
             Err(error) => return FlowOutcome::RelayFailed(RelayFailure::Connect(error)),
         };
@@ -592,7 +609,10 @@ impl TcpProxy {
                 wire_tx: report.written.0,
                 wire_rx: report.written.1,
             }),
-            Err(relay::Error::Io(error)) => FlowOutcome::RelayFailed(RelayFailure::Transfer(error)),
+            Err(relay::Error::Io(error)) => FlowOutcome::RelayFailed(RelayFailure::Transfer {
+                error,
+                fault: report.fault,
+            }),
             Err(relay::Error::Cancelled | relay::Error::Idle) => FlowOutcome::Cancelled,
         }
     }
@@ -625,19 +645,15 @@ impl TcpProxy {
     fn record(&self, dst: SocketAddr, host: Option<&DomainName>, outcome: FlowOutcome) -> bool {
         let (status, detail) = outcome.metric_tags();
         pplx_space_metrics::gateway::tcp_connection(status, detail);
-        let reported = if let (Some(host), Some(reason)) = (host, outcome.failure_reason()) {
-            self.known_egress_state
-                .report_tcp_failure(self.sandbox_id, dst, host, reason.as_ref())
-        } else {
-            false
-        };
+        let reported = host.is_some_and(|host| self.report_known_egress(dst, host, &outcome));
 
         match outcome {
             // These phases have no branch-specific telemetry beyond the
             // terminal connection metric emitted above.
             FlowOutcome::Cancelled
             | FlowOutcome::InspectedTls
-            | FlowOutcome::RelayFailed(RelayFailure::Connect(_) | RelayFailure::Transfer(_)) => {}
+            | FlowOutcome::RelayFailed(RelayFailure::Connect(_) | RelayFailure::Transfer { .. }) => {
+            }
             FlowOutcome::RelayFailed(RelayFailure::Inspected(error)) => {
                 pplx_space_metrics::gateway::domain_binding(
                     "tcp",
@@ -768,6 +784,39 @@ impl TcpProxy {
             }
         }
         reported
+    }
+
+    fn report_known_egress(
+        &self,
+        dst: SocketAddr,
+        host: &DomainName,
+        outcome: &FlowOutcome,
+    ) -> bool {
+        let Some(reason) = outcome.failure_reason() else {
+            return false;
+        };
+        let FlowOutcome::RelayFailed(RelayFailure::Transfer { fault, .. }) = outcome else {
+            return self.known_egress_state.report_tcp_failure(
+                self.sandbox_id,
+                dst,
+                host,
+                reason.as_ref(),
+            );
+        };
+        // `copy_bidirectional` only fails through a leg, so a missing fault is
+        // unexpected; leave it at the level that keeps it visible.
+        let failed_peer = match fault.map(relay::RelayFault::side) {
+            Some(relay::Side::Guest) => TransferPeer::Guest,
+            Some(relay::Side::Origin) | None => TransferPeer::Destination,
+        };
+        self.known_egress_state.report_tcp_transfer_failure(
+            self.sandbox_id,
+            dst,
+            host,
+            failed_peer,
+            fault.map_or("relay_io", relay::RelayFault::as_str),
+            reason.as_ref(),
+        )
     }
 }
 

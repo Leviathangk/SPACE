@@ -12,6 +12,7 @@ use pplx_space_observability::test_capture::{CapturedEvent, CapturedEventsLayer,
 use tracing::instrument::WithSubscriber as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 
+mod known_egress;
 mod tls_interception;
 
 fn dns_attribution_denied(reason: DenyReason) -> TcpAdmissionDenial {
@@ -776,9 +777,10 @@ async fn record_emits_one_connection_metric_and_reports_every_failure_outcome() 
             io::Error::new(io::ErrorKind::ConnectionRefused, "test connect failure").into(),
         )),
         FlowOutcome::Rejected(Rejection::TlsInterception(TlsInterceptionError::Timeout)),
-        FlowOutcome::RelayFailed(RelayFailure::Transfer(io::Error::other(
-            "test transfer failure",
-        ))),
+        FlowOutcome::RelayFailed(RelayFailure::Transfer {
+            error: io::Error::other("test transfer failure"),
+            fault: None,
+        }),
         FlowOutcome::Relayed(Relay::Tunnelled {
             wire_tx: 1,
             wire_rx: 2,

@@ -45,7 +45,6 @@ pub(in crate::tcp_proxy) struct RelayFault {
 }
 
 impl RelayFault {
-    #[cfg(test)]
     pub(in crate::tcp_proxy) const fn side(self) -> Side {
         self.side
     }

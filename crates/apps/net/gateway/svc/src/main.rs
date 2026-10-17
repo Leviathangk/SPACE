@@ -46,7 +46,9 @@ struct Cli {
     #[arg(long = "tcp-domain-authorization-mode", hide = true)]
     _tcp_domain_authorization_mode: Option<TcpDomainAuthorizationMode>,
 
-    /// Exact domains whose failed DNS or TCP flows should emit an error.
+    /// Exact domains whose failed DNS or TCP flows should be logged. A flow
+    /// that never connects emits an error; one that fails after connecting is
+    /// logged at info, or at debug when the guest abandoned it.
     #[arg(long = "known-egress-domain", value_name = "DOMAIN")]
     known_egress_domains: Vec<DomainName>,
 
