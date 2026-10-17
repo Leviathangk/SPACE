@@ -64,6 +64,7 @@ const SPACED_GUEST_HEALTH_TIMEOUT: Duration = Duration::from_millis(500);
 const NET_GATEWAY_HEALTH_TIMEOUT: Duration = Duration::from_millis(250);
 const SIDECAR_RESTART_TIMEOUT: Duration = Duration::from_secs(10);
 const SIDECAR_RESTART_CONCURRENCY: usize = 16;
+const SIDECAR_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(60);
 const RUN_DIR: &str = pplx_space_common_core::host::linux::paths::SANDBOX_RUN_DIR;
 const GUEST_HEALTH_LIFECYCLES: [crate::state::SandboxState; 9] = [
     crate::state::SandboxState::Starting,
@@ -167,6 +168,38 @@ enum SpacedHostRestartError {
     DatabaseMutexPoisoned,
     #[error("persist spaced-host replacement pid: {0}")]
     Persist(#[source] rusqlite::Error),
+}
+
+impl SpacedHostRestartError {
+    fn launch_status(&self) -> Option<&tonic::Status> {
+        match self {
+            Self::Launch(status) => Some(status),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum NetGatewayRelaunchError {
+    #[error("launch net-gateway replacement: {0}")]
+    Launch(#[source] tonic::Status),
+    #[error("{0}")]
+    Other(String),
+}
+
+impl From<String> for NetGatewayRelaunchError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
+impl NetGatewayRelaunchError {
+    fn launch_status(&self) -> Option<&tonic::Status> {
+        match self {
+            Self::Launch(status) => Some(status),
+            Self::Other(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -276,6 +309,7 @@ fn sidecar_info_from_row(row: &crate::db::SandboxRow) -> SidecarInfo {
     }
 }
 
+#[derive(Clone)]
 enum SidecarRestartRequest {
     SpacedHost(SidecarInfo),
     NetGateway(SidecarInfo),
@@ -295,8 +329,12 @@ struct SidecarRestartKey {
 
 impl SidecarRestartRequest {
     fn sandbox_id(&self) -> &str {
+        &self.info().sandbox_id
+    }
+
+    fn info(&self) -> &SidecarInfo {
         match self {
-            Self::SpacedHost(info) | Self::NetGateway(info) => &info.sandbox_id,
+            Self::SpacedHost(info) | Self::NetGateway(info) => info,
         }
     }
 
@@ -351,14 +389,36 @@ impl SidecarRestartRequest {
 #[derive(Default)]
 struct SidecarRestartQueue {
     pending: VecDeque<SidecarRestartRequest>,
-    scheduled: HashSet<SidecarRestartKey>,
+    /// Admitted keys and the sweep tick that admitted them. Backoff counts
+    /// from that tick so a retry lines up with a later sweep.
+    scheduled: HashMap<SidecarRestartKey, Instant>,
+    /// Restarts that failed under the authority they were attempted with. A
+    /// request under that same authority waits for `retry_at`; any authority
+    /// change (a new uid, PID, or lifecycle re-arm) starts afresh.
+    deferred: HashMap<SidecarRestartKey, DeferredSidecarRestart>,
+}
+
+struct DeferredSidecarRestart {
+    attempted: SidecarRestartRequest,
+    consecutive_failures: u32,
+    /// `None` parks the restart until the sandbox's authority changes.
+    retry_at: Option<Instant>,
 }
 
 impl SidecarRestartQueue {
-    fn schedule(&mut self, request: SidecarRestartRequest) -> bool {
-        if !self.scheduled.insert(request.key()) {
+    fn schedule(&mut self, request: SidecarRestartRequest, now: Instant) -> bool {
+        let key = request.key();
+        if let Some(deferred) = self.deferred.get(&key) {
+            if !deferred.attempted.still_has_authority(request.info()) {
+                self.deferred.remove(&key);
+            } else if deferred.retry_at.is_none_or(|retry_at| now < retry_at) {
+                return false;
+            }
+        }
+        if self.scheduled.contains_key(&key) {
             return false;
         }
+        self.scheduled.insert(key, now);
         self.pending.push_back(request);
         true
     }
@@ -377,18 +437,116 @@ impl SidecarRestartQueue {
                 false
             }
         });
+        self.deferred
+            .retain(|_, deferred| retain(&deferred.attempted));
     }
 
     fn complete(&mut self, key: &SidecarRestartKey) {
         self.scheduled.remove(key);
     }
+
+    fn succeed(&mut self, key: &SidecarRestartKey) {
+        self.scheduled.remove(key);
+        self.deferred.remove(key);
+    }
+
+    /// Release a failed restart and return how long the same authority must
+    /// wait, counted from the sweep that admitted the attempt.
+    fn defer(&mut self, request: SidecarRestartRequest) -> Duration {
+        let (consecutive_failures, scheduled_at) = self.record_failure(&request);
+        let delay = sidecar_restart_retry_delay(consecutive_failures);
+        let retry_at = scheduled_at.unwrap_or_else(Instant::now) + delay;
+        self.insert_deferred(request, consecutive_failures, Some(retry_at));
+        delay
+    }
+
+    /// Release a restart that cannot succeed under its current authority.
+    fn park(&mut self, request: SidecarRestartRequest) {
+        let (consecutive_failures, _) = self.record_failure(&request);
+        self.insert_deferred(request, consecutive_failures, None);
+    }
+
+    fn record_failure(&mut self, request: &SidecarRestartRequest) -> (u32, Option<Instant>) {
+        let key = request.key();
+        let scheduled_at = self.scheduled.remove(&key);
+        let consecutive_failures = self
+            .deferred
+            .get(&key)
+            .filter(|deferred| deferred.attempted.still_has_authority(request.info()))
+            .map_or(1, |deferred| {
+                deferred.consecutive_failures.saturating_add(1)
+            });
+        (consecutive_failures, scheduled_at)
+    }
+
+    fn insert_deferred(
+        &mut self,
+        attempted: SidecarRestartRequest,
+        consecutive_failures: u32,
+        retry_at: Option<Instant>,
+    ) {
+        self.deferred.insert(
+            attempted.key(),
+            DeferredSidecarRestart {
+                attempted,
+                consecutive_failures,
+                retry_at,
+            },
+        );
+    }
+}
+
+/// Exponential backoff from the sweep interval, so the first retry keeps the
+/// historical cadence and a persistent failure settles at the cap.
+fn sidecar_restart_retry_delay(consecutive_failures: u32) -> Duration {
+    let doublings = consecutive_failures.saturating_sub(1).min(16);
+    SIDECAR_CHECK_INTERVAL
+        .saturating_mul(1 << doublings)
+        .min(SIDECAR_RESTART_MAX_BACKOFF)
+}
+
+/// Why a sidecar restart attempt failed, as far as retrying is concerned.
+#[derive(Debug)]
+enum SidecarRestartFailure {
+    /// node-manager holds no network lease for the sandbox, so no replacement
+    /// can launch until a lifecycle operation re-establishes one.
+    NotAllocated(String),
+    Retryable(String),
+}
+
+impl SidecarRestartFailure {
+    fn classify<E>(
+        error: WatchdogTimeoutError<E>,
+        launch_status: impl FnOnce(&E) -> Option<&tonic::Status>,
+    ) -> Self
+    where
+        E: fmt::Debug + fmt::Display,
+    {
+        let not_allocated = match &error {
+            WatchdogTimeoutError::Operation(operation) => {
+                launch_status(operation).is_some_and(launch_reports_no_allocation)
+            }
+            WatchdogTimeoutError::Timeout { .. } => false,
+        };
+        if not_allocated {
+            Self::NotAllocated(error.to_string())
+        } else {
+            Self::Retryable(error.to_string())
+        }
+    }
+}
+
+/// node-manager's `Launch` checks the execution fence first and then answers
+/// NOT_FOUND only when the fenced sandbox has no leasing or leased network
+/// slot. That is node-manager's authoritative answer for this execution, not
+/// a transient condition.
+fn launch_reports_no_allocation(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::NotFound
 }
 
 struct SidecarRestartOutcome {
-    key: SidecarRestartKey,
-    sandbox_id: String,
-    operation: &'static str,
-    result: Result<(), String>,
+    request: SidecarRestartRequest,
+    result: Result<(), SidecarRestartFailure>,
 }
 
 type SidecarRestartFuture = BoxFuture<'static, SidecarRestartOutcome>;
@@ -1054,6 +1212,7 @@ impl SandboxWatchdog {
             &self.node_manager,
         )
         .await
+        .map_err(|error| error.to_string())
     }
 
     pub async fn update_network_counters(
@@ -1294,12 +1453,12 @@ async fn sidecar_loop(
     let mut restart_queue = SidecarRestartQueue::default();
     let mut restart_futures = FuturesUnordered::<SidecarRestartFuture>::new();
     loop {
-        let run_sweep = tokio::select! {
+        let sweep_at = tokio::select! {
             _ = shutdown_token.cancelled() => return,
-            _ = interval.tick() => true,
+            tick_at = interval.tick() => Some(tick_at.into_std()),
             outcome = restart_futures.next(), if !restart_futures.is_empty() => {
                 if let Some(outcome) = outcome {
-                    finish_sidecar_restart(&mut restart_queue, outcome);
+                    finish_sidecar_restart(&mut restart_queue, outcome, &sidecars, &db).await;
                 }
                 fill_sidecar_restart_slots(
                     &mut restart_queue,
@@ -1312,21 +1471,22 @@ async fn sidecar_loop(
                     &node_manager,
                 )
                 .await;
-                false
+                None
             }
         };
-        if !run_sweep {
+        let Some(sweep_at) = sweep_at else {
             continue;
-        }
+        };
         tick = tick.wrapping_add(1);
 
         // Snapshot sidecar info for iteration
         let sidecar_snapshot: Vec<SidecarInfo> = {
             let map = sidecars.lock().await;
-            // Drop queued work as soon as its sandbox disappears, its
-            // authority changes, or another actor finishes the repair. This
-            // keeps the FIFO bounded by current work and lets a fresh request
-            // for the same sidecar replace a stale queued generation.
+            // Drop queued and deferred work as soon as its sandbox
+            // disappears, its authority changes, or another actor finishes the
+            // repair. This keeps the FIFO and backoff state bounded by current
+            // work and lets a fresh request for the same sidecar replace a
+            // stale generation.
             restart_queue.retain_pending(|request| {
                 map.get(request.sandbox_id())
                     .is_some_and(|current| request.still_has_authority(current))
@@ -1403,7 +1563,7 @@ async fn sidecar_loop(
             if !spaced_alive
                 && info.uid.is_some()
                 && info.vsock_uds_path.is_some()
-                && restart_queue.schedule(SidecarRestartRequest::SpacedHost(info.clone()))
+                && restart_queue.schedule(SidecarRestartRequest::SpacedHost(info.clone()), sweep_at)
             {
                 tracing::warn!(
                     sandbox_id = %id,
@@ -1414,7 +1574,7 @@ async fn sidecar_loop(
             }
             if !netgtw_alive
                 && info.uid.is_some()
-                && restart_queue.schedule(SidecarRestartRequest::NetGateway(info.clone()))
+                && restart_queue.schedule(SidecarRestartRequest::NetGateway(info.clone()), sweep_at)
             {
                 tracing::warn!(
                     sandbox_id = %id,
@@ -1495,69 +1655,159 @@ async fn fill_sidecar_restart_slots(
             continue;
         }
 
-        let sandbox_id = request.sandbox_id().to_string();
-        let operation = request.operation();
-        let db = Arc::clone(db);
-        let sidecars = Arc::clone(sidecars);
-        let network_policy_reconcile_queue = network_policy_reconcile_queue.clone();
-        let state = Arc::clone(state);
-        let feature_flags = feature_flags.clone();
-        let node_manager = node_manager.clone();
-        let task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
-            match request {
-                SidecarRestartRequest::SpacedHost(info) => watchdog_timeout(
-                    SIDECAR_RESTART_TIMEOUT,
-                    operation,
-                    restart_spaced_host(&info, db, sidecars, &node_manager),
-                )
-                .await
-                .map(|_| ())
-                .map_err(|error| error.to_string()),
-                SidecarRestartRequest::NetGateway(info) => watchdog_timeout(
-                    SIDECAR_RESTART_TIMEOUT,
-                    operation,
-                    restart_netgtw(
-                        &info,
-                        db,
-                        sidecars,
-                        network_policy_reconcile_queue,
-                        &state,
-                        &feature_flags,
-                        &node_manager,
-                    ),
-                )
-                .await
-                .map(|_| ())
-                .map_err(|error| error.to_string()),
-            }
-        }));
-        futures.push(
-            async move {
-                let result = task.await.unwrap_or_else(|error| {
-                    Err(format!("restart task failed before completion: {error}"))
-                });
-                SidecarRestartOutcome {
-                    key,
-                    sandbox_id,
-                    operation,
-                    result,
-                }
-            }
-            .boxed(),
-        );
+        futures.push(start_sidecar_restart(
+            request,
+            db,
+            sidecars,
+            network_policy_reconcile_queue,
+            state,
+            feature_flags,
+            node_manager,
+        ));
     }
 }
 
-fn finish_sidecar_restart(queue: &mut SidecarRestartQueue, outcome: SidecarRestartOutcome) {
-    queue.complete(&outcome.key);
-    if let Err(error) = outcome.result {
-        tracing::error!(
-            sandbox_id = outcome.sandbox_id,
-            %error,
-            operation = outcome.operation,
-            "sidecar restart failed"
-        );
+fn start_sidecar_restart(
+    request: SidecarRestartRequest,
+    db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
+    sidecars: &Arc<Mutex<HashMap<String, SidecarInfo>>>,
+    network_policy_reconcile_queue: &NetworkPolicyReconcileQueue,
+    state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
+    feature_flags: &pplx_space_feature_flags::FeatureFlagClient,
+    node_manager: &NodeManagerConnector,
+) -> SidecarRestartFuture {
+    let operation = request.operation();
+    let attempted = request.clone();
+    let db = Arc::clone(db);
+    let sidecars = Arc::clone(sidecars);
+    let network_policy_reconcile_queue = network_policy_reconcile_queue.clone();
+    let state = Arc::clone(state);
+    let feature_flags = feature_flags.clone();
+    let node_manager = node_manager.clone();
+    let task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        match request {
+            SidecarRestartRequest::SpacedHost(info) => watchdog_timeout(
+                SIDECAR_RESTART_TIMEOUT,
+                operation,
+                restart_spaced_host(&info, db, sidecars, &node_manager),
+            )
+            .await
+            .map_err(|error| {
+                SidecarRestartFailure::classify(error, SpacedHostRestartError::launch_status)
+            }),
+            SidecarRestartRequest::NetGateway(info) => watchdog_timeout(
+                SIDECAR_RESTART_TIMEOUT,
+                operation,
+                restart_netgtw(
+                    &info,
+                    db,
+                    sidecars,
+                    network_policy_reconcile_queue,
+                    &state,
+                    &feature_flags,
+                    &node_manager,
+                ),
+            )
+            .await
+            .map_err(|error| {
+                SidecarRestartFailure::classify(error, NetGatewayRelaunchError::launch_status)
+            }),
+        }
+    }));
+    async move {
+        let result = task.await.unwrap_or_else(|error| {
+            Err(SidecarRestartFailure::Retryable(format!(
+                "restart task failed before completion: {error}"
+            )))
+        });
+        SidecarRestartOutcome {
+            request: attempted,
+            result,
+        }
     }
+    .boxed()
+}
+
+async fn finish_sidecar_restart(
+    queue: &mut SidecarRestartQueue,
+    outcome: SidecarRestartOutcome,
+    sidecars: &Arc<Mutex<HashMap<String, SidecarInfo>>>,
+    db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
+) {
+    let SidecarRestartOutcome { request, result } = outcome;
+    let sandbox_id = request.sandbox_id().to_owned();
+    let operation = request.operation();
+    match result {
+        Ok(()) => queue.succeed(&request.key()),
+        Err(SidecarRestartFailure::Retryable(error)) => {
+            let retry_in = queue.defer(request);
+            tracing::error!(
+                sandbox_id,
+                %error,
+                operation,
+                retry_in_secs = retry_in.as_secs(),
+                "sidecar restart failed"
+            );
+        }
+        Err(SidecarRestartFailure::NotAllocated(error)) => {
+            // Retrying cannot help: hand the contradiction to the lifecycle
+            // record while the attempted authority is still current, and stop
+            // until a lifecycle operation re-arms the sandbox.
+            let still_current = sidecars
+                .lock()
+                .await
+                .get(&sandbox_id)
+                .is_some_and(|current| request.still_has_authority(current));
+            let quarantined =
+                still_current && quarantine_unallocated_sandbox(db, &sandbox_id, operation);
+            queue.park(request);
+            tracing::error!(
+                sandbox_id,
+                %error,
+                operation,
+                quarantined,
+                "sidecar restart stopped: node-manager has no allocation for the sandbox"
+            );
+        }
+    }
+}
+
+/// Quarantine a sandbox whose committed lifecycle still expects live
+/// sidecars after node-manager reported it holds no allocation. Transitional
+/// states belong to the lifecycle operation in flight, which will either
+/// re-arm monitoring or retire it.
+fn quarantine_unallocated_sandbox(
+    db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
+    sandbox_id: &str,
+    operation: &'static str,
+) -> bool {
+    let state = match db.lock() {
+        Ok(conn) => match crate::db::get_sandbox(&conn, sandbox_id) {
+            Ok(Some(row)) => row.state,
+            Ok(None) => return false,
+            Err(error) => {
+                tracing::warn!(sandbox_id, %error, "failed to load sandbox before quarantine");
+                return false;
+            }
+        },
+        Err(error) => {
+            tracing::warn!(sandbox_id, %error, "sandbox database mutex poisoned before quarantine");
+            return false;
+        }
+    };
+    if !matches!(
+        state,
+        crate::state::SandboxState::Started | crate::state::SandboxState::Paused
+    ) {
+        return false;
+    }
+    crate::runtime_reconciliation::mark_quarantined_best_effort(
+        db,
+        sandbox_id,
+        state,
+        pplx_space_common_core::types::SandboxQuarantineReasonCode::RuntimeProbeInconsistent,
+        &format!("{operation} found no node-manager allocation for the sandbox"),
+    )
 }
 
 fn emit_auto_lifecycle_delete_gauges(db: &Arc<std::sync::Mutex<rusqlite::Connection>>) {
@@ -3019,7 +3269,7 @@ async fn restart_netgtw(
     state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
     feature_flags: &pplx_space_feature_flags::FeatureFlagClient,
     node_manager: &NodeManagerConnector,
-) -> Result<(), String> {
+) -> Result<(), NetGatewayRelaunchError> {
     relaunch_netgtw(
         info,
         &db,
@@ -3050,7 +3300,7 @@ async fn relaunch_netgtw(
     state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
     feature_flags: &pplx_space_feature_flags::FeatureFlagClient,
     node_manager: &NodeManagerConnector,
-) -> Result<u32, String> {
+) -> Result<u32, NetGatewayRelaunchError> {
     let sandbox_id = &info.sandbox_id;
     let uid = info
         .uid
@@ -3075,7 +3325,7 @@ async fn relaunch_netgtw(
             env: crate::sidecar_env::net_gateway_env(),
         })
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(NetGatewayRelaunchError::Launch)?;
     let pid = resp.get_ref().pid;
 
     commit_netgtw_replacement(sandbox_id, uid, info.netgtw_pid, pid, db, sidecars, state).await?;
