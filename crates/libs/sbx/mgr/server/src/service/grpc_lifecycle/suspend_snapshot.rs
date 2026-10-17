@@ -1093,6 +1093,7 @@ impl SandboxManagerService {
                         execution_generation,
                         artifact: &staged_artifact,
                         format: published_format,
+                        just_captured: true,
                     },
                 )
                 .await?;

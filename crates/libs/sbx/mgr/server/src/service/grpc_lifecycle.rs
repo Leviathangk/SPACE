@@ -362,6 +362,9 @@ struct TeardownSuspendBackup<'a> {
     execution_generation: pplx_space_common_core::types::ExecutionGeneration,
     artifact: &'a crate::db::LocalArtifactRow,
     format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
+    /// This call captured the artifact under an id it minted, so the cluster
+    /// cannot hold a backup of it yet and asking would only return NOT_FOUND.
+    just_captured: bool,
 }
 
 /// The persisted retained-source identity of a full artifact, if any.

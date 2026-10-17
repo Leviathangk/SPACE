@@ -8,6 +8,10 @@ use pplx_space_node_api_client::proto::{
 #[derive(Clone)]
 struct ReadyBackup;
 
+/// Backup lookups this process's `ReadyBackup` server has answered.
+static READY_BACKUP_LOOKUPS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 impl tonic::server::NamedService for ReadyBackup {
     const NAME: &'static str = "space.node.api.v1.ClusterApi";
 }
@@ -45,6 +49,7 @@ where
 
     fn call(&mut self, request: http::Request<B>) -> Self::Future {
         assert!(request.uri().path().ends_with("/GetArtifactBackupLocation"));
+        READY_BACKUP_LOOKUPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Box::pin(async move {
             let mut grpc = tonic::server::Grpc::new(tonic_prost::ProstCodec::default());
             Ok(grpc.unary(ReadyBackup, request).await)
@@ -124,6 +129,7 @@ async fn teardown_reuses_ready_backup_but_waits_for_active_local_upload() {
                     },
                     artifact: &artifact,
                     format: SuspendSnapshotFormat::Full,
+                    just_captured: false,
                 },
             );
             if active_upload {
@@ -165,6 +171,75 @@ async fn teardown_reuses_ready_backup_but_waits_for_active_local_upload() {
                     .all(|job| job.kind != crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND)
             );
         }
+    }
+    stop.cancel();
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn just_captured_teardown_artifact_skips_the_ready_backup_lookup() {
+    use crate::service::tests::service_tests::insert_stranded_teardown_suspend_sandbox;
+    use pplx_space_common_core::types::ExecutionGeneration;
+    use std::ffi::OsStr;
+
+    // The parent serves and counts lookups; the isolated child makes them.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let stop = tokio_util::sync::CancellationToken::new();
+    let server = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(ReadyBackup)
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                stop.clone().cancelled_owned(),
+            ),
+    );
+    let token = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(token.path(), "synthetic-backup-test-token").unwrap();
+    let child = pplx_space_test_env::enter_test_process(&[
+        ("SPACE_INTERNAL_RPC_INSECURE_DEV", Some(OsStr::new("1"))),
+        (
+            pplx_space_node_api_client::cluster::CLUSTER_API_ENDPOINT_ENV,
+            Some(OsStr::new(&endpoint)),
+        ),
+        (
+            pplx_space_common_svc::bearer_token::SPACE_CLUSTER_API_TOKEN_PATH_ENV,
+            Some(token.path().as_os_str()),
+        ),
+    ]);
+    if child {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new();
+        let generation = ExecutionGeneration::new(7).unwrap();
+        let artifact_id = insert_stranded_teardown_suspend_sandbox(&conn, sandbox_id, generation);
+        let row = crate::db::get_sandbox(&conn, &sandbox_id.to_string())
+            .unwrap()
+            .unwrap();
+        let artifact = crate::db::get_local_artifact(&conn, artifact_id)
+            .unwrap()
+            .unwrap();
+        let service = SandboxManagerService::for_test(conn);
+        // The server would report a ready backup, so only an unasked lookup
+        // leaves the upload path, which has no destination here, to answer.
+        let error = service
+            .ensure_teardown_suspend_backup(
+                &row,
+                super::TeardownSuspendBackup {
+                    execution_generation: generation,
+                    artifact: &artifact,
+                    format: SuspendSnapshotFormat::Full,
+                    just_captured: true,
+                },
+            )
+            .await
+            .expect_err("a fresh capture must be uploaded, not matched to a backup");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{error:?}");
+    } else {
+        assert_eq!(
+            READY_BACKUP_LOOKUPS.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a just-captured artifact has no backup to look up"
+        );
     }
     stop.cancel();
     server.await.unwrap().unwrap();
